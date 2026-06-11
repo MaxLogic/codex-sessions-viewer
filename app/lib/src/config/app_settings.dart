@@ -1,0 +1,1133 @@
+import 'dart:io';
+
+import 'package:toml/toml.dart';
+
+enum AppThemeMode {
+  system('system'),
+  light('light'),
+  dark('dark'),
+  highContrastLight('high_contrast_light'),
+  highContrastDark('high_contrast_dark');
+
+  const AppThemeMode(this.tomlValue);
+
+  final String tomlValue;
+
+  static AppThemeMode parse(String value) => AppThemeMode.values.firstWhere(
+    (mode) => mode.tomlValue == value,
+    orElse: () => throw SettingsValidationException(
+      'ui.theme',
+      'Unsupported theme: $value',
+    ),
+  );
+}
+
+enum UiDensity {
+  comfortable('comfortable'),
+  compact('compact');
+
+  const UiDensity(this.tomlValue);
+
+  final String tomlValue;
+
+  static UiDensity parse(String value) => UiDensity.values.firstWhere(
+    (density) => density.tomlValue == value,
+    orElse: () => throw SettingsValidationException(
+      'ui.density',
+      'Unsupported density: $value',
+    ),
+  );
+}
+
+class SettingsValidationException implements Exception {
+  const SettingsValidationException(this.field, this.message);
+
+  final String field;
+  final String message;
+
+  @override
+  String toString() => 'SettingsValidationException($field): $message';
+}
+
+class SettingsRepository {
+  SettingsRepository(this.file);
+
+  final File file;
+
+  Future<AppSettings> loadOrCreate() async {
+    if (!await file.exists()) {
+      final settings = AppSettings.defaults();
+      await save(settings);
+      return settings;
+    }
+
+    final text = await file.readAsString();
+    final map = TomlDocument.parse(text).toMap();
+    return AppSettings.fromTomlMap(map);
+  }
+
+  Future<void> save(AppSettings settings) async {
+    await file.parent.create(recursive: true);
+    await file.writeAsString(_encodeToml(settings.toTomlMap()));
+  }
+
+  String _encodeToml(Map<String, Object?> map) {
+    final document = TomlAstBuilder().buildDocument(map);
+    final printer = TomlPrettyPrinter();
+    printer.visitDocument(document);
+    return printer.toString();
+  }
+}
+
+class AppSettings {
+  const AppSettings({
+    required this.app,
+    required this.paths,
+    required this.wsl,
+    required this.scanner,
+    required this.ui,
+    required this.terminal,
+    required this.toolOutput,
+    required this.voiceOver,
+    required this.pricing,
+    required this.logging,
+  });
+
+  final GeneralAppSettings app;
+  final PathSettings paths;
+  final WslSettings wsl;
+  final ScannerSettings scanner;
+  final UiSettings ui;
+  final TerminalSettings terminal;
+  final ToolOutputSettings toolOutput;
+  final VoiceOverSettings voiceOver;
+  final PricingSettings pricing;
+  final LoggingSettings logging;
+
+  factory AppSettings.defaults() => const AppSettings(
+    app: GeneralAppSettings(firstRun: false),
+    paths: PathSettings(
+      windowsCodexPath: r'C:\Users\pawel\.codex',
+      wslCodexUncPath: r'\\wsl.localhost\Ubuntu\home\pawel\.codex',
+    ),
+    wsl: WslSettings(
+      distro: 'Ubuntu',
+      linuxHome: '/home/pawel',
+      linuxRootUnc: r'\\wsl.localhost\Ubuntu\',
+    ),
+    scanner: ScannerSettings(
+      backgroundRescanEnabled: true,
+      backgroundRescanIntervalSeconds: 300,
+    ),
+    ui: UiSettings(
+      theme: AppThemeMode.system,
+      useSystemAccentColor: true,
+      fontSize: 14,
+      density: UiDensity.comfortable,
+      showTextOnButtons: true,
+      showIcons: true,
+      nativeTitleBar: true,
+    ),
+    terminal: TerminalSettings(
+      defaultTerminal: 'alacritty',
+      profiles: {
+        'alacritty': TerminalProfileSettings(
+          enabled: true,
+          exe: r'C:\Program Files\Alacritty\alacritty.exe',
+        ),
+        'windows_terminal': TerminalProfileSettings(
+          enabled: true,
+          exe: 'wt.exe',
+        ),
+      },
+    ),
+    toolOutput: ToolOutputSettings(
+      indexToolOutput: false,
+      maxToolOutputPreviewChars: 2000,
+      maxToolOutputStoreChars: 10000,
+      collapseToolOutputByDefault: true,
+    ),
+    voiceOver: VoiceOverSettings(
+      enabled: true,
+      preferWav: true,
+      fallbackToScreenReader: true,
+      events: {
+        'scan_started': VoiceOverEventSettings(
+          text: 'Scanning started',
+          wav: r'assets\voice\scan_started.wav',
+        ),
+        'scan_finished': VoiceOverEventSettings(
+          text: 'Scanning finished',
+          wav: r'assets\voice\scan_finished.wav',
+        ),
+        'copied': VoiceOverEventSettings(
+          text: 'Copied',
+          wav: r'assets\voice\copied.wav',
+        ),
+        'export_finished': VoiceOverEventSettings(
+          text: 'Export finished',
+          wav: r'assets\voice\export_finished.wav',
+        ),
+        'parse_error': VoiceOverEventSettings(
+          text: 'Some sessions could not be parsed',
+          wav: r'assets\voice\parse_error.wav',
+        ),
+        'database_error': VoiceOverEventSettings(
+          text: 'Database error',
+          wav: r'assets\voice\database_error.wav',
+        ),
+      },
+    ),
+    pricing: PricingSettings(
+      provider: 'openrouter',
+      useExternalPricing: true,
+      cachePricingHours: 24,
+      fallbackToOverrides: true,
+      openRouter: OpenRouterSettings(
+        modelsEndpoint: 'https://openrouter.ai/api/v1/models',
+        apiKey: '',
+      ),
+      overrides: {
+        'openai/gpt-5.5-thinking': PricingOverrideSettings(
+          prompt: '0',
+          completion: '0',
+          inputCacheRead: '0',
+          inputCacheWrite: '0',
+          internalReasoning: '0',
+        ),
+      },
+    ),
+    logging: LoggingSettings(
+      level: 'info',
+      logFile: r'logs\codex-session-viewer.log',
+      maxLogFiles: 5,
+      maxLogSizeMb: 10,
+    ),
+  );
+
+  factory AppSettings.fromTomlMap(Map<String, dynamic> map) {
+    final defaults = AppSettings.defaults();
+    return defaults.copyWith(
+      app: GeneralAppSettings.fromMap(_table(map, 'app'), defaults.app),
+      paths: PathSettings.fromMap(_table(map, 'paths'), defaults.paths),
+      wsl: WslSettings.fromMap(_table(map, 'wsl'), defaults.wsl),
+      scanner: ScannerSettings.fromMap(
+        _table(map, 'scanner'),
+        defaults.scanner,
+      ),
+      ui: UiSettings.fromMap(_table(map, 'ui'), defaults.ui),
+      terminal: TerminalSettings.fromMap(
+        _table(map, 'terminal'),
+        defaults.terminal,
+      ),
+      toolOutput: ToolOutputSettings.fromMap(
+        _table(map, 'tool_output'),
+        defaults.toolOutput,
+      ),
+      voiceOver: VoiceOverSettings.fromMap(
+        _table(map, 'voice_over'),
+        defaults.voiceOver,
+      ),
+      pricing: PricingSettings.fromMap(
+        _table(map, 'pricing'),
+        defaults.pricing,
+      ),
+      logging: LoggingSettings.fromMap(
+        _table(map, 'logging'),
+        defaults.logging,
+      ),
+    );
+  }
+
+  AppSettings copyWith({
+    GeneralAppSettings? app,
+    PathSettings? paths,
+    WslSettings? wsl,
+    ScannerSettings? scanner,
+    UiSettings? ui,
+    TerminalSettings? terminal,
+    ToolOutputSettings? toolOutput,
+    VoiceOverSettings? voiceOver,
+    PricingSettings? pricing,
+    LoggingSettings? logging,
+  }) => AppSettings(
+    app: app ?? this.app,
+    paths: paths ?? this.paths,
+    wsl: wsl ?? this.wsl,
+    scanner: scanner ?? this.scanner,
+    ui: ui ?? this.ui,
+    terminal: terminal ?? this.terminal,
+    toolOutput: toolOutput ?? this.toolOutput,
+    voiceOver: voiceOver ?? this.voiceOver,
+    pricing: pricing ?? this.pricing,
+    logging: logging ?? this.logging,
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'app': app.toTomlMap(),
+    'paths': paths.toTomlMap(),
+    'wsl': wsl.toTomlMap(),
+    'scanner': scanner.toTomlMap(),
+    'ui': ui.toTomlMap(),
+    'terminal': terminal.toTomlMap(),
+    'tool_output': toolOutput.toTomlMap(),
+    'voice_over': voiceOver.toTomlMap(),
+    'pricing': pricing.toTomlMap(),
+    'logging': logging.toTomlMap(),
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is AppSettings &&
+      app == other.app &&
+      paths == other.paths &&
+      wsl == other.wsl &&
+      scanner == other.scanner &&
+      ui == other.ui &&
+      terminal == other.terminal &&
+      toolOutput == other.toolOutput &&
+      voiceOver == other.voiceOver &&
+      pricing == other.pricing &&
+      logging == other.logging;
+
+  @override
+  int get hashCode => Object.hash(
+    app,
+    paths,
+    wsl,
+    scanner,
+    ui,
+    terminal,
+    toolOutput,
+    voiceOver,
+    pricing,
+    logging,
+  );
+}
+
+class GeneralAppSettings {
+  const GeneralAppSettings({required this.firstRun});
+
+  final bool firstRun;
+
+  factory GeneralAppSettings.fromMap(
+    Map<String, dynamic> map,
+    GeneralAppSettings defaults,
+  ) => GeneralAppSettings(
+    firstRun: _bool(map, 'first_run', defaults.firstRun, 'app.first_run'),
+  );
+
+  Map<String, Object?> toTomlMap() => {'first_run': firstRun};
+
+  @override
+  bool operator ==(Object other) =>
+      other is GeneralAppSettings && firstRun == other.firstRun;
+
+  @override
+  int get hashCode => firstRun.hashCode;
+}
+
+class PathSettings {
+  const PathSettings({
+    required this.windowsCodexPath,
+    required this.wslCodexUncPath,
+  });
+
+  final String windowsCodexPath;
+  final String wslCodexUncPath;
+
+  factory PathSettings.fromMap(
+    Map<String, dynamic> map,
+    PathSettings defaults,
+  ) => PathSettings(
+    windowsCodexPath: _string(
+      map,
+      'windows_codex_path',
+      defaults.windowsCodexPath,
+      'paths.windows_codex_path',
+    ),
+    wslCodexUncPath: _string(
+      map,
+      'wsl_codex_unc_path',
+      defaults.wslCodexUncPath,
+      'paths.wsl_codex_unc_path',
+    ),
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'windows_codex_path': windowsCodexPath,
+    'wsl_codex_unc_path': wslCodexUncPath,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is PathSettings &&
+      windowsCodexPath == other.windowsCodexPath &&
+      wslCodexUncPath == other.wslCodexUncPath;
+
+  @override
+  int get hashCode => Object.hash(windowsCodexPath, wslCodexUncPath);
+}
+
+class WslSettings {
+  const WslSettings({
+    required this.distro,
+    required this.linuxHome,
+    required this.linuxRootUnc,
+  });
+
+  final String distro;
+  final String linuxHome;
+  final String linuxRootUnc;
+
+  factory WslSettings.fromMap(Map<String, dynamic> map, WslSettings defaults) =>
+      WslSettings(
+        distro: _string(map, 'distro', defaults.distro, 'wsl.distro'),
+        linuxHome: _string(
+          map,
+          'linux_home',
+          defaults.linuxHome,
+          'wsl.linux_home',
+        ),
+        linuxRootUnc: _string(
+          map,
+          'linux_root_unc',
+          defaults.linuxRootUnc,
+          'wsl.linux_root_unc',
+        ),
+      );
+
+  Map<String, Object?> toTomlMap() => {
+    'distro': distro,
+    'linux_home': linuxHome,
+    'linux_root_unc': linuxRootUnc,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is WslSettings &&
+      distro == other.distro &&
+      linuxHome == other.linuxHome &&
+      linuxRootUnc == other.linuxRootUnc;
+
+  @override
+  int get hashCode => Object.hash(distro, linuxHome, linuxRootUnc);
+}
+
+class ScannerSettings {
+  const ScannerSettings({
+    required this.backgroundRescanEnabled,
+    required this.backgroundRescanIntervalSeconds,
+  });
+
+  final bool backgroundRescanEnabled;
+  final int backgroundRescanIntervalSeconds;
+
+  factory ScannerSettings.fromMap(
+    Map<String, dynamic> map,
+    ScannerSettings defaults,
+  ) => ScannerSettings(
+    backgroundRescanEnabled: _bool(
+      map,
+      'background_rescan_enabled',
+      defaults.backgroundRescanEnabled,
+      'scanner.background_rescan_enabled',
+    ),
+    backgroundRescanIntervalSeconds: _positiveInt(
+      map,
+      'background_rescan_interval_seconds',
+      defaults.backgroundRescanIntervalSeconds,
+      'scanner.background_rescan_interval_seconds',
+    ),
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'background_rescan_enabled': backgroundRescanEnabled,
+    'background_rescan_interval_seconds': backgroundRescanIntervalSeconds,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is ScannerSettings &&
+      backgroundRescanEnabled == other.backgroundRescanEnabled &&
+      backgroundRescanIntervalSeconds == other.backgroundRescanIntervalSeconds;
+
+  @override
+  int get hashCode =>
+      Object.hash(backgroundRescanEnabled, backgroundRescanIntervalSeconds);
+}
+
+class UiSettings {
+  const UiSettings({
+    required this.theme,
+    required this.useSystemAccentColor,
+    required this.fontSize,
+    required this.density,
+    required this.showTextOnButtons,
+    required this.showIcons,
+    required this.nativeTitleBar,
+  });
+
+  final AppThemeMode theme;
+  final bool useSystemAccentColor;
+  final int fontSize;
+  final UiDensity density;
+  final bool showTextOnButtons;
+  final bool showIcons;
+  final bool nativeTitleBar;
+
+  factory UiSettings.fromMap(
+    Map<String, dynamic> map,
+    UiSettings defaults,
+  ) => UiSettings(
+    theme: AppThemeMode.parse(
+      _string(map, 'theme', defaults.theme.tomlValue, 'ui.theme'),
+    ),
+    useSystemAccentColor: _bool(
+      map,
+      'use_system_accent_color',
+      defaults.useSystemAccentColor,
+      'ui.use_system_accent_color',
+    ),
+    fontSize: _positiveInt(map, 'font_size', defaults.fontSize, 'ui.font_size'),
+    density: UiDensity.parse(
+      _string(map, 'density', defaults.density.tomlValue, 'ui.density'),
+    ),
+    showTextOnButtons: _bool(
+      map,
+      'show_text_on_buttons',
+      defaults.showTextOnButtons,
+      'ui.show_text_on_buttons',
+    ),
+    showIcons: _bool(map, 'show_icons', defaults.showIcons, 'ui.show_icons'),
+    nativeTitleBar: _bool(
+      map,
+      'native_title_bar',
+      defaults.nativeTitleBar,
+      'ui.native_title_bar',
+    ),
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'theme': theme.tomlValue,
+    'use_system_accent_color': useSystemAccentColor,
+    'font_size': fontSize,
+    'density': density.tomlValue,
+    'show_text_on_buttons': showTextOnButtons,
+    'show_icons': showIcons,
+    'native_title_bar': nativeTitleBar,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is UiSettings &&
+      theme == other.theme &&
+      useSystemAccentColor == other.useSystemAccentColor &&
+      fontSize == other.fontSize &&
+      density == other.density &&
+      showTextOnButtons == other.showTextOnButtons &&
+      showIcons == other.showIcons &&
+      nativeTitleBar == other.nativeTitleBar;
+
+  @override
+  int get hashCode => Object.hash(
+    theme,
+    useSystemAccentColor,
+    fontSize,
+    density,
+    showTextOnButtons,
+    showIcons,
+    nativeTitleBar,
+  );
+}
+
+class TerminalSettings {
+  const TerminalSettings({
+    required this.defaultTerminal,
+    required this.profiles,
+  });
+
+  final String defaultTerminal;
+  final Map<String, TerminalProfileSettings> profiles;
+
+  factory TerminalSettings.fromMap(
+    Map<String, dynamic> map,
+    TerminalSettings defaults,
+  ) {
+    final profiles = <String, TerminalProfileSettings>{};
+    final defaultProfiles = defaults.profiles;
+    profiles.addAll(defaultProfiles);
+    for (final entry in map.entries) {
+      if (entry.value is Map) {
+        profiles[entry.key] = TerminalProfileSettings.fromMap(
+          _table(map, entry.key),
+          defaultProfiles[entry.key] ??
+              const TerminalProfileSettings(enabled: false, exe: ''),
+          'terminal.${entry.key}',
+        );
+      }
+    }
+    final defaultTerminal = _string(
+      map,
+      'default_terminal',
+      defaults.defaultTerminal,
+      'terminal.default_terminal',
+    );
+    if (!profiles.containsKey(defaultTerminal)) {
+      throw SettingsValidationException(
+        'terminal.default_terminal',
+        'Default terminal profile is not configured: $defaultTerminal',
+      );
+    }
+    return TerminalSettings(
+      defaultTerminal: defaultTerminal,
+      profiles: Map.unmodifiable(profiles),
+    );
+  }
+
+  Map<String, Object?> toTomlMap() => {
+    'default_terminal': defaultTerminal,
+    for (final entry in profiles.entries) entry.key: entry.value.toTomlMap(),
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is TerminalSettings &&
+      defaultTerminal == other.defaultTerminal &&
+      _mapEquals(profiles, other.profiles);
+
+  @override
+  int get hashCode => Object.hash(defaultTerminal, _mapHash(profiles));
+}
+
+class TerminalProfileSettings {
+  const TerminalProfileSettings({required this.enabled, required this.exe});
+
+  final bool enabled;
+  final String exe;
+
+  factory TerminalProfileSettings.fromMap(
+    Map<String, dynamic> map,
+    TerminalProfileSettings defaults,
+    String fieldPrefix,
+  ) => TerminalProfileSettings(
+    enabled: _bool(map, 'enabled', defaults.enabled, '$fieldPrefix.enabled'),
+    exe: _string(map, 'exe', defaults.exe, '$fieldPrefix.exe'),
+  );
+
+  Map<String, Object?> toTomlMap() => {'enabled': enabled, 'exe': exe};
+
+  @override
+  bool operator ==(Object other) =>
+      other is TerminalProfileSettings &&
+      enabled == other.enabled &&
+      exe == other.exe;
+
+  @override
+  int get hashCode => Object.hash(enabled, exe);
+}
+
+class ToolOutputSettings {
+  const ToolOutputSettings({
+    required this.indexToolOutput,
+    required this.maxToolOutputPreviewChars,
+    required this.maxToolOutputStoreChars,
+    required this.collapseToolOutputByDefault,
+  });
+
+  final bool indexToolOutput;
+  final int maxToolOutputPreviewChars;
+  final int maxToolOutputStoreChars;
+  final bool collapseToolOutputByDefault;
+
+  factory ToolOutputSettings.fromMap(
+    Map<String, dynamic> map,
+    ToolOutputSettings defaults,
+  ) => ToolOutputSettings(
+    indexToolOutput: _bool(
+      map,
+      'index_tool_output',
+      defaults.indexToolOutput,
+      'tool_output.index_tool_output',
+    ),
+    maxToolOutputPreviewChars: _positiveInt(
+      map,
+      'max_tool_output_preview_chars',
+      defaults.maxToolOutputPreviewChars,
+      'tool_output.max_tool_output_preview_chars',
+    ),
+    maxToolOutputStoreChars: _positiveInt(
+      map,
+      'max_tool_output_store_chars',
+      defaults.maxToolOutputStoreChars,
+      'tool_output.max_tool_output_store_chars',
+    ),
+    collapseToolOutputByDefault: _bool(
+      map,
+      'collapse_tool_output_by_default',
+      defaults.collapseToolOutputByDefault,
+      'tool_output.collapse_tool_output_by_default',
+    ),
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'index_tool_output': indexToolOutput,
+    'max_tool_output_preview_chars': maxToolOutputPreviewChars,
+    'max_tool_output_store_chars': maxToolOutputStoreChars,
+    'collapse_tool_output_by_default': collapseToolOutputByDefault,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is ToolOutputSettings &&
+      indexToolOutput == other.indexToolOutput &&
+      maxToolOutputPreviewChars == other.maxToolOutputPreviewChars &&
+      maxToolOutputStoreChars == other.maxToolOutputStoreChars &&
+      collapseToolOutputByDefault == other.collapseToolOutputByDefault;
+
+  @override
+  int get hashCode => Object.hash(
+    indexToolOutput,
+    maxToolOutputPreviewChars,
+    maxToolOutputStoreChars,
+    collapseToolOutputByDefault,
+  );
+}
+
+class VoiceOverSettings {
+  const VoiceOverSettings({
+    required this.enabled,
+    required this.preferWav,
+    required this.fallbackToScreenReader,
+    required this.events,
+  });
+
+  final bool enabled;
+  final bool preferWav;
+  final bool fallbackToScreenReader;
+  final Map<String, VoiceOverEventSettings> events;
+
+  factory VoiceOverSettings.fromMap(
+    Map<String, dynamic> map,
+    VoiceOverSettings defaults,
+  ) {
+    final eventsMap = _table(map, 'events');
+    final events = <String, VoiceOverEventSettings>{};
+    events.addAll(defaults.events);
+    for (final entry in eventsMap.entries) {
+      if (entry.value is Map) {
+        events[entry.key] = VoiceOverEventSettings.fromMap(
+          _table(eventsMap, entry.key),
+          defaults.events[entry.key] ??
+              const VoiceOverEventSettings(text: '', wav: ''),
+          'voice_over.events.${entry.key}',
+        );
+      }
+    }
+    return VoiceOverSettings(
+      enabled: _bool(map, 'enabled', defaults.enabled, 'voice_over.enabled'),
+      preferWav: _bool(
+        map,
+        'prefer_wav',
+        defaults.preferWav,
+        'voice_over.prefer_wav',
+      ),
+      fallbackToScreenReader: _bool(
+        map,
+        'fallback_to_screen_reader',
+        defaults.fallbackToScreenReader,
+        'voice_over.fallback_to_screen_reader',
+      ),
+      events: Map.unmodifiable(events),
+    );
+  }
+
+  Map<String, Object?> toTomlMap() => {
+    'enabled': enabled,
+    'prefer_wav': preferWav,
+    'fallback_to_screen_reader': fallbackToScreenReader,
+    'events': {
+      for (final entry in events.entries) entry.key: entry.value.toTomlMap(),
+    },
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is VoiceOverSettings &&
+      enabled == other.enabled &&
+      preferWav == other.preferWav &&
+      fallbackToScreenReader == other.fallbackToScreenReader &&
+      _mapEquals(events, other.events);
+
+  @override
+  int get hashCode =>
+      Object.hash(enabled, preferWav, fallbackToScreenReader, _mapHash(events));
+}
+
+class VoiceOverEventSettings {
+  const VoiceOverEventSettings({required this.text, required this.wav});
+
+  final String text;
+  final String wav;
+
+  factory VoiceOverEventSettings.fromMap(
+    Map<String, dynamic> map,
+    VoiceOverEventSettings defaults,
+    String fieldPrefix,
+  ) => VoiceOverEventSettings(
+    text: _string(map, 'text', defaults.text, '$fieldPrefix.text'),
+    wav: _string(map, 'wav', defaults.wav, '$fieldPrefix.wav'),
+  );
+
+  Map<String, Object?> toTomlMap() => {'text': text, 'wav': wav};
+
+  @override
+  bool operator ==(Object other) =>
+      other is VoiceOverEventSettings && text == other.text && wav == other.wav;
+
+  @override
+  int get hashCode => Object.hash(text, wav);
+}
+
+class PricingSettings {
+  const PricingSettings({
+    required this.provider,
+    required this.useExternalPricing,
+    required this.cachePricingHours,
+    required this.fallbackToOverrides,
+    required this.openRouter,
+    required this.overrides,
+  });
+
+  final String provider;
+  final bool useExternalPricing;
+  final int cachePricingHours;
+  final bool fallbackToOverrides;
+  final OpenRouterSettings openRouter;
+  final Map<String, PricingOverrideSettings> overrides;
+
+  factory PricingSettings.fromMap(
+    Map<String, dynamic> map,
+    PricingSettings defaults,
+  ) {
+    final overridesMap = _table(map, 'overrides');
+    final overrides = <String, PricingOverrideSettings>{};
+    overrides.addAll(defaults.overrides);
+    for (final entry in overridesMap.entries) {
+      if (entry.value is Map) {
+        overrides[entry.key] = PricingOverrideSettings.fromMap(
+          _table(overridesMap, entry.key),
+          defaults.overrides[entry.key] ??
+              const PricingOverrideSettings(
+                prompt: '0',
+                completion: '0',
+                inputCacheRead: '0',
+                inputCacheWrite: '0',
+                internalReasoning: '0',
+              ),
+          'pricing.overrides.${entry.key}',
+        );
+      }
+    }
+    return PricingSettings(
+      provider: _string(map, 'provider', defaults.provider, 'pricing.provider'),
+      useExternalPricing: _bool(
+        map,
+        'use_external_pricing',
+        defaults.useExternalPricing,
+        'pricing.use_external_pricing',
+      ),
+      cachePricingHours: _positiveInt(
+        map,
+        'cache_pricing_hours',
+        defaults.cachePricingHours,
+        'pricing.cache_pricing_hours',
+      ),
+      fallbackToOverrides: _bool(
+        map,
+        'fallback_to_overrides',
+        defaults.fallbackToOverrides,
+        'pricing.fallback_to_overrides',
+      ),
+      openRouter: OpenRouterSettings.fromMap(
+        _table(map, 'openrouter'),
+        defaults.openRouter,
+      ),
+      overrides: Map.unmodifiable(overrides),
+    );
+  }
+
+  Map<String, Object?> toTomlMap() => {
+    'provider': provider,
+    'use_external_pricing': useExternalPricing,
+    'cache_pricing_hours': cachePricingHours,
+    'fallback_to_overrides': fallbackToOverrides,
+    'openrouter': openRouter.toTomlMap(),
+    'overrides': {
+      for (final entry in overrides.entries) entry.key: entry.value.toTomlMap(),
+    },
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is PricingSettings &&
+      provider == other.provider &&
+      useExternalPricing == other.useExternalPricing &&
+      cachePricingHours == other.cachePricingHours &&
+      fallbackToOverrides == other.fallbackToOverrides &&
+      openRouter == other.openRouter &&
+      _mapEquals(overrides, other.overrides);
+
+  @override
+  int get hashCode => Object.hash(
+    provider,
+    useExternalPricing,
+    cachePricingHours,
+    fallbackToOverrides,
+    openRouter,
+    _mapHash(overrides),
+  );
+}
+
+class OpenRouterSettings {
+  const OpenRouterSettings({
+    required this.modelsEndpoint,
+    required this.apiKey,
+  });
+
+  final String modelsEndpoint;
+  final String apiKey;
+
+  factory OpenRouterSettings.fromMap(
+    Map<String, dynamic> map,
+    OpenRouterSettings defaults,
+  ) => OpenRouterSettings(
+    modelsEndpoint: _string(
+      map,
+      'models_endpoint',
+      defaults.modelsEndpoint,
+      'pricing.openrouter.models_endpoint',
+    ),
+    apiKey: _string(
+      map,
+      'api_key',
+      defaults.apiKey,
+      'pricing.openrouter.api_key',
+    ),
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'models_endpoint': modelsEndpoint,
+    'api_key': apiKey,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is OpenRouterSettings &&
+      modelsEndpoint == other.modelsEndpoint &&
+      apiKey == other.apiKey;
+
+  @override
+  int get hashCode => Object.hash(modelsEndpoint, apiKey);
+}
+
+class PricingOverrideSettings {
+  const PricingOverrideSettings({
+    required this.prompt,
+    required this.completion,
+    required this.inputCacheRead,
+    required this.inputCacheWrite,
+    required this.internalReasoning,
+  });
+
+  final String prompt;
+  final String completion;
+  final String inputCacheRead;
+  final String inputCacheWrite;
+  final String internalReasoning;
+
+  factory PricingOverrideSettings.fromMap(
+    Map<String, dynamic> map,
+    PricingOverrideSettings defaults,
+    String fieldPrefix,
+  ) => PricingOverrideSettings(
+    prompt: _string(map, 'prompt', defaults.prompt, '$fieldPrefix.prompt'),
+    completion: _string(
+      map,
+      'completion',
+      defaults.completion,
+      '$fieldPrefix.completion',
+    ),
+    inputCacheRead: _string(
+      map,
+      'input_cache_read',
+      defaults.inputCacheRead,
+      '$fieldPrefix.input_cache_read',
+    ),
+    inputCacheWrite: _string(
+      map,
+      'input_cache_write',
+      defaults.inputCacheWrite,
+      '$fieldPrefix.input_cache_write',
+    ),
+    internalReasoning: _string(
+      map,
+      'internal_reasoning',
+      defaults.internalReasoning,
+      '$fieldPrefix.internal_reasoning',
+    ),
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'prompt': prompt,
+    'completion': completion,
+    'input_cache_read': inputCacheRead,
+    'input_cache_write': inputCacheWrite,
+    'internal_reasoning': internalReasoning,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is PricingOverrideSettings &&
+      prompt == other.prompt &&
+      completion == other.completion &&
+      inputCacheRead == other.inputCacheRead &&
+      inputCacheWrite == other.inputCacheWrite &&
+      internalReasoning == other.internalReasoning;
+
+  @override
+  int get hashCode => Object.hash(
+    prompt,
+    completion,
+    inputCacheRead,
+    inputCacheWrite,
+    internalReasoning,
+  );
+}
+
+class LoggingSettings {
+  const LoggingSettings({
+    required this.level,
+    required this.logFile,
+    required this.maxLogFiles,
+    required this.maxLogSizeMb,
+  });
+
+  final String level;
+  final String logFile;
+  final int maxLogFiles;
+  final int maxLogSizeMb;
+
+  factory LoggingSettings.fromMap(
+    Map<String, dynamic> map,
+    LoggingSettings defaults,
+  ) => LoggingSettings(
+    level: _string(map, 'level', defaults.level, 'logging.level'),
+    logFile: _string(map, 'log_file', defaults.logFile, 'logging.log_file'),
+    maxLogFiles: _positiveInt(
+      map,
+      'max_log_files',
+      defaults.maxLogFiles,
+      'logging.max_log_files',
+    ),
+    maxLogSizeMb: _positiveInt(
+      map,
+      'max_log_size_mb',
+      defaults.maxLogSizeMb,
+      'logging.max_log_size_mb',
+    ),
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'level': level,
+    'log_file': logFile,
+    'max_log_files': maxLogFiles,
+    'max_log_size_mb': maxLogSizeMb,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is LoggingSettings &&
+      level == other.level &&
+      logFile == other.logFile &&
+      maxLogFiles == other.maxLogFiles &&
+      maxLogSizeMb == other.maxLogSizeMb;
+
+  @override
+  int get hashCode => Object.hash(level, logFile, maxLogFiles, maxLogSizeMb);
+}
+
+Map<String, dynamic> _table(Map<String, dynamic> map, String key) {
+  final value = map[key];
+  if (value == null) {
+    return const {};
+  }
+  if (value is Map) {
+    return value.cast<String, dynamic>();
+  }
+  throw SettingsValidationException(key, 'Expected a TOML table.');
+}
+
+String _string(
+  Map<String, dynamic> map,
+  String key,
+  String defaultValue,
+  String field,
+) {
+  final value = map[key];
+  if (value == null) {
+    return defaultValue;
+  }
+  if (value is String) {
+    return value;
+  }
+  throw SettingsValidationException(field, 'Expected a string.');
+}
+
+bool _bool(
+  Map<String, dynamic> map,
+  String key,
+  bool defaultValue,
+  String field,
+) {
+  final value = map[key];
+  if (value == null) {
+    return defaultValue;
+  }
+  if (value is bool) {
+    return value;
+  }
+  throw SettingsValidationException(field, 'Expected a boolean.');
+}
+
+int _positiveInt(
+  Map<String, dynamic> map,
+  String key,
+  int defaultValue,
+  String field,
+) {
+  final value = map[key];
+  if (value == null) {
+    return defaultValue;
+  }
+  if (value is int && value > 0) {
+    return value;
+  }
+  throw SettingsValidationException(field, 'Expected a positive integer.');
+}
+
+bool _mapEquals<K, V>(Map<K, V> left, Map<K, V> right) {
+  if (left.length != right.length) {
+    return false;
+  }
+  for (final entry in left.entries) {
+    if (!right.containsKey(entry.key) || right[entry.key] != entry.value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int _mapHash<K, V>(Map<K, V> map) => Object.hashAll(
+  map.entries.map((entry) => Object.hash(entry.key, entry.value)),
+);

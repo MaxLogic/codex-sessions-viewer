@@ -1,0 +1,93 @@
+[app]
+first_run = false
+
+[paths]
+windows_codex_path = 'C:\Users\pawel\.codex'
+wsl_codex_unc_path = '\\wsl.localhost\Ubuntu\home\pawel\.codex'
+
+[wsl]
+distro = 'Ubuntu'
+linux_home = '/home/pawel'
+linux_root_unc = '\\wsl.localhost\Ubuntu\'
+
+[scanner]
+background_rescan_enabled = true
+background_rescan_interval_seconds = 300
+
+[ui]
+theme = 'system'
+use_system_accent_color = true
+font_size = 14
+density = 'comfortable'
+show_text_on_buttons = true
+show_icons = true
+native_title_bar = true
+
+[terminal]
+default_terminal = 'alacritty'
+
+[terminal.alacritty]
+enabled = true
+exe = 'C:\Program Files\Alacritty\alacritty.exe'
+
+[terminal.windows_terminal]
+enabled = true
+exe = 'wt.exe'
+
+[tool_output]
+index_tool_output = false
+max_tool_output_preview_chars = 2000
+max_tool_output_store_chars = 10000
+collapse_tool_output_by_default = true
+
+[voice_over]
+enabled = true
+prefer_wav = true
+fallback_to_screen_reader = true
+
+[voice_over.events.scan_started]
+text = 'Scanning started'
+wav = 'assets\voice\scan_started.wav'
+
+[voice_over.events.scan_finished]
+text = 'Scanning finished'
+wav = 'assets\voice\scan_finished.wav'
+
+[voice_over.events.copied]
+text = 'Copied'
+wav = 'assets\voice\copied.wav'
+
+[voice_over.events.export_finished]
+text = 'Export finished'
+wav = 'assets\voice\export_finished.wav'
+
+[voice_over.events.parse_error]
+text = 'Some sessions could not be parsed'
+wav = 'assets\voice\parse_error.wav'
+
+[voice_over.events.database_error]
+text = 'Database error'
+wav = 'assets\voice\database_error.wav'
+
+[pricing]
+provider = 'openrouter'
+use_external_pricing = true
+cache_pricing_hours = 24
+fallback_to_overrides = true
+
+[pricing.openrouter]
+models_endpoint = 'https://openrouter.ai/api/v1/models'
+api_key = ''
+
+[pricing.overrides.'openai/gpt-5.5-thinking']
+prompt = '0'
+completion = '0'
+input_cache_read = '0'
+input_cache_write = '0'
+internal_reasoning = '0'
+
+[logging]
+level = 'info'
+log_file = 'logs\codex-session-viewer.log'
+max_log_files = 5
+max_log_size_mb = 10
