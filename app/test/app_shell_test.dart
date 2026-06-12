@@ -3,7 +3,8 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   testWidgets('launches a minimal app shell', (tester) async {
-    await tester.pumpWidget(const CodexSessionsViewerApp());
+    await tester.pumpWidget(CodexSessionsViewerApp());
+    await tester.pump();
 
     expect(find.text(CodexSessionsViewerApp.appTitle), findsOneWidget);
     expect(CodexSessionsViewerApp.nativeTitleBarEnabled, isTrue);
