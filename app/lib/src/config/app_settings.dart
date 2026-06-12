@@ -134,10 +134,18 @@ class AppSettings {
         'alacritty': TerminalProfileSettings(
           enabled: true,
           exe: r'C:\Program Files\Alacritty\alacritty.exe',
+          windowsCommand:
+              '{terminal_exe} --working-directory {working_dir} -e powershell.exe -NoExit -Command {resume_command}',
+          wslCommand:
+              '{terminal_exe} -e wsl.exe -d {wsl_distro} --cd {wsl_working_dir} bash -lc {resume_command}',
         ),
         'windows_terminal': TerminalProfileSettings(
           enabled: true,
           exe: 'wt.exe',
+          windowsCommand:
+              '{terminal_exe} -d {working_dir} powershell.exe -NoExit -Command {resume_command}',
+          wslCommand:
+              '{terminal_exe} wsl.exe -d {wsl_distro} --cd {wsl_working_dir} bash -lc {resume_command}',
         ),
       },
     ),
@@ -601,10 +609,17 @@ class TerminalSettings {
 }
 
 class TerminalProfileSettings {
-  const TerminalProfileSettings({required this.enabled, required this.exe});
+  const TerminalProfileSettings({
+    required this.enabled,
+    required this.exe,
+    this.windowsCommand = '',
+    this.wslCommand = '',
+  });
 
   final bool enabled;
   final String exe;
+  final String windowsCommand;
+  final String wslCommand;
 
   factory TerminalProfileSettings.fromMap(
     Map<String, dynamic> map,
@@ -613,18 +628,37 @@ class TerminalProfileSettings {
   ) => TerminalProfileSettings(
     enabled: _bool(map, 'enabled', defaults.enabled, '$fieldPrefix.enabled'),
     exe: _string(map, 'exe', defaults.exe, '$fieldPrefix.exe'),
+    windowsCommand: _string(
+      map,
+      'windows_command',
+      defaults.windowsCommand,
+      '$fieldPrefix.windows_command',
+    ),
+    wslCommand: _string(
+      map,
+      'wsl_command',
+      defaults.wslCommand,
+      '$fieldPrefix.wsl_command',
+    ),
   );
 
-  Map<String, Object?> toTomlMap() => {'enabled': enabled, 'exe': exe};
+  Map<String, Object?> toTomlMap() => {
+    'enabled': enabled,
+    'exe': exe,
+    'windows_command': windowsCommand,
+    'wsl_command': wslCommand,
+  };
 
   @override
   bool operator ==(Object other) =>
       other is TerminalProfileSettings &&
       enabled == other.enabled &&
-      exe == other.exe;
+      exe == other.exe &&
+      windowsCommand == other.windowsCommand &&
+      wslCommand == other.wslCommand;
 
   @override
-  int get hashCode => Object.hash(enabled, exe);
+  int get hashCode => Object.hash(enabled, exe, windowsCommand, wslCommand);
 }
 
 class ToolOutputSettings {
