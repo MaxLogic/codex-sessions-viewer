@@ -1,0 +1,22 @@
+{
+  "session_id": "unknown-message-001",
+  "source_type": "windows",
+  "source_file_path": "C:\\Users\\pawel\\.codex\\sessions\\unknown-message-001.json",
+  "display_path": "C:\\Users\\pawel\\.codex\\sessions\\unknown-message-001.json",
+  "platform_path": "C:\\Users\\pawel\\.codex\\sessions\\unknown-message-001.json",
+  "messages": [
+    {
+      "type": "user",
+      "id": "m1",
+      "content": "Keep parsing even if a future event appears."
+    },
+    {
+      "type": "future_codex_event",
+      "id": "m2",
+      "payload": {
+        "kind": "new-format",
+        "value": 42
+      }
+    }
+  ]
+}

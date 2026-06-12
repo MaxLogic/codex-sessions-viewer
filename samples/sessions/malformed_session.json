@@ -1,0 +1,6 @@
+{
+  "session_id": "malformed-001",
+  "source_type": "windows",
+  "messages": [
+    { "type": "user", "content": "This JSON is intentionally truncated." }
+
