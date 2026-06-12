@@ -55,11 +55,15 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 1);
+    expect(versionRows.length, 2);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
     expect(versionRows.first['success'], 1);
+    expect(versionRows.last['version'], 2);
+    expect(versionRows.last['filename'], '002_search_filter_schema.sql');
+    expect(versionRows.last['checksum_length'], greaterThan(20));
+    expect(versionRows.last['success'], 1);
   });
 
   test(
@@ -83,7 +87,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 1);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 2);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -100,6 +104,167 @@ void main() {
     expect(result.canStartNormalUi, isFalse);
     expect(result.fatalError?.summary, contains('FTS5'));
     expect(result.fatalError?.databasePath, dbFile.path);
+  });
+
+  test('migration 002 backfills search rows and filter flags', () async {
+    final sqlRoot = await _copySqlRoot(tempDir);
+    final copiedMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}002_search_filter_schema.sql',
+    );
+    await copiedMigration.delete();
+    final firstRun = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(firstRun.canStartNormalUi, isTrue);
+
+    final db = sqlite3.open(dbFile.path);
+    db.execute('''
+      insert into projects (id, name, created_at_utc, updated_at_utc)
+      values (1, 'Migrated Project', '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z')
+      ''');
+    db.execute('''
+      insert into sessions (
+        id,
+        source_type,
+        source_file_path,
+        display_path,
+        platform_path,
+        title,
+        summary,
+        project_id,
+        project_name_snapshot,
+        scan_status,
+        parse_status,
+        tool_call_count,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        'existing',
+        'windows',
+        'C:\\sessions\\existing.jsonl',
+        'C:\\sessions\\existing.jsonl',
+        'C:\\sessions\\existing.jsonl',
+        'Migration title',
+        'Migration summary',
+        1,
+        'Migrated Snapshot',
+        'available',
+        'available',
+        1,
+        '2026-06-12T00:00:00Z',
+        '2026-06-12T00:00:00Z'
+      )
+      ''');
+    db.execute('''
+      insert into messages (
+        session_id,
+        message_index,
+        author_type,
+        first_line,
+        content_plain,
+        content_preview,
+        has_tool_calls,
+        has_error,
+        created_at_db_utc,
+        updated_at_db_utc
+      ) values (
+        'existing',
+        0,
+        'user',
+        'Find migrated needle',
+        'Find migrated needle',
+        'Find migrated needle',
+        1,
+        0,
+        '2026-06-12T00:00:00Z',
+        '2026-06-12T00:00:00Z'
+      )
+      ''');
+    db.execute('''
+      insert into messages (
+        session_id,
+        message_index,
+        author_type,
+        first_line,
+        content_plain,
+        content_preview,
+        has_tool_calls,
+        has_error,
+        created_at_db_utc,
+        updated_at_db_utc
+      ) values (
+        'existing',
+        1,
+        'assistant',
+        '```dart',
+        '```dart\nthrow Exception("boom");\n```',
+        '```dart',
+        0,
+        1,
+        '2026-06-12T00:00:00Z',
+        '2026-06-12T00:00:00Z'
+      )
+      ''');
+    db.execute('''
+      insert into tool_calls (
+        session_id,
+        tool_index,
+        tool_name,
+        status,
+        output_preview,
+        error_message
+      ) values (
+        'existing',
+        0,
+        'shell_command',
+        'failed',
+        'preview-token',
+        'boom'
+      )
+      ''');
+    db.execute('''
+      insert into tags (id, name, created_at_utc, updated_at_utc)
+      values (1, 'migrated-tag', '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z')
+      ''');
+    db.execute('''
+      insert into session_tags (session_id, tag_id, created_at_utc)
+      values ('existing', 1, '2026-06-12T00:00:00Z')
+      ''');
+    db.execute('''
+      insert into session_path_keys (session_id, path_key)
+      values ('existing', 'c:/sessions/existing.jsonl')
+      ''');
+    db.close();
+    await File(
+      '../sql/migration/002_search_filter_schema.sql',
+    ).copy(copiedMigration.path);
+
+    final result = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isTrue);
+
+    final migrated = sqlite3.open(dbFile.path);
+    addTearDown(migrated.close);
+
+    expect(
+      migrated
+          .select(
+            'select s.id from sessions s join session_search f on f.rowid = s.rowid '
+            "where session_search match 'user_messages: migrated'",
+          )
+          .single['id'],
+      'existing',
+    );
+    final row = migrated.select(
+      'select has_code_blocks, has_tool_calls, has_errors '
+      'from sessions where id = ?',
+      ['existing'],
+    ).single;
+    expect(row['has_code_blocks'], 1);
+    expect(row['has_tool_calls'], 1);
+    expect(row['has_errors'], 1);
   });
 
   test('rolls back failed migrations and records failure metadata', () async {
