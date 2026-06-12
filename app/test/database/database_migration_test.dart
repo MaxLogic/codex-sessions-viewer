@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
@@ -55,15 +56,19 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 2);
+    expect(versionRows.length, 3);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
     expect(versionRows.first['success'], 1);
-    expect(versionRows.last['version'], 2);
-    expect(versionRows.last['filename'], '002_search_filter_schema.sql');
-    expect(versionRows.last['checksum_length'], greaterThan(20));
-    expect(versionRows.last['success'], 1);
+    expect(versionRows[1]['version'], 2);
+    expect(versionRows[1]['filename'], '002_search_filter_schema.sql');
+    expect(versionRows[1]['checksum_length'], greaterThan(20));
+    expect(versionRows[1]['success'], 1);
+    expect(versionRows[2]['version'], 3);
+    expect(versionRows[2]['filename'], '003_project_override.sql');
+    expect(versionRows[2]['checksum_length'], greaterThan(20));
+    expect(versionRows[2]['success'], 1);
   });
 
   test(
@@ -87,7 +92,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 2);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 3);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -112,7 +117,12 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}002_search_filter_schema.sql',
     );
+    final copiedProjectOverrideMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}003_project_override.sql',
+    );
     await copiedMigration.delete();
+    await copiedProjectOverrideMigration.delete();
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
@@ -239,6 +249,9 @@ void main() {
     await File(
       '../sql/migration/002_search_filter_schema.sql',
     ).copy(copiedMigration.path);
+    await File(
+      '../sql/migration/003_project_override.sql',
+    ).copy(copiedProjectOverrideMigration.path);
 
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
@@ -266,6 +279,100 @@ void main() {
     expect(row['has_tool_calls'], 1);
     expect(row['has_errors'], 1);
   });
+
+  test(
+    'migration 003 preserves existing project assignments as overrides',
+    () async {
+      final sqlRoot = await _copySqlRoot(tempDir);
+      final copiedProjectOverrideMigration = File(
+        '${sqlRoot.path}${Platform.pathSeparator}migration'
+        '${Platform.pathSeparator}003_project_override.sql',
+      );
+      await copiedProjectOverrideMigration.delete();
+      final firstRun = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+      expect(firstRun.canStartNormalUi, isTrue);
+
+      final db = sqlite3.open(dbFile.path);
+      db.execute('''
+      insert into projects (id, name, created_at_utc, updated_at_utc)
+      values (1, 'Manual Project', '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z')
+      ''');
+      db.execute('''
+      insert into projects (id, name, created_at_utc, updated_at_utc)
+      values (2, 'Mask Project', '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z')
+      ''');
+      db.execute('''
+      insert into project_path_masks (
+        project_id,
+        path_mask,
+        priority,
+        is_active,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        2,
+        'c:/work/*',
+        1,
+        1,
+        '2026-06-12T00:00:00Z',
+        '2026-06-12T00:00:00Z'
+      )
+      ''');
+      db.execute('''
+      insert into sessions (
+        id,
+        source_type,
+        source_file_path,
+        display_path,
+        platform_path,
+        project_id,
+        project_name_snapshot,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        'existing-project',
+        'windows',
+        'C:\\work\\session.jsonl',
+        'C:\\work\\session.jsonl',
+        'C:\\work\\session.jsonl',
+        1,
+        'Manual Project',
+        '2026-06-12T00:00:00Z',
+        '2026-06-12T00:00:00Z'
+      )
+      ''');
+      db.close();
+
+      await File(
+        '../sql/migration/003_project_override.sql',
+      ).copy(copiedProjectOverrideMigration.path);
+
+      final result = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+      expect(result.canStartNormalUi, isTrue);
+
+      final migrated = sqlite3.open(dbFile.path);
+      addTearDown(migrated.close);
+      expect(
+        migrated.select('select project_override from sessions where id = ?', [
+          'existing-project',
+        ]).single['project_override'],
+        1,
+      );
+
+      ProjectTagStateStore(migrated).recalculateSessionProjects();
+
+      final row = migrated.select(
+        'select project_id, project_name_snapshot from sessions where id = ?',
+        ['existing-project'],
+      ).single;
+      expect(row['project_id'], 1);
+      expect(row['project_name_snapshot'], 'Manual Project');
+    },
+  );
 
   test('rolls back failed migrations and records failure metadata', () async {
     final sqlRoot = Directory(

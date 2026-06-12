@@ -23,6 +23,7 @@ class SessionSearchIndex {
 
   void upsert(SessionSearchDocument document) {
     final now = DateTime.now().toUtc().toIso8601String();
+    final existingState = _existingUserState(document.id);
     db.execute(
       '''
       insert into sessions (
@@ -66,9 +67,6 @@ class SessionSearchIndex {
         total_tokens = excluded.total_tokens,
         model_primary = excluded.model_primary,
         models_used = excluded.models_used,
-        project_name_snapshot = excluded.project_name_snapshot,
-        is_pinned = excluded.is_pinned,
-        is_archived = excluded.is_archived,
         updated_at_utc = excluded.updated_at_utc
       ''',
       [
@@ -116,6 +114,8 @@ class SessionSearchIndex {
               document.id,
             ]).single['rowid']
             as int;
+    final ftsProjectName = existingState?.projectName ?? document.projectName;
+    final ftsTags = existingState?.tags ?? document.tags;
     db.execute('delete from session_search where rowid = ?', [rowid]);
     db.execute(
       '''
@@ -142,28 +142,32 @@ class SessionSearchIndex {
         document.toolNames,
         document.displayPath,
         document.normalizedPathKeys,
-        document.projectName,
-        document.tags.join(' '),
+        ftsProjectName,
+        ftsTags.join(' '),
         document.toolOutput,
       ],
     );
-    for (final tag in document.tags) {
-      db.execute(
-        'insert or ignore into tags (name, created_at_utc, updated_at_utc) '
-        'values (?, ?, ?)',
-        [tag, now, now],
-      );
-    }
-    db.execute('delete from session_tags where session_id = ?', [document.id]);
-    for (final tag in document.tags) {
-      final tagId =
-          db.select('select id from tags where name = ?', [tag]).single['id']
-              as int;
-      db.execute(
-        'insert or ignore into session_tags (session_id, tag_id, created_at_utc) '
-        'values (?, ?, ?)',
-        [document.id, tagId, now],
-      );
+    if (existingState == null) {
+      for (final tag in document.tags) {
+        db.execute(
+          'insert or ignore into tags (name, created_at_utc, updated_at_utc) '
+          'values (?, ?, ?)',
+          [tag, now, now],
+        );
+      }
+      db.execute('delete from session_tags where session_id = ?', [
+        document.id,
+      ]);
+      for (final tag in document.tags) {
+        final tagId =
+            db.select('select id from tags where name = ?', [tag]).single['id']
+                as int;
+        db.execute(
+          'insert or ignore into session_tags (session_id, tag_id, created_at_utc) '
+          'values (?, ?, ?)',
+          [document.id, tagId, now],
+        );
+      }
     }
   }
 
@@ -300,6 +304,37 @@ class SessionSearchIndex {
       [matchQuery, ...args],
     );
   }
+
+  _ExistingUserState? _existingUserState(String sessionId) {
+    final rows = db.select(
+      'select project_name_snapshot from sessions where id = ?',
+      [sessionId],
+    );
+    if (rows.isEmpty) {
+      return null;
+    }
+    final tagRows = db.select(
+      '''
+      select t.name
+      from session_tags st
+      join tags t on t.id = st.tag_id
+      where st.session_id = ?
+      order by t.name
+      ''',
+      [sessionId],
+    );
+    return _ExistingUserState(
+      projectName: rows.single['project_name_snapshot'] as String? ?? '',
+      tags: [for (final row in tagRows) row['name'] as String],
+    );
+  }
+}
+
+class _ExistingUserState {
+  const _ExistingUserState({required this.projectName, required this.tags});
+
+  final String projectName;
+  final List<String> tags;
 }
 
 class SessionSearchDocument {
