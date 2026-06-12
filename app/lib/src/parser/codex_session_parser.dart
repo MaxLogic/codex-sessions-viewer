@@ -13,6 +13,8 @@ class CodexSessionParser {
     this.maxMessageContentChars = 12000,
   });
 
+  static const int currentVersion = 1;
+
   final int maxToolOutputPreviewChars;
   final int maxMessageContentChars;
 
