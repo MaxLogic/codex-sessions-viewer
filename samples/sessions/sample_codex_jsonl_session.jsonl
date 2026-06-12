@@ -1,0 +1,9 @@
+{"timestamp":"2026-06-10T10:00:00.000Z","type":"session_meta","payload":{"id":"jsonl-session-001","timestamp":"2026-06-10T10:00:00.000Z","cwd":"F:\\projects\\MaxLogic\\codex-sessions-viewer","source":"codex_cli"}}
+{"timestamp":"2026-06-10T10:00:01.000Z","type":"turn_context","payload":{"cwd":"F:\\projects\\MaxLogic\\codex-sessions-viewer","working_directory_unc":"\\\\localhost\\F$\\projects\\MaxLogic\\codex-sessions-viewer","model":"gpt-5.5-thinking","summary":"Synthetic JSONL parser fixture"}}
+{"timestamp":"2026-06-10T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Open the viewer task list.\nSecond line stays out of first_line."}],"usage":{"input_tokens":"invalid","output_tokens":0}}}
+{"timestamp":"2026-06-10T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will inspect the local files."}],"usage":{"output_tokens":17,"cached_input_tokens":4}}}
+{"timestamp":"2026-06-10T10:00:04.000Z","type":"response_item","payload":{"type":"function_call","call_id":"call_1","name":"shell_command","arguments":"{\"command\":\"Get-ChildItem TASKS.md\"}"}}
+{"timestamp":"2026-06-10T10:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"TASKS.md"}}
+{"timestamp":"2026-06-10T10:00:06.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42,"output_tokens":21}}}}
+{"timestamp":"2026-06-10T10:00:07.000Z","type":"response_item","payload":{"type":"future_payload","new_field":"new-format"}}
+{"timestamp":"2026-06-10T10:00:08.000Z","type":"future_record","payload":{"type":"new_container","schema_key":"present"}}
