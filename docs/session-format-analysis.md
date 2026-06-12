@@ -131,3 +131,50 @@ Codex JSONL records.
   parser version should skip unchanged files.
 - Parse changed files concurrently with a bounded worker pool or Dart isolates.
 - Aggregate results deterministically so UI counts and logs are stable.
+
+## Scanner And Parser Integration Notes
+
+These notes come from implementing the first parser and scanner slices after the
+format scan.
+
+- Final scan status and scan progress events are separate concepts. A file can
+  emit a transient `changed_pending_parse` event and later finish as
+  `available`, `parse_error`, `permission_denied`, `path_unreachable`, or
+  `unsupported_format`. Final per-file status output should not leave completed
+  files in `changed_pending_parse`.
+- Status values intended for persistence, filters, logs, or diagnostics should
+  use the spec names: `available`, `missing`, `path_unreachable`,
+  `parse_error`, `permission_denied`, `unsupported_format`, and
+  `changed_pending_parse`.
+- Parser `unsupportedRoot` failures should surface as scanner
+  `unsupported_format`, not generic `parse_error`. This covers syntactically
+  valid JSON or JSONL that is not a known Codex session shape.
+- Unknown record or payload types inside an otherwise recognizable JSONL
+  session should remain non-fatal and produce structured warnings. Those
+  warnings are the hook for notifying us that a new Codex format appeared.
+- Missing cached files should only be marked `missing` after the relevant root
+  was reachable and scanned. If a Windows or WSL root is unreachable, existing
+  cached results remain usable and should not be downgraded to missing.
+- Cache and scanner comparisons need canonical path keys: slash-normalized,
+  case-normalized, duplicate-slash-collapsed, and trailing-separator-trimmed.
+  This prevents false missing statuses for equivalent path spellings.
+- Deterministic aggregation matters. File enumeration order is not guaranteed,
+  so candidates and final sessions/errors/statuses should be sorted by stable
+  source/path keys before returning results.
+
+## Confidence And Open Format Risks
+
+The current local scan gives enough information to build the first production
+parser and scanner path for the observed Codex JSONL corpus. It does not prove
+that every future Codex record shape is known. The implementation should
+therefore keep these guardrails:
+
+- JSONL remains the primary format, with legacy JSON-object fixtures retained
+  for compatibility tests.
+- Unknown top-level records, response item types, event message types, and
+  payload keys should be counted and surfaced through warnings or diagnostics.
+- Token usage parsing should remain tolerant of partial data and should treat
+  `total_token_usage` as authoritative when present.
+- Cache invalidation details are the next scanner slice: source size, modified
+  UTC, content hash, parser version, and forced reparse state belong in the
+  T-008 implementation.
