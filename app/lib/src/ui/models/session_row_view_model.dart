@@ -1,3 +1,5 @@
+import 'conversation_message_view_model.dart';
+
 enum SessionRowPlatform { windows, wsl }
 
 class SessionRowViewModel {
@@ -27,6 +29,7 @@ class SessionRowViewModel {
     this.outputTokens = 0,
     this.cachedInputTokens = 0,
     this.modelsUsed = const [],
+    this.conversationMessages = const [],
     this.isPinned = false,
     this.isArchived = false,
     this.hasError = false,
@@ -57,6 +60,7 @@ class SessionRowViewModel {
   final int outputTokens;
   final int cachedInputTokens;
   final List<String> modelsUsed;
+  final List<ConversationMessageViewModel> conversationMessages;
   final bool isPinned;
   final bool isArchived;
   final bool hasError;

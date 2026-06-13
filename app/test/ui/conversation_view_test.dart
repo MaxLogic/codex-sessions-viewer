@@ -1,0 +1,98 @@
+import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
+import 'package:codex_sessions_viewer/src/ui/widgets/conversation_view.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  testWidgets('renders conversation lazily with message index navigation', (
+    tester,
+  ) async {
+    final messages = [
+      for (var i = 1; i <= 80; i++)
+        ConversationMessageViewModel(
+          id: 'm$i',
+          number: i,
+          author: i.isOdd
+              ? ConversationAuthor.user
+              : ConversationAuthor.assistant,
+          createdAtUtc: DateTime.utc(2026, 6, 12, 9, i % 60),
+          preview: 'Message $i preview',
+          body: 'Message $i body',
+          tokenCount: i * 10,
+        ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: ConversationView(messages: messages)),
+      ),
+    );
+
+    expect(find.byType(ListView), findsWidgets);
+    expect(find.text('Message 1 body'), findsOneWidget);
+    expect(find.text('Message 80 body'), findsNothing);
+    expect(find.bySemanticsLabel('#1 User, 10 tokens'), findsOneWidget);
+
+    await tester.tap(find.bySemanticsLabel('#2 Assistant, 20 tokens'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Selected message 2'), findsOneWidget);
+  });
+
+  testWidgets('collapses long messages and tool output with explicit actions', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'long',
+                number: 1,
+                author: ConversationAuthor.assistant,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Long assistant answer preview',
+                body: 'full long message ' * 80,
+                tokenCount: 500,
+                isLong: true,
+              ),
+              ConversationMessageViewModel(
+                id: 'tool',
+                number: 2,
+                author: ConversationAuthor.tool,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                preview: 'shell_command',
+                body: 'line 1\nline 2\nline 3',
+                tokenCount: 30,
+                hasToolOutput: true,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Long assistant answer preview'), findsOneWidget);
+    expect(find.textContaining('full long message full long'), findsNothing);
+    expect(
+      find.widgetWithText(OutlinedButton, 'Show full message'),
+      findsOneWidget,
+    );
+    expect(
+      find.bySemanticsLabel(
+        'Tool output collapsed, 3 lines. Press Enter to expand.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('line 1\nline 2\nline 3'), findsNothing);
+    expect(
+      find.widgetWithText(OutlinedButton, 'Copy message Markdown'),
+      findsNWidgets(2),
+    );
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Expand tool output'));
+    await tester.pumpAndSettle();
+    expect(find.text('line 1\nline 2\nline 3'), findsOneWidget);
+  });
+}

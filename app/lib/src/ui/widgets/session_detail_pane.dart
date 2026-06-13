@@ -4,6 +4,7 @@ import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
 import '../models/session_row_view_model.dart';
 import 'command_preview.dart';
+import 'conversation_view.dart';
 
 class SessionDetailPane extends StatelessWidget {
   const SessionDetailPane({super.key, required this.row, this.settings});
@@ -40,6 +41,13 @@ class SessionDetailPane extends StatelessWidget {
           _ActionArea(row: row, commandSet: commandSet),
           const SizedBox(height: 16),
           CommandPreview(commandSet: commandSet),
+          const SizedBox(height: 16),
+          Text('Conversation', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 420,
+            child: ConversationView(messages: row.conversationMessages),
+          ),
         ],
       ),
     );
