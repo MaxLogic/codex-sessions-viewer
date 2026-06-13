@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../database/database_migrator.dart';
+import '../ui/app_shell.dart';
+import '../ui/themes.dart';
 
 class CodexSessionsViewerApp extends StatelessWidget {
   CodexSessionsViewerApp({
@@ -22,10 +24,15 @@ class CodexSessionsViewerApp extends StatelessWidget {
     return MaterialApp(
       title: appTitle,
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey),
-        useMaterial3: true,
+      theme: CodexAppTheme.themeData(CodexThemeMode.light),
+      darkTheme: CodexAppTheme.themeData(CodexThemeMode.dark),
+      highContrastTheme: CodexAppTheme.themeData(
+        CodexThemeMode.highContrastLight,
       ),
+      highContrastDarkTheme: CodexAppTheme.themeData(
+        CodexThemeMode.highContrastDark,
+      ),
+      themeMode: CodexAppTheme.themeMode(CodexThemeMode.system),
       home: FutureBuilder<DatabaseStartupResult>(
         future: databaseStartup,
         builder: (context, snapshot) {
@@ -43,7 +50,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
           if (!result.canStartNormalUi) {
             return FatalDatabaseScreen(error: result.fatalError!);
           }
-          return const Scaffold(body: Center(child: Text(appTitle)));
+          return const CodexAppShell();
         },
       ),
     );
