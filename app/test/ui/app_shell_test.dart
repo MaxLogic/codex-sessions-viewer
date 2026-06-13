@@ -27,7 +27,7 @@ void main() {
     await tester.tap(find.bySemanticsLabel('Settings navigation'));
     await tester.pumpAndSettle();
     expect(find.text('Settings'), findsWidgets);
-    expect(find.text('Settings form'), findsOneWidget);
+    expect(find.text('Save settings'), findsOneWidget);
 
     await tester.tap(find.bySemanticsLabel('Logs navigation'));
     await tester.pumpAndSettle();

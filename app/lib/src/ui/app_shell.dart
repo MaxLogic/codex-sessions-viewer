@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'screens/sessions_screen.dart';
+import 'screens/settings_screen.dart';
 import 'screens/usage_screen.dart';
 
 enum CodexAppSection {
@@ -100,6 +101,9 @@ class _SectionContent extends StatelessWidget {
     }
     if (section == CodexAppSection.usage) {
       return const UsageScreen();
+    }
+    if (section == CodexAppSection.settings) {
+      return const SettingsScreen();
     }
     final scheme = Theme.of(context).colorScheme;
     return FocusTraversalGroup(
