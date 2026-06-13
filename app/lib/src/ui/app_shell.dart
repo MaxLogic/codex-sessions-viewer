@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'screens/sessions_screen.dart';
+
 enum CodexAppSection {
   sessions('Sessions', Icons.history),
   usage('Usage', Icons.query_stats),
@@ -77,7 +79,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
               thickness: 1,
               color: Theme.of(context).colorScheme.outlineVariant,
             ),
-            Expanded(child: _SectionPlaceholder(section: section)),
+            Expanded(child: _SectionContent(section: section)),
           ],
         ),
       ),
@@ -85,13 +87,16 @@ class _CodexAppShellState extends State<CodexAppShell> {
   }
 }
 
-class _SectionPlaceholder extends StatelessWidget {
-  const _SectionPlaceholder({required this.section});
+class _SectionContent extends StatelessWidget {
+  const _SectionContent({required this.section});
 
   final CodexAppSection section;
 
   @override
   Widget build(BuildContext context) {
+    if (section == CodexAppSection.sessions) {
+      return const SessionsScreen();
+    }
     final scheme = Theme.of(context).colorScheme;
     return FocusTraversalGroup(
       child: Container(
