@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'screens/logs_screen.dart';
 import 'screens/sessions_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/usage_screen.dart';
@@ -104,6 +105,9 @@ class _SectionContent extends StatelessWidget {
     }
     if (section == CodexAppSection.settings) {
       return const SettingsScreen();
+    }
+    if (section == CodexAppSection.logs) {
+      return const LogsScreen();
     }
     final scheme = Theme.of(context).colorScheme;
     return FocusTraversalGroup(
