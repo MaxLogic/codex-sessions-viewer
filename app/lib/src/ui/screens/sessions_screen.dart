@@ -1,53 +1,13 @@
 import 'package:flutter/material.dart';
 
-enum SessionRowPlatform { windows, wsl }
+import '../models/session_row_view_model.dart';
+import '../widgets/session_detail_pane.dart';
+
+export '../models/session_row_view_model.dart';
 
 enum SessionsPlatformFilter { both, windows, wsl }
 
 enum SessionsArchivedFilter { activeOnly, archivedOnly, all }
-
-class SessionRowViewModel {
-  const SessionRowViewModel({
-    required this.id,
-    required this.startedAtUtc,
-    required this.lastMessageAtUtc,
-    required this.platform,
-    required this.project,
-    required this.path,
-    required this.title,
-    required this.summary,
-    required this.messageCount,
-    required this.totalTokens,
-    required this.model,
-    required this.tags,
-    required this.status,
-    this.isPinned = false,
-    this.isArchived = false,
-    this.hasError = false,
-  });
-
-  final String id;
-  final DateTime startedAtUtc;
-  final DateTime lastMessageAtUtc;
-  final SessionRowPlatform platform;
-  final String project;
-  final String path;
-  final String title;
-  final String summary;
-  final int messageCount;
-  final int totalTokens;
-  final String model;
-  final List<String> tags;
-  final String status;
-  final bool isPinned;
-  final bool isArchived;
-  final bool hasError;
-
-  String get platformLabel => switch (platform) {
-    SessionRowPlatform.windows => 'Windows',
-    SessionRowPlatform.wsl => 'WSL',
-  };
-}
 
 class SessionsScreen extends StatefulWidget {
   const SessionsScreen({
@@ -756,6 +716,9 @@ class _SessionDetailPlaceholder extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (row != null) {
+      return SessionDetailPane(row: row!);
+    }
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -763,13 +726,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
         children: [
           Text('Session detail', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 12),
-          if (row == null)
-            const Text('No session selected')
-          else ...[
-            Text('Selected: ${row!.title}'),
-            const SizedBox(height: 8),
-            Text(row!.summary),
-          ],
+          const Text('No session selected'),
         ],
       ),
     );
