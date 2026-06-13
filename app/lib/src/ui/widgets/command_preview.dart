@@ -75,27 +75,50 @@ class _CommandBlock extends StatelessWidget {
             spacing: 8,
             runSpacing: 8,
             children: [
-              Semantics(
+              _LabeledCommandButton(
                 label: copySemanticsLabel,
-                button: true,
-                child: OutlinedButton(
-                  onPressed: copyEnabled ? () {} : null,
-                  child: const Text('Copy'),
-                ),
+                text: 'Copy',
+                onPressed: copyEnabled ? () {} : null,
               ),
               if (showRunActions) ...[
-                OutlinedButton(
+                _LabeledCommandButton(
+                  label: 'Run terminal launch command',
+                  text: 'Run',
                   onPressed: copyEnabled ? () {} : null,
-                  child: const Text('Run'),
                 ),
-                OutlinedButton(
+                _LabeledCommandButton(
+                  label: 'Edit terminal launch command before running',
+                  text: 'Edit and run',
                   onPressed: copyEnabled ? () {} : null,
-                  child: const Text('Edit and run'),
                 ),
               ],
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _LabeledCommandButton extends StatelessWidget {
+  const _LabeledCommandButton({
+    required this.label,
+    required this.text,
+    required this.onPressed,
+  });
+
+  final String label;
+  final String text;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: label,
+      child: Semantics(
+        label: label,
+        button: true,
+        child: OutlinedButton(onPressed: onPressed, child: Text(text)),
       ),
     );
   }
