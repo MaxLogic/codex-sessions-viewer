@@ -5,6 +5,7 @@ import '../../config/app_settings.dart';
 import '../models/session_row_view_model.dart';
 import 'command_preview.dart';
 import 'conversation_view.dart';
+import 'focus_reader_view.dart';
 
 class SessionDetailPane extends StatelessWidget {
   const SessionDetailPane({super.key, required this.row, this.settings});
@@ -47,6 +48,13 @@ class SessionDetailPane extends StatelessWidget {
           SizedBox(
             height: 420,
             child: ConversationView(messages: row.conversationMessages),
+          ),
+          const SizedBox(height: 16),
+          Text('Focus reader', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 420,
+            child: FocusReaderView(messages: row.conversationMessages),
           ),
         ],
       ),
