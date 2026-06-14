@@ -263,11 +263,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         _TextSetting(
                           label: 'Windows Codex path',
                           semanticsLabel: 'Windows Codex path input',
+                          helperText:
+                              'Folder containing native Windows Codex session files.',
                           controller: _windowsCodexPath,
                         ),
                         _TextSetting(
                           label: 'WSL Codex UNC path',
                           semanticsLabel: 'WSL Codex UNC path input',
+                          helperText:
+                              'UNC folder used to read WSL Codex sessions from Windows.',
                           controller: _wslCodexUncPath,
                         ),
                       ],
@@ -294,6 +298,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       children: [
                         _TextSetting(
                           label: 'Default terminal',
+                          helperText:
+                              'Command profile used when launching resume commands.',
                           controller: _defaultTerminal,
                         ),
                         _TextSetting(
@@ -310,7 +316,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       title: 'Scanner',
                       children: [
                         _TextSetting(
-                          label: 'Scan interval',
+                          label: 'Scan interval (seconds)',
                           controller: _scanInterval,
                         ),
                         _SwitchSetting(
@@ -350,7 +356,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             });
                           },
                         ),
-                        _TextSetting(label: 'Font size', controller: _fontSize),
+                        _TextSetting(
+                          label: 'Font size (pixels)',
+                          controller: _fontSize,
+                        ),
                         _ChoiceSetting(
                           label: 'UI density',
                           value: _settings.ui.density.tomlValue,
@@ -409,6 +418,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ),
                         _TextSetting(
                           label: 'Voice-over file paths',
+                          helperText: 'One voice-over event WAV path per line.',
                           controller: _voiceOverFiles,
                           maxLines: 3,
                         ),
@@ -438,7 +448,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           },
                         ),
                         _TextSetting(
-                          label: 'Pricing cache duration',
+                          label: 'Pricing cache duration (hours)',
+                          helperText:
+                              'Public model-pricing metadata only; no session content is sent.',
                           controller: _pricingCacheDuration,
                         ),
                         _TextSetting(
@@ -552,12 +564,14 @@ class _TextSetting extends StatelessWidget {
     required this.label,
     required this.controller,
     this.semanticsLabel,
+    this.helperText,
     this.maxLines = 1,
   });
 
   final String label;
   final TextEditingController controller;
   final String? semanticsLabel;
+  final String? helperText;
   final int maxLines;
 
   @override
@@ -575,9 +589,10 @@ class _TextSetting extends StatelessWidget {
               child: TextField(
                 controller: controller,
                 maxLines: maxLines,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   isDense: true,
-                  border: OutlineInputBorder(),
+                  border: const OutlineInputBorder(),
+                  helperText: helperText,
                 ),
               ),
             ),

@@ -46,10 +46,10 @@ void main() {
       'Default terminal',
       'Alacritty executable path',
       'Windows Terminal executable path',
-      'Scan interval',
+      'Scan interval (seconds)',
       'Background scan enabled',
       'Theme',
-      'Font size',
+      'Font size (pixels)',
       'UI density',
       'Show icons',
       'Show text on buttons',
@@ -57,12 +57,22 @@ void main() {
       'Voice-over enabled',
       'Voice-over file paths',
       'OpenRouter pricing enabled',
-      'Pricing cache duration',
+      'Pricing cache duration (hours)',
       'Pricing overrides',
       'Cache/database location',
       'Export folder',
     ]) {
       expect(find.text(label), findsOneWidget);
+    }
+
+    for (final helper in const [
+      'Folder containing native Windows Codex session files.',
+      'UNC folder used to read WSL Codex sessions from Windows.',
+      'Command profile used when launching resume commands.',
+      'One voice-over event WAV path per line.',
+      'Public model-pricing metadata only; no session content is sent.',
+    ]) {
+      expect(find.text(helper), findsOneWidget);
     }
 
     await tester.enterText(

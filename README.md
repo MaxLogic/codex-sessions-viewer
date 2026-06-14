@@ -77,6 +77,16 @@ enabled = true
 exe = 'wt.exe'
 ```
 
+Scanner and pricing durations use explicit units:
+
+```toml
+[scanner]
+background_rescan_interval_seconds = 300
+
+[pricing]
+cache_pricing_hours = 24
+```
+
 OpenRouter pricing:
 
 ```toml
