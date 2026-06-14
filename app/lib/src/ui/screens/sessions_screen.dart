@@ -14,10 +14,18 @@ class SessionsScreen extends StatefulWidget {
     super.key,
     this.initialRows = const [],
     this.onRefresh,
+    this.onRefreshResult,
+    this.onOpenSettings,
+    this.onTestWslPath,
+    this.initialStatusMessage = '',
   });
 
   final List<SessionRowViewModel> initialRows;
   final Future<List<SessionRowViewModel>> Function()? onRefresh;
+  final Future<SessionsRefreshResult> Function()? onRefreshResult;
+  final VoidCallback? onOpenSettings;
+  final VoidCallback? onTestWslPath;
+  final String initialStatusMessage;
 
   @override
   State<SessionsScreen> createState() => _SessionsScreenState();
@@ -37,6 +45,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   void initState() {
     super.initState();
     _rows = List.of(widget.initialRows);
+    _scanAnnouncement = widget.initialStatusMessage;
     _searchController.addListener(_filtersChanged);
     _pathController.addListener(_filtersChanged);
   }
@@ -113,11 +122,21 @@ class _SessionsScreenState extends State<SessionsScreen> {
                 children: [
                   Expanded(
                     flex: 3,
-                    child: _SessionsTable(
-                      rows: visibleRows,
-                      selectedId: _selectedId,
-                      onSelect: _select,
-                    ),
+                    child: visibleRows.isEmpty
+                        ? _SessionsEmptyState(
+                            hasRows: _rows.isNotEmpty,
+                            hasActiveFilters: _hasActiveFilters,
+                            statusMessage: _scanAnnouncement,
+                            unreachablePaths: _unreachablePaths,
+                            onClearFilters: _clearFilters,
+                            onOpenSettings: widget.onOpenSettings,
+                            onTestWslPath: widget.onTestWslPath ?? _refresh,
+                          )
+                        : _SessionsTable(
+                            rows: visibleRows,
+                            selectedId: _selectedId,
+                            onSelect: _select,
+                          ),
                   ),
                   VerticalDivider(
                     width: 1,
@@ -193,6 +212,28 @@ class _SessionsScreenState extends State<SessionsScreen> {
     ].any((value) => value.toLowerCase().contains(search));
   }
 
+  bool get _hasActiveFilters {
+    return _searchController.text.trim().isNotEmpty ||
+        _pathController.text.trim().isNotEmpty ||
+        _platformFilter != SessionsPlatformFilter.both ||
+        _archivedFilter != SessionsArchivedFilter.activeOnly;
+  }
+
+  List<String> get _unreachablePaths {
+    final source = _scanAnnouncement;
+    final marker = 'Unreachable paths: ';
+    final markerIndex = source.indexOf(marker);
+    if (markerIndex < 0) {
+      return const [];
+    }
+    return source
+        .substring(markerIndex + marker.length)
+        .split(';')
+        .map((path) => path.trim())
+        .where((path) => path.isNotEmpty)
+        .toList(growable: false);
+  }
+
   SessionRowViewModel? _selectedRow(List<SessionRowViewModel> visibleRows) {
     final selectedId = _selectedId;
     if (selectedId == null) {
@@ -251,19 +292,157 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _isScanning = true;
       _scanAnnouncement = 'Scanning started';
     });
-    final refreshedRows =
-        await (widget.onRefresh?.call() ??
-            Future<List<SessionRowViewModel>>.value(_rows));
-    if (!mounted) {
-      return;
+    try {
+      final refreshResult = await _refreshResult();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _rows = List.of(refreshResult.rows);
+        _scanAnnouncement = refreshResult.statusMessage;
+        _retainSelection();
+      });
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _scanAnnouncement = 'Refresh failed. $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isScanning = false;
+        });
+      }
     }
-    setState(() {
-      _rows = List.of(refreshedRows);
-      _isScanning = false;
-      _scanAnnouncement =
-          'Scan finished. ${_rows.length} ${_rows.length == 1 ? 'session' : 'sessions'} found.';
-      _retainSelection();
-    });
+  }
+
+  Future<SessionsRefreshResult> _refreshResult() async {
+    final refreshResult = widget.onRefreshResult;
+    if (refreshResult != null) {
+      return refreshResult();
+    }
+    final refreshRows = widget.onRefresh;
+    if (refreshRows != null) {
+      final rows = await refreshRows();
+      return SessionsRefreshResult.scanFinished(rows);
+    }
+    return SessionsRefreshResult.scanFinished(_rows);
+  }
+}
+
+class SessionsRefreshResult {
+  const SessionsRefreshResult({
+    required this.rows,
+    required this.statusMessage,
+  });
+
+  factory SessionsRefreshResult.scanFinished(List<SessionRowViewModel> rows) {
+    return SessionsRefreshResult(
+      rows: rows,
+      statusMessage:
+          'Scan finished. ${rows.length} ${rows.length == 1 ? 'session' : 'sessions'} found.',
+    );
+  }
+
+  final List<SessionRowViewModel> rows;
+  final String statusMessage;
+}
+
+class _SessionsEmptyState extends StatelessWidget {
+  const _SessionsEmptyState({
+    required this.hasRows,
+    required this.hasActiveFilters,
+    required this.statusMessage,
+    required this.unreachablePaths,
+    required this.onClearFilters,
+    required this.onOpenSettings,
+    required this.onTestWslPath,
+  });
+
+  final bool hasRows;
+  final bool hasActiveFilters;
+  final String statusMessage;
+  final List<String> unreachablePaths;
+  final VoidCallback onClearFilters;
+  final VoidCallback? onOpenSettings;
+  final VoidCallback? onTestWslPath;
+
+  @override
+  Widget build(BuildContext context) {
+    final isUnreachable = statusMessage.toLowerCase().contains('unreachable');
+    final title = isUnreachable
+        ? 'Codex session path is currently unreachable.'
+        : hasRows && hasActiveFilters
+        ? 'No sessions match the current filters.'
+        : 'No sessions found.';
+    final body = isUnreachable
+        ? 'Cached sessions remain visible when available. Check the configured path, then run Refresh.'
+        : hasRows && hasActiveFilters
+        ? 'Try clearing filters or expanding the date range.'
+        : 'Check your Windows and WSL Codex paths in Settings, then run Refresh.';
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Session table', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 24),
+          Semantics(
+            liveRegion: true,
+            container: true,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Text(body),
+                if (isUnreachable && unreachablePaths.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  SelectableText(
+                    'Configured path: ${unreachablePaths.join('; ')}',
+                  ),
+                ],
+                if (isUnreachable) ...[
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      OutlinedButton(
+                        onPressed: onTestWslPath,
+                        child: const Text('Test WSL path'),
+                      ),
+                      OutlinedButton(
+                        onPressed: onOpenSettings,
+                        child: const Text('Open Settings'),
+                      ),
+                    ],
+                  ),
+                ] else if (hasRows && hasActiveFilters) ...[
+                  const SizedBox(height: 12),
+                  OutlinedButton(
+                    onPressed: onClearFilters,
+                    child: const Text('Clear filters'),
+                  ),
+                ] else ...[
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      OutlinedButton(
+                        onPressed: onOpenSettings,
+                        child: const Text('Open Settings'),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

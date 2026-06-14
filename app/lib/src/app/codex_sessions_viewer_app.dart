@@ -1,23 +1,36 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
+import '../config/app_settings.dart';
 import '../database/database_migrator.dart';
+import '../app/runtime_session_controller.dart';
 import '../ui/app_shell.dart';
+import '../ui/screens/sessions_screen.dart';
 import '../ui/themes.dart';
 
 class CodexSessionsViewerApp extends StatelessWidget {
   CodexSessionsViewerApp({
     super.key,
     Future<DatabaseStartupResult>? databaseStartup,
+    File? settingsFile,
+    File? databaseFile,
+    this.sessionRefresh,
   }) : databaseStartup =
            databaseStartup ??
            Future.value(
              DatabaseStartupResult.ready(lastAppliedSchemaVersion: 0),
-           );
+           ),
+       settingsFile = settingsFile ?? defaultSettingsFile(),
+       databaseFile = databaseFile ?? defaultDatabaseFile();
 
   static const appTitle = 'Codex Session Viewer';
   static const nativeTitleBarEnabled = true;
 
   final Future<DatabaseStartupResult> databaseStartup;
+  final File settingsFile;
+  final File databaseFile;
+  final Future<SessionsRefreshResult> Function()? sessionRefresh;
 
   @override
   Widget build(BuildContext context) {
@@ -50,10 +63,21 @@ class CodexSessionsViewerApp extends StatelessWidget {
           if (!result.canStartNormalUi) {
             return FatalDatabaseScreen(error: result.fatalError!);
           }
-          return const CodexAppShell();
+          return CodexAppShell(sessionRefresh: _sessionRefresh);
         },
       ),
     );
+  }
+
+  Future<SessionsRefreshResult> _sessionRefresh() {
+    final refresh = sessionRefresh;
+    if (refresh != null) {
+      return refresh();
+    }
+    return RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
   }
 }
 

@@ -18,9 +18,16 @@ enum CodexAppSection {
 }
 
 class CodexAppShell extends StatefulWidget {
-  const CodexAppShell({super.key, this.title = 'Codex Session Viewer'});
+  const CodexAppShell({
+    super.key,
+    this.title = 'Codex Session Viewer',
+    this.sessionsScreen,
+    this.sessionRefresh,
+  });
 
   final String title;
+  final Widget? sessionsScreen;
+  final Future<SessionsRefreshResult> Function()? sessionRefresh;
 
   @override
   State<CodexAppShell> createState() => _CodexAppShellState();
@@ -82,7 +89,18 @@ class _CodexAppShellState extends State<CodexAppShell> {
               thickness: 1,
               color: Theme.of(context).colorScheme.outlineVariant,
             ),
-            Expanded(child: _SectionContent(section: section)),
+            Expanded(
+              child: _SectionContent(
+                section: section,
+                sessionsScreen: widget.sessionsScreen,
+                sessionRefresh: widget.sessionRefresh,
+                onOpenSettings: () {
+                  setState(() {
+                    _selectedIndex = CodexAppSection.settings.index;
+                  });
+                },
+              ),
+            ),
           ],
         ),
       ),
@@ -91,14 +109,26 @@ class _CodexAppShellState extends State<CodexAppShell> {
 }
 
 class _SectionContent extends StatelessWidget {
-  const _SectionContent({required this.section});
+  const _SectionContent({
+    required this.section,
+    required this.sessionsScreen,
+    required this.sessionRefresh,
+    required this.onOpenSettings,
+  });
 
   final CodexAppSection section;
+  final Widget? sessionsScreen;
+  final Future<SessionsRefreshResult> Function()? sessionRefresh;
+  final VoidCallback onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
     if (section == CodexAppSection.sessions) {
-      return const SessionsScreen();
+      return sessionsScreen ??
+          SessionsScreen(
+            onRefreshResult: sessionRefresh,
+            onOpenSettings: onOpenSettings,
+          );
     }
     if (section == CodexAppSection.usage) {
       return const UsageScreen();
