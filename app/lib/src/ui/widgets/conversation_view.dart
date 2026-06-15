@@ -1,11 +1,19 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/conversation_message_view_model.dart';
 
+typedef CopyTextCallback = Future<void> Function(String text);
+
 class ConversationView extends StatefulWidget {
-  const ConversationView({super.key, required this.messages});
+  const ConversationView({
+    super.key,
+    required this.messages,
+    this.onCopyMessageMarkdown,
+  });
 
   final List<ConversationMessageViewModel> messages;
+  final CopyTextCallback? onCopyMessageMarkdown;
 
   @override
   State<ConversationView> createState() => _ConversationViewState();
@@ -70,6 +78,7 @@ class _ConversationViewState extends State<ConversationView> {
                         message: message,
                         expanded: _expanded.contains(message.id),
                         selected: message.number == _selectedNumber,
+                        onCopyMarkdown: widget.onCopyMessageMarkdown,
                         onToggleExpanded: () {
                           setState(() {
                             if (!_expanded.add(message.id)) {
@@ -171,12 +180,14 @@ class _ConversationMessageCard extends StatelessWidget {
     required this.message,
     required this.expanded,
     required this.selected,
+    required this.onCopyMarkdown,
     required this.onToggleExpanded,
   });
 
   final ConversationMessageViewModel message;
   final bool expanded;
   final bool selected;
+  final CopyTextCallback? onCopyMarkdown;
   final VoidCallback onToggleExpanded;
 
   @override
@@ -239,7 +250,7 @@ class _ConversationMessageCard extends StatelessWidget {
                         ),
                       ),
                     OutlinedButton(
-                      onPressed: () {},
+                      onPressed: () => _copyMarkdown(context),
                       child: const Text('Copy message Markdown'),
                     ),
                   ],
@@ -250,6 +261,31 @@ class _ConversationMessageCard extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  Future<void> _copyMarkdown(BuildContext context) async {
+    final callback = onCopyMarkdown;
+    final text = _messageMarkdown(message);
+    if (callback != null) {
+      await callback(text);
+    } else {
+      await Clipboard.setData(ClipboardData(text: text));
+    }
+    if (!context.mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Message Markdown copied.')));
+  }
+
+  String _messageMarkdown(ConversationMessageViewModel message) {
+    return [
+      '### Message ${message.number} - ${message.authorLabel}',
+      '',
+      message.body,
+      '',
+    ].join('\n');
   }
 }
 

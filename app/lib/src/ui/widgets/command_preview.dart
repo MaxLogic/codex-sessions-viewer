@@ -1,11 +1,21 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../commands/resume_command_generator.dart';
 
+typedef TerminalCommandCallback = Future<void> Function(String command);
+
 class CommandPreview extends StatelessWidget {
-  const CommandPreview({super.key, required this.commandSet});
+  const CommandPreview({
+    super.key,
+    required this.commandSet,
+    this.onRunTerminalCommand,
+    this.onEditTerminalCommand,
+  });
 
   final ResumeCommandSet commandSet;
+  final TerminalCommandCallback? onRunTerminalCommand;
+  final TerminalCommandCallback? onEditTerminalCommand;
 
   @override
   Widget build(BuildContext context) {
@@ -23,12 +33,16 @@ class CommandPreview extends StatelessWidget {
             command: commandSet.plainResumeCommand,
             copyEnabled: commandSet.plainResumeCommand != null,
             copySemanticsLabel: 'Copy plain resume command',
+            onRunTerminalCommand: onRunTerminalCommand,
+            onEditTerminalCommand: onEditTerminalCommand,
           ),
           _CommandBlock(
             label: 'Platform resume command:',
             command: commandSet.platformResumeCommand,
             copyEnabled: commandSet.platformResumeCommand != null,
             copySemanticsLabel: 'Copy platform resume command',
+            onRunTerminalCommand: onRunTerminalCommand,
+            onEditTerminalCommand: onEditTerminalCommand,
           ),
           _CommandBlock(
             label: 'Terminal launch command:',
@@ -38,6 +52,8 @@ class CommandPreview extends StatelessWidget {
             copyEnabled: commandSet.terminalLaunchCommand != null,
             showRunActions: true,
             copySemanticsLabel: 'Copy terminal launch command',
+            onRunTerminalCommand: onRunTerminalCommand,
+            onEditTerminalCommand: onEditTerminalCommand,
           ),
         ],
       ],
@@ -51,6 +67,8 @@ class _CommandBlock extends StatelessWidget {
     required this.command,
     required this.copyEnabled,
     required this.copySemanticsLabel,
+    required this.onRunTerminalCommand,
+    required this.onEditTerminalCommand,
     this.showRunActions = false,
   });
 
@@ -59,6 +77,8 @@ class _CommandBlock extends StatelessWidget {
   final bool copyEnabled;
   final String copySemanticsLabel;
   final bool showRunActions;
+  final TerminalCommandCallback? onRunTerminalCommand;
+  final TerminalCommandCallback? onEditTerminalCommand;
 
   @override
   Widget build(BuildContext context) {
@@ -78,24 +98,94 @@ class _CommandBlock extends StatelessWidget {
               _LabeledCommandButton(
                 label: copySemanticsLabel,
                 text: 'Copy',
-                onPressed: copyEnabled ? () {} : null,
+                onPressed: copyEnabled && command != null
+                    ? () => _copyCommand(context, command!)
+                    : null,
               ),
               if (showRunActions) ...[
                 _LabeledCommandButton(
                   label: 'Run terminal launch command',
                   text: 'Run',
-                  onPressed: copyEnabled ? () {} : null,
+                  onPressed: copyEnabled && command != null
+                      ? () => _runTerminalCommand(context, command!)
+                      : null,
                 ),
                 _LabeledCommandButton(
                   label: 'Edit terminal launch command before running',
                   text: 'Edit and run',
-                  onPressed: copyEnabled ? () {} : null,
+                  onPressed: copyEnabled && command != null
+                      ? () => _editTerminalCommand(context, command!)
+                      : null,
                 ),
               ],
             ],
           ),
         ],
       ),
+    );
+  }
+
+  Future<void> _copyCommand(BuildContext context, String command) async {
+    await Clipboard.setData(ClipboardData(text: command));
+    if (!context.mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Command copied.')));
+  }
+
+  Future<void> _runTerminalCommand(BuildContext context, String command) async {
+    final callback = onRunTerminalCommand;
+    if (callback != null) {
+      await callback(command);
+    }
+    if (!context.mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Terminal command run requested.')),
+    );
+  }
+
+  Future<void> _editTerminalCommand(
+    BuildContext context,
+    String command,
+  ) async {
+    final controller = TextEditingController(text: command);
+    final edited = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit terminal command'),
+        content: TextField(
+          controller: controller,
+          maxLines: 4,
+          decoration: const InputDecoration(labelText: 'Command'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Run'),
+          ),
+        ],
+      ),
+    );
+    if (edited == null) {
+      return;
+    }
+    final callback = onEditTerminalCommand ?? onRunTerminalCommand;
+    if (callback != null) {
+      await callback(edited);
+    }
+    if (!context.mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Edited terminal command run requested.')),
     );
   }
 }

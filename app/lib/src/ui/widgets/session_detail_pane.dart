@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
@@ -7,11 +8,39 @@ import 'command_preview.dart';
 import 'conversation_view.dart';
 import 'focus_reader_view.dart';
 
+typedef DetailCopyCallback = Future<void> Function(String text);
+typedef SessionDetailActionCallback =
+    Future<void> Function(SessionDetailAction action);
+
+enum SessionDetailAction {
+  openContainingFolder,
+  openTerminalHere,
+  openTerminalResume,
+  exportMarkdown,
+  reparse,
+  togglePin,
+  toggleArchive,
+  editTags,
+  assignProject,
+}
+
 class SessionDetailPane extends StatelessWidget {
-  const SessionDetailPane({super.key, required this.row, this.settings});
+  const SessionDetailPane({
+    super.key,
+    required this.row,
+    this.settings,
+    this.onCopyText,
+    this.onSessionAction,
+    this.onRunTerminalCommand,
+    this.onEditTerminalCommand,
+  });
 
   final SessionRowViewModel row;
   final AppSettings? settings;
+  final DetailCopyCallback? onCopyText;
+  final SessionDetailActionCallback? onSessionAction;
+  final TerminalCommandCallback? onRunTerminalCommand;
+  final TerminalCommandCallback? onEditTerminalCommand;
 
   @override
   Widget build(BuildContext context) {
@@ -39,15 +68,27 @@ class SessionDetailPane extends StatelessWidget {
           const SizedBox(height: 12),
           _MetadataGrid(row: row),
           const SizedBox(height: 16),
-          _ActionArea(row: row, commandSet: commandSet),
+          _ActionArea(
+            row: row,
+            commandSet: commandSet,
+            onCopyText: onCopyText,
+            onSessionAction: onSessionAction,
+          ),
           const SizedBox(height: 16),
-          CommandPreview(commandSet: commandSet),
+          CommandPreview(
+            commandSet: commandSet,
+            onRunTerminalCommand: onRunTerminalCommand,
+            onEditTerminalCommand: onEditTerminalCommand,
+          ),
           const SizedBox(height: 16),
           Text('Conversation', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
           SizedBox(
             height: 420,
-            child: ConversationView(messages: row.conversationMessages),
+            child: ConversationView(
+              messages: row.conversationMessages,
+              onCopyMessageMarkdown: onCopyText,
+            ),
           ),
           const SizedBox(height: 16),
           Text('Focus reader', style: Theme.of(context).textTheme.titleMedium),
@@ -118,10 +159,17 @@ class _DetailText extends StatelessWidget {
 }
 
 class _ActionArea extends StatelessWidget {
-  const _ActionArea({required this.row, required this.commandSet});
+  const _ActionArea({
+    required this.row,
+    required this.commandSet,
+    required this.onCopyText,
+    required this.onSessionAction,
+  });
 
   final SessionRowViewModel row;
   final ResumeCommandSet commandSet;
+  final DetailCopyCallback? onCopyText;
+  final SessionDetailActionCallback? onSessionAction;
 
   @override
   Widget build(BuildContext context) {
@@ -131,33 +179,162 @@ class _ActionArea extends StatelessWidget {
       spacing: 8,
       runSpacing: 8,
       children: [
-        _action('Copy session path'),
-        _action('Copy working directory'),
-        _action('Copy plain resume command', enabled: canResume),
-        _action(
+        _copyAction(context, 'Copy session path', row.sourcePathForDisplay),
+        _copyAction(
+          context,
+          'Copy working directory',
+          row.workingDirectoryForCommands,
+        ),
+        _copyAction(
+          context,
+          'Copy plain resume command',
+          commandSet.plainResumeCommand,
+          enabled: canResume,
+        ),
+        _copyAction(
+          context,
           'Copy platform resume command',
+          commandSet.platformResumeCommand,
           enabled: commandSet.platformResumeCommand != null,
         ),
-        _action('Open containing folder'),
-        _action('Open terminal here'),
-        _action('Open in terminal and resume', enabled: terminalEnabled),
-        _action('Copy terminal launch command', enabled: terminalEnabled),
-        _action('Export Markdown'),
-        _action('Copy conversation Markdown'),
-        _action('Re-parse this session'),
-        _action(row.isPinned ? 'Unpin session' : 'Pin session'),
-        _action(row.isArchived ? 'Unarchive session' : 'Archive session'),
-        _action('Add/remove tags'),
-        _action('Assign/change project'),
+        _callbackAction(
+          'Open containing folder',
+          SessionDetailAction.openContainingFolder,
+        ),
+        _callbackAction(
+          'Open terminal here',
+          SessionDetailAction.openTerminalHere,
+          enabled: false,
+          disabledReason:
+              'Opening a terminal without resume is not available yet.',
+        ),
+        _callbackAction(
+          'Open in terminal and resume',
+          SessionDetailAction.openTerminalResume,
+          enabled: terminalEnabled,
+        ),
+        _copyAction(
+          context,
+          'Copy terminal launch command',
+          commandSet.terminalLaunchCommand,
+          enabled: terminalEnabled,
+        ),
+        _callbackAction(
+          'Export Markdown',
+          SessionDetailAction.exportMarkdown,
+          enabled: false,
+          disabledReason: 'Markdown file export is not available yet.',
+        ),
+        _copyAction(
+          context,
+          'Copy conversation Markdown',
+          _conversationMarkdown(row),
+        ),
+        _callbackAction('Re-parse this session', SessionDetailAction.reparse),
+        _callbackAction(
+          row.isPinned ? 'Unpin session' : 'Pin session',
+          SessionDetailAction.togglePin,
+        ),
+        _callbackAction(
+          row.isArchived ? 'Unarchive session' : 'Archive session',
+          SessionDetailAction.toggleArchive,
+        ),
+        _callbackAction(
+          'Add/remove tags',
+          SessionDetailAction.editTags,
+          enabled: false,
+          disabledReason: 'Tag editing is not available yet.',
+        ),
+        _callbackAction(
+          'Assign/change project',
+          SessionDetailAction.assignProject,
+          enabled: false,
+          disabledReason: 'Project assignment is not available yet.',
+        ),
       ],
     );
   }
 
-  Widget _action(String label, {bool enabled = true}) {
+  Widget _copyAction(
+    BuildContext context,
+    String label,
+    String? text, {
+    bool enabled = true,
+  }) {
     return OutlinedButton(
-      onPressed: enabled ? () {} : null,
+      onPressed: enabled && text != null
+          ? () => _copyText(context, _copySuccessMessage(label), text)
+          : null,
       child: Text(label),
     );
+  }
+
+  Widget _callbackAction(
+    String label,
+    SessionDetailAction action, {
+    bool enabled = true,
+    String? disabledReason,
+  }) {
+    final button = OutlinedButton(
+      onPressed: enabled && onSessionAction != null
+          ? () => _invokeAction(action)
+          : null,
+      child: Text(label),
+    );
+    if (enabled || disabledReason == null) {
+      return button;
+    }
+    return Tooltip(message: disabledReason, child: button);
+  }
+
+  Future<void> _copyText(
+    BuildContext context,
+    String message,
+    String text,
+  ) async {
+    final callback = onCopyText;
+    if (callback != null) {
+      await callback(text);
+    } else {
+      await Clipboard.setData(ClipboardData(text: text));
+    }
+    if (context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  Future<void> _invokeAction(SessionDetailAction action) async {
+    final callback = onSessionAction;
+    if (callback != null) {
+      await callback(action);
+    }
+  }
+
+  String _conversationMarkdown(SessionRowViewModel row) {
+    return [
+      '# ${row.title}',
+      '',
+      for (final message in row.conversationMessages) ...[
+        '## Message ${message.number} - ${message.authorLabel}',
+        '',
+        message.body,
+        '',
+      ],
+    ].join('\n');
+  }
+
+  String _copySuccessMessage(String label) {
+    return switch (label) {
+      'Copy session path' => 'Copied session path.',
+      'Copy working directory' => 'Copied working directory.',
+      'Copy plain resume command' => 'Copied plain resume command.',
+      'Copy platform resume command' => 'Copied platform resume command.',
+      'Copy terminal launch command' => 'Copied terminal launch command.',
+      'Copy conversation Markdown' => 'Copied conversation Markdown.',
+      _ => 'Copied.',
+    };
   }
 }
 

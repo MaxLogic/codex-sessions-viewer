@@ -53,6 +53,50 @@ void main() {
       expect(find.widgetWithText(OutlinedButton, action), findsOneWidget);
     }
   });
+
+  testWidgets('detail copy actions use injected callbacks', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1000, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final copied = <String>[];
+    final actions = <SessionDetailAction>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionDetailPane(
+            row: _detailRow(),
+            onCopyText: (text) async {
+              copied.add(text);
+            },
+            onSessionAction: (action) async {
+              actions.add(action);
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Copy session path'));
+    await tester.pumpAndSettle();
+    final copyResume = find.widgetWithText(
+      OutlinedButton,
+      'Copy plain resume command',
+    );
+    await tester.ensureVisible(copyResume);
+    await tester.tap(copyResume);
+    await tester.pumpAndSettle();
+    final reparse = find.widgetWithText(
+      OutlinedButton,
+      'Re-parse this session',
+    );
+    await tester.ensureVisible(reparse);
+    await tester.tap(reparse);
+    await tester.pumpAndSettle();
+
+    expect(copied.first, '/home/pawel/.codex/sessions/session.jsonl');
+    expect(copied.last, 'codex resume abc123');
+    expect(actions, [SessionDetailAction.reparse]);
+    expect(find.text('Copied session path.'), findsOneWidget);
+  });
 }
 
 SessionRowViewModel _detailRow() {

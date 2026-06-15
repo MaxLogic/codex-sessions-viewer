@@ -95,4 +95,40 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('line 1\nline 2\nline 3'), findsOneWidget);
   });
+
+  testWidgets('copy message Markdown uses injected copy callback', (
+    tester,
+  ) async {
+    final copied = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'm1',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Short preview',
+                body: 'Full message body',
+                tokenCount: 12,
+              ),
+            ],
+            onCopyMessageMarkdown: (markdown) async {
+              copied.add(markdown);
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(
+      find.widgetWithText(OutlinedButton, 'Copy message Markdown'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(copied.single, contains('Full message body'));
+    expect(find.text('Message Markdown copied.'), findsOneWidget);
+  });
 }

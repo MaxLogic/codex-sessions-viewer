@@ -1,6 +1,8 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:sqlite3/sqlite3.dart';
 
 import '../config/app_settings.dart';
 import '../database/database_migrator.dart';
@@ -18,6 +20,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
     Future<DatabaseStartupResult>? databaseStartup,
     File? settingsFile,
     File? databaseFile,
+    Future<AppSettings>? settingsStartup,
     this.sessionRefresh,
   }) : databaseStartup =
            databaseStartup ??
@@ -25,12 +28,18 @@ class CodexSessionsViewerApp extends StatelessWidget {
              DatabaseStartupResult.ready(lastAppliedSchemaVersion: 0),
            ),
        settingsFile = settingsFile ?? defaultSettingsFile(),
-       databaseFile = databaseFile ?? defaultDatabaseFile();
+       databaseFile = databaseFile ?? defaultDatabaseFile(),
+       settingsStartup =
+           settingsStartup ??
+           SettingsRepository(
+             settingsFile ?? defaultSettingsFile(),
+           ).loadOrCreate();
 
   static const appTitle = 'Codex Session Viewer';
   static const nativeTitleBarEnabled = true;
 
   final Future<DatabaseStartupResult> databaseStartup;
+  final Future<AppSettings> settingsStartup;
   final File settingsFile;
   final File databaseFile;
   final Future<SessionsRefreshResult> Function()? sessionRefresh;
@@ -66,14 +75,35 @@ class CodexSessionsViewerApp extends StatelessWidget {
           if (!result.canStartNormalUi) {
             return FatalDatabaseScreen(error: result.fatalError!);
           }
-          return CodexAppShell(
-            sessionsScreenBuilder: (context, onOpenSettings) => SessionsScreen(
-              onRefreshResult: _sessionRefresh,
-              onOpenSettings: onOpenSettings,
-            ),
-            usageScreen: const UsageScreen(),
-            settingsScreen: const SettingsScreen(),
-            logsScreen: const LogsScreen(),
+          return FutureBuilder<AppSettings>(
+            future: settingsStartup,
+            initialData: AppSettings.defaults(),
+            builder: (context, settingsSnapshot) {
+              if (settingsSnapshot.hasError) {
+                return FatalDatabaseScreen(
+                  error: DatabaseFatalError(
+                    summary: 'Settings startup failed.',
+                    databasePath: settingsFile.path,
+                    lastAppliedSchemaVersion: result.lastAppliedSchemaVersion,
+                    details: settingsSnapshot.error.toString(),
+                  ),
+                );
+              }
+              final settings = settingsSnapshot.requireData;
+              return CodexAppShell(
+                sessionsScreenBuilder: (context, onOpenSettings) =>
+                    SessionsScreen(
+                      settings: settings,
+                      onRefreshResult: _sessionRefresh,
+                      onOpenSettings: onOpenSettings,
+                      onSessionAction: (request) =>
+                          _handleSessionAction(request),
+                    ),
+                usageScreen: const UsageScreen(),
+                settingsScreen: SettingsScreen(initialSettings: settings),
+                logsScreen: const LogsScreen(),
+              );
+            },
           );
         },
       ),
@@ -89,6 +119,82 @@ class CodexSessionsViewerApp extends StatelessWidget {
       settingsFile: settingsFile,
       databaseFile: databaseFile,
     ).refresh();
+  }
+
+  Future<void> _handleSessionAction(SessionActionRequest request) async {
+    final payload = request.payload;
+    switch (request.action) {
+      case SessionRowAction.copyPath:
+      case SessionRowAction.copyPlainResumeCommand:
+      case SessionRowAction.copyPlatformResumeCommand:
+      case SessionRowAction.copyTerminalCommand:
+        if (payload != null) {
+          await Clipboard.setData(ClipboardData(text: payload));
+        }
+        return;
+      case SessionRowAction.openPath:
+        await _openPath(payload ?? request.row.sourcePathForDisplay);
+        return;
+      case SessionRowAction.openTerminalResume:
+        if (payload != null) {
+          await _runDetachedCommand(payload);
+        }
+        return;
+      case SessionRowAction.togglePin:
+        _updateSessionFlag(
+          request.row.id,
+          column: 'is_pinned',
+          value: !request.row.isPinned,
+        );
+        return;
+      case SessionRowAction.toggleArchive:
+        _updateSessionFlag(
+          request.row.id,
+          column: 'is_archived',
+          value: !request.row.isArchived,
+        );
+        return;
+      case SessionRowAction.reparse:
+        await RuntimeSessionController(
+          settingsFile: settingsFile,
+          databaseFile: databaseFile,
+        ).refresh();
+        return;
+    }
+  }
+
+  Future<void> _openPath(String path) async {
+    if (path.trim().isEmpty) {
+      return;
+    }
+    await Process.start('explorer.exe', ['/select,', path]);
+  }
+
+  Future<void> _runDetachedCommand(String command) async {
+    if (command.trim().isEmpty) {
+      return;
+    }
+    await Process.start('cmd.exe', [
+      '/c',
+      command,
+    ], mode: ProcessStartMode.detached);
+  }
+
+  void _updateSessionFlag(
+    String sessionId, {
+    required String column,
+    required bool value,
+  }) {
+    assert(column == 'is_pinned' || column == 'is_archived');
+    final db = sqlite3.open(databaseFile.path);
+    try {
+      db.execute(
+        'update sessions set $column = ?, updated_at_utc = ? where id = ?',
+        [value ? 1 : 0, DateTime.now().toUtc().toIso8601String(), sessionId],
+      );
+    } finally {
+      db.close();
+    }
   }
 }
 

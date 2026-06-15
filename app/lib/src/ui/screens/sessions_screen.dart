@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import '../../commands/resume_command_generator.dart';
+import '../../config/app_settings.dart';
 import '../models/session_row_view_model.dart';
+import '../widgets/command_preview.dart';
 import '../widgets/session_detail_pane.dart';
 
 export '../models/session_row_view_model.dart';
@@ -8,6 +12,32 @@ export '../models/session_row_view_model.dart';
 enum SessionsPlatformFilter { both, windows, wsl }
 
 enum SessionsArchivedFilter { activeOnly, archivedOnly, all }
+
+enum SessionRowAction {
+  openPath,
+  copyPath,
+  copyPlainResumeCommand,
+  copyPlatformResumeCommand,
+  openTerminalResume,
+  copyTerminalCommand,
+  togglePin,
+  toggleArchive,
+  reparse,
+}
+
+typedef SessionActionCallback = Future<void> Function(SessionActionRequest);
+
+class SessionActionRequest {
+  const SessionActionRequest({
+    required this.row,
+    required this.action,
+    this.payload,
+  });
+
+  final SessionRowViewModel row;
+  final SessionRowAction action;
+  final String? payload;
+}
 
 class SessionsScreen extends StatefulWidget {
   const SessionsScreen({
@@ -17,6 +47,8 @@ class SessionsScreen extends StatefulWidget {
     this.onRefreshResult,
     this.onOpenSettings,
     this.onTestWslPath,
+    this.onSessionAction,
+    this.settings,
     this.initialStatusMessage = '',
   });
 
@@ -25,6 +57,8 @@ class SessionsScreen extends StatefulWidget {
   final Future<SessionsRefreshResult> Function()? onRefreshResult;
   final VoidCallback? onOpenSettings;
   final VoidCallback? onTestWslPath;
+  final SessionActionCallback? onSessionAction;
+  final AppSettings? settings;
   final String initialStatusMessage;
 
   @override
@@ -136,6 +170,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
                             rows: visibleRows,
                             selectedId: _selectedId,
                             onSelect: _select,
+                            onAction: _handleSessionAction,
+                            settings: widget.settings ?? AppSettings.defaults(),
                           ),
                   ),
                   VerticalDivider(
@@ -145,7 +181,32 @@ class _SessionsScreenState extends State<SessionsScreen> {
                   ),
                   Expanded(
                     flex: 2,
-                    child: _SessionDetailPlaceholder(row: selectedRow),
+                    child: _SessionDetailPlaceholder(
+                      row: selectedRow,
+                      settings: widget.settings ?? AppSettings.defaults(),
+                      onSessionAction: selectedRow == null
+                          ? null
+                          : (action) =>
+                                _handleDetailAction(selectedRow, action),
+                      onRunTerminalCommand: selectedRow == null
+                          ? null
+                          : (command) => _handleSessionAction(
+                              SessionActionRequest(
+                                row: selectedRow,
+                                action: SessionRowAction.openTerminalResume,
+                                payload: command,
+                              ),
+                            ),
+                      onEditTerminalCommand: selectedRow == null
+                          ? null
+                          : (command) => _handleSessionAction(
+                              SessionActionRequest(
+                                row: selectedRow,
+                                action: SessionRowAction.openTerminalResume,
+                                payload: command,
+                              ),
+                            ),
+                    ),
                   ),
                 ],
               ),
@@ -329,6 +390,99 @@ class _SessionsScreenState extends State<SessionsScreen> {
       return SessionsRefreshResult.scanFinished(rows);
     }
     return SessionsRefreshResult.scanFinished(_rows);
+  }
+
+  Future<void> _handleSessionAction(SessionActionRequest request) async {
+    final callback = widget.onSessionAction;
+    if (callback != null) {
+      await callback(request);
+      return;
+    }
+    final payload = request.payload;
+    final messenger = ScaffoldMessenger.of(context);
+    if (payload != null && _isCopyAction(request.action)) {
+      await Clipboard.setData(ClipboardData(text: payload));
+      if (!mounted) {
+        return;
+      }
+      messenger.showSnackBar(
+        SnackBar(content: Text(_copySuccessMessage(request.action))),
+      );
+      return;
+    }
+    messenger.showSnackBar(
+      SnackBar(content: Text('${request.action.label} is not wired yet.')),
+    );
+  }
+
+  Future<void> _handleDetailAction(
+    SessionRowViewModel row,
+    SessionDetailAction action,
+  ) async {
+    final commandSet =
+        ResumeCommandGenerator(
+          settings: widget.settings ?? AppSettings.defaults(),
+        ).build(
+          ResumeCommandSession(
+            sessionId: row.sessionId,
+            sourceType: row.platform == SessionRowPlatform.wsl
+                ? ResumeSessionSourceType.wsl
+                : ResumeSessionSourceType.windows,
+            workingDirectory: row.workingDirectoryForCommands,
+          ),
+        );
+    final request = switch (action) {
+      SessionDetailAction.openContainingFolder => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.openPath,
+        payload: row.sourcePathForDisplay,
+      ),
+      SessionDetailAction.openTerminalResume => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.openTerminalResume,
+        payload: commandSet.terminalLaunchCommand,
+      ),
+      SessionDetailAction.reparse => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.reparse,
+      ),
+      SessionDetailAction.togglePin => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.togglePin,
+      ),
+      SessionDetailAction.toggleArchive => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.toggleArchive,
+      ),
+      SessionDetailAction.openTerminalHere ||
+      SessionDetailAction.exportMarkdown ||
+      SessionDetailAction.editTags ||
+      SessionDetailAction.assignProject => null,
+    };
+    if (request != null) {
+      await _handleSessionAction(request);
+    }
+  }
+
+  bool _isCopyAction(SessionRowAction action) {
+    return switch (action) {
+      SessionRowAction.copyPath ||
+      SessionRowAction.copyPlainResumeCommand ||
+      SessionRowAction.copyPlatformResumeCommand ||
+      SessionRowAction.copyTerminalCommand => true,
+      _ => false,
+    };
+  }
+
+  String _copySuccessMessage(SessionRowAction action) {
+    return switch (action) {
+      SessionRowAction.copyPath => 'Session path copied.',
+      SessionRowAction.copyPlainResumeCommand => 'Plain resume command copied.',
+      SessionRowAction.copyPlatformResumeCommand =>
+        'Platform resume command copied.',
+      SessionRowAction.copyTerminalCommand => 'Terminal launch command copied.',
+      _ => 'Copied.',
+    };
   }
 }
 
@@ -628,7 +782,7 @@ class _FilterBar extends StatelessWidget {
                   child: const Text('Clear filters'),
                 ),
                 OutlinedButton(
-                  onPressed: () {},
+                  onPressed: null,
                   child: const Text('Advanced filters'),
                 ),
               ],
@@ -675,11 +829,15 @@ class _SessionsTable extends StatelessWidget {
     required this.rows,
     required this.selectedId,
     required this.onSelect,
+    required this.onAction,
+    required this.settings,
   });
 
   final List<SessionRowViewModel> rows;
   final String? selectedId;
   final ValueChanged<String> onSelect;
+  final SessionActionCallback onAction;
+  final AppSettings settings;
 
   @override
   Widget build(BuildContext context) {
@@ -746,7 +904,11 @@ class _SessionsTable extends StatelessWidget {
                             onTap: () => onSelect(row.id),
                           ),
                           DataCell(
-                            _ActionsMenu(row: row),
+                            _ActionsMenu(
+                              row: row,
+                              onAction: onAction,
+                              settings: settings,
+                            ),
                             onTap: () => onSelect(row.id),
                           ),
                         ],
@@ -852,51 +1014,169 @@ class _StatusCell extends StatelessWidget {
 }
 
 class _ActionsMenu extends StatelessWidget {
-  const _ActionsMenu({required this.row});
+  const _ActionsMenu({
+    required this.row,
+    required this.onAction,
+    required this.settings,
+  });
 
   final SessionRowViewModel row;
+  final SessionActionCallback onAction;
+  final AppSettings settings;
 
   @override
   Widget build(BuildContext context) {
+    final commandSet = _commandSet(row);
     return Semantics(
       label: 'Actions for ${row.title}',
       button: true,
-      child: PopupMenuButton<String>(
+      child: PopupMenuButton<SessionRowAction>(
         tooltip: 'More actions',
-        itemBuilder: (context) => const [
-          PopupMenuItem(value: 'open_path', child: Text('Open path')),
-          PopupMenuItem(value: 'copy_path', child: Text('Copy path')),
-          PopupMenuItem(value: 'copy_plain_resume', child: Text('Copy resume')),
-          PopupMenuItem(
-            value: 'copy_platform_resume',
-            child: Text('Copy platform resume'),
+        onSelected: (action) => onAction(
+          SessionActionRequest(
+            row: row,
+            action: action,
+            payload: _payloadFor(row, commandSet, action),
           ),
-          PopupMenuItem(
-            value: 'terminal_resume',
-            child: Text('Open terminal and resume'),
+        ),
+        itemBuilder: (context) => [
+          _item(SessionRowAction.openPath, 'Open path'),
+          _item(SessionRowAction.copyPath, 'Copy path'),
+          _item(
+            SessionRowAction.copyPlainResumeCommand,
+            'Copy plain resume command',
+            enabled: commandSet.plainResumeCommand != null,
+            disabledReason: commandSet.disabledReason,
           ),
-          PopupMenuItem(
-            value: 'copy_terminal',
-            child: Text('Copy terminal command'),
+          _item(
+            SessionRowAction.copyPlatformResumeCommand,
+            'Copy platform resume command',
+            enabled: commandSet.platformResumeCommand != null,
+            disabledReason: commandSet.disabledReason,
           ),
-          PopupMenuItem(value: 'pin', child: Text('Pin or unpin')),
-          PopupMenuItem(value: 'archive', child: Text('Archive or unarchive')),
-          PopupMenuItem(value: 'reparse', child: Text('Re-parse session')),
+          _item(
+            SessionRowAction.openTerminalResume,
+            'Open terminal and resume',
+            enabled: commandSet.terminalLaunchCommand != null,
+            disabledReason:
+                commandSet.terminalDisabledReason ?? commandSet.disabledReason,
+          ),
+          _item(
+            SessionRowAction.copyTerminalCommand,
+            'Copy terminal command',
+            enabled: commandSet.terminalLaunchCommand != null,
+            disabledReason:
+                commandSet.terminalDisabledReason ?? commandSet.disabledReason,
+          ),
+          _item(
+            SessionRowAction.togglePin,
+            row.isPinned ? 'Unpin session' : 'Pin session',
+          ),
+          _item(
+            SessionRowAction.toggleArchive,
+            row.isArchived ? 'Unarchive session' : 'Archive session',
+          ),
+          _item(SessionRowAction.reparse, 'Re-parse session'),
         ],
       ),
     );
   }
+
+  PopupMenuItem<SessionRowAction> _item(
+    SessionRowAction action,
+    String label, {
+    bool enabled = true,
+    String? disabledReason,
+  }) {
+    return PopupMenuItem<SessionRowAction>(
+      value: action,
+      enabled: enabled,
+      child: enabled || disabledReason == null
+          ? Text(label)
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label),
+                Text(disabledReason, style: const TextStyle(fontSize: 12)),
+              ],
+            ),
+    );
+  }
+
+  ResumeCommandSet _commandSet(SessionRowViewModel row) {
+    return ResumeCommandGenerator(settings: settings).build(
+      ResumeCommandSession(
+        sessionId: row.sessionId,
+        sourceType: row.platform == SessionRowPlatform.wsl
+            ? ResumeSessionSourceType.wsl
+            : ResumeSessionSourceType.windows,
+        workingDirectory: row.workingDirectoryForCommands,
+      ),
+    );
+  }
+
+  String? _payloadFor(
+    SessionRowViewModel row,
+    ResumeCommandSet commandSet,
+    SessionRowAction action,
+  ) {
+    return switch (action) {
+      SessionRowAction.openPath ||
+      SessionRowAction.copyPath => row.sourcePathForDisplay,
+      SessionRowAction.copyPlainResumeCommand => commandSet.plainResumeCommand,
+      SessionRowAction.copyPlatformResumeCommand =>
+        commandSet.platformResumeCommand,
+      SessionRowAction.openTerminalResume ||
+      SessionRowAction.copyTerminalCommand => commandSet.terminalLaunchCommand,
+      SessionRowAction.togglePin ||
+      SessionRowAction.toggleArchive ||
+      SessionRowAction.reparse => null,
+    };
+  }
+}
+
+extension on SessionRowAction {
+  String get label {
+    return switch (this) {
+      SessionRowAction.openPath => 'Open path',
+      SessionRowAction.copyPath => 'Copy path',
+      SessionRowAction.copyPlainResumeCommand => 'Copy plain resume command',
+      SessionRowAction.copyPlatformResumeCommand =>
+        'Copy platform resume command',
+      SessionRowAction.openTerminalResume => 'Open terminal and resume',
+      SessionRowAction.copyTerminalCommand => 'Copy terminal command',
+      SessionRowAction.togglePin => 'Pin or unpin session',
+      SessionRowAction.toggleArchive => 'Archive or unarchive session',
+      SessionRowAction.reparse => 'Re-parse session',
+    };
+  }
 }
 
 class _SessionDetailPlaceholder extends StatelessWidget {
-  const _SessionDetailPlaceholder({required this.row});
+  const _SessionDetailPlaceholder({
+    required this.row,
+    required this.settings,
+    required this.onSessionAction,
+    required this.onRunTerminalCommand,
+    required this.onEditTerminalCommand,
+  });
 
   final SessionRowViewModel? row;
+  final AppSettings settings;
+  final SessionDetailActionCallback? onSessionAction;
+  final TerminalCommandCallback? onRunTerminalCommand;
+  final TerminalCommandCallback? onEditTerminalCommand;
 
   @override
   Widget build(BuildContext context) {
     if (row != null) {
-      return SessionDetailPane(row: row!);
+      return SessionDetailPane(
+        row: row!,
+        settings: settings,
+        onSessionAction: onSessionAction,
+        onRunTerminalCommand: onRunTerminalCommand,
+        onEditTerminalCommand: onEditTerminalCommand,
+      );
     }
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),

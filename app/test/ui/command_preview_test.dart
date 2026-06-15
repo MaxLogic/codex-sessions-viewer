@@ -71,4 +71,48 @@ void main() {
     );
     expect(find.text('Plain resume command:'), findsNothing);
   });
+
+  testWidgets('runs and edits terminal launch command through callbacks', (
+    tester,
+  ) async {
+    final commandSet = ResumeCommandGenerator(settings: AppSettings.defaults())
+        .build(
+          const ResumeCommandSession(
+            sessionId: 'abc123',
+            sourceType: ResumeSessionSourceType.windows,
+            workingDirectory: r'F:\project',
+          ),
+        );
+    final ran = <String>[];
+    final edited = <String>[];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: CommandPreview(
+            commandSet: commandSet,
+            onRunTerminalCommand: (command) async {
+              ran.add(command);
+            },
+            onEditTerminalCommand: (command) async {
+              edited.add(command);
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Run'));
+    await tester.pumpAndSettle();
+    expect(ran.single, contains('codex resume abc123'));
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Edit and run'));
+    await tester.pumpAndSettle();
+    expect(find.text('Edit terminal command'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), 'custom terminal command');
+    await tester.tap(find.widgetWithText(FilledButton, 'Run'));
+    await tester.pumpAndSettle();
+
+    expect(edited.single, 'custom terminal command');
+  });
 }
