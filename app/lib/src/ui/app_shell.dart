@@ -1,9 +1,7 @@
 import 'package:flutter/material.dart';
 
-import 'screens/logs_screen.dart';
-import 'screens/sessions_screen.dart';
-import 'screens/settings_screen.dart';
-import 'screens/usage_screen.dart';
+typedef SessionsScreenBuilder =
+    Widget Function(BuildContext context, VoidCallback onOpenSettings);
 
 enum CodexAppSection {
   sessions('Sessions', Icons.history),
@@ -21,13 +19,17 @@ class CodexAppShell extends StatefulWidget {
   const CodexAppShell({
     super.key,
     this.title = 'Codex Session Viewer',
-    this.sessionsScreen,
-    this.sessionRefresh,
+    required this.sessionsScreenBuilder,
+    required this.usageScreen,
+    required this.settingsScreen,
+    required this.logsScreen,
   });
 
   final String title;
-  final Widget? sessionsScreen;
-  final Future<SessionsRefreshResult> Function()? sessionRefresh;
+  final SessionsScreenBuilder sessionsScreenBuilder;
+  final Widget usageScreen;
+  final Widget settingsScreen;
+  final Widget logsScreen;
 
   @override
   State<CodexAppShell> createState() => _CodexAppShellState();
@@ -92,8 +94,10 @@ class _CodexAppShellState extends State<CodexAppShell> {
             Expanded(
               child: _SectionContent(
                 section: section,
-                sessionsScreen: widget.sessionsScreen,
-                sessionRefresh: widget.sessionRefresh,
+                sessionsScreenBuilder: widget.sessionsScreenBuilder,
+                usageScreen: widget.usageScreen,
+                settingsScreen: widget.settingsScreen,
+                logsScreen: widget.logsScreen,
                 onOpenSettings: () {
                   setState(() {
                     _selectedIndex = CodexAppSection.settings.index;
@@ -111,69 +115,34 @@ class _CodexAppShellState extends State<CodexAppShell> {
 class _SectionContent extends StatelessWidget {
   const _SectionContent({
     required this.section,
-    required this.sessionsScreen,
-    required this.sessionRefresh,
+    required this.sessionsScreenBuilder,
+    required this.usageScreen,
+    required this.settingsScreen,
+    required this.logsScreen,
     required this.onOpenSettings,
   });
 
   final CodexAppSection section;
-  final Widget? sessionsScreen;
-  final Future<SessionsRefreshResult> Function()? sessionRefresh;
+  final SessionsScreenBuilder sessionsScreenBuilder;
+  final Widget usageScreen;
+  final Widget settingsScreen;
+  final Widget logsScreen;
   final VoidCallback onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
     if (section == CodexAppSection.sessions) {
-      return sessionsScreen ??
-          SessionsScreen(
-            onRefreshResult: sessionRefresh,
-            onOpenSettings: onOpenSettings,
-          );
+      return sessionsScreenBuilder(context, onOpenSettings);
     }
     if (section == CodexAppSection.usage) {
-      return const UsageScreen();
+      return usageScreen;
     }
     if (section == CodexAppSection.settings) {
-      return const SettingsScreen();
+      return settingsScreen;
     }
     if (section == CodexAppSection.logs) {
-      return const LogsScreen();
+      return logsScreen;
     }
-    final scheme = Theme.of(context).colorScheme;
-    return FocusTraversalGroup(
-      child: Container(
-        color: scheme.surface,
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(section.label, style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 16),
-            Expanded(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  border: Border.all(color: scheme.outline),
-                ),
-                child: SizedBox.expand(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Text(_placeholderText(section)),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+    throw StateError('Unsupported app section: $section');
   }
-}
-
-String _placeholderText(CodexAppSection section) {
-  return switch (section) {
-    CodexAppSection.sessions => 'Session table',
-    CodexAppSection.usage => 'Usage summary',
-    CodexAppSection.settings => 'Settings form',
-    CodexAppSection.logs => 'Log table',
-  };
 }

@@ -6,7 +6,10 @@ import '../config/app_settings.dart';
 import '../database/database_migrator.dart';
 import '../app/runtime_session_controller.dart';
 import '../ui/app_shell.dart';
+import '../ui/screens/logs_screen.dart';
 import '../ui/screens/sessions_screen.dart';
+import '../ui/screens/settings_screen.dart';
+import '../ui/screens/usage_screen.dart';
 import '../ui/themes.dart';
 
 class CodexSessionsViewerApp extends StatelessWidget {
@@ -63,7 +66,15 @@ class CodexSessionsViewerApp extends StatelessWidget {
           if (!result.canStartNormalUi) {
             return FatalDatabaseScreen(error: result.fatalError!);
           }
-          return CodexAppShell(sessionRefresh: _sessionRefresh);
+          return CodexAppShell(
+            sessionsScreenBuilder: (context, onOpenSettings) => SessionsScreen(
+              onRefreshResult: _sessionRefresh,
+              onOpenSettings: onOpenSettings,
+            ),
+            usageScreen: const UsageScreen(),
+            settingsScreen: const SettingsScreen(),
+            logsScreen: const LogsScreen(),
+          );
         },
       ),
     );
