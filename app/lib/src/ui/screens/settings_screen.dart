@@ -180,6 +180,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         showTextOnButtons: _settings.ui.showTextOnButtons,
         showIcons: _settings.ui.showIcons,
         nativeTitleBar: _settings.ui.nativeTitleBar,
+        window: _settings.ui.window,
       ),
       terminal: TerminalSettings(
         defaultTerminal: _defaultTerminal.text,
@@ -532,6 +533,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           showTextOnButtons: showTextOnButtons ?? ui.showTextOnButtons,
           showIcons: showIcons ?? ui.showIcons,
           nativeTitleBar: nativeTitleBar ?? ui.nativeTitleBar,
+          window: ui.window,
         ),
       );
     });
@@ -671,23 +673,7 @@ class _ChoiceSetting extends StatelessWidget {
 }
 
 extension on UiSettings {
-  UiSettings copyWithTheme(AppThemeMode theme) => UiSettings(
-    theme: theme,
-    useSystemAccentColor: useSystemAccentColor,
-    fontSize: fontSize,
-    density: density,
-    showTextOnButtons: showTextOnButtons,
-    showIcons: showIcons,
-    nativeTitleBar: nativeTitleBar,
-  );
+  UiSettings copyWithTheme(AppThemeMode theme) => copyWith(theme: theme);
 
-  UiSettings copyWithDensity(UiDensity density) => UiSettings(
-    theme: theme,
-    useSystemAccentColor: useSystemAccentColor,
-    fontSize: fontSize,
-    density: density,
-    showTextOnButtons: showTextOnButtons,
-    showIcons: showIcons,
-    nativeTitleBar: nativeTitleBar,
-  );
+  UiSettings copyWithDensity(UiDensity density) => copyWith(density: density);
 }

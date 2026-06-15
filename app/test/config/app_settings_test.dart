@@ -76,6 +76,13 @@ void main() {
         showTextOnButtons: false,
         showIcons: true,
         nativeTitleBar: true,
+        window: WindowPlacementSettings(
+          x: 20,
+          y: 30,
+          width: 1200,
+          height: 800,
+          isMaximized: true,
+        ),
       ),
       terminal: const TerminalSettings(
         defaultTerminal: 'windows_terminal',

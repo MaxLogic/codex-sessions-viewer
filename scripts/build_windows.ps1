@@ -139,7 +139,9 @@ else {
 }
 
 $releaseSettings = Join-Path $OutputDirectory 'settings.toml'
-if (-not (Test-Path -LiteralPath $releaseSettings -PathType Leaf)) {
+$hasUsableReleaseSettings = (Test-Path -LiteralPath $releaseSettings -PathType Leaf) -and
+    ((Get-Item -LiteralPath $releaseSettings).Length -gt 0)
+if (-not $hasUsableReleaseSettings) {
     Copy-Item -LiteralPath $settingsFile -Destination $releaseSettings -Force
 }
 

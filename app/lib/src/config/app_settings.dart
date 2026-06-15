@@ -144,6 +144,7 @@ class AppSettings {
       showTextOnButtons: true,
       showIcons: true,
       nativeTitleBar: true,
+      window: null,
     ),
     terminal: TerminalSettings(
       defaultTerminal: 'alacritty',
@@ -491,6 +492,7 @@ class UiSettings {
     required this.showTextOnButtons,
     required this.showIcons,
     required this.nativeTitleBar,
+    required this.window,
   });
 
   final AppThemeMode theme;
@@ -500,6 +502,29 @@ class UiSettings {
   final bool showTextOnButtons;
   final bool showIcons;
   final bool nativeTitleBar;
+  final WindowPlacementSettings? window;
+
+  UiSettings copyWith({
+    AppThemeMode? theme,
+    bool? useSystemAccentColor,
+    int? fontSize,
+    UiDensity? density,
+    bool? showTextOnButtons,
+    bool? showIcons,
+    bool? nativeTitleBar,
+    Object? window = _sentinel,
+  }) => UiSettings(
+    theme: theme ?? this.theme,
+    useSystemAccentColor: useSystemAccentColor ?? this.useSystemAccentColor,
+    fontSize: fontSize ?? this.fontSize,
+    density: density ?? this.density,
+    showTextOnButtons: showTextOnButtons ?? this.showTextOnButtons,
+    showIcons: showIcons ?? this.showIcons,
+    nativeTitleBar: nativeTitleBar ?? this.nativeTitleBar,
+    window: window == _sentinel
+        ? this.window
+        : window as WindowPlacementSettings?,
+  );
 
   factory UiSettings.fromMap(
     Map<String, dynamic> map,
@@ -531,6 +556,7 @@ class UiSettings {
       defaults.nativeTitleBar,
       'ui.native_title_bar',
     ),
+    window: WindowPlacementSettings.fromMap(_table(map, 'window')),
   );
 
   Map<String, Object?> toTomlMap() => {
@@ -541,6 +567,7 @@ class UiSettings {
     'show_text_on_buttons': showTextOnButtons,
     'show_icons': showIcons,
     'native_title_bar': nativeTitleBar,
+    if (window != null) 'window': window!.toTomlMap(),
   };
 
   @override
@@ -552,7 +579,8 @@ class UiSettings {
       density == other.density &&
       showTextOnButtons == other.showTextOnButtons &&
       showIcons == other.showIcons &&
-      nativeTitleBar == other.nativeTitleBar;
+      nativeTitleBar == other.nativeTitleBar &&
+      window == other.window;
 
   @override
   int get hashCode => Object.hash(
@@ -563,7 +591,57 @@ class UiSettings {
     showTextOnButtons,
     showIcons,
     nativeTitleBar,
+    window,
   );
+}
+
+class WindowPlacementSettings {
+  const WindowPlacementSettings({
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+    required this.isMaximized,
+  });
+
+  final double x;
+  final double y;
+  final double width;
+  final double height;
+  final bool isMaximized;
+
+  static WindowPlacementSettings? fromMap(Map<String, dynamic> map) {
+    if (map.isEmpty) {
+      return null;
+    }
+    return WindowPlacementSettings(
+      x: _number(map, 'x', 'ui.window.x'),
+      y: _number(map, 'y', 'ui.window.y'),
+      width: _number(map, 'width', 'ui.window.width'),
+      height: _number(map, 'height', 'ui.window.height'),
+      isMaximized: _bool(map, 'is_maximized', false, 'ui.window.is_maximized'),
+    );
+  }
+
+  Map<String, Object?> toTomlMap() => {
+    'x': x,
+    'y': y,
+    'width': width,
+    'height': height,
+    'is_maximized': isMaximized,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is WindowPlacementSettings &&
+      x == other.x &&
+      y == other.y &&
+      width == other.width &&
+      height == other.height &&
+      isMaximized == other.isMaximized;
+
+  @override
+  int get hashCode => Object.hash(x, y, width, height, isMaximized);
 }
 
 class TerminalSettings {
@@ -1167,6 +1245,14 @@ int _positiveInt(
   throw SettingsValidationException(field, 'Expected a positive integer.');
 }
 
+double _number(Map<String, dynamic> map, String key, String field) {
+  final value = map[key];
+  if (value is num) {
+    return value.toDouble();
+  }
+  throw SettingsValidationException(field, 'Expected a number.');
+}
+
 bool _mapEquals<K, V>(Map<K, V> left, Map<K, V> right) {
   if (left.length != right.length) {
     return false;
@@ -1182,3 +1268,5 @@ bool _mapEquals<K, V>(Map<K, V> left, Map<K, V> right) {
 int _mapHash<K, V>(Map<K, V> map) => Object.hashAll(
   map.entries.map((entry) => Object.hash(entry.key, entry.value)),
 );
+
+const Object _sentinel = Object();
