@@ -40,6 +40,7 @@ void main() {
             linuxHome: '/home/pawel',
             linuxRootUnc: '${wslRoot.path}${Platform.pathSeparator}',
           ),
+          logging: _testLogging(temp),
         ),
       );
 
@@ -53,7 +54,8 @@ void main() {
         settingsFile: settingsFile,
         databaseFile: databaseFile,
       );
-      final result = await controller.refresh();
+      final progressEvents = <SessionsRefreshProgress>[];
+      final result = await controller.refresh(onProgress: progressEvents.add);
 
       expect(result.rows, hasLength(2));
       expect(
@@ -73,6 +75,123 @@ void main() {
             .select('select count(*) as count from session_search')
             .single['count'],
         2,
+      );
+      expect(
+        progressEvents.map((event) => event.statusMessage),
+        contains(contains('scanned')),
+      );
+      expect(
+        progressEvents.any((event) => event.rows?.isNotEmpty ?? false),
+        isTrue,
+      );
+      expect(
+        progressEvents.last.statusMessage,
+        contains('estimated progress 100%'),
+      );
+    },
+  );
+
+  test('background runtime scan emits progress and returns rows', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_background_scan_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _copyFixture('sample_windows_session.json', windowsRoot);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final progressEvents = <SessionsRefreshProgress>[];
+    var callerStillPumping = false;
+    final resultFuture = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refreshInBackground(onProgress: progressEvents.add);
+
+    await Future<void>.delayed(Duration.zero);
+    callerStillPumping = true;
+
+    final result = await resultFuture;
+
+    expect(callerStillPumping, isTrue);
+    expect(result.rows, hasLength(1));
+    expect(progressEvents, isNotEmpty);
+    expect(
+      progressEvents.map((event) => event.statusMessage),
+      contains(contains('scanned')),
+    );
+  });
+
+  test(
+    'runtime refresh status reports cached visible sessions separately',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_cached_status_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      await _copyFixture('sample_windows_session.json', windowsRoot);
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      final firstResult = await controller.refresh();
+      final secondResult = await controller.refresh();
+
+      expect(firstResult.rows, hasLength(1));
+      expect(secondResult.rows, hasLength(1));
+      expect(secondResult.statusMessage, contains('1 session visible'));
+      expect(
+        secondResult.statusMessage,
+        contains('0 new or changed sessions parsed'),
       );
     },
   );
@@ -105,6 +224,7 @@ void main() {
             windowsCodexPath: windowsRoot.path,
             wslCodexUncPath: wslRoot.path,
           ),
+          logging: _testLogging(temp),
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
@@ -130,6 +250,59 @@ void main() {
         [fixture.path],
       ).single;
       expect(row['scan_status'], 'missing');
+    },
+  );
+
+  test(
+    'runtime refresh narrows a configured codex root to session files',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_codex_root_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final codexRoot = Directory(p.join(temp.path, '.codex'));
+      final sessionsRoot = Directory(p.join(codexRoot.path, 'sessions'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await sessionsRoot.create(recursive: true);
+      await wslRoot.create();
+      await _copyFixture('sample_windows_session.json', sessionsRoot);
+      await File(
+        p.join(codexRoot.path, 'config.json'),
+      ).writeAsString('{ bad json');
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: codexRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final result = await RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      ).refresh();
+
+      expect(result.rows, hasLength(1));
+      final db = sqlite3.open(databaseFile.path);
+      addTearDown(db.close);
+      expect(
+        db.select('select count(*) as count from scan_errors').single['count'],
+        0,
+      );
     },
   );
 
@@ -216,6 +389,7 @@ void main() {
           windowsCodexPath: emptyRoot.path,
           wslCodexUncPath: missingRoot,
         ),
+        logging: _testLogging(temp),
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
@@ -255,6 +429,8 @@ void main() {
           windowsCodexPath: windowsRoot.path,
           wslCodexUncPath: wslRoot.path,
         ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
@@ -332,6 +508,107 @@ void main() {
     expect(find.text('runtime-row'), findsOneWidget);
   });
 
+  test('runtime loads cached sessions before refresh is clicked', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_cached_startup_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _copyFixture('sample_windows_session.json', windowsRoot);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
+
+    final cached = await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).loadCachedRows();
+
+    expect(cached.rows, hasLength(1));
+    expect(cached.rows.single.title, 'Windows parser fixture');
+    expect(cached.rows.single.estimatedCostDisplay, '\$0.0575');
+    expect(cached.rows.single.userMessageTokens, 12);
+    expect(cached.rows.single.assistantResponseTokens, 31);
+    expect(cached.rows.single.modelsUsedForDetail, ['gpt-5.5-thinking']);
+    expect(cached.statusMessage, 'Loaded 1 session from the previous scan.');
+  });
+
+  test(
+    'runtime falls back to aggregate token counts for JSONL message rows',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_aggregate_tokens_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      await _writeAggregateJsonlFixture(windowsRoot);
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          pricing: _testPricing(),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final result = await RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      ).refresh();
+
+      final row = result.rows.single;
+      expect(row.userMessageTokens, 42);
+      expect(row.assistantResponseTokens, 21);
+      expect(row.toolCallTokens, 0);
+      expect(row.totalTokens, 70);
+      expect(row.estimatedCostDisplay, '\$0.0875');
+    },
+  );
+
   testWidgets(
     'production empty-state actions open settings and retry path test',
     (tester) async {
@@ -341,42 +618,92 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
 
       var refreshCalls = 0;
+      var openSettingsCalls = 0;
       await tester.pumpWidget(
-        CodexSessionsViewerApp(
-          databaseStartup: Future.value(
-            DatabaseStartupResult.ready(lastAppliedSchemaVersion: 3),
+        MaterialApp(
+          home: SessionsScreen(
+            onRefreshWithProgress: (_) async {
+              refreshCalls++;
+              return const SessionsRefreshResult(
+                rows: [],
+                statusMessage:
+                    r'Scan finished. Session root is unreachable. Unreachable paths: \\wsl.localhost\Ubuntu\home\pawel\.codex',
+              );
+            },
+            onOpenSettings: () {
+              openSettingsCalls++;
+            },
           ),
-          sessionRefresh: () async {
-            refreshCalls++;
-            return const SessionsRefreshResult(
-              rows: [],
-              statusMessage:
-                  r'Scan finished. Session root is unreachable. Unreachable paths: \\wsl.localhost\Ubuntu\home\pawel\.codex',
-            );
-          },
         ),
       );
       await tester.pump();
 
       await tester.tap(find.text('Refresh'));
-      await tester.pumpAndSettle();
+      await _pumpFrames(tester);
       expect(refreshCalls, 1);
 
       await tester.tap(find.text('Test WSL path'));
-      await tester.pumpAndSettle();
+      await _pumpFrames(tester);
       expect(refreshCalls, 2);
 
       await tester.tap(find.text('Open Settings'));
-      await tester.pumpAndSettle();
-      expect(find.text('Save settings'), findsOneWidget);
+      await _pumpFrames(tester);
+      expect(openSettingsCalls, 1);
     },
   );
+}
+
+Future<void> _pumpFrames(WidgetTester tester, {int count = 5}) async {
+  for (var i = 0; i < count; i++) {
+    await tester.pump(const Duration(milliseconds: 50));
+  }
 }
 
 Future<File> _copyFixture(String name, Directory destination) async {
   final source = File(p.normalize(p.join('..', 'samples', 'sessions', name)));
   return source.copy(p.join(destination.path, name));
 }
+
+Future<File> _writeAggregateJsonlFixture(Directory destination) async {
+  final file = File(p.join(destination.path, 'aggregate_usage.jsonl'));
+  await file.writeAsString(
+    [
+      '{"timestamp":"2026-06-10T10:00:00.000Z","type":"session_meta","payload":{"id":"aggregate-jsonl-001","timestamp":"2026-06-10T10:00:00.000Z","cwd":"F:\\\\projects\\\\MaxLogic\\\\codex-sessions-viewer"}}',
+      '{"timestamp":"2026-06-10T10:00:01.000Z","type":"turn_context","payload":{"cwd":"F:\\\\projects\\\\MaxLogic\\\\codex-sessions-viewer","model":"gpt-5.5-thinking"}}',
+      '{"timestamp":"2026-06-10T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Aggregate-only request"}]}}',
+      '{"timestamp":"2026-06-10T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Aggregate-only response"}]}}',
+      '{"timestamp":"2026-06-10T10:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42,"output_tokens":21,"cached_input_tokens":7}}}}',
+    ].join('\n'),
+  );
+  return file;
+}
+
+LoggingSettings _testLogging(Directory temp) => LoggingSettings(
+  level: 'info',
+  logFile: p.join(temp.path, 'logs', 'codex-session-viewer.log'),
+  maxLogFiles: 2,
+  maxLogSizeMb: 1,
+);
+
+PricingSettings _testPricing() => const PricingSettings(
+  provider: 'openrouter',
+  useExternalPricing: false,
+  cachePricingHours: 24,
+  fallbackToOverrides: true,
+  openRouter: OpenRouterSettings(
+    modelsEndpoint: 'https://openrouter.ai/api/v1/models',
+    apiKey: '',
+  ),
+  overrides: {
+    'gpt-5.5-thinking': PricingOverrideSettings(
+      prompt: '0.001',
+      completion: '0.002',
+      inputCacheRead: '0.0005',
+      inputCacheWrite: '0',
+      internalReasoning: '0',
+    ),
+  },
+);
 
 SessionRowViewModel _row(String title, SessionRowPlatform platform) {
   return SessionRowViewModel(

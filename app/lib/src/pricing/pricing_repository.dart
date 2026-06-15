@@ -72,6 +72,15 @@ class PricingRepository {
     }
   }
 
+  UsagePricingCatalog loadCached(PricingSettings settings, {DateTime? nowUtc}) {
+    final now = (nowUtc ?? DateTime.now().toUtc()).toUtc();
+    _upsertOverrides(settings, now);
+    if (!settings.useExternalPricing) {
+      return _loadCatalog(settings, includeOpenRouter: false);
+    }
+    return _loadCatalog(settings, cutoff: _openRouterCutoff(settings, now));
+  }
+
   Future<void> _fetchAndCache(
     PricingSettings settings,
     OpenRouterModelsClient client,

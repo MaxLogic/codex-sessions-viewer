@@ -169,6 +169,26 @@ void main() {
     },
   );
 
+  test('estimates a single session cost from cached model pricing', () {
+    final estimate = estimateUsageCost(
+      inputTokens: 24,
+      outputTokens: 16,
+      cachedInputTokens: 3,
+      model: 'openai/session-model',
+      pricing: const UsagePricingCatalog({
+        'openai/session-model': UsageModelPricing(
+          promptPricePerToken: '0.001',
+          completionPricePerToken: '0.002',
+          cachedInputPricePerToken: '0.0005',
+        ),
+      }),
+    );
+
+    expect(estimate.estimatedCostText, '0.0575');
+    expect(estimate.costUnknown, isFalse);
+    expect(estimate.estimatedCostDisplay, '\$0.0575');
+  });
+
   test('rebuilds usage_daily with persisted decimal cost text', () {
     _insertSession(
       db,

@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
 
@@ -33,12 +36,28 @@ class SessionScanner {
     required this.parser,
     required this.pathMapper,
     this.maxConcurrentParses = 4,
-  }) : assert(maxConcurrentParses > 0);
+    this.maxConcurrentDirectoryScans = 4,
+    this.useParserIsolates = true,
+    this.onProgress,
+    this.onSessionParsed,
+    this.progressEveryWorkItems = 100,
+  }) : assert(maxConcurrentParses > 0),
+       assert(maxConcurrentDirectoryScans > 0);
 
   final CodexSessionParser parser;
   final CodexPathMapper pathMapper;
   final int maxConcurrentParses;
+  final int maxConcurrentDirectoryScans;
+  final bool useParserIsolates;
+  final void Function(ScanProgress progress)? onProgress;
+  final Future<void> Function(
+    ScannedSessionFile session,
+    ScanProgress progress,
+  )?
+  onSessionParsed;
+  final int progressEveryWorkItems;
   bool _isScanning = false;
+  int _lastProgressWorkItems = 0;
 
   Future<SessionScanResult> scan(SessionScanRequest request) async {
     if (_isScanning) {
@@ -47,104 +66,86 @@ class SessionScanner {
     _isScanning = true;
     try {
       final progress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
+      _lastProgressWorkItems = 0;
+      _emitProgress(progress, force: true);
       final sessions = <ScannedSessionFile>[];
       final errors = <ScanFileError>[];
       final fileStatuses = <ScannedFileStatus>[];
       final statusEvents = <ScannedFileStatus>[];
       final skippedFiles = <ScannedFileStatus>[];
       final candidates = <_ScanCandidate>[];
+      final parsed = <_ParsedCandidate>[];
       final reachableRoots = <String>[];
       final forcedReparse = request.forceReparsePlan.apply(
         request.cachedSessions,
       );
+      final cachedIndex = _CachedSessionIndex(request.cachedSessions);
+      final directoryQueue = _WorkQueue<_ScanDirectory>();
+      final parseQueue = _AsyncQueue<_ScanCandidate>();
+      final parserPool = await _createParserPool();
 
-      if (await _collectRoot(
-        rootPath: request.windowsRoot,
-        sourceType: SessionSourceType.windows,
-        progress: progress,
-        errors: errors,
-        fileStatuses: fileStatuses,
-        statusEvents: statusEvents,
-        candidates: candidates,
-      )) {
-        reachableRoots.add(request.windowsRoot!);
-      }
-      if (await _collectRoot(
-        rootPath: request.wslRoot,
-        sourceType: SessionSourceType.wsl,
-        progress: progress,
-        errors: errors,
-        fileStatuses: fileStatuses,
-        statusEvents: statusEvents,
-        candidates: candidates,
-      )) {
-        reachableRoots.add(request.wslRoot!);
-      }
-
-      candidates.sort(_compareCandidates);
-
-      final parseCandidates = <_ScanCandidate>[];
-      for (final candidate in candidates) {
-        final decision = await _parseDecision(
-          candidate.file,
-          request.cachedSessions,
-          forcedReparse,
+      try {
+        await _enqueueRoot(
+          rootPath: request.windowsRoot,
+          sourceType: SessionSourceType.windows,
+          progress: progress,
+          errors: errors,
+          fileStatuses: fileStatuses,
+          statusEvents: statusEvents,
+          reachableRoots: reachableRoots,
+          directoryQueue: directoryQueue,
         );
-        if (!decision.shouldParse) {
-          progress.filesSkipped++;
-          skippedFiles.add(
-            ScannedFileStatus(
-              sourcePath: candidate.file.path,
-              status: SessionFileStatus.available,
-            ),
-          );
-          fileStatuses.add(
-            ScannedFileStatus(
-              sourcePath: candidate.file.path,
-              status: SessionFileStatus.available,
-            ),
-          );
-          continue;
-        }
-        progress.sessionsChanged++;
-        statusEvents.add(
-          ScannedFileStatus(
-            sourcePath: candidate.file.path,
-            status: SessionFileStatus.changedPendingParse,
-          ),
+        await _enqueueRoot(
+          rootPath: request.wslRoot,
+          sourceType: SessionSourceType.wsl,
+          progress: progress,
+          errors: errors,
+          fileStatuses: fileStatuses,
+          statusEvents: statusEvents,
+          reachableRoots: reachableRoots,
+          directoryQueue: directoryQueue,
         );
-        parseCandidates.add(candidate);
+        directoryQueue.closeWhenIdle();
+
+        final directoryWorkers = [
+          for (var i = 0; i < maxConcurrentDirectoryScans; i++)
+            _directoryWorker(
+              directoryQueue: directoryQueue,
+              parseQueue: parseQueue,
+              progress: progress,
+              errors: errors,
+              fileStatuses: fileStatuses,
+              statusEvents: statusEvents,
+              candidates: candidates,
+            ),
+        ];
+        final parserWorkers = [
+          for (var i = 0; i < maxConcurrentParses; i++)
+            _parserWorker(
+              parseQueue: parseQueue,
+              progress: progress,
+              parsed: parsed,
+              fileStatuses: fileStatuses,
+              statusEvents: statusEvents,
+              skippedFiles: skippedFiles,
+              cachedIndex: cachedIndex,
+              forcedReparse: forcedReparse,
+              parserPool: parserPool,
+            ),
+        ];
+
+        await Future.wait(directoryWorkers);
+        parseQueue.close();
+        await Future.wait(parserWorkers);
+      } finally {
+        await parserPool?.close();
       }
-      final parsed = await _parseCandidates(parseCandidates, progress);
+
       for (final parsedFile in parsed) {
         if (parsedFile.error == null) {
           sessions.add(parsedFile.session!);
-          fileStatuses.add(
-            ScannedFileStatus(
-              sourcePath: parsedFile.session!.sourcePath,
-              status: SessionFileStatus.available,
-            ),
-          );
-          statusEvents.add(
-            ScannedFileStatus(
-              sourcePath: parsedFile.session!.sourcePath,
-              status: SessionFileStatus.available,
-            ),
-          );
         } else {
           errors.add(parsedFile.error!);
-          fileStatuses.add(
-            ScannedFileStatus(
-              sourcePath: parsedFile.error!.sourcePath,
-              status: parsedFile.error!.status,
-            ),
-          );
-          statusEvents.add(
-            ScannedFileStatus(
-              sourcePath: parsedFile.error!.sourcePath,
-              status: parsedFile.error!.status,
-            ),
-          );
         }
       }
       if (reachableRoots.isNotEmpty) {
@@ -162,8 +163,10 @@ class SessionScanner {
       sessions.sort(_compareScannedSessions);
       errors.sort(_compareErrors);
       fileStatuses.sort(_compareStatuses);
+      final finishedProgress = progress.finish();
+      _emitProgress(finishedProgress, force: true);
       return SessionScanResult(
-        progress: progress.finish(),
+        progress: finishedProgress,
         sessions: List.unmodifiable(sessions),
         errors: List.unmodifiable(errors),
         fileStatuses: List.unmodifiable(fileStatuses),
@@ -176,21 +179,23 @@ class SessionScanner {
     }
   }
 
-  Future<bool> _collectRoot({
+  Future<void> _enqueueRoot({
     required String? rootPath,
     required SessionSourceType sourceType,
     required ScanProgress progress,
     required List<ScanFileError> errors,
     required List<ScannedFileStatus> fileStatuses,
     required List<ScannedFileStatus> statusEvents,
-    required List<_ScanCandidate> candidates,
+    required List<String> reachableRoots,
+    required _WorkQueue<_ScanDirectory> directoryQueue,
   }) async {
     if (rootPath == null || rootPath.isEmpty) {
-      return false;
+      return;
     }
     final root = Directory(rootPath);
     if (!await root.exists()) {
       progress.filesFailed++;
+      _emitProgress(progress);
       errors.add(
         ScanFileError(
           sourcePath: rootPath,
@@ -210,16 +215,73 @@ class SessionScanner {
           status: SessionFileStatus.pathUnreachable,
         ),
       );
-      return false;
+      return;
     }
+    reachableRoots.add(rootPath);
+    directoryQueue.add(_ScanDirectory(directory: root, sourceType: sourceType));
+  }
+
+  Future<void> _directoryWorker({
+    required _WorkQueue<_ScanDirectory> directoryQueue,
+    required _AsyncQueue<_ScanCandidate> parseQueue,
+    required ScanProgress progress,
+    required List<ScanFileError> errors,
+    required List<ScannedFileStatus> fileStatuses,
+    required List<ScannedFileStatus> statusEvents,
+    required List<_ScanCandidate> candidates,
+  }) async {
+    while (true) {
+      final scanDirectory = await directoryQueue.take();
+      if (scanDirectory == null) {
+        return;
+      }
+      try {
+        await _scanDirectory(
+          scanDirectory: scanDirectory,
+          directoryQueue: directoryQueue,
+          parseQueue: parseQueue,
+          progress: progress,
+          errors: errors,
+          fileStatuses: fileStatuses,
+          statusEvents: statusEvents,
+          candidates: candidates,
+        );
+      } finally {
+        directoryQueue.completeItem();
+      }
+    }
+  }
+
+  Future<void> _scanDirectory({
+    required _ScanDirectory scanDirectory,
+    required _WorkQueue<_ScanDirectory> directoryQueue,
+    required _AsyncQueue<_ScanCandidate> parseQueue,
+    required ScanProgress progress,
+    required List<ScanFileError> errors,
+    required List<ScannedFileStatus> fileStatuses,
+    required List<ScannedFileStatus> statusEvents,
+    required List<_ScanCandidate> candidates,
+  }) async {
+    final root = scanDirectory.directory;
     try {
-      await for (final entity in root.list(recursive: true)) {
+      progress.directoriesScanned++;
+      _emitProgress(progress);
+      await for (final entity in root.list(followLinks: false)) {
+        if (entity is Directory) {
+          directoryQueue.add(
+            _ScanDirectory(
+              directory: entity,
+              sourceType: scanDirectory.sourceType,
+            ),
+          );
+          continue;
+        }
         if (entity is! File) {
           continue;
         }
         if (!_isSupportedSessionFile(entity.path)) {
           progress.filesSkipped++;
-          progress.filesFailed++;
+          _emitProgress(progress);
           errors.add(
             ScanFileError(
               sourcePath: entity.path,
@@ -242,88 +304,137 @@ class SessionScanner {
           continue;
         }
         progress.filesFound++;
-        candidates.add(_ScanCandidate(file: entity, sourceType: sourceType));
+        _emitProgress(progress);
+        final candidate = _ScanCandidate(
+          file: entity,
+          sourceType: scanDirectory.sourceType,
+        );
+        candidates.add(candidate);
+        parseQueue.add(candidate);
       }
-      return true;
     } on FileSystemException catch (error) {
       progress.filesFailed++;
+      _emitProgress(progress);
       errors.add(
         ScanFileError(
-          sourcePath: rootPath,
+          sourcePath: root.path,
           status: _statusFromFileSystemError(error),
           message: error.message,
         ),
       );
       fileStatuses.add(
         ScannedFileStatus(
-          sourcePath: rootPath,
+          sourcePath: root.path,
           status: _statusFromFileSystemError(error),
         ),
       );
       statusEvents.add(
         ScannedFileStatus(
-          sourcePath: rootPath,
+          sourcePath: root.path,
           status: _statusFromFileSystemError(error),
         ),
       );
-      return false;
     }
   }
 
-  Future<List<_ParsedCandidate>> _parseCandidates(
-    List<_ScanCandidate> candidates,
-    ScanProgress progress,
-  ) async {
-    final results = List<_ParsedCandidate?>.filled(candidates.length, null);
-    var nextIndex = 0;
-
-    Future<void> worker() async {
-      while (true) {
-        final index = nextIndex;
-        if (index >= candidates.length) {
-          return;
-        }
-        nextIndex++;
-        results[index] = await _parseCandidate(candidates[index], progress);
+  Future<void> _parserWorker({
+    required _AsyncQueue<_ScanCandidate> parseQueue,
+    required ScanProgress progress,
+    required List<_ParsedCandidate> parsed,
+    required List<ScannedFileStatus> fileStatuses,
+    required List<ScannedFileStatus> statusEvents,
+    required List<ScannedFileStatus> skippedFiles,
+    required _CachedSessionIndex cachedIndex,
+    required ForceReparseSelection forcedReparse,
+    required _ParserIsolatePool? parserPool,
+  }) async {
+    while (true) {
+      final candidate = await parseQueue.take();
+      if (candidate == null) {
+        return;
+      }
+      final decision = await _parseDecision(
+        candidate.file,
+        cachedIndex,
+        forcedReparse,
+      );
+      if (!decision.shouldParse) {
+        progress.filesSkipped++;
+        _emitProgress(progress);
+        final status = ScannedFileStatus(
+          sourcePath: candidate.file.path,
+          status: SessionFileStatus.available,
+        );
+        skippedFiles.add(status);
+        fileStatuses.add(status);
+        continue;
+      }
+      progress.sessionsChanged++;
+      _emitProgress(progress);
+      statusEvents.add(
+        ScannedFileStatus(
+          sourcePath: candidate.file.path,
+          status: SessionFileStatus.changedPendingParse,
+        ),
+      );
+      final parsedFile = await _parseCandidate(
+        candidate,
+        progress,
+        parserPool: parserPool,
+      );
+      parsed.add(parsedFile);
+      if (parsedFile.error == null) {
+        final status = ScannedFileStatus(
+          sourcePath: parsedFile.session!.sourcePath,
+          status: SessionFileStatus.available,
+        );
+        fileStatuses.add(status);
+        statusEvents.add(status);
+      } else {
+        final status = ScannedFileStatus(
+          sourcePath: parsedFile.error!.sourcePath,
+          status: parsedFile.error!.status,
+        );
+        fileStatuses.add(status);
+        statusEvents.add(status);
       }
     }
-
-    final workerCount = candidates.length < maxConcurrentParses
-        ? candidates.length
-        : maxConcurrentParses;
-    await Future.wait([for (var i = 0; i < workerCount; i++) worker()]);
-    return results.whereType<_ParsedCandidate>().toList(growable: false);
   }
 
   Future<_ParsedCandidate> _parseCandidate(
     _ScanCandidate candidate,
-    ScanProgress progress,
-  ) async {
+    ScanProgress progress, {
+    required _ParserIsolatePool? parserPool,
+  }) async {
     final mappedPath = candidate.sourceType == SessionSourceType.windows
         ? pathMapper.mapWindowsPath(candidate.file.path)
         : pathMapper.mapWslUncPath(candidate.file.path);
-    final parseResult = await parser.parseFile(candidate.file);
+    final parseResult = parserPool == null
+        ? await parser.parseFile(candidate.file)
+        : await parserPool.parseFile(candidate.file.path);
     if (!parseResult.isSuccess) {
       progress.filesFailed++;
+      _emitProgress(progress);
       final error = parseResult.error;
       return _ParsedCandidate.error(
         ScanFileError(
           sourcePath: candidate.file.path,
           status: _statusFromParseError(error),
-          message: error?.message ?? 'Parse failed.',
+          message: _parseErrorMessage(error),
         ),
       );
     }
     progress.filesParsed++;
-    return _ParsedCandidate.session(
-      ScannedSessionFile(
-        sourcePath: candidate.file.path,
-        sourceType: candidate.sourceType,
-        status: SessionFileStatus.available,
-        mappedPath: mappedPath,
-        parsedSession: parseResult.session!,
-      ),
+    final session = ScannedSessionFile(
+      sourcePath: candidate.file.path,
+      sourceType: candidate.sourceType,
+      status: SessionFileStatus.available,
+      mappedPath: mappedPath,
+      parsedSession: parseResult.session!,
     );
+    await onSessionParsed?.call(session, progress.snapshot());
+    _emitProgress(progress);
+    return _ParsedCandidate.session(session);
   }
 
   void _recordMissingCachedSessions(
@@ -352,6 +463,7 @@ class SessionScanner {
         continue;
       }
       progress.sessionsMissing++;
+      _emitProgress(progress);
       errors.add(
         ScanFileError(
           sourcePath: cached.sourcePath,
@@ -376,13 +488,13 @@ class SessionScanner {
 
   Future<_ParseDecision> _parseDecision(
     File file,
-    List<CachedSessionSnapshot> cachedSessions,
+    _CachedSessionIndex cachedSessions,
     ForceReparseSelection forcedReparse,
   ) async {
     if (forcedReparse.shouldForceParse(file.path)) {
       return const _ParseDecision.parse();
     }
-    final cached = _cachedForPath(cachedSessions, file.path);
+    final cached = cachedSessions.lookup(file.path);
     if (cached == null || !cached.hasCompleteInvalidationMetadata) {
       return const _ParseDecision.parse();
     }
@@ -397,22 +509,51 @@ class SessionScanner {
     final String currentHash;
     try {
       stat = await file.stat();
-      currentHash = await _contentHash(file);
     } on Object {
       return const _ParseDecision.parse();
     }
     final currentSize = stat.size;
-    final currentModifiedUtc = stat.modified.toUtc();
     final sizeChanged = currentSize != cached.sourceFileSize;
-    final modifiedChanged = currentModifiedUtc != cached.sourceModifiedUtc;
-    final hashChanged = currentHash != cached.sourceContentHash;
-    if (!sizeChanged && !modifiedChanged && !hashChanged) {
-      return const _ParseDecision.skip();
+    if (sizeChanged) {
+      return const _ParseDecision.parse();
     }
+    try {
+      currentHash = await _contentHash(file);
+    } on Object {
+      return const _ParseDecision.parse();
+    }
+    final hashChanged = currentHash != cached.sourceContentHash;
     if (hashChanged) {
       return const _ParseDecision.parse();
     }
     return const _ParseDecision.skip();
+  }
+
+  Future<_ParserIsolatePool?> _createParserPool() async {
+    if (!useParserIsolates || parser.runtimeType != CodexSessionParser) {
+      return null;
+    }
+    final pool = _ParserIsolatePool(
+      workerCount: maxConcurrentParses,
+      maxToolOutputPreviewChars: parser.maxToolOutputPreviewChars,
+      maxMessageContentChars: parser.maxMessageContentChars,
+    );
+    await pool.start();
+    return pool;
+  }
+
+  void _emitProgress(ScanProgress progress, {bool force = false}) {
+    if (onProgress == null) {
+      return;
+    }
+    final workItems = progress.workItems;
+    if (!force &&
+        progressEveryWorkItems > 0 &&
+        workItems - _lastProgressWorkItems < progressEveryWorkItems) {
+      return;
+    }
+    _lastProgressWorkItems = workItems;
+    onProgress?.call(progress.snapshot());
   }
 }
 
@@ -455,6 +596,7 @@ class ScanProgress {
 
   final DateTime startedAtUtc;
   DateTime? finishedAtUtc;
+  int directoriesScanned = 0;
   int filesFound = 0;
   int filesSkipped = 0;
   int filesParsed = 0;
@@ -463,10 +605,32 @@ class ScanProgress {
   int sessionsChanged = 0;
   int sessionsMissing = 0;
 
+  int get workItems =>
+      directoriesScanned +
+      filesFound +
+      filesSkipped +
+      filesParsed +
+      filesFailed +
+      sessionsMissing;
+
   ScanProgress finish() {
     finishedAtUtc = DateTime.now().toUtc();
     sessionsAdded = filesParsed;
     return this;
+  }
+
+  ScanProgress snapshot() {
+    final copy = ScanProgress(startedAtUtc: startedAtUtc)
+      ..finishedAtUtc = finishedAtUtc
+      ..directoriesScanned = directoriesScanned
+      ..filesFound = filesFound
+      ..filesSkipped = filesSkipped
+      ..filesParsed = filesParsed
+      ..filesFailed = filesFailed
+      ..sessionsAdded = sessionsAdded
+      ..sessionsChanged = sessionsChanged
+      ..sessionsMissing = sessionsMissing;
+    return copy;
   }
 }
 
@@ -676,6 +840,13 @@ class _ScanCandidate {
   final SessionSourceType sourceType;
 }
 
+class _ScanDirectory {
+  const _ScanDirectory({required this.directory, required this.sourceType});
+
+  final Directory directory;
+  final SessionSourceType sourceType;
+}
+
 class _ParsedCandidate {
   const _ParsedCandidate._({this.session, this.error});
 
@@ -697,21 +868,322 @@ class _ParseDecision {
   final bool shouldParse;
 }
 
-bool _isSupportedSessionFile(String path) =>
-    path.endsWith('.json') || path.endsWith('.jsonl');
-
-CachedSessionSnapshot? _cachedForPath(
-  List<CachedSessionSnapshot> cachedSessions,
-  String sourcePath,
-) {
-  final key = _canonicalScanPath(sourcePath);
-  for (final cached in cachedSessions) {
-    if (_snapshotPathKeys(cached).contains(key)) {
-      return cached;
+class _CachedSessionIndex {
+  _CachedSessionIndex(List<CachedSessionSnapshot> snapshots) {
+    for (final snapshot in snapshots) {
+      for (final key in _snapshotPathKeys(snapshot)) {
+        _byPath[key] = snapshot;
+      }
     }
   }
-  return null;
+
+  final Map<String, CachedSessionSnapshot> _byPath = {};
+
+  CachedSessionSnapshot? lookup(String sourcePath) =>
+      _byPath[_canonicalScanPath(sourcePath)];
 }
+
+class _AsyncQueue<T> {
+  final Queue<T> _items = Queue<T>();
+  final Queue<Completer<T?>> _waiters = Queue<Completer<T?>>();
+  bool _closed = false;
+
+  void add(T item) {
+    if (_closed) {
+      throw StateError('Cannot add to a closed queue.');
+    }
+    if (_waiters.isNotEmpty) {
+      _waiters.removeFirst().complete(item);
+      return;
+    }
+    _items.addLast(item);
+  }
+
+  Future<T?> take() {
+    if (_items.isNotEmpty) {
+      return Future.value(_items.removeFirst());
+    }
+    if (_closed) {
+      return Future.value();
+    }
+    final waiter = Completer<T?>();
+    _waiters.addLast(waiter);
+    return waiter.future;
+  }
+
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    while (_waiters.isNotEmpty) {
+      _waiters.removeFirst().complete();
+    }
+  }
+}
+
+class _WorkQueue<T> {
+  final Queue<T> _items = Queue<T>();
+  final Queue<Completer<T?>> _waiters = Queue<Completer<T?>>();
+  var _activeItems = 0;
+  var _closeRequested = false;
+  var _closed = false;
+
+  void add(T item) {
+    if (_closed) {
+      throw StateError('Cannot add to a closing queue.');
+    }
+    if (_waiters.isNotEmpty) {
+      _activeItems++;
+      _waiters.removeFirst().complete(item);
+      return;
+    }
+    _items.addLast(item);
+  }
+
+  Future<T?> take() {
+    if (_items.isNotEmpty) {
+      _activeItems++;
+      return Future.value(_items.removeFirst());
+    }
+    if (_closed) {
+      return Future.value();
+    }
+    final waiter = Completer<T?>();
+    _waiters.addLast(waiter);
+    return waiter.future;
+  }
+
+  void completeItem() {
+    _activeItems--;
+    _closeIfIdle();
+  }
+
+  void closeWhenIdle() {
+    _closeRequested = true;
+    _closeIfIdle();
+  }
+
+  void _closeIfIdle() {
+    if (_closed || !_closeRequested || _activeItems != 0 || _items.isNotEmpty) {
+      return;
+    }
+    _closed = true;
+    while (_waiters.isNotEmpty) {
+      _waiters.removeFirst().complete();
+    }
+  }
+}
+
+class _ParserIsolatePool {
+  _ParserIsolatePool({
+    required this.workerCount,
+    required this.maxToolOutputPreviewChars,
+    required this.maxMessageContentChars,
+  });
+
+  final int workerCount;
+  final int maxToolOutputPreviewChars;
+  final int maxMessageContentChars;
+  final Queue<_ParserWorker> _available = Queue<_ParserWorker>();
+  final Queue<_ParserJob> _pending = Queue<_ParserJob>();
+  final Map<int, Completer<CodexParseResult>> _completers = {};
+  final Map<int, _ParserWorker> _busyWorkers = {};
+  final List<_ParserWorker> _workers = [];
+  var _nextJobId = 0;
+  var _closed = false;
+
+  Future<void> start() async {
+    final count = math.max(1, workerCount);
+    for (var index = 0; index < count; index++) {
+      final worker = await _ParserWorker.start(
+        maxToolOutputPreviewChars: maxToolOutputPreviewChars,
+        maxMessageContentChars: maxMessageContentChars,
+        onResult: _handleResult,
+      );
+      _workers.add(worker);
+      _available.add(worker);
+    }
+  }
+
+  Future<CodexParseResult> parseFile(String sourcePath) {
+    if (_closed) {
+      throw StateError('Parser pool is closed.');
+    }
+    final jobId = _nextJobId++;
+    final completer = Completer<CodexParseResult>();
+    _completers[jobId] = completer;
+    _pending.add(_ParserJob(id: jobId, sourcePath: sourcePath));
+    _pump();
+    return completer.future;
+  }
+
+  Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    for (final completer in _completers.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(StateError('Parser pool closed.'));
+      }
+    }
+    _completers.clear();
+    _pending.clear();
+    for (final worker in _workers) {
+      await worker.close();
+    }
+    _available.clear();
+    _busyWorkers.clear();
+    _workers.clear();
+  }
+
+  void _pump() {
+    while (_available.isNotEmpty && _pending.isNotEmpty) {
+      final worker = _available.removeFirst();
+      final job = _pending.removeFirst();
+      _busyWorkers[job.id] = worker;
+      worker.parse(job);
+    }
+  }
+
+  void _handleResult(_ParserWorkerResult result) {
+    final worker = _busyWorkers.remove(result.id);
+    final completer = _completers.remove(result.id);
+    if (worker != null && !_closed) {
+      _available.add(worker);
+    }
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(result.result);
+    }
+    if (!_closed) {
+      _pump();
+    }
+  }
+}
+
+class _ParserWorker {
+  _ParserWorker._({
+    required this.isolate,
+    required this.port,
+    required this.subscription,
+    required this.receivePort,
+  });
+
+  final Isolate isolate;
+  final SendPort port;
+  final StreamSubscription<Object?> subscription;
+  final ReceivePort receivePort;
+
+  static Future<_ParserWorker> start({
+    required int maxToolOutputPreviewChars,
+    required int maxMessageContentChars,
+    required void Function(_ParserWorkerResult result) onResult,
+  }) async {
+    final receivePort = ReceivePort();
+    final ready = Completer<SendPort>();
+    late StreamSubscription<Object?> subscription;
+    subscription = receivePort.listen((message) {
+      if (message is _ParserWorkerReady) {
+        ready.complete(message.port);
+        return;
+      }
+      if (message is _ParserWorkerResult) {
+        onResult(message);
+      }
+    });
+    final isolate = await Isolate.spawn(
+      _parserWorkerEntry,
+      _ParserWorkerStart(
+        replyPort: receivePort.sendPort,
+        maxToolOutputPreviewChars: maxToolOutputPreviewChars,
+        maxMessageContentChars: maxMessageContentChars,
+      ),
+    );
+    return _ParserWorker._(
+      isolate: isolate,
+      port: await ready.future,
+      subscription: subscription,
+      receivePort: receivePort,
+    );
+  }
+
+  void parse(_ParserJob job) {
+    port.send(_ParserWorkerParse(id: job.id, sourcePath: job.sourcePath));
+  }
+
+  Future<void> close() async {
+    port.send(const _ParserWorkerStop());
+    isolate.kill(priority: Isolate.immediate);
+    await subscription.cancel();
+    receivePort.close();
+  }
+}
+
+class _ParserJob {
+  const _ParserJob({required this.id, required this.sourcePath});
+
+  final int id;
+  final String sourcePath;
+}
+
+class _ParserWorkerStart {
+  const _ParserWorkerStart({
+    required this.replyPort,
+    required this.maxToolOutputPreviewChars,
+    required this.maxMessageContentChars,
+  });
+
+  final SendPort replyPort;
+  final int maxToolOutputPreviewChars;
+  final int maxMessageContentChars;
+}
+
+class _ParserWorkerReady {
+  const _ParserWorkerReady(this.port);
+
+  final SendPort port;
+}
+
+class _ParserWorkerParse {
+  const _ParserWorkerParse({required this.id, required this.sourcePath});
+
+  final int id;
+  final String sourcePath;
+}
+
+class _ParserWorkerStop {
+  const _ParserWorkerStop();
+}
+
+class _ParserWorkerResult {
+  const _ParserWorkerResult({required this.id, required this.result});
+
+  final int id;
+  final CodexParseResult result;
+}
+
+Future<void> _parserWorkerEntry(_ParserWorkerStart start) async {
+  final receivePort = ReceivePort();
+  final parser = CodexSessionParser(
+    maxToolOutputPreviewChars: start.maxToolOutputPreviewChars,
+    maxMessageContentChars: start.maxMessageContentChars,
+  );
+  start.replyPort.send(_ParserWorkerReady(receivePort.sendPort));
+  await for (final message in receivePort) {
+    if (message is _ParserWorkerStop) {
+      receivePort.close();
+      return;
+    }
+    if (message is _ParserWorkerParse) {
+      final result = await parser.parseFile(File(message.sourcePath));
+      start.replyPort.send(_ParserWorkerResult(id: message.id, result: result));
+    }
+  }
+}
+
+bool _isSupportedSessionFile(String path) =>
+    path.endsWith('.json') || path.endsWith('.jsonl');
 
 Set<String> _snapshotPathKeys(CachedSessionSnapshot snapshot) => {
   _canonicalScanPath(snapshot.sourcePath),
@@ -722,16 +1194,6 @@ Set<String> _snapshotPathKeys(CachedSessionSnapshot snapshot) => {
 Future<String> _contentHash(File file) async {
   final bytes = await file.readAsBytes();
   return sha256.convert(bytes).toString();
-}
-
-int _compareCandidates(_ScanCandidate left, _ScanCandidate right) {
-  final sourceCompare = left.sourceType.index.compareTo(right.sourceType.index);
-  if (sourceCompare != 0) {
-    return sourceCompare;
-  }
-  return _normalizedSortPath(
-    left.file.path,
-  ).compareTo(_normalizedSortPath(right.file.path));
 }
 
 int _compareScannedSessions(
@@ -802,4 +1264,19 @@ SessionFileStatus _statusFromParseError(CodexParseError? error) {
     return SessionFileStatus.permissionDenied;
   }
   return SessionFileStatus.pathUnreachable;
+}
+
+String _parseErrorMessage(CodexParseError? error) {
+  if (error == null) {
+    return 'Parse failed.';
+  }
+  final line = error.line;
+  if (line == null) {
+    return error.message;
+  }
+  final column = error.column;
+  if (column == null) {
+    return '${error.message} at line $line.';
+  }
+  return '${error.message} at line $line, column $column.';
 }

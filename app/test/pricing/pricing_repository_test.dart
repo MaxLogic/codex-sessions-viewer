@@ -97,6 +97,30 @@ void main() {
     expect(result.catalog.models['local/model']?.promptPricePerToken, '0.10');
   });
 
+  test('loads cached pricing without fetching OpenRouter', () async {
+    _insertCachedPrice(
+      db,
+      modelId: 'openai/cached',
+      prompt: '0.01',
+      completion: '0.02',
+      inputCacheRead: '0.003',
+      fetchedAtUtc: DateTime.utc(2026, 6, 13, 9),
+      source: 'openrouter',
+    );
+    final client = _FakeOpenRouterClient(
+      response: const OpenRouterModelsResponse([]),
+    );
+
+    final catalog = repository.loadCached(
+      settings,
+      nowUtc: DateTime.utc(2026, 6, 13, 10),
+    );
+
+    expect(client.calls, isEmpty);
+    expect(catalog.models['openai/cached']?.promptPricePerToken, '0.01');
+    expect(catalog.models['local/model']?.promptPricePerToken, '0.10');
+  });
+
   test(
     'stale cache fetch failure is recoverable and keeps local prices',
     () async {

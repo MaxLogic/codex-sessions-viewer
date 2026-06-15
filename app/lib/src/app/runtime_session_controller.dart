@@ -1,14 +1,20 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
 import '../config/app_settings.dart';
+import '../logging/structured_logger.dart';
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
+import '../pricing/pricing_repository.dart';
 import '../scanner/session_scanner.dart';
 import '../search/session_search.dart';
+import '../usage/usage_summary.dart';
 import '../ui/models/conversation_message_view_model.dart';
 import '../ui/screens/sessions_screen.dart';
 
@@ -21,38 +27,364 @@ class RuntimeSessionController {
   final File settingsFile;
   final File databaseFile;
 
-  Future<SessionsRefreshResult> refresh() async {
+  Future<SessionsRefreshResult> loadCachedRows() async {
     final settings = await SettingsRepository(settingsFile).loadOrCreate();
     final db = sqlite3.open(databaseFile.path);
     try {
+      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      final rows = _loadRows(db, pricing: pricing);
+      return SessionsRefreshResult(
+        rows: rows,
+        statusMessage: rows.isEmpty
+            ? ''
+            : 'Loaded ${_plural(rows.length, 'session')} from the previous scan.',
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  Future<SessionRowViewModel?> loadSessionDetail(String sessionId) async {
+    final settings = await SettingsRepository(settingsFile).loadOrCreate();
+    final db = sqlite3.open(databaseFile.path);
+    try {
+      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      final rows = _loadRows(
+        db,
+        sessionId: sessionId,
+        includeMessages: true,
+        pricing: pricing,
+      );
+      if (rows.isEmpty) {
+        return null;
+      }
+      return rows.single;
+    } finally {
+      db.close();
+    }
+  }
+
+  Future<SessionsRefreshResult> refreshInBackground({
+    SessionsRefreshProgressCallback? onProgress,
+  }) async {
+    final messages = ReceivePort();
+    final errors = ReceivePort();
+    final exits = ReceivePort();
+    Isolate? isolate;
+    try {
+      isolate = await Isolate.spawn<_BackgroundRefreshRequest>(
+        _backgroundRefreshEntry,
+        _BackgroundRefreshRequest(
+          settingsFilePath: settingsFile.path,
+          databaseFilePath: databaseFile.path,
+          sendPort: messages.sendPort,
+        ),
+        onError: errors.sendPort,
+        onExit: exits.sendPort,
+      );
+
+      final result = Completer<SessionsRefreshResult>();
+      late StreamSubscription<Object?> messageSubscription;
+      late StreamSubscription<Object?> errorSubscription;
+      late StreamSubscription<Object?> exitSubscription;
+
+      void finishError(Object error, [StackTrace? stackTrace]) {
+        if (!result.isCompleted) {
+          result.completeError(error, stackTrace);
+        }
+      }
+
+      messageSubscription = messages.listen((message) {
+        if (message is _BackgroundRefreshProgress) {
+          onProgress?.call(message.progress);
+          return;
+        }
+        if (message is _BackgroundRefreshDone) {
+          if (!result.isCompleted) {
+            result.complete(message.result);
+          }
+          return;
+        }
+        if (message is _BackgroundRefreshError) {
+          finishError(
+            StateError(message.error),
+            StackTrace.fromString(message.stackTrace),
+          );
+        }
+      });
+      errorSubscription = errors.listen((message) {
+        finishError(StateError('Background scan failed. $message'));
+      });
+      exitSubscription = exits.listen((_) {
+        if (!result.isCompleted) {
+          finishError(StateError('Background scan exited before completion.'));
+        }
+      });
+
+      return await result.future.whenComplete(() async {
+        await messageSubscription.cancel();
+        await errorSubscription.cancel();
+        await exitSubscription.cancel();
+      });
+    } finally {
+      messages.close();
+      errors.close();
+      exits.close();
+      isolate?.kill(priority: Isolate.immediate);
+    }
+  }
+
+  Future<SessionsRefreshResult> refresh({
+    SessionsRefreshProgressCallback? onProgress,
+  }) async {
+    final settings = await SettingsRepository(settingsFile).loadOrCreate();
+    final db = sqlite3.open(databaseFile.path);
+    final logger = StructuredLogger(db: db, settings: settings.logging);
+    final pricing = PricingRepository(db).loadCached(settings.pricing);
+    int? scanRunId;
+    var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
+    final pendingParsedSessions = <ScannedSessionFile>[];
+    try {
+      scanRunId = _startScanRun(db);
+      final activeScanRunId = scanRunId;
+
+      void flushParsedSessions(ScanProgress progress) {
+        if (pendingParsedSessions.isEmpty) {
+          return;
+        }
+        _persistParsedSessions(db, pendingParsedSessions);
+        pendingParsedSessions.clear();
+        onProgress?.call(
+          SessionsRefreshProgress(
+            statusMessage: _progressStatusMessage(progress),
+            rows: _loadRows(db, pricing: pricing),
+          ),
+        );
+      }
+
+      final cachedRows = _loadRows(db, pricing: pricing);
+      if (onProgress != null && cachedRows.isNotEmpty) {
+        onProgress(
+          SessionsRefreshProgress(
+            rows: cachedRows,
+            statusMessage:
+                'Loaded ${_plural(cachedRows.length, 'session')} from the previous scan. Scanning started.',
+          ),
+        );
+      }
+
+      await logger.write(
+        LogEntryDraft(
+          level: LogLevel.info,
+          category: LogCategory.scanner,
+          message: 'Session scan started.',
+          details: {
+            'directory_workers': _defaultDirectoryWorkerCount(),
+            'parser_workers': _defaultParserWorkerCount(),
+            'parser_isolates': true,
+          },
+        ),
+      );
       final mapper = CodexPathMapper(
         wslDistro: settings.wsl.distro,
         wslLinuxHome: settings.wsl.linuxHome,
         wslUncRoot: settings.wsl.linuxRootUnc,
       );
+      final parserWorkerCount = _defaultParserWorkerCount();
+      final directoryWorkerCount = _defaultDirectoryWorkerCount();
       final scanner = SessionScanner(
         parser: CodexSessionParser(
           maxToolOutputPreviewChars:
               settings.toolOutput.maxToolOutputPreviewChars,
         ),
         pathMapper: mapper,
+        maxConcurrentParses: parserWorkerCount,
+        maxConcurrentDirectoryScans: directoryWorkerCount,
+        onProgress: onProgress == null
+            ? null
+            : (progress) {
+                latestProgress = progress;
+                _updateScanRun(db, activeScanRunId, progress);
+                onProgress(
+                  SessionsRefreshProgress(
+                    statusMessage: _progressStatusMessage(progress),
+                  ),
+                );
+              },
+        onSessionParsed: onProgress == null
+            ? null
+            : (session, progress) async {
+                pendingParsedSessions.add(session);
+                if (pendingParsedSessions.length >= 25) {
+                  flushParsedSessions(progress);
+                }
+              },
       );
       final result = await scanner.scan(
         SessionScanRequest(
-          windowsRoot: settings.paths.windowsCodexPath,
-          wslRoot: settings.paths.wslCodexUncPath,
+          windowsRoot: _sessionScanRoot(settings.paths.windowsCodexPath),
+          wslRoot: _sessionScanRoot(settings.paths.wslCodexUncPath),
           cachedSessions: _cachedSessions(db),
         ),
       );
-      _persistScan(db, result);
-      return SessionsRefreshResult(
-        rows: _loadRows(db),
-        statusMessage: _statusMessage(result),
+      flushParsedSessions(result.progress);
+      _persistScan(
+        db,
+        result,
+        scanRunId: activeScanRunId,
+        persistSessions: onProgress == null,
       );
+      final rows = _loadRows(db, pricing: pricing);
+      await logger.write(
+        LogEntryDraft(
+          level: LogLevel.info,
+          category: LogCategory.scanner,
+          message: 'Session scan finished.',
+          details: {
+            ..._progressLogDetails(result.progress),
+            'visible_sessions': rows.length,
+            'directory_workers': directoryWorkerCount,
+            'parser_workers': parserWorkerCount,
+          },
+        ),
+      );
+      return SessionsRefreshResult(
+        rows: rows,
+        statusMessage: _statusMessage(result, visibleSessionCount: rows.length),
+      );
+    } on Object catch (error) {
+      final progress = latestProgress.finish();
+      if (scanRunId != null) {
+        _updateScanRun(db, scanRunId, progress);
+      }
+      await logger.write(
+        LogEntryDraft(
+          level: LogLevel.error,
+          category: LogCategory.scanner,
+          message: 'Session scan failed.',
+          details: {
+            ..._progressLogDetails(progress),
+            'error_type': error.runtimeType.toString(),
+          },
+        ),
+      );
+      rethrow;
     } finally {
       db.close();
     }
   }
+}
+
+Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
+  try {
+    final result =
+        await RuntimeSessionController(
+          settingsFile: File(request.settingsFilePath),
+          databaseFile: File(request.databaseFilePath),
+        ).refresh(
+          onProgress: (progress) {
+            request.sendPort.send(_BackgroundRefreshProgress(progress));
+          },
+        );
+    request.sendPort.send(_BackgroundRefreshDone(result));
+  } on Object catch (error, stackTrace) {
+    request.sendPort.send(
+      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+    );
+  }
+}
+
+class _BackgroundRefreshRequest {
+  const _BackgroundRefreshRequest({
+    required this.settingsFilePath,
+    required this.databaseFilePath,
+    required this.sendPort,
+  });
+
+  final String settingsFilePath;
+  final String databaseFilePath;
+  final SendPort sendPort;
+}
+
+class _BackgroundRefreshProgress {
+  const _BackgroundRefreshProgress(this.progress);
+
+  final SessionsRefreshProgress progress;
+}
+
+class _BackgroundRefreshDone {
+  const _BackgroundRefreshDone(this.result);
+
+  final SessionsRefreshResult result;
+}
+
+class _BackgroundRefreshError {
+  const _BackgroundRefreshError(this.error, this.stackTrace);
+
+  final String error;
+  final String stackTrace;
+}
+
+void _persistParsedSessions(Database db, List<ScannedSessionFile> sessions) {
+  db.execute('begin immediate');
+  try {
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final session in sessions) {
+      _upsertParsedSession(db, session, now);
+    }
+    db.execute('commit');
+  } on Object {
+    db.execute('rollback');
+    rethrow;
+  }
+}
+
+int _startScanRun(Database db) {
+  db.execute(
+    '''
+    insert into scan_runs (
+      started_at_utc,
+      files_found,
+      files_skipped,
+      files_parsed,
+      files_failed,
+      sessions_added,
+      sessions_changed,
+      sessions_missing
+    ) values (?, 0, 0, 0, 0, 0, 0, 0)
+    ''',
+    [DateTime.now().toUtc().toIso8601String()],
+  );
+  return db.lastInsertRowId;
+}
+
+void _updateScanRun(Database db, int scanRunId, ScanProgress progress) {
+  db.execute(
+    '''
+    update scan_runs
+    set
+      finished_at_utc = ?,
+      files_found = ?,
+      files_skipped = ?,
+      files_parsed = ?,
+      files_failed = ?,
+      sessions_added = ?,
+      sessions_changed = ?,
+      sessions_missing = ?
+    where id = ?
+    ''',
+    [
+      progress.finishedAtUtc?.toIso8601String(),
+      progress.filesFound,
+      progress.filesSkipped,
+      progress.filesParsed,
+      progress.filesFailed,
+      progress.sessionsAdded,
+      progress.sessionsChanged,
+      progress.sessionsMissing,
+      scanRunId,
+    ],
+  );
 }
 
 List<CachedSessionSnapshot> _cachedSessions(Database db) {
@@ -85,37 +417,16 @@ List<CachedSessionSnapshot> _cachedSessions(Database db) {
   ];
 }
 
-void _persistScan(Database db, SessionScanResult result) {
+void _persistScan(
+  Database db,
+  SessionScanResult result, {
+  required int scanRunId,
+  required bool persistSessions,
+}) {
   db.execute('begin immediate');
   try {
     final now = DateTime.now().toUtc().toIso8601String();
-    db.execute(
-      '''
-      insert into scan_runs (
-        started_at_utc,
-        finished_at_utc,
-        files_found,
-        files_skipped,
-        files_parsed,
-        files_failed,
-        sessions_added,
-        sessions_changed,
-        sessions_missing
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ''',
-      [
-        result.progress.startedAtUtc.toIso8601String(),
-        result.progress.finishedAtUtc?.toIso8601String(),
-        result.progress.filesFound,
-        result.progress.filesSkipped,
-        result.progress.filesParsed,
-        result.progress.filesFailed,
-        result.progress.sessionsAdded,
-        result.progress.sessionsChanged,
-        result.progress.sessionsMissing,
-      ],
-    );
-    final scanRunId = db.lastInsertRowId;
+    _updateScanRun(db, scanRunId, result.progress);
     for (final error in result.errors) {
       db.execute(
         '''
@@ -136,8 +447,10 @@ void _persistScan(Database db, SessionScanResult result) {
         ],
       );
     }
-    for (final session in result.sessions) {
-      _upsertParsedSession(db, session, now);
+    if (persistSessions) {
+      for (final session in result.sessions) {
+        _upsertParsedSession(db, session, now);
+      }
     }
     for (final status in result.fileStatuses) {
       if (result.sessions.any(
@@ -413,8 +726,20 @@ void _upsertScanStatusOnly(Database db, ScannedFileStatus status, String now) {
   );
 }
 
-List<SessionRowViewModel> _loadRows(Database db) {
-  final rows = db.select('''
+List<SessionRowViewModel> _loadRows(
+  Database db, {
+  bool includeMessages = false,
+  String? sessionId,
+  UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+}) {
+  final filters = [
+    "s.parse_status = 'available'",
+    "s.scan_status = 'available'",
+    "coalesce(s.session_id, '') <> ''",
+    if (sessionId != null) 's.id = ?',
+  ];
+  final rows = db.select(
+    '''
     select
       s.id,
       s.session_id,
@@ -435,6 +760,24 @@ List<SessionRowViewModel> _loadRows(Database db) {
       s.output_tokens,
       s.cached_input_tokens,
       s.total_tokens,
+      coalesce((
+        select sum(coalesce(m.token_total, 0))
+        from messages m
+        where m.session_id = s.id
+          and m.author_type = 'user'
+      ), 0) as user_message_tokens,
+      coalesce((
+        select sum(coalesce(m.token_total, 0))
+        from messages m
+        where m.session_id = s.id
+          and m.author_type = 'assistant'
+      ), 0) as assistant_response_tokens,
+      coalesce((
+        select sum(coalesce(m.token_total, 0))
+        from messages m
+        where m.session_id = s.id
+          and m.author_type = 'tool'
+      ), 0) as tool_call_tokens,
       s.model_primary,
       s.models_used,
       s.project_name_snapshot,
@@ -444,54 +787,94 @@ List<SessionRowViewModel> _loadRows(Database db) {
       s.is_archived,
       s.has_errors
     from sessions s
-    where s.parse_status = 'available'
-      and s.scan_status = 'available'
-      and coalesce(s.session_id, '') <> ''
+    where ${filters.join(' and ')}
     order by coalesce(s.last_message_at_utc, s.started_at_utc, s.updated_at_utc) desc,
              s.id asc
-    ''');
+    ''',
+    [?sessionId],
+  );
   return [
     for (final row in rows)
-      SessionRowViewModel(
-        id: row['id'] as String,
-        sessionId: row['session_id'] as String? ?? '',
-        sourceFilePath: row['source_file_path'] as String? ?? '',
-        displayPath: row['display_path'] as String? ?? '',
-        workingDirectory: row['working_directory_display'] as String? ?? '',
-        startedAtUtc:
-            _dateTime(row['started_at_utc'] as String?) ??
-            DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
-        lastMessageAtUtc:
-            _dateTime(row['last_message_at_utc'] as String?) ??
-            DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
-        platform: (row['source_type'] as String?) == 'wsl'
-            ? SessionRowPlatform.wsl
-            : SessionRowPlatform.windows,
-        project: row['project_name_snapshot'] as String? ?? 'Unassigned',
-        path:
-            row['display_path'] as String? ??
-            row['source_file_path'] as String? ??
-            '',
-        title: row['title'] as String? ?? 'Untitled session',
-        summary: row['summary'] as String? ?? '',
-        messageCount: row['message_count'] as int? ?? 0,
-        userMessageCount: row['user_message_count'] as int? ?? 0,
-        assistantMessageCount: row['assistant_message_count'] as int? ?? 0,
-        toolCallCount: row['tool_call_count'] as int? ?? 0,
-        inputTokens: row['input_tokens'] as int? ?? 0,
-        outputTokens: row['output_tokens'] as int? ?? 0,
-        cachedInputTokens: row['cached_input_tokens'] as int? ?? 0,
-        totalTokens: row['total_tokens'] as int? ?? 0,
-        model: row['model_primary'] as String? ?? '',
-        modelsUsed: _decodeMembership(row['models_used'] as String?),
-        tags: _loadTags(db, row['id'] as String),
-        status: _rowStatus(row),
-        isPinned: (row['is_pinned'] as int? ?? 0) == 1,
-        isArchived: (row['is_archived'] as int? ?? 0) == 1,
-        hasError: (row['has_errors'] as int? ?? 0) == 1,
-        conversationMessages: _loadMessages(db, row['id'] as String),
-      ),
+      _loadRow(db, row, includeMessages: includeMessages, pricing: pricing),
   ];
+}
+
+SessionRowViewModel _loadRow(
+  Database db,
+  Row row, {
+  required bool includeMessages,
+  required UsagePricingCatalog pricing,
+}) {
+  final inputTokens = row['input_tokens'] as int? ?? 0;
+  final outputTokens = row['output_tokens'] as int? ?? 0;
+  final cachedInputTokens = row['cached_input_tokens'] as int? ?? 0;
+  final storedUserMessageTokens = row['user_message_tokens'] as int? ?? 0;
+  final storedAssistantResponseTokens =
+      row['assistant_response_tokens'] as int? ?? 0;
+  final storedToolCallTokens = row['tool_call_tokens'] as int? ?? 0;
+  final hasMessageTokenBreakdown =
+      storedUserMessageTokens +
+          storedAssistantResponseTokens +
+          storedToolCallTokens >
+      0;
+  final model = row['model_primary'] as String? ?? '';
+  final estimate = estimateUsageCost(
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+    cachedInputTokens: cachedInputTokens,
+    model: model.isEmpty ? null : model,
+    pricing: pricing,
+  );
+  return SessionRowViewModel(
+    id: row['id'] as String,
+    sessionId: row['session_id'] as String? ?? '',
+    sourceFilePath: row['source_file_path'] as String? ?? '',
+    displayPath: row['display_path'] as String? ?? '',
+    workingDirectory: row['working_directory_display'] as String? ?? '',
+    startedAtUtc:
+        _dateTime(row['started_at_utc'] as String?) ??
+        DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+    lastMessageAtUtc:
+        _dateTime(row['last_message_at_utc'] as String?) ??
+        DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+    platform: (row['source_type'] as String?) == 'wsl'
+        ? SessionRowPlatform.wsl
+        : SessionRowPlatform.windows,
+    project: row['project_name_snapshot'] as String? ?? 'Unassigned',
+    path:
+        row['display_path'] as String? ??
+        row['source_file_path'] as String? ??
+        '',
+    title: row['title'] as String? ?? 'Untitled session',
+    summary: row['summary'] as String? ?? '',
+    messageCount: row['message_count'] as int? ?? 0,
+    userMessageCount: row['user_message_count'] as int? ?? 0,
+    assistantMessageCount: row['assistant_message_count'] as int? ?? 0,
+    toolCallCount: row['tool_call_count'] as int? ?? 0,
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+    cachedInputTokens: cachedInputTokens,
+    userMessageTokens: hasMessageTokenBreakdown
+        ? storedUserMessageTokens
+        : inputTokens,
+    assistantResponseTokens: hasMessageTokenBreakdown
+        ? storedAssistantResponseTokens
+        : outputTokens,
+    toolCallTokens: storedToolCallTokens,
+    totalTokens: row['total_tokens'] as int? ?? 0,
+    estimatedCostText: estimate.estimatedCostText,
+    costUnknown: estimate.costUnknown,
+    model: model,
+    modelsUsed: _decodeMembership(row['models_used'] as String?),
+    tags: _loadTags(db, row['id'] as String),
+    status: _rowStatus(row),
+    isPinned: (row['is_pinned'] as int? ?? 0) == 1,
+    isArchived: (row['is_archived'] as int? ?? 0) == 1,
+    hasError: (row['has_errors'] as int? ?? 0) == 1,
+    conversationMessages: includeMessages
+        ? _loadMessages(db, row['id'] as String)
+        : const [],
+  );
 }
 
 List<String> _loadTags(Database db, String sessionId) {
@@ -559,8 +942,12 @@ String _messagesForAuthor(
     .map((message) => message.contentPlain)
     .join('\n');
 
-String _statusMessage(SessionScanResult result) {
-  final count = _plural(result.progress.filesParsed, 'session');
+String _statusMessage(
+  SessionScanResult result, {
+  required int visibleSessionCount,
+}) {
+  final visible = _plural(visibleSessionCount, 'session');
+  final parsed = _plural(result.progress.filesParsed, 'new or changed session');
   if (result.errors.any(
     (error) => error.status == SessionFileStatus.pathUnreachable,
   )) {
@@ -568,13 +955,97 @@ String _statusMessage(SessionScanResult result) {
         .where((error) => error.status == SessionFileStatus.pathUnreachable)
         .map((error) => error.sourcePath)
         .join('; ');
-    return 'Scan finished. $count parsed. Session root is unreachable. '
-        'Unreachable paths: $paths';
+    return 'Scan finished. $visible visible. $parsed parsed. '
+        'Session root is unreachable. Unreachable paths: $paths';
   }
-  if (result.progress.filesFound == 0) {
+  if (result.progress.filesFound == 0 && visibleSessionCount == 0) {
     return 'Scan finished. No supported files found.';
   }
-  return 'Scan finished. $count found.';
+  return 'Scan finished. $visible visible. $parsed parsed.';
+}
+
+String _progressStatusMessage(ScanProgress progress) {
+  final directories = _plural(progress.directoriesScanned, 'directory');
+  final found = _plural(progress.filesFound, 'JSON file');
+  final skipped = _plural(progress.filesSkipped, 'unchanged file');
+  final parsed = _plural(progress.filesParsed, 'changed JSON file');
+  final sessions = _plural(progress.filesParsed, 'valid session');
+  final failed = _plural(progress.filesFailed, 'file');
+  final percent = _estimatedProgressPercent(progress);
+  return 'Scanning... scanned $directories, found $found, skipped $skipped, parsed $parsed, '
+      'found $sessions, failed to parse $failed, estimated progress $percent%, '
+      'ETA ${_estimatedEta(progress)}.';
+}
+
+int _estimatedProgressPercent(ScanProgress progress) {
+  if (progress.finishedAtUtc != null) {
+    return 100;
+  }
+  final processed =
+      progress.filesParsed + progress.filesSkipped + progress.filesFailed;
+  final totalKnown = [
+    progress.filesFound,
+    processed,
+  ].reduce((left, right) => left > right ? left : right);
+  if (totalKnown == 0) {
+    return 0;
+  }
+  return ((processed / totalKnown) * 100).clamp(0, 99).round();
+}
+
+String _sessionScanRoot(String rootPath) {
+  final sessions = Directory(p.join(rootPath, 'sessions'));
+  if (sessions.existsSync()) {
+    return sessions.path;
+  }
+  return rootPath;
+}
+
+Map<String, Object?> _progressLogDetails(ScanProgress progress) => {
+  'directories_scanned': progress.directoriesScanned,
+  'files_found': progress.filesFound,
+  'files_skipped': progress.filesSkipped,
+  'files_parsed': progress.filesParsed,
+  'files_failed': progress.filesFailed,
+  'sessions_added': progress.sessionsAdded,
+  'sessions_changed': progress.sessionsChanged,
+  'sessions_missing': progress.sessionsMissing,
+  'finished': progress.finishedAtUtc != null,
+};
+
+int _defaultParserWorkerCount() {
+  final processors = Platform.numberOfProcessors;
+  if (processors <= 2) {
+    return 1;
+  }
+  return math.min(8, processors - 1);
+}
+
+int _defaultDirectoryWorkerCount() {
+  final processors = Platform.numberOfProcessors;
+  return math.min(8, math.max(2, processors ~/ 2));
+}
+
+String _estimatedEta(ScanProgress progress) {
+  final percent = _estimatedProgressPercent(progress);
+  if (percent >= 100) {
+    return '0s';
+  }
+  if (percent <= 0) {
+    return 'calculating';
+  }
+  final elapsed = DateTime.now().toUtc().difference(progress.startedAtUtc);
+  final remainingSeconds = (elapsed.inSeconds * (100 - percent) / percent)
+      .round();
+  if (remainingSeconds <= 0) {
+    return 'calculating';
+  }
+  if (remainingSeconds < 60) {
+    return '${remainingSeconds}s';
+  }
+  final minutes = remainingSeconds ~/ 60;
+  final seconds = remainingSeconds % 60;
+  return '${minutes}m ${seconds}s';
 }
 
 String _plural(int count, String label) =>

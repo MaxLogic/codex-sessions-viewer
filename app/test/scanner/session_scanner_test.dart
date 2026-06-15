@@ -60,7 +60,7 @@ void main() {
       expect(result.progress.filesFound, 3);
       expect(result.progress.filesSkipped, 1);
       expect(result.progress.filesParsed, 2);
-      expect(result.progress.filesFailed, 2);
+      expect(result.progress.filesFailed, 1);
       expect(result.sessions, hasLength(2));
       expect(
         result.sessions.map((session) => session.sourceType),
@@ -366,6 +366,62 @@ void main() {
     expect(result.progress.filesParsed, 5);
     expect(parser.maxActiveParses, 2);
   });
+
+  test('starts parsing before directory discovery completes', () async {
+    final root = Directory('${temp.path}${Platform.pathSeparator}win');
+    await root.create();
+    for (var i = 0; i < 200; i++) {
+      await File(
+        '${root.path}${Platform.pathSeparator}${i.toString().padLeft(3, '0')}.json',
+      ).writeAsString(_validJsonSession('win-$i'));
+    }
+    final events = <ScanProgress>[];
+    final parser = _ProgressCapturingParser(
+      filesFound: () => events.last.filesFound,
+    );
+    final scanner = SessionScanner(
+      parser: parser,
+      pathMapper: mapper,
+      maxConcurrentParses: 1,
+      maxConcurrentDirectoryScans: 1,
+      progressEveryWorkItems: 1,
+      useParserIsolates: false,
+      onProgress: events.add,
+    );
+
+    final result = await scanner.scan(
+      SessionScanRequest(windowsRoot: root.path),
+    );
+
+    expect(result.progress.filesFound, 200);
+    expect(parser.filesFoundAtFirstParse, isNotNull);
+    expect(
+      parser.filesFoundAtFirstParse!,
+      lessThan(result.progress.filesFound),
+    );
+  });
+
+  test('throttles progress callbacks while scanning many files', () async {
+    final root = Directory('${temp.path}${Platform.pathSeparator}win');
+    await root.create();
+    for (var i = 0; i < 250; i++) {
+      await File(
+        '${root.path}${Platform.pathSeparator}notes_$i.txt',
+      ).writeAsString('not a session');
+    }
+    final events = <ScanProgress>[];
+    final scanner = SessionScanner(
+      parser: CodexSessionParser(),
+      pathMapper: mapper,
+      onProgress: events.add,
+    );
+
+    await scanner.scan(SessionScanRequest(windowsRoot: root.path));
+
+    expect(events.length, lessThanOrEqualTo(8));
+    expect(events.first.directoriesScanned, 0);
+    expect(events.last.finishedAtUtc, isNotNull);
+  });
 }
 
 String _validJsonSession(String id) =>
@@ -407,6 +463,20 @@ class _CountingParser extends CodexSessionParser {
     final result = await super.parseFile(source);
     activeParses--;
     return result;
+  }
+}
+
+class _ProgressCapturingParser extends CodexSessionParser {
+  _ProgressCapturingParser({required this.filesFound});
+
+  final int Function() filesFound;
+  int? filesFoundAtFirstParse;
+
+  @override
+  Future<CodexParseResult> parseFile(File source) async {
+    filesFoundAtFirstParse ??= filesFound();
+    await Future<void>.delayed(Duration.zero);
+    return super.parseFile(source);
   }
 }
 

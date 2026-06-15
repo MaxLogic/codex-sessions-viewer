@@ -191,6 +191,28 @@ void main() {
     expect(result.error?.details, isNull);
   });
 
+  test('tolerates NUL-padded JSONL records from interrupted writes', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}nul.jsonl');
+    await source.writeAsString(
+      [
+        '{"timestamp":"2026-06-10T11:00:00Z","type":"session_meta","payload":{"id":"nul-session","cwd":"F:\\\\repo"}}',
+        '\u0000\u0000',
+        '\u0000\u0000{"timestamp":"2026-06-10T11:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Prompt after padding"}}',
+      ].join('\n'),
+    );
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.sessionId, 'nul-session');
+    expect(
+      result.session!.messages.single.contentPlain,
+      'Prompt after padding',
+    );
+  });
+
   test(
     'tolerates missing optional fields and truncates large tool output',
     () async {

@@ -448,12 +448,14 @@ class CodexSessionParser {
     final lines = const LineSplitter().convert(text);
     for (var index = 0; index < lines.length; index++) {
       final line = lines[index];
-      if (line.trim().isEmpty) {
+      final normalizedLine = _stripLeadingNulPadding(line);
+      final leadingPadding = line.length - normalizedLine.length;
+      if (normalizedLine.trim().isEmpty) {
         offset += line.length + 1;
         continue;
       }
       try {
-        final decoded = jsonDecode(line);
+        final decoded = jsonDecode(normalizedLine);
         if (decoded is! Map<String, Object?>) {
           return _JsonlDecodeResult.error(
             CodexParseError(
@@ -468,13 +470,15 @@ class CodexSessionParser {
         }
         records.add(decoded);
       } on FormatException catch (error) {
-        final column = error.offset == null ? null : error.offset! + 1;
+        final column = error.offset == null
+            ? null
+            : leadingPadding + error.offset! + 1;
         return _JsonlDecodeResult.error(
           CodexParseError(
             sourcePath: source.path,
             kind: CodexParseErrorKind.malformedJson,
             message: error.message,
-            offset: offset + (error.offset ?? 0),
+            offset: offset + leadingPadding + (error.offset ?? 0),
             line: index + 1,
             column: column,
           ),
@@ -483,6 +487,14 @@ class CodexSessionParser {
       offset += line.length + 1;
     }
     return _JsonlDecodeResult.records(records);
+  }
+
+  String _stripLeadingNulPadding(String line) {
+    var firstJsonChar = 0;
+    while (firstJsonChar < line.length && line.codeUnitAt(firstJsonChar) == 0) {
+      firstJsonChar++;
+    }
+    return firstJsonChar == 0 ? line : line.substring(firstJsonChar);
   }
 }
 

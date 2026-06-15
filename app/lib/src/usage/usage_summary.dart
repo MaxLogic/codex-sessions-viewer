@@ -202,6 +202,39 @@ class UsageModelPricing {
   final String? cachedInputPricePerToken;
 }
 
+class UsageCostEstimate {
+  const UsageCostEstimate({
+    required this.estimatedCostText,
+    required this.costUnknown,
+  });
+
+  final String? estimatedCostText;
+  final bool costUnknown;
+
+  String get estimatedCostDisplay =>
+      costUnknown ? 'Cost unknown' : '\$${estimatedCostText ?? '0'}';
+}
+
+UsageCostEstimate estimateUsageCost({
+  required int? inputTokens,
+  required int? outputTokens,
+  required int? cachedInputTokens,
+  required String? model,
+  required UsagePricingCatalog pricing,
+}) {
+  final cost = _costForTokenUsage(
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+    cachedInputTokens: cachedInputTokens,
+    model: model,
+    pricingCatalog: pricing,
+  );
+  return UsageCostEstimate(
+    estimatedCostText: cost?.toDecimalString(),
+    costUnknown: cost == null,
+  );
+}
+
 class UsageSummary {
   const UsageSummary({
     required this.period,
@@ -454,21 +487,30 @@ _UsageAggregate _aggregateRows(
 _DecimalAmount? _sessionCost(
   _UsageSession session,
   UsagePricingCatalog pricingCatalog,
-) {
-  if (session.inputTokens == 0 &&
-      session.outputTokens == 0 &&
-      session.cachedInputTokens == 0) {
+) => _costForTokenUsage(
+  inputTokens: session.inputTokens,
+  outputTokens: session.outputTokens,
+  cachedInputTokens: session.cachedInputTokens,
+  model: session.modelPrimary,
+  pricingCatalog: pricingCatalog,
+);
+
+_DecimalAmount? _costForTokenUsage({
+  required int? inputTokens,
+  required int? outputTokens,
+  required int? cachedInputTokens,
+  required String? model,
+  required UsagePricingCatalog pricingCatalog,
+}) {
+  if (inputTokens == 0 && outputTokens == 0 && cachedInputTokens == 0) {
     return _DecimalAmount.zero;
   }
-  if (session.inputTokens == null ||
-      session.outputTokens == null ||
-      session.cachedInputTokens == null) {
+  if (inputTokens == null ||
+      outputTokens == null ||
+      cachedInputTokens == null) {
     return null;
   }
-  final inputTokens = session.inputTokens!;
-  final outputTokens = session.outputTokens!;
-  final cachedInputTokens = session.cachedInputTokens!;
-  final pricing = pricingCatalog[session.modelPrimary];
+  final pricing = pricingCatalog[model];
   if (pricing == null) {
     return null;
   }

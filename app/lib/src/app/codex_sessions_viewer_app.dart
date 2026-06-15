@@ -92,9 +92,11 @@ class CodexSessionsViewerApp extends StatelessWidget {
               final settings = settingsSnapshot.requireData;
               return CodexAppShell(
                 sessionsScreenBuilder: (context, onOpenSettings) =>
-                    SessionsScreen(
+                    _SessionsScreenLoader(
                       settings: settings,
-                      onRefreshResult: _sessionRefresh,
+                      settingsFile: settingsFile,
+                      databaseFile: databaseFile,
+                      onRefreshWithProgress: _sessionRefresh,
                       onOpenSettings: onOpenSettings,
                       onSessionAction: (request) =>
                           _handleSessionAction(request),
@@ -110,7 +112,9 @@ class CodexSessionsViewerApp extends StatelessWidget {
     );
   }
 
-  Future<SessionsRefreshResult> _sessionRefresh() {
+  Future<SessionsRefreshResult> _sessionRefresh([
+    SessionsRefreshProgressCallback? onProgress,
+  ]) {
     final refresh = sessionRefresh;
     if (refresh != null) {
       return refresh();
@@ -118,7 +122,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
     return RuntimeSessionController(
       settingsFile: settingsFile,
       databaseFile: databaseFile,
-    ).refresh();
+    ).refreshInBackground(onProgress: onProgress);
   }
 
   Future<void> _handleSessionAction(SessionActionRequest request) async {
@@ -195,6 +199,74 @@ class CodexSessionsViewerApp extends StatelessWidget {
     } finally {
       db.close();
     }
+  }
+}
+
+class _SessionsScreenLoader extends StatefulWidget {
+  const _SessionsScreenLoader({
+    required this.settings,
+    required this.settingsFile,
+    required this.databaseFile,
+    required this.onRefreshWithProgress,
+    required this.onOpenSettings,
+    required this.onSessionAction,
+  });
+
+  final AppSettings settings;
+  final File settingsFile;
+  final File databaseFile;
+  final SessionsRefreshWithProgress onRefreshWithProgress;
+  final VoidCallback onOpenSettings;
+  final SessionActionCallback onSessionAction;
+
+  @override
+  State<_SessionsScreenLoader> createState() => _SessionsScreenLoaderState();
+}
+
+class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
+  late Future<SessionsRefreshResult> _cachedRows;
+
+  @override
+  void initState() {
+    super.initState();
+    _cachedRows = _controller.loadCachedRows();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SessionsScreenLoader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.settingsFile.path != widget.settingsFile.path ||
+        oldWidget.databaseFile.path != widget.databaseFile.path) {
+      _cachedRows = _controller.loadCachedRows();
+    }
+  }
+
+  RuntimeSessionController get _controller => RuntimeSessionController(
+    settingsFile: widget.settingsFile,
+    databaseFile: widget.databaseFile,
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<SessionsRefreshResult>(
+      future: _cachedRows,
+      initialData: const SessionsRefreshResult(rows: [], statusMessage: ''),
+      builder: (context, snapshot) {
+        final cached = snapshot.data;
+        final statusMessage = snapshot.hasError
+            ? 'Failed to load cached sessions. ${snapshot.error}'
+            : cached?.statusMessage ?? '';
+        return SessionsScreen(
+          settings: widget.settings,
+          initialRows: cached?.rows ?? const [],
+          initialStatusMessage: statusMessage,
+          onRefreshWithProgress: widget.onRefreshWithProgress,
+          onOpenSettings: widget.onOpenSettings,
+          onSessionAction: widget.onSessionAction,
+          onLoadSessionDetail: _controller.loadSessionDetail,
+        );
+      },
+    );
   }
 }
 
