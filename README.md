@@ -38,6 +38,13 @@ Windows release build. It prepares `release\windows` with
 `package_release.ps1` rebuilds through the build script, creates
 `release\package`, and writes `release\codex_session_viewer_windows.zip`.
 
+Refresh local benchmark results with:
+
+```powershell
+cd app
+dart run bin/benchmark_local.dart --fixtures ../samples/sessions --out ../docs/benchmark-results.md
+```
+
 ## Configuration
 
 Configuration lives in `settings.toml`. The packaged copy is a starting point;
