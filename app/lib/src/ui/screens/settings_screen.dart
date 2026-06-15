@@ -8,7 +8,8 @@ typedef SettingsSaveCallback = Future<void> Function(AppSettings settings);
 typedef SettingsReloadCallback = Future<AppSettings> Function();
 
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({
+  // ignore: prefer_const_constructors_in_immutables
+  SettingsScreen({
     super.key,
     this.initialSettings,
     this.onSave,

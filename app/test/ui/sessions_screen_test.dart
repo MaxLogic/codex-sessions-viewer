@@ -38,6 +38,27 @@ void main() {
       expect(find.bySemanticsLabel('Model filter'), findsOneWidget);
       expect(find.bySemanticsLabel('Status filter'), findsOneWidget);
       expect(find.bySemanticsLabel('Archived filter'), findsOneWidget);
+      expect(
+        find.text('Additional time ranges are not available yet.'),
+        findsOneWidget,
+      );
+      for (final text in const [
+        'Project values are not available yet.',
+        'Tags values are not available yet.',
+        'Model values are not available yet.',
+        'Status values are not available yet.',
+      ]) {
+        expect(find.text(text), findsOneWidget);
+      }
+      expect(
+        find
+            .byType(Tooltip)
+            .evaluate()
+            .map((element) => element.widget)
+            .whereType<Tooltip>()
+            .map((tooltip) => tooltip.message),
+        contains('Advanced filters are not available yet.'),
+      );
       expect(find.text('2 sessions visible'), findsOneWidget);
       expect(find.text('Archived session'), findsNothing);
 

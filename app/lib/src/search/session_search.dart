@@ -181,7 +181,7 @@ class SessionSearchIndex {
     }
     if (query.sourceTypes.isNotEmpty) {
       where.add(
-        's.source_type in (${_placeholders(query.sourceTypes.length)})',
+        's.source_type in (${_sqlParameters(query.sourceTypes.length)})',
       );
       args.addAll(query.sourceTypes.map((source) => source.wireName));
     }
@@ -202,7 +202,7 @@ class SessionSearchIndex {
     }
     if (query.projectNames.isNotEmpty) {
       where.add(
-        's.project_name_snapshot in (${_placeholders(query.projectNames.length)})',
+        's.project_name_snapshot in (${_sqlParameters(query.projectNames.length)})',
       );
       args.addAll(query.projectNames);
     }
@@ -224,8 +224,8 @@ class SessionSearchIndex {
     }
     if (query.statuses.isNotEmpty) {
       where.add(
-        '(s.scan_status in (${_placeholders(query.statuses.length)}) '
-        'or s.parse_status in (${_placeholders(query.statuses.length)}))',
+        '(s.scan_status in (${_sqlParameters(query.statuses.length)}) '
+        'or s.parse_status in (${_sqlParameters(query.statuses.length)}))',
       );
       args
         ..addAll(query.statuses)
@@ -486,7 +486,7 @@ extension on SearchTextScope {
   ];
 }
 
-String _placeholders(int count) => List.filled(count, '?').join(', ');
+String _sqlParameters(int count) => List.filled(count, '?').join(', ');
 
 List<String> _searchTokens(String text) => text
     .toLowerCase()

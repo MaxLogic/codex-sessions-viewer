@@ -276,7 +276,7 @@ void main() {
     tester,
   ) async {
     await tester.pumpWidget(
-      const MaterialApp(
+      MaterialApp(
         home: SessionsScreen(
           initialStatusMessage: 'Scan finished. No supported files found.',
         ),

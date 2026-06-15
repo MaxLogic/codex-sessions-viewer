@@ -6,7 +6,8 @@ typedef LogEntryAction = Future<void> Function(LogEntry entry);
 typedef LogsAction = Future<void> Function();
 
 class LogsScreen extends StatefulWidget {
-  const LogsScreen({
+  // ignore: prefer_const_constructors_in_immutables
+  LogsScreen({
     super.key,
     this.entries = const [],
     this.onCopySelected,

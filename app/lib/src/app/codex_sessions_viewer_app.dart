@@ -99,9 +99,9 @@ class CodexSessionsViewerApp extends StatelessWidget {
                       onSessionAction: (request) =>
                           _handleSessionAction(request),
                     ),
-                usageScreen: const UsageScreen(),
+                usageScreen: UsageScreen(),
                 settingsScreen: SettingsScreen(initialSettings: settings),
-                logsScreen: const LogsScreen(),
+                logsScreen: LogsScreen(),
               );
             },
           );

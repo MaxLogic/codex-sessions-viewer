@@ -40,7 +40,8 @@ class SessionActionRequest {
 }
 
 class SessionsScreen extends StatefulWidget {
-  const SessionsScreen({
+  // ignore: prefer_const_constructors_in_immutables
+  SessionsScreen({
     super.key,
     this.initialRows = const [],
     this.onRefresh,
@@ -691,14 +692,18 @@ class _FilterBar extends StatelessWidget {
                         child: DropdownButtonFormField<String>(
                           initialValue: 'Last 30 days',
                           isExpanded: true,
-                          decoration: const InputDecoration(labelText: 'Time'),
+                          decoration: const InputDecoration(
+                            labelText: 'Time',
+                            helperText:
+                                'Additional time ranges are not available yet.',
+                          ),
                           items: const [
                             DropdownMenuItem(
                               value: 'Last 30 days',
                               child: Text('Last 30 days'),
                             ),
                           ],
-                          onChanged: (_) {},
+                          onChanged: null,
                         ),
                       ),
                     ),
@@ -781,9 +786,12 @@ class _FilterBar extends StatelessWidget {
                   onPressed: onClearFilters,
                   child: const Text('Clear filters'),
                 ),
-                OutlinedButton(
-                  onPressed: null,
-                  child: const Text('Advanced filters'),
+                const Tooltip(
+                  message: 'Advanced filters are not available yet.',
+                  child: OutlinedButton(
+                    onPressed: null,
+                    child: Text('Advanced filters'),
+                  ),
                 ),
               ],
             ),
@@ -799,9 +807,12 @@ class _FilterBar extends StatelessWidget {
       child: DropdownButtonFormField<String>(
         initialValue: 'All',
         isExpanded: true,
-        decoration: InputDecoration(labelText: label),
+        decoration: InputDecoration(
+          labelText: label,
+          helperText: '$label values are not available yet.',
+        ),
         items: const [DropdownMenuItem(value: 'All', child: Text('All'))],
-        onChanged: (_) {},
+        onChanged: null,
       ),
     );
   }

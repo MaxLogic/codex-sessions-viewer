@@ -9,3 +9,4 @@
 - Added a local benchmark harness and baseline report for scanner, parser, cache skip, SQLite search, and release packaging timings.
 - Added an explicit app composition boundary so production screen wiring lives in the app layer and the shell renders injected screens.
 - Wired session row actions plus message, command, and detail copy buttons to callbacks or clipboard behavior.
+- Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.

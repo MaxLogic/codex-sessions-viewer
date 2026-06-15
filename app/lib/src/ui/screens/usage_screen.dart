@@ -4,7 +4,8 @@ import '../../accessibility/announcement_service.dart';
 import '../../usage/usage_summary.dart';
 
 class UsageScreen extends StatefulWidget {
-  const UsageScreen({super.key, this.summary, this.announcer});
+  // ignore: prefer_const_constructors_in_immutables
+  UsageScreen({super.key, this.summary, this.announcer});
 
   final UsageSummary? summary;
   final ScreenReaderAnnouncer? announcer;
