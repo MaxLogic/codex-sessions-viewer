@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -26,6 +28,14 @@ enum SessionRowAction {
 }
 
 typedef SessionActionCallback = Future<void> Function(SessionActionRequest);
+typedef SessionsRefreshProgressCallback =
+    void Function(SessionsRefreshProgress progress);
+typedef SessionsRefreshWithProgress =
+    Future<SessionsRefreshResult> Function(
+      SessionsRefreshProgressCallback onProgress,
+    );
+typedef SessionDetailLoader =
+    Future<SessionRowViewModel?> Function(String sessionId);
 
 class SessionActionRequest {
   const SessionActionRequest({
@@ -46,9 +56,11 @@ class SessionsScreen extends StatefulWidget {
     this.initialRows = const [],
     this.onRefresh,
     this.onRefreshResult,
+    this.onRefreshWithProgress,
     this.onOpenSettings,
     this.onTestWslPath,
     this.onSessionAction,
+    this.onLoadSessionDetail,
     this.settings,
     this.initialStatusMessage = '',
   });
@@ -56,9 +68,11 @@ class SessionsScreen extends StatefulWidget {
   final List<SessionRowViewModel> initialRows;
   final Future<List<SessionRowViewModel>> Function()? onRefresh;
   final Future<SessionsRefreshResult> Function()? onRefreshResult;
+  final SessionsRefreshWithProgress? onRefreshWithProgress;
   final VoidCallback? onOpenSettings;
   final VoidCallback? onTestWslPath;
   final SessionActionCallback? onSessionAction;
+  final SessionDetailLoader? onLoadSessionDetail;
   final AppSettings? settings;
   final String initialStatusMessage;
 
@@ -73,7 +87,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
   var _isScanning = false;
   var _scanAnnouncement = '';
+  var _hasRefreshOwnedRows = false;
   String? _selectedId;
+  String? _loadingDetailId;
   late List<SessionRowViewModel> _rows;
 
   @override
@@ -88,9 +104,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
   @override
   void didUpdateWidget(covariant SessionsScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.initialRows != widget.initialRows) {
-      _rows = List.of(widget.initialRows);
+    if (!_hasRefreshOwnedRows && oldWidget.initialRows != widget.initialRows) {
+      _replaceRows(widget.initialRows);
       _retainSelection();
+    }
+    if (!_isScanning &&
+        oldWidget.initialStatusMessage != widget.initialStatusMessage) {
+      _scanAnnouncement = widget.initialStatusMessage;
     }
   }
 
@@ -207,6 +227,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                 payload: command,
                               ),
                             ),
+                      isLoadingMessages:
+                          selectedRow != null &&
+                          _loadingDetailId == selectedRow.id,
                     ),
                   ),
                 ],
@@ -313,6 +336,39 @@ class _SessionsScreenState extends State<SessionsScreen> {
     setState(() {
       _selectedId = id;
     });
+    unawaited(_loadSelectedDetail(id));
+  }
+
+  Future<void> _loadSelectedDetail(String id) async {
+    final loader = widget.onLoadSessionDetail;
+    if (loader == null || _loadingDetailId == id) {
+      return;
+    }
+    final row = _rowById(id);
+    if (row == null ||
+        row.messageCount == 0 ||
+        row.conversationMessages.isNotEmpty) {
+      return;
+    }
+    setState(() {
+      _loadingDetailId = id;
+    });
+    try {
+      final loaded = await loader(id);
+      if (!mounted || loaded == null) {
+        return;
+      }
+      setState(() {
+        _replaceRow(loaded);
+        _retainSelection();
+      });
+    } finally {
+      if (mounted && _loadingDetailId == id) {
+        setState(() {
+          _loadingDetailId = null;
+        });
+      }
+    }
   }
 
   void _filtersChanged() {
@@ -352,15 +408,17 @@ class _SessionsScreenState extends State<SessionsScreen> {
     }
     setState(() {
       _isScanning = true;
+      _hasRefreshOwnedRows = true;
       _scanAnnouncement = 'Scanning started';
     });
     try {
-      final refreshResult = await _refreshResult();
+      final refreshResult = await _refreshResult(_handleRefreshProgress);
       if (!mounted) {
         return;
       }
       setState(() {
-        _rows = List.of(refreshResult.rows);
+        _hasRefreshOwnedRows = true;
+        _replaceRows(refreshResult.rows);
         _scanAnnouncement = refreshResult.statusMessage;
         _retainSelection();
       });
@@ -380,7 +438,28 @@ class _SessionsScreenState extends State<SessionsScreen> {
     }
   }
 
-  Future<SessionsRefreshResult> _refreshResult() async {
+  void _handleRefreshProgress(SessionsRefreshProgress progress) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      final rows = progress.rows;
+      if (rows != null) {
+        _hasRefreshOwnedRows = true;
+        _replaceRows(rows);
+      }
+      _scanAnnouncement = progress.statusMessage;
+      _retainSelection();
+    });
+  }
+
+  Future<SessionsRefreshResult> _refreshResult(
+    SessionsRefreshProgressCallback onProgress,
+  ) async {
+    final refreshWithProgress = widget.onRefreshWithProgress;
+    if (refreshWithProgress != null) {
+      return refreshWithProgress(onProgress);
+    }
     final refreshResult = widget.onRefreshResult;
     if (refreshResult != null) {
       return refreshResult();
@@ -485,6 +564,39 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _ => 'Copied.',
     };
   }
+
+  SessionRowViewModel? _rowById(String id) {
+    for (final row in _rows) {
+      if (row.id == id) {
+        return row;
+      }
+    }
+    return null;
+  }
+
+  void _replaceRow(SessionRowViewModel replacement) {
+    final index = _rows.indexWhere((row) => row.id == replacement.id);
+    if (index < 0) {
+      return;
+    }
+    _rows[index] = replacement;
+  }
+
+  void _replaceRows(List<SessionRowViewModel> rows) {
+    final loadedMessagesById = {
+      for (final row in _rows)
+        if (row.conversationMessages.isNotEmpty)
+          row.id: row.conversationMessages,
+    };
+    _rows = [
+      for (final row in rows)
+        if (row.conversationMessages.isEmpty &&
+            loadedMessagesById.containsKey(row.id))
+          row.copyWithConversationMessages(loadedMessagesById[row.id]!)
+        else
+          row,
+    ];
+  }
 }
 
 class SessionsRefreshResult {
@@ -502,6 +614,13 @@ class SessionsRefreshResult {
   }
 
   final List<SessionRowViewModel> rows;
+  final String statusMessage;
+}
+
+class SessionsRefreshProgress {
+  const SessionsRefreshProgress({required this.statusMessage, this.rows});
+
+  final List<SessionRowViewModel>? rows;
   final String statusMessage;
 }
 
@@ -850,6 +969,23 @@ class _SessionsTable extends StatelessWidget {
   final SessionActionCallback onAction;
   final AppSettings settings;
 
+  static const _tableWidth = 1420.0;
+  static const _rowHeight = 80.0;
+  static const _columns = <({String label, double width})>[
+    (label: 'Date', width: 120),
+    (label: 'Actions', width: 66),
+    (label: 'Last message', width: 120),
+    (label: 'Project', width: 112),
+    (label: 'Path', width: 232),
+    (label: 'Title', width: 148),
+    (label: 'Summary', width: 180),
+    (label: 'Messages', width: 70),
+    (label: 'Tokens', width: 70),
+    (label: 'Model', width: 92),
+    (label: 'Tags', width: 100),
+    (label: 'Status', width: 110),
+  ];
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -865,65 +1001,20 @@ class _SessionsTable extends StatelessWidget {
         Expanded(
           child: Scrollbar(
             child: SingleChildScrollView(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: DataTable(
-                  showCheckboxColumn: false,
-                  dataRowMinHeight: 64,
-                  dataRowMaxHeight: 80,
-                  columns: const [
-                    DataColumn(label: Text('Date')),
-                    DataColumn(label: Text('Last message')),
-                    DataColumn(label: Text('Platform')),
-                    DataColumn(label: Text('Project')),
-                    DataColumn(label: Text('Path')),
-                    DataColumn(label: Text('Title')),
-                    DataColumn(label: Text('Summary')),
-                    DataColumn(label: Text('Messages')),
-                    DataColumn(label: Text('Tokens')),
-                    DataColumn(label: Text('Model')),
-                    DataColumn(label: Text('Tags')),
-                    DataColumn(label: Text('Status')),
-                    DataColumn(label: Text('Actions')),
-                  ],
-                  rows: [
-                    for (final row in rows)
-                      DataRow(
-                        selected: row.id == selectedId,
-                        color: WidgetStateProperty.resolveWith(
-                          (_) => _rowColor(context, row),
-                        ),
-                        onSelectChanged: (_) => onSelect(row.id),
-                        cells: [
-                          _dateCell(row),
-                          _cell(
-                            row.lastMessageAtUtc.shortDateTime,
-                            row,
-                            width: 120,
-                          ),
-                          _cell(row.platformLabel, row, width: 72),
-                          _cell(row.project, row, width: 112),
-                          _cell(row.path, row, width: 160),
-                          _cell(row.title, row, width: 148),
-                          _cell(row.summary, row, width: 180),
-                          _cell(row.messageCount.toString(), row, width: 70),
-                          _cell(row.totalTokens.toString(), row, width: 70),
-                          _cell(row.model, row, width: 92),
-                          _cell(row.tags.join(', '), row, width: 100),
-                          DataCell(
-                            _StatusCell(row: row),
-                            onTap: () => onSelect(row.id),
-                          ),
-                          DataCell(
-                            _ActionsMenu(
-                              row: row,
-                              onAction: onAction,
-                              settings: settings,
-                            ),
-                            onTap: () => onSelect(row.id),
-                          ),
-                        ],
+              scrollDirection: Axis.horizontal,
+              child: SizedBox(
+                width: _tableWidth,
+                child: Column(
+                  children: [
+                    _header(context),
+                    Expanded(
+                      child: ListView.builder(
+                        itemExtent: _rowHeight,
+                        itemCount: rows.length,
+                        itemBuilder: (context, index) =>
+                            _sessionRow(context, rows[index]),
                       ),
+                    ),
                   ],
                 ),
               ),
@@ -934,45 +1025,108 @@ class _SessionsTable extends StatelessWidget {
     );
   }
 
-  DataCell _cell(
-    String text,
-    SessionRowViewModel row, {
-    required double width,
-    String? semanticLabel,
-  }) {
-    return DataCell(
-      semanticLabel == null
-          ? SizedBox(
-              width: width,
-              child: Text(text, overflow: TextOverflow.ellipsis),
-            )
-          : Semantics(
-              label: semanticLabel,
-              button: true,
-              child: ExcludeSemantics(
-                child: SizedBox(
-                  width: width,
-                  child: Text(text, overflow: TextOverflow.ellipsis),
+  Widget _header(BuildContext context) {
+    final style = Theme.of(context).textTheme.labelMedium;
+    return Container(
+      height: 40,
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Theme.of(context).colorScheme.outline),
+        ),
+      ),
+      child: Row(
+        children: [
+          for (final column in _columns)
+            SizedBox(
+              width: column.width,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Text(
+                  column.label,
+                  overflow: TextOverflow.ellipsis,
+                  style: style,
                 ),
               ),
             ),
-      onTap: () => onSelect(row.id),
+        ],
+      ),
     );
   }
 
-  DataCell _dateCell(SessionRowViewModel row) {
+  Widget _sessionRow(BuildContext context, SessionRowViewModel row) {
+    final selected = row.id == selectedId;
+    final color = _rowColor(context, row, selected: selected);
+    return InkWell(
+      onTap: () => onSelect(row.id),
+      child: Container(
+        height: _rowHeight,
+        color: color,
+        child: Row(
+          children: [
+            _dateCell(row, selected: selected),
+            SizedBox(
+              width: 66,
+              child: _ActionsMenu(
+                row: row,
+                onAction: onAction,
+                settings: settings,
+              ),
+            ),
+            _cell(row.lastMessageAtUtc.shortDateTime, width: 120),
+            _cell(row.project, width: 112),
+            _PathCell(
+              row: row,
+              width: 232,
+              onCopy: () => onAction(
+                SessionActionRequest(
+                  row: row,
+                  action: SessionRowAction.copyPath,
+                  payload: row.path,
+                ),
+              ),
+            ),
+            _cell(row.title, width: 148),
+            _cell(row.summary, width: 180),
+            _cell(row.messageCount.toString(), width: 70),
+            _cell(row.totalTokens.toString(), width: 70),
+            _cell(row.model, width: 92),
+            _cell(row.tags.join(', '), width: 100),
+            SizedBox(
+              width: 110,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: _StatusCell(row: row),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _cell(String text, {required double width}) => SizedBox(
+    width: width,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Text(text, overflow: TextOverflow.ellipsis),
+    ),
+  );
+
+  Widget _dateCell(SessionRowViewModel row, {required bool selected}) {
     final badges = [
       if (row.isPinned) 'Pinned',
       if (row.isArchived) 'Archived',
       if (row.hasError) row.status,
     ];
-    return DataCell(
-      Semantics(
-        label: 'Select session ${row.title}',
-        button: true,
-        child: ExcludeSemantics(
-          child: SizedBox(
-            width: 120,
+    return Semantics(
+      label: 'Select session ${row.title}',
+      button: true,
+      selected: selected,
+      child: ExcludeSemantics(
+        child: SizedBox(
+          width: 120,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -989,12 +1143,18 @@ class _SessionsTable extends StatelessWidget {
           ),
         ),
       ),
-      onTap: () => onSelect(row.id),
     );
   }
 
-  Color? _rowColor(BuildContext context, SessionRowViewModel row) {
+  Color? _rowColor(
+    BuildContext context,
+    SessionRowViewModel row, {
+    required bool selected,
+  }) {
     final scheme = Theme.of(context).colorScheme;
+    if (selected) {
+      return scheme.primaryContainer.withValues(alpha: 0.7);
+    }
     if (row.hasError) {
       return scheme.errorContainer.withValues(alpha: 0.55);
     }
@@ -1005,6 +1165,76 @@ class _SessionsTable extends StatelessWidget {
       return scheme.primaryContainer.withValues(alpha: 0.45);
     }
     return null;
+  }
+}
+
+class _PathCell extends StatelessWidget {
+  const _PathCell({
+    required this.row,
+    required this.width,
+    required this.onCopy,
+  });
+
+  final SessionRowViewModel row;
+  final double width;
+  final VoidCallback onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: width,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 8, right: 4),
+        child: Row(
+          children: [
+            Expanded(
+              child: Semantics(
+                label: '${row.platformLabel} path ${row.path}',
+                container: true,
+                child: ExcludeSemantics(
+                  child: Row(
+                    children: [
+                      Icon(_platformIcon, size: 16),
+                      const SizedBox(width: 4),
+                      Text(
+                        row.platformLabel,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.labelSmall,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(row.path, overflow: TextOverflow.ellipsis),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Semantics(
+              label: 'Copy path for ${row.title}',
+              button: true,
+              child: IconButton(
+                tooltip: 'Copy path',
+                icon: const Icon(Icons.copy, size: 16),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints.tightFor(
+                  width: 32,
+                  height: 32,
+                ),
+                onPressed: onCopy,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  IconData get _platformIcon {
+    return switch (row.platform) {
+      SessionRowPlatform.windows => Icons.desktop_windows_outlined,
+      SessionRowPlatform.wsl => Icons.terminal_outlined,
+    };
   }
 }
 
@@ -1170,6 +1400,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
     required this.onSessionAction,
     required this.onRunTerminalCommand,
     required this.onEditTerminalCommand,
+    required this.isLoadingMessages,
   });
 
   final SessionRowViewModel? row;
@@ -1177,6 +1408,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
   final SessionDetailActionCallback? onSessionAction;
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
+  final bool isLoadingMessages;
 
   @override
   Widget build(BuildContext context) {
@@ -1187,6 +1419,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
         onSessionAction: onSessionAction,
         onRunTerminalCommand: onRunTerminalCommand,
         onEditTerminalCommand: onEditTerminalCommand,
+        isLoadingMessages: isLoadingMessages,
       );
     }
     return SingleChildScrollView(

@@ -117,48 +117,14 @@ class _LogsScreenState extends State<LogsScreen> {
             const SizedBox(height: 8),
             Expanded(
               flex: 3,
-              child: Semantics(
-                label: 'Logs table',
-                container: true,
-                child: ClipRect(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: SingleChildScrollView(
-                      child: DataTable(
-                        columnSpacing: 24,
-                        showCheckboxColumn: false,
-                        columns: const [
-                          DataColumn(label: Text('Time')),
-                          DataColumn(label: Text('Level')),
-                          DataColumn(label: Text('Category')),
-                          DataColumn(label: Text('Message')),
-                          DataColumn(label: Text('Details')),
-                        ],
-                        rows: [
-                          for (final entry in visible)
-                            DataRow(
-                              selected: _selected?.id == entry.id,
-                              onSelectChanged: (_) {
-                                setState(() {
-                                  _selected = entry;
-                                });
-                              },
-                              cells: [
-                                _cell(entry, _formatTime(entry.timeUtc)),
-                                _cell(entry, entry.level.name),
-                                _cell(entry, entry.category.displayLabel),
-                                _messageCell(entry),
-                                _cell(
-                                  entry,
-                                  entry.details == null ? 'No' : 'Yes',
-                                ),
-                              ],
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
+              child: _LogsTable(
+                entries: visible,
+                selected: _selected,
+                onSelected: (entry) {
+                  setState(() {
+                    _selected = entry;
+                  });
+                },
               ),
             ),
             const SizedBox(height: 12),
@@ -195,27 +161,163 @@ class _LogsScreenState extends State<LogsScreen> {
       ),
     );
   }
+}
 
-  DataCell _cell(LogEntry entry, String text) {
-    return DataCell(
-      Text(text),
-      onTap: () {
-        setState(() {
-          _selected = entry;
-        });
-      },
+class _LogsTable extends StatelessWidget {
+  const _LogsTable({
+    required this.entries,
+    required this.selected,
+    required this.onSelected,
+  });
+
+  static const _rowHeight = 44.0;
+  static const _columns = <({String label, double width})>[
+    (label: 'Time', width: 96),
+    (label: 'Level', width: 96),
+    (label: 'Category', width: 136),
+    (label: 'Message', width: 420),
+    (label: 'Details', width: 96),
+  ];
+
+  final List<LogEntry> entries;
+  final LogEntry? selected;
+  final ValueChanged<LogEntry> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final width = _columns.fold<double>(
+      0,
+      (total, column) => total + column.width,
+    );
+    return Semantics(
+      label: 'Logs table',
+      container: true,
+      child: ClipRect(
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: SizedBox(
+            width: width,
+            child: Column(
+              children: [
+                const _LogsHeader(columns: _columns),
+                const Divider(height: 1),
+                Expanded(
+                  child: ListView.builder(
+                    itemExtent: _rowHeight,
+                    itemCount: entries.length,
+                    itemBuilder: (context, index) {
+                      final entry = entries[index];
+                      return _LogsRow(
+                        entry: entry,
+                        columns: _columns,
+                        selected: selected?.id == entry.id,
+                        onSelected: onSelected,
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
+}
 
-  DataCell _messageCell(LogEntry entry) {
-    return DataCell(
-      TextButton(
-        onPressed: () {
-          setState(() {
-            _selected = entry;
-          });
-        },
-        child: Text(entry.message),
+class _LogsHeader extends StatelessWidget {
+  const _LogsHeader({required this.columns});
+
+  final List<({String label, double width})> columns;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = Theme.of(context).textTheme.labelLarge;
+    return SizedBox(
+      height: 40,
+      child: Row(
+        children: [
+          for (final column in columns)
+            SizedBox(
+              width: column.width,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Text(column.label, style: style),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LogsRow extends StatelessWidget {
+  const _LogsRow({
+    required this.entry,
+    required this.columns,
+    required this.selected,
+    required this.onSelected,
+  });
+
+  final LogEntry entry;
+  final List<({String label, double width})> columns;
+  final bool selected;
+  final ValueChanged<LogEntry> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final background = selected ? scheme.secondaryContainer : null;
+    return Material(
+      color: background,
+      child: InkWell(
+        onTap: () => onSelected(entry),
+        child: Row(
+          children: [
+            _LogCell(width: columns[0].width, text: _formatTime(entry.timeUtc)),
+            _LogCell(width: columns[1].width, text: entry.level.name),
+            _LogCell(
+              width: columns[2].width,
+              text: entry.category.displayLabel,
+            ),
+            SizedBox(
+              width: columns[3].width,
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton(
+                  onPressed: () => onSelected(entry),
+                  child: Text(
+                    entry.message,
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                ),
+              ),
+            ),
+            _LogCell(
+              width: columns[4].width,
+              text: entry.details == null ? 'No' : 'Yes',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _LogCell extends StatelessWidget {
+  const _LogCell({required this.width, required this.text});
+
+  final double width;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: width,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: Text(text, overflow: TextOverflow.ellipsis, maxLines: 1),
       ),
     );
   }

@@ -65,7 +65,6 @@ void main() {
       for (final column in const [
         'Date',
         'Last message',
-        'Platform',
         'Project',
         'Path',
         'Title',
@@ -80,6 +79,26 @@ void main() {
         expect(find.text(column), findsWidgets);
       }
 
+      expect(
+        find.bySemanticsLabel(
+          r'Windows path F:\projects\MaxLogic\codex-sessions-viewer',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel(
+          'WSL path /home/pawel/.codex/sessions/2026/06/12/session.jsonl',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel('Copy path for Parser cache'),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel('Copy path for Broken JSONL'),
+        findsOneWidget,
+      );
       expect(find.text('Pinned'), findsOneWidget);
       expect(find.text('Parse error'), findsWidgets);
       expect(find.bySemanticsLabel('Actions for Parser cache'), findsOneWidget);

@@ -33,6 +33,7 @@ class SessionDetailPane extends StatelessWidget {
     this.onSessionAction,
     this.onRunTerminalCommand,
     this.onEditTerminalCommand,
+    this.isLoadingMessages = false,
   });
 
   final SessionRowViewModel row;
@@ -41,6 +42,7 @@ class SessionDetailPane extends StatelessWidget {
   final SessionDetailActionCallback? onSessionAction;
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
+  final bool isLoadingMessages;
 
   @override
   Widget build(BuildContext context) {
@@ -58,29 +60,44 @@ class SessionDetailPane extends StatelessWidget {
           ),
         );
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text('Selected: ${row.title}'),
-          const SizedBox(height: 8),
+          const SizedBox(height: 4),
           Text(row.title, style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _MetadataGrid(row: row),
-          const SizedBox(height: 16),
+          const SizedBox(height: 10),
           _ActionArea(
             row: row,
             commandSet: commandSet,
             onCopyText: onCopyText,
             onSessionAction: onSessionAction,
           ),
-          const SizedBox(height: 16),
-          CommandPreview(
-            commandSet: commandSet,
-            onRunTerminalCommand: onRunTerminalCommand,
-            onEditTerminalCommand: onEditTerminalCommand,
+          const SizedBox(height: 8),
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            childrenPadding: EdgeInsets.zero,
+            title: Text(
+              'Commands',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            children: [
+              CommandPreview(
+                commandSet: commandSet,
+                onRunTerminalCommand: onRunTerminalCommand,
+                onEditTerminalCommand: onEditTerminalCommand,
+              ),
+            ],
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 8),
+          if (isLoadingMessages)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: LinearProgressIndicator(),
+            ),
           Text('Conversation', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
           SizedBox(
@@ -113,8 +130,8 @@ class _MetadataGrid extends StatelessWidget {
     final duration =
         row.duration ?? row.lastMessageAtUtc.difference(row.startedAtUtc);
     return Wrap(
-      spacing: 16,
-      runSpacing: 8,
+      spacing: 12,
+      runSpacing: 6,
       children: [
         _DetailText('Platform', row.platformLabel),
         _DetailText('Project', row.project),
@@ -125,15 +142,39 @@ class _MetadataGrid extends StatelessWidget {
         _DetailText('Last message', row.lastMessageAtUtc.shortDateTime),
         _DetailText('Duration', duration.humanDuration),
         _DetailText('Total messages', row.messageCount.toString()),
-        _DetailText('User messages', row.userMessageCount.toString()),
-        _DetailText('Assistant messages', row.assistantMessageCount.toString()),
-        _DetailText('Tool calls', row.toolCallCount.toString()),
+        _DetailText('User message count', row.userMessageCount.toString()),
         _DetailText(
-          'Tokens',
-          '${row.inputTokens} input, ${row.outputTokens} output, '
-              '${row.cachedInputTokens} cached, ${row.totalTokens} total',
+          'Assistant message count',
+          row.assistantMessageCount.toString(),
         ),
-        _DetailText('Models', row.modelsUsedForDetail.join(', ')),
+        _DetailText('Tool call count', row.toolCallCount.toString()),
+        _DetailText('Total tokens', row.totalTokens.toString()),
+        _DetailText('Input tokens', row.inputTokens.toString()),
+        _DetailText('Output tokens', row.outputTokens.toString()),
+        _DetailText(
+          'Cached input tokens',
+          _tokensWithShare(row, row.cachedInputTokens),
+        ),
+        _DetailText(
+          'User message tokens',
+          _tokensWithShare(row, row.userMessageTokens),
+        ),
+        _DetailText(
+          'AI response tokens',
+          _tokensWithShare(row, row.assistantResponseTokens),
+        ),
+        _DetailText(
+          'Tool call tokens',
+          _tokensWithShare(row, row.toolCallTokens),
+        ),
+        _DetailText('Estimated cost', row.estimatedCostDisplay),
+        _DetailText(
+          'Models used',
+          row.modelsUsedForDetail.isEmpty
+              ? 'Unknown'
+              : row.modelsUsedForDetail.join(', '),
+          width: 532,
+        ),
         _DetailText('Status', row.status),
         _DetailText('Tags', row.tags.join(', ')),
         _DetailText('Pinned', row.isPinned ? 'Yes' : 'No'),
@@ -141,18 +182,23 @@ class _MetadataGrid extends StatelessWidget {
       ],
     );
   }
+
+  String _tokensWithShare(SessionRowViewModel row, int tokens) {
+    return '$tokens (${row.tokenShareText(tokens)})';
+  }
 }
 
 class _DetailText extends StatelessWidget {
-  const _DetailText(this.label, this.value);
+  const _DetailText(this.label, this.value, {this.width = 260});
 
   final String label;
   final String value;
+  final double width;
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 320,
+      width: width,
       child: Text('$label: $value', overflow: TextOverflow.ellipsis),
     );
   }
@@ -176,8 +222,8 @@ class _ActionArea extends StatelessWidget {
     final canResume = commandSet.canResume;
     final terminalEnabled = commandSet.terminalLaunchCommand != null;
     return Wrap(
-      spacing: 8,
-      runSpacing: 8,
+      spacing: 6,
+      runSpacing: 6,
       children: [
         _copyAction(context, 'Copy session path', row.sourcePathForDisplay),
         _copyAction(

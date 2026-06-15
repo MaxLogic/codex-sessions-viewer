@@ -37,6 +37,8 @@ void main() {
     ]) {
       expect(find.text(column), findsWidgets);
     }
+    expect(find.byType(ListView), findsOneWidget);
+    expect(find.byType(DataTable), findsNothing);
 
     for (final filter in const [
       'Errors only',

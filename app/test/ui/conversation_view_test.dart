@@ -131,4 +131,35 @@ void main() {
     expect(copied.single, contains('Full message body'));
     expect(find.text('Message Markdown copied.'), findsOneWidget);
   });
+
+  testWidgets('message cards expose readable per-message semantics', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'm1',
+                number: 1,
+                author: ConversationAuthor.assistant,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Short answer body for the screen reader.',
+                body: 'Short answer body for the screen reader.',
+                tokenCount: 12,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(
+      find.bySemanticsLabel(
+        'Message 1 Assistant. Short answer body for the screen reader.',
+      ),
+      findsOneWidget,
+    );
+  });
 }

@@ -47,6 +47,33 @@ void main() {
     expect(actions[1].payload, 'codex resume abc123');
   });
 
+  testWidgets('path cell copy button copies the visible path', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(5000, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final actions = <SessionActionRequest>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionsScreen(
+            initialRows: [_row(sessionId: 'abc123')],
+            onSessionAction: (request) async {
+              actions.add(request);
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.bySemanticsLabel('Copy path for Parser cache'));
+    await tester.pumpAndSettle();
+
+    expect(actions.single.action, SessionRowAction.copyPath);
+    expect(
+      actions.single.payload,
+      r'F:\projects\MaxLogic\codex-sessions-viewer',
+    );
+  });
+
   testWidgets('resume actions are disabled when session id is unavailable', (
     tester,
   ) async {
@@ -135,6 +162,9 @@ void main() {
     );
 
     await tester.tap(find.text('Parser cache').first);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Commands'));
     await tester.pumpAndSettle();
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Run'));

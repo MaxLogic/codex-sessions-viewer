@@ -200,7 +200,12 @@ class _ConversationMessageCard extends StatelessWidget {
         : message.body;
     return Semantics(
       container: true,
-      label: 'Message ${message.number} ${message.authorLabel}',
+      label: _messageSemanticsLabel(
+        message,
+        collapsedToolOutput
+            ? 'Tool output collapsed, ${message.lineCount} lines.'
+            : body,
+      ),
       explicitChildNodes: true,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
@@ -286,6 +291,20 @@ class _ConversationMessageCard extends StatelessWidget {
       message.body,
       '',
     ].join('\n');
+  }
+
+  String _messageSemanticsLabel(
+    ConversationMessageViewModel message,
+    String body,
+  ) {
+    final normalizedBody = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalizedBody.isEmpty) {
+      return 'Message ${message.number} ${message.authorLabel}. Empty message.';
+    }
+    final readableBody = normalizedBody.length <= 1000
+        ? normalizedBody
+        : '${normalizedBody.substring(0, 1000)} truncated.';
+    return 'Message ${message.number} ${message.authorLabel}. $readableBody';
   }
 }
 

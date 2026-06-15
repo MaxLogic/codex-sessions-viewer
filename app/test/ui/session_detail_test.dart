@@ -20,11 +20,18 @@ void main() {
       'Working directory: /home/pawel/projects/codex-viewer',
       'Duration: 1h 30m',
       'Total messages: 9',
-      'User messages: 3',
-      'Assistant messages: 4',
-      'Tool calls: 2',
-      'Tokens: 100 input, 200 output, 50 cached, 350 total',
-      'Models: gpt-5.4, gpt-5.4-mini',
+      'User message count: 3',
+      'Assistant message count: 4',
+      'Tool call count: 2',
+      'Total tokens: 400',
+      'Input tokens: 100',
+      'Output tokens: 200',
+      'Cached input tokens: 50 (12.5%)',
+      'User message tokens: 100 (25%)',
+      'AI response tokens: 200 (50%)',
+      'Tool call tokens: 50 (12.5%)',
+      'Estimated cost: \$0.1234',
+      'Models used: gpt-5.4, gpt-5.4-mini',
       'Status: Available',
       'Tags: Flutter, accessibility',
       'Pinned: Yes',
@@ -97,6 +104,27 @@ void main() {
     expect(actions, [SessionDetailAction.reparse]);
     expect(find.text('Copied session path.'), findsOneWidget);
   });
+
+  testWidgets(
+    'keeps command preview collapsed in the selected-session header',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1200, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: SessionDetailPane(row: _detailRow())),
+        ),
+      );
+
+      expect(find.text('Commands'), findsOneWidget);
+      expect(find.text('Plain resume command:'), findsNothing);
+
+      await tester.tap(find.text('Commands'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Plain resume command:'), findsOneWidget);
+    },
+  );
 }
 
 SessionRowViewModel _detailRow() {
@@ -121,7 +149,12 @@ SessionRowViewModel _detailRow() {
     inputTokens: 100,
     outputTokens: 200,
     cachedInputTokens: 50,
-    totalTokens: 350,
+    totalTokens: 400,
+    userMessageTokens: 100,
+    assistantResponseTokens: 200,
+    toolCallTokens: 50,
+    estimatedCostText: '0.1234',
+    costUnknown: false,
     model: 'gpt-5.4',
     modelsUsed: const ['gpt-5.4', 'gpt-5.4-mini'],
     tags: const ['Flutter', 'accessibility'],
