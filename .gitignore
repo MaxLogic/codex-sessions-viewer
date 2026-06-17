@@ -1,2 +1,16 @@
 .agents/
 release/
+
+# Flutter app generated state
+app/.dart_tool/
+app/build/
+app/.flutter-plugins-dependencies
+app/flutter_*.log
+
+# Local runtime data
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
