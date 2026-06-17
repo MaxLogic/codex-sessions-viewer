@@ -64,10 +64,12 @@ class SessionDetailPane extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Selected: ${row.title}'),
-          const SizedBox(height: 4),
-          Text(row.title, style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 8),
+          if (row.title.trim().isNotEmpty) ...[
+            Text('Selected: ${row.title}'),
+            const SizedBox(height: 4),
+            Text(row.title, style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 8),
+          ],
           _MetadataGrid(row: row),
           const SizedBox(height: 10),
           _ActionArea(
@@ -360,8 +362,7 @@ class _ActionArea extends StatelessWidget {
 
   String _conversationMarkdown(SessionRowViewModel row) {
     return [
-      '# ${row.title}',
-      '',
+      if (row.title.trim().isNotEmpty) ...['# ${row.title}', ''],
       for (final message in row.conversationMessages) ...[
         '## Message ${message.number} - ${message.authorLabel}',
         '',

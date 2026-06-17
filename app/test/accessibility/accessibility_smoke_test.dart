@@ -76,7 +76,11 @@ void main() {
     );
 
     expect(
-      find.bySemanticsLabel('Select session Parser review'),
+      find.bySemanticsLabel('Summary Reviewed JSONL formats'),
+      findsOneWidget,
+    );
+    expect(
+      find.bySemanticsLabel(RegExp(r'^Last Message Date \d')),
       findsOneWidget,
     );
     expect(find.bySemanticsLabel('Actions for Parser review'), findsOneWidget);

@@ -108,7 +108,7 @@ void main() {
       r'\\localhost\F$\projects\MaxLogic\codex-sessions-viewer',
     );
     expect(session.summary, 'Synthetic JSONL parser fixture');
-    expect(session.title, 'Open the viewer task list.');
+    expect(session.title, isNull);
     expect(session.modelIds, contains('gpt-5.5-thinking'));
     expect(session.startedAtUtc, DateTime.utc(2026, 6, 10, 10));
     expect(session.lastMessageAtUtc, DateTime.utc(2026, 6, 10, 10, 0, 7));
@@ -136,6 +136,27 @@ void main() {
     expect(session.usage.outputTokens, 21);
     expect(session.usage.cachedInputTokens, isNull);
     expect(session.usage.totalTokens, 63);
+  });
+
+  test('uses explicit JSONL title metadata and ignores auto summary', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}renamed.jsonl');
+    await source.writeAsString('''
+{"timestamp":"2026-06-10T12:00:00Z","type":"session_meta","payload":{"id":"renamed-session","cwd":"F:\\\\repo","title":"Renamed session"}}
+{"timestamp":"2026-06-10T12:00:01Z","type":"turn_context","payload":{"summary":"auto","model":"gpt-5.5-thinking"}}
+{"timestamp":"2026-06-10T12:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions"}]}}
+''');
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.title, 'Renamed session');
+    expect(result.session!.summary, isNull);
+    expect(
+      result.session!.messages.single.firstLine,
+      '# AGENTS.md instructions',
+    );
   });
 
   test('captures observed token usage fields and custom tool calls', () async {

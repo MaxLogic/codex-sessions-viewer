@@ -28,19 +28,96 @@ class RuntimeSessionController {
   final File databaseFile;
 
   Future<SessionsRefreshResult> loadCachedRows() async {
-    final settings = await SettingsRepository(settingsFile).loadOrCreate();
     final db = sqlite3.open(databaseFile.path);
     try {
-      final pricing = PricingRepository(db).loadCached(settings.pricing);
-      final rows = _loadRows(db, pricing: pricing);
+      _cleanSessionMetadataPlaceholders(db);
+      _backfillAutomaticProjects(db);
+      final rows = _loadRows(db);
       return SessionsRefreshResult(
         rows: rows,
         statusMessage: rows.isEmpty
             ? ''
-            : 'Loaded ${_plural(rows.length, 'session')} from the previous scan.',
+            : 'Loaded ${rows.length} of ${rows.length} sessions from the previous scan.',
       );
     } finally {
       db.close();
+    }
+  }
+
+  Future<SessionsRefreshResult> loadCachedRowsInBackground({
+    SessionsRefreshProgressCallback? onProgress,
+    int batchSize = 250,
+  }) async {
+    final messages = ReceivePort();
+    final errors = ReceivePort();
+    final exits = ReceivePort();
+    Isolate? isolate;
+    try {
+      isolate = await Isolate.spawn<_BackgroundCachedRowsRequest>(
+        _backgroundCachedRowsEntry,
+        _BackgroundCachedRowsRequest(
+          databaseFilePath: databaseFile.path,
+          sendPort: messages.sendPort,
+          batchSize: batchSize,
+        ),
+        onError: errors.sendPort,
+        onExit: exits.sendPort,
+      );
+
+      final result = Completer<SessionsRefreshResult>();
+      late StreamSubscription<Object?> messageSubscription;
+      late StreamSubscription<Object?> errorSubscription;
+      late StreamSubscription<Object?> exitSubscription;
+
+      void finishError(Object error, [StackTrace? stackTrace]) {
+        if (!result.isCompleted) {
+          result.completeError(error, stackTrace);
+        }
+      }
+
+      messageSubscription = messages.listen((message) {
+        if (message is _BackgroundRefreshProgress) {
+          onProgress?.call(message.progress);
+          return;
+        }
+        if (message is _BackgroundRefreshDone) {
+          if (!result.isCompleted) {
+            result.complete(message.result);
+          }
+          return;
+        }
+        if (message is _BackgroundRefreshError) {
+          finishError(
+            StateError(message.error),
+            StackTrace.fromString(message.stackTrace),
+          );
+        }
+      });
+      errorSubscription = errors.listen((message) {
+        finishError(
+          StateError('Background cached session load failed. $message'),
+        );
+      });
+      exitSubscription = exits.listen((_) {
+        if (!result.isCompleted) {
+          finishError(
+            StateError(
+              'Background cached session load exited before completion.',
+            ),
+          );
+        }
+      });
+
+      return await result.future.whenComplete(() async {
+        await messageSubscription.cancel();
+        await errorSubscription.cancel();
+        await exitSubscription.cancel();
+      });
+    } finally {
+      messages.close();
+      errors.close();
+      exits.close();
+      isolate?.kill(priority: Isolate.immediate);
     }
   }
 
@@ -48,6 +125,8 @@ class RuntimeSessionController {
     final settings = await SettingsRepository(settingsFile).loadOrCreate();
     final db = sqlite3.open(databaseFile.path);
     try {
+      _cleanSessionMetadataPlaceholders(db);
+      _backfillAutomaticProjects(db);
       final pricing = PricingRepository(db).loadCached(settings.pricing);
       final rows = _loadRows(
         db,
@@ -145,6 +224,7 @@ class RuntimeSessionController {
     var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
     final pendingParsedSessions = <ScannedSessionFile>[];
     try {
+      _cleanSessionMetadataPlaceholders(db);
       scanRunId = _startScanRun(db);
       final activeScanRunId = scanRunId;
 
@@ -168,7 +248,7 @@ class RuntimeSessionController {
           SessionsRefreshProgress(
             rows: cachedRows,
             statusMessage:
-                'Loaded ${_plural(cachedRows.length, 'session')} from the previous scan. Scanning started.',
+                'Loaded ${cachedRows.length} of ${cachedRows.length} sessions from the previous scan. Scanning started.',
           ),
         );
       }
@@ -294,6 +374,48 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
   }
 }
 
+Future<void> _backgroundCachedRowsEntry(
+  _BackgroundCachedRowsRequest request,
+) async {
+  try {
+    final db = sqlite3.open(request.databaseFilePath);
+    try {
+      _cleanSessionMetadataPlaceholders(db);
+      _backfillAutomaticProjects(db);
+      final total = _visibleRowCount(db);
+      final rows = <SessionRowViewModel>[];
+      var offset = 0;
+      while (offset < total) {
+        rows.addAll(_loadRows(db, limit: request.batchSize, offset: offset));
+        offset = rows.length;
+        request.sendPort.send(
+          _BackgroundRefreshProgress(
+            SessionsRefreshProgress(
+              rows: List.unmodifiable(rows),
+              statusMessage:
+                  'Loaded ${rows.length} of $total sessions from the previous scan.',
+            ),
+          ),
+        );
+      }
+      request.sendPort.send(
+        _BackgroundRefreshDone(
+          SessionsRefreshResult(
+            rows: List.unmodifiable(rows),
+            statusMessage: '',
+          ),
+        ),
+      );
+    } finally {
+      db.close();
+    }
+  } on Object catch (error, stackTrace) {
+    request.sendPort.send(
+      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+    );
+  }
+}
+
 class _BackgroundRefreshRequest {
   const _BackgroundRefreshRequest({
     required this.settingsFilePath,
@@ -304,6 +426,18 @@ class _BackgroundRefreshRequest {
   final String settingsFilePath;
   final String databaseFilePath;
   final SendPort sendPort;
+}
+
+class _BackgroundCachedRowsRequest {
+  const _BackgroundCachedRowsRequest({
+    required this.databaseFilePath,
+    required this.sendPort,
+    required this.batchSize,
+  });
+
+  final String databaseFilePath;
+  final SendPort sendPort;
+  final int batchSize;
 }
 
 class _BackgroundRefreshProgress {
@@ -329,8 +463,9 @@ void _persistParsedSessions(Database db, List<ScannedSessionFile> sessions) {
   db.execute('begin immediate');
   try {
     final now = DateTime.now().toUtc().toIso8601String();
+    final resolver = _ProjectPathResolver();
     for (final session in sessions) {
-      _upsertParsedSession(db, session, now);
+      _upsertParsedSession(db, session, now, resolver);
     }
     db.execute('commit');
   } on Object {
@@ -448,8 +583,9 @@ void _persistScan(
       );
     }
     if (persistSessions) {
+      final resolver = _ProjectPathResolver();
       for (final session in result.sessions) {
-        _upsertParsedSession(db, session, now);
+        _upsertParsedSession(db, session, now, resolver);
       }
     }
     for (final status in result.fileStatuses) {
@@ -471,6 +607,7 @@ void _upsertParsedSession(
   Database db,
   ScannedSessionFile scannedSession,
   String now,
+  _ProjectPathResolver projectResolver,
 ) {
   final parsed = scannedSession.parsedSession;
   final sourceType = scannedSession.sourceType == SessionSourceType.windows
@@ -480,6 +617,10 @@ void _upsertParsedSession(
   final hasErrors =
       parsed.messages.any((message) => message.hasError) ||
       parsed.toolCalls.any((tool) => tool.hasError);
+  final autoProject = projectResolver.resolve(
+    parsed.workingDirectoryDisplay,
+    sourceType: scannedSession.sourceType,
+  );
   SessionSearchIndex(db).upsert(
     SessionSearchDocument(
       id: parsed.internalId,
@@ -487,8 +628,8 @@ void _upsertParsedSession(
       sourceFilePath: scannedSession.sourcePath,
       displayPath: scannedSession.mappedPath.displayPath,
       platformPath: scannedSession.mappedPath.platformPath,
-      title: parsed.title ?? '',
-      summary: parsed.summary ?? '',
+      title: _cleanDisplayTitle(parsed.title),
+      summary: _cleanDisplaySummary(parsed.summary),
       userMessages: _messagesForAuthor(parsed, CodexMessageAuthorType.user),
       assistantMessages: _messagesForAuthor(
         parsed,
@@ -510,6 +651,7 @@ void _upsertParsedSession(
       hasToolCalls: parsed.toolCalls.isNotEmpty,
       hasErrors: hasErrors,
       totalTokens: parsed.usage.totalTokens,
+      projectName: autoProject?.name ?? '',
     ),
   );
   db.execute(
@@ -532,6 +674,11 @@ void _upsertParsedSession(
       input_tokens = ?,
       output_tokens = ?,
       cached_input_tokens = ?,
+      project_id = case when project_override = 1 then project_id else ? end,
+      project_name_snapshot = case
+        when project_override = 1 then project_name_snapshot
+        else ?
+      end,
       last_scanned_utc = ?,
       last_parsed_utc = ?
     where id = ?
@@ -559,11 +706,18 @@ void _upsertParsedSession(
       parsed.usage.inputTokens,
       parsed.usage.outputTokens,
       parsed.usage.cachedInputTokens,
+      autoProject == null
+          ? null
+          : _upsertAutoProject(db, autoProject.name, now),
+      autoProject?.name,
       now,
       now,
       parsed.internalId,
     ],
   );
+  if (autoProject != null) {
+    _updateSearchProjectIfAutomatic(db, parsed.internalId, autoProject.name);
+  }
   _replaceMessages(db, parsed, now);
   _replaceToolCalls(db, parsed);
 }
@@ -730,6 +884,8 @@ List<SessionRowViewModel> _loadRows(
   Database db, {
   bool includeMessages = false,
   String? sessionId,
+  int? limit,
+  int offset = 0,
   UsagePricingCatalog pricing = const UsagePricingCatalog({}),
 }) {
   final filters = [
@@ -738,8 +894,14 @@ List<SessionRowViewModel> _loadRows(
     "coalesce(s.session_id, '') <> ''",
     if (sessionId != null) 's.id = ?',
   ];
-  final rows = db.select(
-    '''
+  final limitClause = limit == null ? '' : 'limit ? offset ?';
+  final args = <Object?>[?sessionId];
+  if (limit != null) {
+    args
+      ..add(limit)
+      ..add(offset);
+  }
+  final rows = db.select('''
     select
       s.id,
       s.session_id,
@@ -750,6 +912,7 @@ List<SessionRowViewModel> _loadRows(
       s.working_directory_display,
       s.started_at_utc,
       s.last_message_at_utc,
+      nullif(trim(s.title), '') as row_title,
       s.title,
       s.summary,
       s.message_count,
@@ -790,13 +953,31 @@ List<SessionRowViewModel> _loadRows(
     where ${filters.join(' and ')}
     order by coalesce(s.last_message_at_utc, s.started_at_utc, s.updated_at_utc) desc,
              s.id asc
-    ''',
-    [?sessionId],
-  );
+    $limitClause
+    ''', args);
+  final sessionIds = [for (final row in rows) row['id'] as String];
+  final tagsBySessionId = _loadTagsBySessionId(db, sessionIds);
   return [
     for (final row in rows)
-      _loadRow(db, row, includeMessages: includeMessages, pricing: pricing),
+      _loadRow(
+        db,
+        row,
+        includeMessages: includeMessages,
+        pricing: pricing,
+        tagsBySessionId: tagsBySessionId,
+      ),
   ];
+}
+
+int _visibleRowCount(Database db) {
+  final row = db.select('''
+    select count(*) as count
+    from sessions s
+    where s.parse_status = 'available'
+      and s.scan_status = 'available'
+      and coalesce(s.session_id, '') <> ''
+    ''').single;
+  return row['count'] as int? ?? 0;
 }
 
 SessionRowViewModel _loadRow(
@@ -804,6 +985,7 @@ SessionRowViewModel _loadRow(
   Row row, {
   required bool includeMessages,
   required UsagePricingCatalog pricing,
+  required Map<String, List<String>> tagsBySessionId,
 }) {
   final inputTokens = row['input_tokens'] as int? ?? 0;
   final outputTokens = row['output_tokens'] as int? ?? 0;
@@ -840,13 +1022,14 @@ SessionRowViewModel _loadRow(
     platform: (row['source_type'] as String?) == 'wsl'
         ? SessionRowPlatform.wsl
         : SessionRowPlatform.windows,
-    project: row['project_name_snapshot'] as String? ?? 'Unassigned',
+    project: row['project_name_snapshot'] as String? ?? '',
     path:
+        row['working_directory_display'] as String? ??
         row['display_path'] as String? ??
         row['source_file_path'] as String? ??
         '',
-    title: row['title'] as String? ?? 'Untitled session',
-    summary: row['summary'] as String? ?? '',
+    title: _cleanDisplayTitle(row['row_title'] as String?),
+    summary: _cleanDisplaySummary(row['summary'] as String?),
     messageCount: row['message_count'] as int? ?? 0,
     userMessageCount: row['user_message_count'] as int? ?? 0,
     assistantMessageCount: row['assistant_message_count'] as int? ?? 0,
@@ -866,7 +1049,7 @@ SessionRowViewModel _loadRow(
     costUnknown: estimate.costUnknown,
     model: model,
     modelsUsed: _decodeMembership(row['models_used'] as String?),
-    tags: _loadTags(db, row['id'] as String),
+    tags: tagsBySessionId[row['id'] as String] ?? const [],
     status: _rowStatus(row),
     isPinned: (row['is_pinned'] as int? ?? 0) == 1,
     isArchived: (row['is_archived'] as int? ?? 0) == 1,
@@ -877,18 +1060,28 @@ SessionRowViewModel _loadRow(
   );
 }
 
-List<String> _loadTags(Database db, String sessionId) {
-  final rows = db.select(
-    '''
-    select t.name
+Map<String, List<String>> _loadTagsBySessionId(
+  Database db,
+  List<String> sessionIds,
+) {
+  if (sessionIds.isEmpty) {
+    return const {};
+  }
+  final placeholders = List.filled(sessionIds.length, '?').join(', ');
+  final rows = db.select('''
+    select st.session_id, t.name
     from session_tags st
     join tags t on t.id = st.tag_id
-    where st.session_id = ?
-    order by t.name
-    ''',
-    [sessionId],
-  );
-  return [for (final row in rows) row['name'] as String];
+    where st.session_id in ($placeholders)
+    order by st.session_id, t.name
+    ''', sessionIds);
+  final result = <String, List<String>>{};
+  for (final row in rows) {
+    (result[row['session_id'] as String] ??= <String>[]).add(
+      row['name'] as String,
+    );
+  }
+  return result;
 }
 
 List<ConversationMessageViewModel> _loadMessages(
@@ -932,6 +1125,233 @@ List<ConversationMessageViewModel> _loadMessages(
         hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
       ),
   ];
+}
+
+int _upsertAutoProject(Database db, String name, String now) {
+  db.execute(
+    '''
+    insert into projects (name, description, is_active, created_at_utc, updated_at_utc)
+    values (?, ?, 1, ?, ?)
+    on conflict(name) do update set updated_at_utc = excluded.updated_at_utc
+    ''',
+    [name, 'Auto-detected from session working directory.', now, now],
+  );
+  return db.select('select id from projects where name = ?', [
+        name,
+      ]).single['id']
+      as int;
+}
+
+String _cleanDisplayTitle(String? value) {
+  final trimmed = value?.trim();
+  if (trimmed == null || trimmed.isEmpty) {
+    return '';
+  }
+  if (trimmed.toLowerCase().startsWith('# agents.md')) {
+    return '';
+  }
+  return trimmed;
+}
+
+String _cleanDisplaySummary(String? value) {
+  final trimmed = value?.trim();
+  if (trimmed == null || trimmed.isEmpty) {
+    return '';
+  }
+  if (trimmed.toLowerCase() == 'auto') {
+    return '';
+  }
+  return trimmed;
+}
+
+void _cleanSessionMetadataPlaceholders(Database db) {
+  db.execute('begin immediate');
+  try {
+    db.execute('''
+      update sessions
+      set title = null
+      where lower(trim(coalesce(title, ''))) like '# agents.md%'
+      ''');
+    db.execute('''
+      update sessions
+      set summary = null
+      where lower(trim(coalesce(summary, ''))) = 'auto'
+      ''');
+    db.execute('''
+      update session_search
+      set title = ''
+      where lower(trim(coalesce(title, ''))) like '# agents.md%'
+      ''');
+    db.execute('''
+      update session_search
+      set summary = ''
+      where lower(trim(coalesce(summary, ''))) = 'auto'
+      ''');
+    db.execute('commit');
+  } on Object {
+    db.execute('rollback');
+    rethrow;
+  }
+}
+
+void _updateSearchProjectIfAutomatic(
+  Database db,
+  String sessionId,
+  String projectName,
+) {
+  final rows = db.select(
+    'select rowid, project_override from sessions where id = ?',
+    [sessionId],
+  );
+  if (rows.isEmpty || (rows.single['project_override'] as int? ?? 0) == 1) {
+    return;
+  }
+  db.execute('update session_search set project_name = ? where rowid = ?', [
+    projectName,
+    rows.single['rowid'] as int,
+  ]);
+}
+
+void _backfillAutomaticProjects(Database db) {
+  final rows = db.select('''
+    select id, source_type, working_directory_display
+    from sessions
+    where coalesce(project_override, 0) = 0
+      and coalesce(trim(project_name_snapshot), '') = ''
+      and coalesce(trim(working_directory_display), '') <> ''
+      and parse_status = 'available'
+      and scan_status = 'available'
+    ''');
+  if (rows.isEmpty) {
+    return;
+  }
+  final resolver = _ProjectPathResolver();
+  final resolvedRows = <({String sessionId, String projectName})>[];
+  for (final row in rows) {
+    final sourceType = (row['source_type'] as String?) == 'wsl'
+        ? SessionSourceType.wsl
+        : SessionSourceType.windows;
+    final autoProject = resolver.resolve(
+      row['working_directory_display'] as String?,
+      sourceType: sourceType,
+    );
+    final projectName = autoProject?.name.trim() ?? '';
+    if (projectName.isNotEmpty) {
+      resolvedRows.add((
+        sessionId: row['id'] as String,
+        projectName: projectName,
+      ));
+    }
+  }
+  if (resolvedRows.isEmpty) {
+    return;
+  }
+  db.execute('begin immediate');
+  try {
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final row in resolvedRows) {
+      final projectName = row.projectName;
+      final projectId = _upsertAutoProject(db, projectName, now);
+      final sessionId = row.sessionId;
+      db.execute(
+        '''
+        update sessions
+        set project_id = ?,
+            project_name_snapshot = ?,
+            updated_at_utc = ?
+        where id = ?
+          and coalesce(project_override, 0) = 0
+        ''',
+        [projectId, projectName, now, sessionId],
+      );
+      _updateSearchProjectIfAutomatic(db, sessionId, projectName);
+    }
+    db.execute('commit');
+  } on Object {
+    db.execute('rollback');
+    rethrow;
+  }
+}
+
+class _ResolvedProjectPath {
+  const _ResolvedProjectPath(this.name);
+
+  final String name;
+}
+
+class _ProjectPathResolver {
+  final _cache = <String, _ResolvedProjectPath?>{};
+
+  _ResolvedProjectPath? resolve(
+    String? workingDirectory, {
+    required SessionSourceType sourceType,
+  }) {
+    final path = workingDirectory?.trim();
+    if (path == null || path.isEmpty) {
+      return null;
+    }
+    return _cache.putIfAbsent('$sourceType|$path', () {
+      return switch (sourceType) {
+        SessionSourceType.windows => _resolveWindows(path),
+        SessionSourceType.wsl => _resolveWsl(path),
+      };
+    });
+  }
+
+  _ResolvedProjectPath? _resolveWindows(String path) {
+    final directory = Directory(path);
+    if (!directory.existsSync()) {
+      return _projectFromPath(path);
+    }
+    var current = directory.absolute;
+    while (true) {
+      if (Directory(p.join(current.path, '.git')).existsSync() ||
+          File(p.join(current.path, '.git')).existsSync()) {
+        return _projectFromPath(current.path);
+      }
+      final parent = current.parent;
+      if (parent.path == current.path) {
+        break;
+      }
+      current = parent;
+    }
+    return _projectFromPath(directory.path);
+  }
+
+  _ResolvedProjectPath? _resolveWsl(String path) {
+    try {
+      final result = Process.runSync('wsl.exe', [
+        'sh',
+        '-lc',
+        'cd "\$1" 2>/dev/null && '
+            'root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd) && '
+            'basename "\$root"',
+        'sh',
+        path,
+      ]);
+      if (result.exitCode == 0) {
+        final name = result.stdout.toString().trim().split('\n').last.trim();
+        if (name.isNotEmpty) {
+          return _ResolvedProjectPath(name);
+        }
+      }
+    } on Object {
+      // WSL may be unavailable during tests/startup; use the path segment.
+    }
+    return _projectFromPath(path);
+  }
+
+  _ResolvedProjectPath? _projectFromPath(String path) {
+    final segments = path
+        .replaceAll(r'\', '/')
+        .split('/')
+        .where((segment) => segment.trim().isNotEmpty)
+        .toList();
+    if (segments.isEmpty) {
+      return null;
+    }
+    return _ResolvedProjectPath(segments.last);
+  }
 }
 
 String _messagesForAuthor(

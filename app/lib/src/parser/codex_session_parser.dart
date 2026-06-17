@@ -139,8 +139,8 @@ class CodexSessionParser {
       workingDirectoryDisplay: workingDirectory,
       workingDirectoryPlatform: workingDirectory,
       workingDirectoryUnc: _string(json['working_directory_unc']),
-      title: _string(json['title']),
-      summary: _string(json['summary']),
+      title: _cleanTitle(_string(json['title'])),
+      summary: _cleanSummary(_string(json['summary'])),
       startedAtUtc: _dateTime(json['created_at']),
       lastMessageAtUtc: lastMessageAtUtc,
       modelIds: Set.unmodifiable(modelIds),
@@ -184,6 +184,7 @@ class CodexSessionParser {
       if (recordType == 'session_meta') {
         sessionId = _string(payload['id']) ?? sessionId;
         workingDirectory = _string(payload['cwd']) ?? workingDirectory;
+        title = _cleanTitle(_string(payload['title'])) ?? title;
         sourceFileUncPath = _string(payload['source_file_unc_path']);
         startedAtUtc =
             _dateTime(payload['timestamp']) ?? timestamp ?? startedAtUtc;
@@ -193,7 +194,8 @@ class CodexSessionParser {
         workingDirectory = _string(payload['cwd']) ?? workingDirectory;
         workingDirectoryUnc =
             _string(payload['working_directory_unc']) ?? workingDirectoryUnc;
-        summary = _string(payload['summary']) ?? summary;
+        title = _cleanTitle(_string(payload['title'])) ?? title;
+        summary = _cleanSummary(_string(payload['summary'])) ?? summary;
         final model = _string(payload['model']);
         if (model != null && model.isNotEmpty) {
           modelIds.add(model);
@@ -257,9 +259,6 @@ class CodexSessionParser {
             hasError: false,
           ),
         );
-        title ??= authorType == CodexMessageAuthorType.user
-            ? _firstLine(content)
-            : null;
         lastMessageAtUtc = _maxDateTime(lastMessageAtUtc, timestamp);
         continue;
       }
@@ -286,9 +285,6 @@ class CodexSessionParser {
             hasError: false,
           ),
         );
-        title ??= authorType == CodexMessageAuthorType.user
-            ? _firstLine(content)
-            : null;
         lastMessageAtUtc = _maxDateTime(lastMessageAtUtc, timestamp);
         continue;
       }
@@ -395,8 +391,8 @@ class CodexSessionParser {
       workingDirectoryDisplay: workingDirectory,
       workingDirectoryPlatform: workingDirectory,
       workingDirectoryUnc: workingDirectoryUnc,
-      title: title,
-      summary: summary,
+      title: _cleanTitle(title),
+      summary: _cleanSummary(summary),
       startedAtUtc: startedAtUtc,
       lastMessageAtUtc: lastMessageAtUtc,
       modelIds: Set.unmodifiable(modelIds),
@@ -871,6 +867,28 @@ Map<String, Object?> _map(Object? value) =>
     value is Map ? value.cast<String, Object?>() : <String, Object?>{};
 
 String? _string(Object? value) => value is String ? value : null;
+
+String? _cleanTitle(String? value) {
+  final trimmed = value?.trim();
+  if (trimmed == null || trimmed.isEmpty) {
+    return null;
+  }
+  if (trimmed.toLowerCase().startsWith('# agents.md')) {
+    return null;
+  }
+  return trimmed;
+}
+
+String? _cleanSummary(String? value) {
+  final trimmed = value?.trim();
+  if (trimmed == null || trimmed.isEmpty) {
+    return null;
+  }
+  if (trimmed.toLowerCase() == 'auto') {
+    return null;
+  }
+  return trimmed;
+}
 
 int? _int(Object? value) => value is int ? value : null;
 

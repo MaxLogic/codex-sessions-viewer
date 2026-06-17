@@ -145,6 +145,12 @@ class AppSettings {
       showIcons: true,
       nativeTitleBar: true,
       window: null,
+      sessionTable: SessionTableSettings(
+        columnWidths: {},
+        sorts: [
+          SessionTableSortSettings(column: 'last_message_at', ascending: false),
+        ],
+      ),
     ),
     terminal: TerminalSettings(
       defaultTerminal: 'alacritty',
@@ -493,6 +499,7 @@ class UiSettings {
     required this.showIcons,
     required this.nativeTitleBar,
     required this.window,
+    required this.sessionTable,
   });
 
   final AppThemeMode theme;
@@ -503,6 +510,7 @@ class UiSettings {
   final bool showIcons;
   final bool nativeTitleBar;
   final WindowPlacementSettings? window;
+  final SessionTableSettings sessionTable;
 
   UiSettings copyWith({
     AppThemeMode? theme,
@@ -513,6 +521,7 @@ class UiSettings {
     bool? showIcons,
     bool? nativeTitleBar,
     Object? window = _sentinel,
+    SessionTableSettings? sessionTable,
   }) => UiSettings(
     theme: theme ?? this.theme,
     useSystemAccentColor: useSystemAccentColor ?? this.useSystemAccentColor,
@@ -524,6 +533,7 @@ class UiSettings {
     window: window == _sentinel
         ? this.window
         : window as WindowPlacementSettings?,
+    sessionTable: sessionTable ?? this.sessionTable,
   );
 
   factory UiSettings.fromMap(
@@ -557,6 +567,10 @@ class UiSettings {
       'ui.native_title_bar',
     ),
     window: WindowPlacementSettings.fromMap(_table(map, 'window')),
+    sessionTable: SessionTableSettings.fromMap(
+      _table(map, 'session_table'),
+      defaults.sessionTable,
+    ),
   );
 
   Map<String, Object?> toTomlMap() => {
@@ -568,6 +582,7 @@ class UiSettings {
     'show_icons': showIcons,
     'native_title_bar': nativeTitleBar,
     if (window != null) 'window': window!.toTomlMap(),
+    'session_table': sessionTable.toTomlMap(),
   };
 
   @override
@@ -580,7 +595,8 @@ class UiSettings {
       showTextOnButtons == other.showTextOnButtons &&
       showIcons == other.showIcons &&
       nativeTitleBar == other.nativeTitleBar &&
-      window == other.window;
+      window == other.window &&
+      sessionTable == other.sessionTable;
 
   @override
   int get hashCode => Object.hash(
@@ -592,7 +608,88 @@ class UiSettings {
     showIcons,
     nativeTitleBar,
     window,
+    sessionTable,
   );
+}
+
+class SessionTableSettings {
+  const SessionTableSettings({required this.columnWidths, required this.sorts});
+
+  final Map<String, double> columnWidths;
+  final List<SessionTableSortSettings> sorts;
+
+  factory SessionTableSettings.fromMap(
+    Map<String, dynamic> map,
+    SessionTableSettings defaults,
+  ) {
+    final widthsMap = _table(map, 'column_widths');
+    final widths = <String, double>{...defaults.columnWidths};
+    for (final entry in widthsMap.entries) {
+      final value = entry.value;
+      if (value is num && value > 0) {
+        widths[entry.key] = value.toDouble();
+      }
+    }
+    final sortMaps = _listOfMaps(map, 'sorts', 'ui.session_table.sorts');
+    final sorts = sortMaps
+        .map(SessionTableSortSettings.fromMap)
+        .where((sort) => sort.column.isNotEmpty)
+        .toList(growable: false);
+    return SessionTableSettings(
+      columnWidths: Map.unmodifiable(widths),
+      sorts: sorts.isEmpty ? defaults.sorts : List.unmodifiable(sorts),
+    );
+  }
+
+  Map<String, Object?> toTomlMap() => {
+    'column_widths': columnWidths,
+    'sorts': [for (final sort in sorts) sort.toTomlMap()],
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is SessionTableSettings &&
+      _mapEquals(columnWidths, other.columnWidths) &&
+      _listEquals(sorts, other.sorts);
+
+  @override
+  int get hashCode =>
+      Object.hash(_mapHash(columnWidths), Object.hashAll(sorts));
+}
+
+class SessionTableSortSettings {
+  const SessionTableSortSettings({
+    required this.column,
+    required this.ascending,
+  });
+
+  final String column;
+  final bool ascending;
+
+  factory SessionTableSortSettings.fromMap(Map<String, dynamic> map) =>
+      SessionTableSortSettings(
+        column: _string(map, 'column', '', 'ui.session_table.sorts.column'),
+        ascending: _bool(
+          map,
+          'ascending',
+          true,
+          'ui.session_table.sorts.ascending',
+        ),
+      );
+
+  Map<String, Object?> toTomlMap() => {
+    'column': column,
+    'ascending': ascending,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is SessionTableSortSettings &&
+      column == other.column &&
+      ascending == other.ascending;
+
+  @override
+  int get hashCode => Object.hash(column, ascending);
 }
 
 class WindowPlacementSettings {
@@ -1265,8 +1362,41 @@ bool _mapEquals<K, V>(Map<K, V> left, Map<K, V> right) {
   return true;
 }
 
+bool _listEquals<T>(List<T> left, List<T> right) {
+  if (left.length != right.length) {
+    return false;
+  }
+  for (var i = 0; i < left.length; i++) {
+    if (left[i] != right[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int _mapHash<K, V>(Map<K, V> map) => Object.hashAll(
   map.entries.map((entry) => Object.hash(entry.key, entry.value)),
 );
+
+List<Map<String, dynamic>> _listOfMaps(
+  Map<String, dynamic> map,
+  String key,
+  String field,
+) {
+  final value = map[key];
+  if (value == null) {
+    return const [];
+  }
+  if (value is List) {
+    return [
+      for (final item in value)
+        if (item is Map)
+          item.cast<String, dynamic>()
+        else
+          throw SettingsValidationException(field, 'Expected TOML tables.'),
+    ];
+  }
+  throw SettingsValidationException(field, 'Expected a TOML array.');
+}
 
 const Object _sentinel = Object();

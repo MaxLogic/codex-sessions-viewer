@@ -181,6 +181,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         showIcons: _settings.ui.showIcons,
         nativeTitleBar: _settings.ui.nativeTitleBar,
         window: _settings.ui.window,
+        sessionTable: _settings.ui.sessionTable,
       ),
       terminal: TerminalSettings(
         defaultTerminal: _defaultTerminal.text,
@@ -534,6 +535,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           showIcons: showIcons ?? ui.showIcons,
           nativeTitleBar: nativeTitleBar ?? ui.nativeTitleBar,
           window: ui.window,
+          sessionTable: ui.sessionTable,
         ),
       );
     });

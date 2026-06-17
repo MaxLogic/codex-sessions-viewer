@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -100,6 +101,9 @@ class CodexSessionsViewerApp extends StatelessWidget {
                       onOpenSettings: onOpenSettings,
                       onSessionAction: (request) =>
                           _handleSessionAction(request),
+                      onTableStateChanged: (state) {
+                        unawaited(_saveSessionTableState(state));
+                      },
                     ),
                 usageScreen: UsageScreen(),
                 settingsScreen: SettingsScreen(initialSettings: settings),
@@ -200,6 +204,14 @@ class CodexSessionsViewerApp extends StatelessWidget {
       db.close();
     }
   }
+
+  Future<void> _saveSessionTableState(SessionTableSettings tableState) async {
+    final repository = SettingsRepository(settingsFile);
+    final settings = await repository.loadOrCreate();
+    await repository.save(
+      settings.copyWith(ui: settings.ui.copyWith(sessionTable: tableState)),
+    );
+  }
 }
 
 class _SessionsScreenLoader extends StatefulWidget {
@@ -210,6 +222,7 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.onRefreshWithProgress,
     required this.onOpenSettings,
     required this.onSessionAction,
+    required this.onTableStateChanged,
   });
 
   final AppSettings settings;
@@ -218,18 +231,22 @@ class _SessionsScreenLoader extends StatefulWidget {
   final SessionsRefreshWithProgress onRefreshWithProgress;
   final VoidCallback onOpenSettings;
   final SessionActionCallback onSessionAction;
+  final SessionTableStateChanged onTableStateChanged;
 
   @override
   State<_SessionsScreenLoader> createState() => _SessionsScreenLoaderState();
 }
 
 class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
-  late Future<SessionsRefreshResult> _cachedRows;
+  var _cachedRows = <SessionRowViewModel>[];
+  var _cachedStatusMessage = '';
+  var _cachedLoadGeneration = 0;
+  var _autoRefreshToken = 0;
 
   @override
   void initState() {
     super.initState();
-    _cachedRows = _controller.loadCachedRows();
+    _startCachedLoad();
   }
 
   @override
@@ -237,7 +254,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.settingsFile.path != widget.settingsFile.path ||
         oldWidget.databaseFile.path != widget.databaseFile.path) {
-      _cachedRows = _controller.loadCachedRows();
+      _startCachedLoad();
     }
   }
 
@@ -246,26 +263,59 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
     databaseFile: widget.databaseFile,
   );
 
+  void _startCachedLoad() {
+    final generation = ++_cachedLoadGeneration;
+    setState(() {
+      _cachedRows = const [];
+      _cachedStatusMessage = 'Loading previous sessions...';
+    });
+    unawaited(_loadCachedRows(generation));
+  }
+
+  Future<void> _loadCachedRows(int generation) async {
+    try {
+      final result = await _controller.loadCachedRowsInBackground(
+        onProgress: (progress) {
+          if (!mounted || generation != _cachedLoadGeneration) {
+            return;
+          }
+          setState(() {
+            _cachedRows = progress.rows ?? _cachedRows;
+            _cachedStatusMessage = progress.statusMessage;
+          });
+        },
+      );
+      if (!mounted || generation != _cachedLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _cachedRows = result.rows;
+        _cachedStatusMessage = '';
+        _autoRefreshToken++;
+      });
+    } on Object catch (error) {
+      if (!mounted || generation != _cachedLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _cachedStatusMessage = 'Failed to load cached sessions. $error';
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<SessionsRefreshResult>(
-      future: _cachedRows,
-      initialData: const SessionsRefreshResult(rows: [], statusMessage: ''),
-      builder: (context, snapshot) {
-        final cached = snapshot.data;
-        final statusMessage = snapshot.hasError
-            ? 'Failed to load cached sessions. ${snapshot.error}'
-            : cached?.statusMessage ?? '';
-        return SessionsScreen(
-          settings: widget.settings,
-          initialRows: cached?.rows ?? const [],
-          initialStatusMessage: statusMessage,
-          onRefreshWithProgress: widget.onRefreshWithProgress,
-          onOpenSettings: widget.onOpenSettings,
-          onSessionAction: widget.onSessionAction,
-          onLoadSessionDetail: _controller.loadSessionDetail,
-        );
-      },
+    return SessionsScreen(
+      settings: widget.settings,
+      initialRows: _cachedRows,
+      initialStatusMessage: _cachedStatusMessage,
+      autoRefreshToken: _autoRefreshToken,
+      onRefreshWithProgress: widget.onRefreshWithProgress,
+      onOpenSettings: widget.onOpenSettings,
+      onSessionAction: widget.onSessionAction,
+      onLoadSessionDetail: _controller.loadSessionDetail,
+      initialTableState: widget.settings.ui.sessionTable,
+      onTableStateChanged: widget.onTableStateChanged,
     );
   }
 }

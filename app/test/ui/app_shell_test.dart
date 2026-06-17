@@ -17,7 +17,7 @@ void main() {
       expect(find.bySemanticsLabel('${area.label} navigation'), findsOneWidget);
     }
     expect(find.text('Sessions'), findsWidgets);
-    expect(find.text('Session table'), findsOneWidget);
+    expect(find.text('Session table'), findsNothing);
 
     await tester.tap(find.bySemanticsLabel('Usage navigation'));
     await tester.pumpAndSettle();

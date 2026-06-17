@@ -125,9 +125,24 @@ void main() {
       expect(find.text('Plain resume command:'), findsOneWidget);
     },
   );
+
+  testWidgets('hides the title area when the session has no title', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionDetailPane(row: _detailRow(title: '')),
+        ),
+      ),
+    );
+
+    expect(find.text('Selected: '), findsNothing);
+    expect(find.text('Platform: WSL'), findsOneWidget);
+  });
 }
 
-SessionRowViewModel _detailRow() {
+SessionRowViewModel _detailRow({String title = 'Flutter accessibility spike'}) {
   return SessionRowViewModel(
     id: 'row-1',
     sessionId: 'abc123',
@@ -140,7 +155,7 @@ SessionRowViewModel _detailRow() {
     sourceFilePath: '/home/pawel/.codex/sessions/session.jsonl',
     displayPath: '/home/pawel/.codex/sessions/session.jsonl',
     workingDirectory: '/home/pawel/projects/codex-viewer',
-    title: 'Flutter accessibility spike',
+    title: title,
     summary: 'Session summary',
     messageCount: 9,
     userMessageCount: 3,

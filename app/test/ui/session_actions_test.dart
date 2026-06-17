@@ -218,7 +218,7 @@ SessionRowViewModel _row({
     displayPath: r'F:\projects\MaxLogic\codex-sessions-viewer',
     workingDirectory: r'F:\projects\MaxLogic\codex-sessions-viewer',
     title: 'Parser cache',
-    summary: 'Session summary',
+    summary: 'Parser cache',
     messageCount: 7,
     totalTokens: 1200,
     model: 'gpt-5.4',

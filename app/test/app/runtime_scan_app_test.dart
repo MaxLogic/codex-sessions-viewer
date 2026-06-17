@@ -146,6 +146,72 @@ void main() {
   });
 
   test(
+    'background cached startup load streams newest sessions first',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_cached_background_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      await _copyFixture('sample_windows_session.json', windowsRoot);
+      await _copyFixture('sample_wsl_session.json', wslRoot);
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          wsl: WslSettings(
+            distro: 'Ubuntu',
+            linuxHome: '/home/pawel',
+            linuxRootUnc: '${wslRoot.path}${Platform.pathSeparator}',
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      await controller.refresh();
+
+      final progressEvents = <SessionsRefreshProgress>[];
+      final result = await controller.loadCachedRowsInBackground(
+        onProgress: progressEvents.add,
+        batchSize: 1,
+      );
+
+      expect(progressEvents, hasLength(2));
+      expect(progressEvents.first.rows, hasLength(1));
+      expect(
+        progressEvents.first.statusMessage,
+        'Loaded 1 of 2 sessions from the previous scan.',
+      );
+      expect(progressEvents.first.rows!.single.title, 'WSL parser fixture');
+      expect(result.rows.map((row) => row.title), [
+        'WSL parser fixture',
+        'Windows parser fixture',
+      ]);
+    },
+  );
+
+  test(
     'runtime refresh status reports cached visible sessions separately',
     () async {
       final temp = await Directory.systemTemp.createTemp(
@@ -505,7 +571,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(refreshCalls, 1);
-    expect(find.text('runtime-row'), findsOneWidget);
+    expect(find.text('Loaded from runtime scan'), findsOneWidget);
   });
 
   test('runtime loads cached sessions before refresh is clicked', () async {
@@ -553,11 +619,159 @@ void main() {
 
     expect(cached.rows, hasLength(1));
     expect(cached.rows.single.title, 'Windows parser fixture');
-    expect(cached.rows.single.estimatedCostDisplay, '\$0.0575');
-    expect(cached.rows.single.userMessageTokens, 12);
-    expect(cached.rows.single.assistantResponseTokens, 31);
-    expect(cached.rows.single.modelsUsedForDetail, ['gpt-5.5-thinking']);
-    expect(cached.statusMessage, 'Loaded 1 session from the previous scan.');
+    expect(cached.rows.single.project, 'codex-sessions-viewer');
+    expect(cached.rows.single.estimatedCostDisplay, 'Cost unknown');
+    expect(
+      cached.statusMessage,
+      'Loaded 1 of 1 sessions from the previous scan.',
+    );
+
+    final detail = await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).loadSessionDetail(cached.rows.single.id);
+
+    expect(detail?.estimatedCostDisplay, '\$0.0575');
+    expect(detail?.userMessageTokens, 12);
+    expect(detail?.assistantResponseTokens, 31);
+    expect(detail?.modelsUsedForDetail, ['gpt-5.5-thinking']);
+  });
+
+  test('cached loading backfills auto projects for older sessions', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_cached_auto_project_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _copyFixture('sample_windows_session.json', windowsRoot);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    await controller.refresh();
+
+    final db = sqlite3.open(databaseFile.path);
+    addTearDown(db.close);
+    db.execute('''
+      update sessions
+      set project_id = null,
+          project_name_snapshot = null,
+          project_override = 0,
+          title = '# AGENTS.md instructions for this repo',
+          summary = 'auto'
+      ''');
+    db.execute('update session_search set project_name = ?', ['']);
+    db.execute('update session_search set title = ?, summary = ?', [
+      '# AGENTS.md instructions for this repo',
+      'auto',
+    ]);
+
+    final cached = await controller.loadCachedRows();
+    expect(cached.rows.single.project, 'codex-sessions-viewer');
+    expect(cached.rows.single.title, isEmpty);
+    expect(cached.rows.single.summary, isEmpty);
+    final row = db
+        .select(
+          'select title, summary, project_name_snapshot, project_override from sessions',
+        )
+        .single;
+    expect(row['title'], isNull);
+    expect(row['summary'], isNull);
+    expect(row['project_name_snapshot'], 'codex-sessions-viewer');
+    expect(row['project_override'], 0);
+  });
+
+  test('auto project assignment keeps manual overrides on rescan', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_auto_project_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _copyFixture('sample_windows_session.json', windowsRoot);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final first = await controller.refresh();
+    expect(first.rows.single.project, 'codex-sessions-viewer');
+
+    final db = sqlite3.open(databaseFile.path);
+    addTearDown(db.close);
+    db.execute(
+      '''
+      insert into projects (name, created_at_utc, updated_at_utc)
+      values (?, ?, ?)
+      ''',
+      [
+        'Manual Project',
+        DateTime.now().toUtc().toIso8601String(),
+        DateTime.now().toUtc().toIso8601String(),
+      ],
+    );
+    final manualId = db.lastInsertRowId;
+    db.execute(
+      '''
+      update sessions
+      set project_id = ?,
+          project_name_snapshot = ?,
+          project_override = 1
+      where id = ?
+      ''',
+      [manualId, 'Manual Project', first.rows.single.id],
+    );
+
+    final second = await controller.refresh();
+    expect(second.rows.single.project, 'Manual Project');
   });
 
   test(

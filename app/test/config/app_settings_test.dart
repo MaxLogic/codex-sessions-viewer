@@ -83,6 +83,16 @@ void main() {
           height: 800,
           isMaximized: true,
         ),
+        sessionTable: SessionTableSettings(
+          columnWidths: {'path': 320},
+          sorts: [
+            SessionTableSortSettings(
+              column: 'last_message_at',
+              ascending: false,
+            ),
+            SessionTableSortSettings(column: 'project', ascending: true),
+          ],
+        ),
       ),
       terminal: const TerminalSettings(
         defaultTerminal: 'windows_terminal',

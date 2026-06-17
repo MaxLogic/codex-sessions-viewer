@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
@@ -36,6 +37,7 @@ typedef SessionsRefreshWithProgress =
     );
 typedef SessionDetailLoader =
     Future<SessionRowViewModel?> Function(String sessionId);
+typedef SessionTableStateChanged = void Function(SessionTableSettings);
 
 class SessionActionRequest {
   const SessionActionRequest({
@@ -62,7 +64,10 @@ class SessionsScreen extends StatefulWidget {
     this.onSessionAction,
     this.onLoadSessionDetail,
     this.settings,
+    this.initialTableState,
+    this.onTableStateChanged,
     this.initialStatusMessage = '',
+    this.autoRefreshToken = 0,
   });
 
   final List<SessionRowViewModel> initialRows;
@@ -74,7 +79,10 @@ class SessionsScreen extends StatefulWidget {
   final SessionActionCallback? onSessionAction;
   final SessionDetailLoader? onLoadSessionDetail;
   final AppSettings? settings;
+  final SessionTableSettings? initialTableState;
+  final SessionTableStateChanged? onTableStateChanged;
   final String initialStatusMessage;
+  final int autoRefreshToken;
 
   @override
   State<SessionsScreen> createState() => _SessionsScreenState();
@@ -85,20 +93,36 @@ class _SessionsScreenState extends State<SessionsScreen> {
   final _pathController = TextEditingController();
   var _platformFilter = SessionsPlatformFilter.both;
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
+  var _newestPerProjectOnly = false;
   var _isScanning = false;
   var _scanAnnouncement = '';
   var _hasRefreshOwnedRows = false;
   String? _selectedId;
   String? _loadingDetailId;
   late List<SessionRowViewModel> _rows;
+  late Map<String, double> _columnWidths;
+  late List<SessionTableSortSettings> _sorts;
+  late int _handledAutoRefreshToken;
+  Timer? _relativeDateTimer;
 
   @override
   void initState() {
     super.initState();
     _rows = List.of(widget.initialRows);
+    final tableState =
+        widget.initialTableState ??
+        (widget.settings ?? AppSettings.defaults()).ui.sessionTable;
+    _columnWidths = Map.of(tableState.columnWidths);
+    _sorts = _normalizedSorts(tableState.sorts);
     _scanAnnouncement = widget.initialStatusMessage;
+    _handledAutoRefreshToken = widget.autoRefreshToken;
     _searchController.addListener(_filtersChanged);
     _pathController.addListener(_filtersChanged);
+    _relativeDateTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   @override
@@ -112,6 +136,16 @@ class _SessionsScreenState extends State<SessionsScreen> {
         oldWidget.initialStatusMessage != widget.initialStatusMessage) {
       _scanAnnouncement = widget.initialStatusMessage;
     }
+    if (widget.autoRefreshToken != _handledAutoRefreshToken) {
+      _handledAutoRefreshToken = widget.autoRefreshToken;
+      if (widget.autoRefreshToken > 0) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && !_isScanning) {
+            unawaited(_refresh());
+          }
+        });
+      }
+    }
   }
 
   @override
@@ -122,6 +156,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _pathController
       ..removeListener(_filtersChanged)
       ..dispose();
+    _relativeDateTimer?.cancel();
     super.dispose();
   }
 
@@ -139,6 +174,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
               pathController: _pathController,
               platformFilter: _platformFilter,
               archivedFilter: _archivedFilter,
+              newestPerProjectOnly: _newestPerProjectOnly,
               isScanning: _isScanning,
               onPlatformChanged: (value) {
                 setState(() {
@@ -152,25 +188,15 @@ class _SessionsScreenState extends State<SessionsScreen> {
                   _retainSelection();
                 });
               },
+              onNewestPerProjectOnlyChanged: (value) {
+                setState(() {
+                  _newestPerProjectOnly = value;
+                  _retainSelection();
+                });
+              },
               onClearFilters: _clearFilters,
               onRefresh: _refresh,
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-              child: Semantics(
-                liveRegion: true,
-                label: _resultCountText(visibleRows.length),
-                child: Text(_resultCountText(visibleRows.length)),
-              ),
-            ),
-            if (_scanAnnouncement.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                child: Semantics(
-                  liveRegion: true,
-                  child: Text(_scanAnnouncement),
-                ),
-              ),
             Expanded(
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -182,6 +208,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
                             hasRows: _rows.isNotEmpty,
                             hasActiveFilters: _hasActiveFilters,
                             statusMessage: _scanAnnouncement,
+                            isScanning: _isScanning,
+                            visibleCount: visibleRows.length,
                             unreachablePaths: _unreachablePaths,
                             onClearFilters: _clearFilters,
                             onOpenSettings: widget.onOpenSettings,
@@ -193,6 +221,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
                             onSelect: _select,
                             onAction: _handleSessionAction,
                             settings: widget.settings ?? AppSettings.defaults(),
+                            columnWidths: _columnWidths,
+                            sorts: _sorts,
+                            onColumnWidthChanged: _setColumnWidth,
+                            onSortGesture: _handleSortGesture,
+                            onShowSortOptions: _showSortOptions,
+                            statusMessage: _scanAnnouncement,
+                            isScanning: _isScanning,
                           ),
                   ),
                   VerticalDivider(
@@ -247,7 +282,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         .trim()
         .replaceAll(r'\', '/')
         .toLowerCase();
-    return [
+    final filtered = [
       for (final row in _rows)
         if (_matchesArchived(row) &&
             _matchesPlatform(row) &&
@@ -255,7 +290,84 @@ class _SessionsScreenState extends State<SessionsScreen> {
             _matchesSearch(row, search))
           row,
     ];
+    final reduced = _newestPerProjectOnly
+        ? _newestRowsPerProject(filtered)
+        : filtered;
+    return _sortedRows(reduced);
   }
+
+  List<SessionRowViewModel> _newestRowsPerProject(
+    List<SessionRowViewModel> rows,
+  ) {
+    final newestByProject = <String, SessionRowViewModel>{};
+    for (final row in rows) {
+      final key = _projectGroupKey(row);
+      final current = newestByProject[key];
+      if (current == null || _isNewerProjectRow(row, current)) {
+        newestByProject[key] = row;
+      }
+    }
+    return newestByProject.values.toList(growable: false);
+  }
+
+  String _projectGroupKey(SessionRowViewModel row) {
+    final project = row.project.trim().toLowerCase();
+    if (project.isNotEmpty) {
+      return project;
+    }
+    return 'session:${row.id}';
+  }
+
+  bool _isNewerProjectRow(
+    SessionRowViewModel candidate,
+    SessionRowViewModel current,
+  ) {
+    final timestampOrder = candidate.lastMessageAtUtc.compareTo(
+      current.lastMessageAtUtc,
+    );
+    if (timestampOrder != 0) {
+      return timestampOrder > 0;
+    }
+    return candidate.id.compareTo(current.id) < 0;
+  }
+
+  List<SessionRowViewModel> _sortedRows(List<SessionRowViewModel> rows) {
+    final sorted = List<SessionRowViewModel>.of(rows);
+    sorted.sort((left, right) {
+      for (final sort in _sorts) {
+        final result = _compareRows(left, right, sort.column);
+        if (result != 0) {
+          return sort.ascending ? result : -result;
+        }
+      }
+      return left.id.compareTo(right.id);
+    });
+    return sorted;
+  }
+
+  int _compareRows(
+    SessionRowViewModel left,
+    SessionRowViewModel right,
+    String column,
+  ) {
+    return switch (column) {
+      'last_message_at' => left.lastMessageAtUtc.compareTo(
+        right.lastMessageAtUtc,
+      ),
+      'project' => _compareText(left.project, right.project),
+      'path' => _compareText(left.path, right.path),
+      'summary' => _compareText(left.summary, right.summary),
+      'message_count' => left.messageCount.compareTo(right.messageCount),
+      'total_tokens' => left.totalTokens.compareTo(right.totalTokens),
+      'model' => _compareText(left.model, right.model),
+      'tags' => _compareText(left.tags.join(', '), right.tags.join(', ')),
+      'status' => _compareText(left.status, right.status),
+      _ => 0,
+    };
+  }
+
+  int _compareText(String left, String right) =>
+      left.toLowerCase().compareTo(right.toLowerCase());
 
   bool _matchesArchived(SessionRowViewModel row) {
     return switch (_archivedFilter) {
@@ -301,7 +413,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     return _searchController.text.trim().isNotEmpty ||
         _pathController.text.trim().isNotEmpty ||
         _platformFilter != SessionsPlatformFilter.both ||
-        _archivedFilter != SessionsArchivedFilter.activeOnly;
+        _archivedFilter != SessionsArchivedFilter.activeOnly ||
+        _newestPerProjectOnly;
   }
 
   List<String> get _unreachablePaths {
@@ -394,6 +507,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _pathController.clear();
         _platformFilter = SessionsPlatformFilter.both;
         _archivedFilter = SessionsArchivedFilter.activeOnly;
+        _newestPerProjectOnly = false;
         _retainSelection();
       });
     } finally {
@@ -544,6 +658,85 @@ class _SessionsScreenState extends State<SessionsScreen> {
     }
   }
 
+  void _setColumnWidth(String column, double width) {
+    setState(() {
+      _columnWidths[column] = width.clamp(64, 520).toDouble();
+    });
+    _emitTableState();
+  }
+
+  void _handleSortGesture(String column, _SortGesture gesture) {
+    if (column == 'actions') {
+      return;
+    }
+    setState(() {
+      _sorts = _nextSorts(column, gesture);
+    });
+    _emitTableState();
+  }
+
+  List<SessionTableSortSettings> _nextSorts(
+    String column,
+    _SortGesture gesture,
+  ) {
+    final existingIndex = _sorts.indexWhere((sort) => sort.column == column);
+    if (gesture == _SortGesture.remove) {
+      if (existingIndex < 0) {
+        return _sorts;
+      }
+      final next = List<SessionTableSortSettings>.of(_sorts)
+        ..removeAt(existingIndex);
+      return next.isEmpty ? _defaultSorts : next;
+    }
+    if (gesture == _SortGesture.add) {
+      if (existingIndex >= 0) {
+        final next = List<SessionTableSortSettings>.of(_sorts);
+        final existing = next[existingIndex];
+        next[existingIndex] = SessionTableSortSettings(
+          column: column,
+          ascending: !existing.ascending,
+        );
+        return next;
+      }
+      return [
+        ..._sorts,
+        SessionTableSortSettings(column: column, ascending: true),
+      ];
+    }
+    if (existingIndex == 0 && _sorts.length == 1) {
+      return [
+        SessionTableSortSettings(
+          column: column,
+          ascending: !_sorts.first.ascending,
+        ),
+      ];
+    }
+    return [SessionTableSortSettings(column: column, ascending: true)];
+  }
+
+  Future<void> _showSortOptions(BuildContext context) async {
+    final result = await showDialog<List<SessionTableSortSettings>>(
+      context: context,
+      builder: (context) => _SortOptionsDialog(sorts: _sorts),
+    );
+    if (result == null) {
+      return;
+    }
+    setState(() {
+      _sorts = _normalizedSorts(result);
+    });
+    _emitTableState();
+  }
+
+  void _emitTableState() {
+    widget.onTableStateChanged?.call(
+      SessionTableSettings(
+        columnWidths: Map.unmodifiable(_columnWidths),
+        sorts: List.unmodifiable(_sorts),
+      ),
+    );
+  }
+
   bool _isCopyAction(SessionRowAction action) {
     return switch (action) {
       SessionRowAction.copyPath ||
@@ -629,6 +822,8 @@ class _SessionsEmptyState extends StatelessWidget {
     required this.hasRows,
     required this.hasActiveFilters,
     required this.statusMessage,
+    required this.isScanning,
+    required this.visibleCount,
     required this.unreachablePaths,
     required this.onClearFilters,
     required this.onOpenSettings,
@@ -638,6 +833,8 @@ class _SessionsEmptyState extends StatelessWidget {
   final bool hasRows;
   final bool hasActiveFilters;
   final String statusMessage;
+  final bool isScanning;
+  final int visibleCount;
   final List<String> unreachablePaths;
   final VoidCallback onClearFilters;
   final VoidCallback? onOpenSettings;
@@ -661,7 +858,11 @@ class _SessionsEmptyState extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Session table', style: Theme.of(context).textTheme.titleMedium),
+          _SessionsHeading(visibleCount: visibleCount),
+          if (statusMessage.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            _StatusLine(message: statusMessage, isScanning: isScanning),
+          ],
           const SizedBox(height: 24),
           Semantics(
             liveRegion: true,
@@ -726,9 +927,11 @@ class _FilterBar extends StatelessWidget {
     required this.pathController,
     required this.platformFilter,
     required this.archivedFilter,
+    required this.newestPerProjectOnly,
     required this.isScanning,
     required this.onPlatformChanged,
     required this.onArchivedChanged,
+    required this.onNewestPerProjectOnlyChanged,
     required this.onClearFilters,
     required this.onRefresh,
   });
@@ -737,9 +940,11 @@ class _FilterBar extends StatelessWidget {
   final TextEditingController pathController;
   final SessionsPlatformFilter platformFilter;
   final SessionsArchivedFilter archivedFilter;
+  final bool newestPerProjectOnly;
   final bool isScanning;
   final ValueChanged<SessionsPlatformFilter> onPlatformChanged;
   final ValueChanged<SessionsArchivedFilter> onArchivedChanged;
+  final ValueChanged<bool> onNewestPerProjectOnlyChanged;
   final VoidCallback onClearFilters;
   final VoidCallback onRefresh;
 
@@ -905,6 +1110,10 @@ class _FilterBar extends StatelessWidget {
                   onPressed: onClearFilters,
                   child: const Text('Clear filters'),
                 ),
+                _NewestPerProjectFilter(
+                  value: newestPerProjectOnly,
+                  onChanged: onNewestPerProjectOnlyChanged,
+                ),
                 const Tooltip(
                   message: 'Advanced filters are not available yet.',
                   child: OutlinedButton(
@@ -937,6 +1146,41 @@ class _FilterBar extends StatelessWidget {
   }
 }
 
+class _NewestPerProjectFilter extends StatelessWidget {
+  const _NewestPerProjectFilter({required this.value, required this.onChanged});
+
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: 'Newest session per project filter',
+      toggled: value,
+      container: true,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: () => onChanged(!value),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 40),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Checkbox(
+                value: value,
+                semanticLabel: 'Newest session per project filter',
+                onChanged: (checked) => onChanged(checked ?? false),
+              ),
+              const Text('Newest per project'),
+              const SizedBox(width: 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _FilterSemantics extends StatelessWidget {
   const _FilterSemantics({required this.label, required this.child});
 
@@ -954,6 +1198,253 @@ class _FilterSemantics extends StatelessWidget {
   }
 }
 
+class _SessionsHeading extends StatelessWidget {
+  const _SessionsHeading({required this.visibleCount});
+
+  final int visibleCount;
+
+  @override
+  Widget build(BuildContext context) {
+    final countStyle = Theme.of(context).textTheme.bodySmall;
+    return Semantics(
+      header: true,
+      label: 'Sessions, $visibleCount visible',
+      child: ExcludeSemantics(
+        child: Row(
+          children: [
+            Text('Sessions', style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(width: 6),
+            Text('($visibleCount)', style: countStyle),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusLine extends StatelessWidget {
+  const _StatusLine({required this.message, required this.isScanning});
+
+  final String message;
+  final bool isScanning;
+
+  @override
+  Widget build(BuildContext context) {
+    final lowerMessage = message.toLowerCase();
+    final isLoadingPrevious =
+        lowerMessage.startsWith('loading previous sessions') ||
+        (lowerMessage.startsWith('loaded ') &&
+            lowerMessage.contains('from the previous scan'));
+    final showSpinner = isScanning || isLoadingPrevious;
+    final isFinished = lowerMessage.startsWith('scan finished');
+    final isError =
+        lowerMessage.contains('failed') || lowerMessage.contains('unreachable');
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      liveRegion: true,
+      label: message,
+      child: Row(
+        children: [
+          SizedBox.square(
+            dimension: 16,
+            child: showSpinner
+                ? const CircularProgressIndicator(strokeWidth: 2)
+                : Icon(
+                    isFinished
+                        ? Icons.check_circle_outline
+                        : isError
+                        ? Icons.error_outline
+                        : Icons.info_outline,
+                    size: 16,
+                    color: isFinished
+                        ? scheme.primary
+                        : isError
+                        ? scheme.error
+                        : scheme.onSurfaceVariant,
+                  ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(child: Text(message, overflow: TextOverflow.ellipsis)),
+        ],
+      ),
+    );
+  }
+}
+
+class _SessionColumn {
+  const _SessionColumn({
+    required this.key,
+    required this.label,
+    required this.defaultWidth,
+  });
+
+  final String key;
+  final String label;
+  final double defaultWidth;
+}
+
+enum _SortGesture { replace, add, remove }
+
+class _HeaderCell extends StatelessWidget {
+  const _HeaderCell({
+    required this.column,
+    required this.width,
+    required this.style,
+    required this.sort,
+    required this.sortPriority,
+    required this.onResize,
+    required this.onSortGesture,
+    required this.onShowSortOptions,
+  });
+
+  final _SessionColumn column;
+  final double width;
+  final TextStyle? style;
+  final SessionTableSortSettings? sort;
+  final int? sortPriority;
+  final ValueChanged<double> onResize;
+  final void Function(String column, _SortGesture gesture) onSortGesture;
+  final Future<void> Function(BuildContext context) onShowSortOptions;
+
+  @override
+  Widget build(BuildContext context) {
+    final sort = this.sort;
+    final priority = sortPriority;
+    final sortLabel = sort == null
+        ? ''
+        : ' ${sort.ascending ? 'ascending' : 'descending'}'
+              '${priority == null ? '' : ' priority $priority'}';
+    return SizedBox(
+      width: width,
+      child: Row(
+        children: [
+          Expanded(
+            child: Semantics(
+              label: '${column.label} column$sortLabel',
+              button: column.key != 'actions',
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: column.key == 'actions' ? null : _handleTap,
+                onSecondaryTapDown: (_) => onShowSortOptions(context),
+                child: ExcludeSemantics(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            column.label,
+                            overflow: TextOverflow.ellipsis,
+                            style: style,
+                          ),
+                        ),
+                        if (sort != null)
+                          _SortIndicator(
+                            ascending: sort.ascending,
+                            priority: priority,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          MouseRegion(
+            cursor: SystemMouseCursors.resizeLeftRight,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (details) =>
+                  onResize(width + details.delta.dx),
+              child: const SizedBox(width: 8, height: double.infinity),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _handleTap() {
+    final pressed = HardwareKeyboard.instance.logicalKeysPressed;
+    if (pressed.contains(LogicalKeyboardKey.controlLeft) ||
+        pressed.contains(LogicalKeyboardKey.controlRight)) {
+      onSortGesture(column.key, _SortGesture.remove);
+      return;
+    }
+    if (pressed.contains(LogicalKeyboardKey.shiftLeft) ||
+        pressed.contains(LogicalKeyboardKey.shiftRight)) {
+      onSortGesture(column.key, _SortGesture.add);
+      return;
+    }
+    onSortGesture(column.key, _SortGesture.replace);
+  }
+}
+
+class _SortIndicator extends StatelessWidget {
+  const _SortIndicator({required this.ascending, required this.priority});
+
+  final bool ascending;
+  final int? priority;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = scheme.primary;
+    return Padding(
+      padding: const EdgeInsetsDirectional.only(start: 6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _SvgIcon(
+            ascending
+                ? 'assets/icons/sort_ascending.svg'
+                : 'assets/icons/sort_descending.svg',
+            size: 16,
+            color: color,
+          ),
+          if (priority != null) ...[
+            const SizedBox(width: 4),
+            Container(
+              constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: color.withValues(alpha: 0.34)),
+              ),
+              child: Text(
+                priority.toString(),
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: color,
+                  fontWeight: FontWeight.w700,
+                  height: 1,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _SvgIcon extends StatelessWidget {
+  const _SvgIcon(this.assetName, {required this.size, required this.color});
+
+  final String assetName;
+  final double size;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => SvgPicture.asset(
+    assetName,
+    width: size,
+    height: size,
+    colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
+  );
+}
+
 class _SessionsTable extends StatelessWidget {
   const _SessionsTable({
     required this.rows,
@@ -961,6 +1452,13 @@ class _SessionsTable extends StatelessWidget {
     required this.onSelect,
     required this.onAction,
     required this.settings,
+    required this.columnWidths,
+    required this.sorts,
+    required this.onColumnWidthChanged,
+    required this.onSortGesture,
+    required this.onShowSortOptions,
+    required this.statusMessage,
+    required this.isScanning,
   });
 
   final List<SessionRowViewModel> rows;
@@ -968,23 +1466,36 @@ class _SessionsTable extends StatelessWidget {
   final ValueChanged<String> onSelect;
   final SessionActionCallback onAction;
   final AppSettings settings;
+  final Map<String, double> columnWidths;
+  final List<SessionTableSortSettings> sorts;
+  final void Function(String column, double width) onColumnWidthChanged;
+  final void Function(String column, _SortGesture gesture) onSortGesture;
+  final Future<void> Function(BuildContext context) onShowSortOptions;
+  final String statusMessage;
+  final bool isScanning;
 
-  static const _tableWidth = 1420.0;
   static const _rowHeight = 80.0;
-  static const _columns = <({String label, double width})>[
-    (label: 'Date', width: 120),
-    (label: 'Actions', width: 66),
-    (label: 'Last message', width: 120),
-    (label: 'Project', width: 112),
-    (label: 'Path', width: 232),
-    (label: 'Title', width: 148),
-    (label: 'Summary', width: 180),
-    (label: 'Messages', width: 70),
-    (label: 'Tokens', width: 70),
-    (label: 'Model', width: 92),
-    (label: 'Tags', width: 100),
-    (label: 'Status', width: 110),
+  static const _columns = <_SessionColumn>[
+    _SessionColumn(
+      key: 'last_message_at',
+      label: 'Last Message Date',
+      defaultWidth: 180,
+    ),
+    _SessionColumn(key: 'actions', label: 'Actions', defaultWidth: 66),
+    _SessionColumn(key: 'project', label: 'Project', defaultWidth: 112),
+    _SessionColumn(key: 'path', label: 'Path', defaultWidth: 280),
+    _SessionColumn(key: 'summary', label: 'Summary', defaultWidth: 220),
+    _SessionColumn(key: 'message_count', label: 'Messages', defaultWidth: 82),
+    _SessionColumn(key: 'total_tokens', label: 'Tokens', defaultWidth: 78),
+    _SessionColumn(key: 'model', label: 'Model', defaultWidth: 110),
+    _SessionColumn(key: 'tags', label: 'Tags', defaultWidth: 110),
+    _SessionColumn(key: 'status', label: 'Status', defaultWidth: 130),
   ];
+
+  double get _tableWidth => _columns.fold<double>(
+    0,
+    (total, column) => total + _widthFor(column.key),
+  );
 
   @override
   Widget build(BuildContext context) {
@@ -993,11 +1504,13 @@ class _SessionsTable extends StatelessWidget {
       children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-          child: Text(
-            'Session table',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
+          child: _SessionsHeading(visibleCount: rows.length),
         ),
+        if (statusMessage.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: _StatusLine(message: statusMessage, isScanning: isScanning),
+          ),
         Expanded(
           child: Scrollbar(
             child: SingleChildScrollView(
@@ -1037,16 +1550,15 @@ class _SessionsTable extends StatelessWidget {
       child: Row(
         children: [
           for (final column in _columns)
-            SizedBox(
-              width: column.width,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: Text(
-                  column.label,
-                  overflow: TextOverflow.ellipsis,
-                  style: style,
-                ),
-              ),
+            _HeaderCell(
+              column: column,
+              width: _widthFor(column.key),
+              style: style,
+              sort: _sortFor(column.key),
+              sortPriority: _sortPriority(column.key),
+              onResize: (width) => onColumnWidthChanged(column.key, width),
+              onSortGesture: onSortGesture,
+              onShowSortOptions: onShowSortOptions,
             ),
         ],
       ),
@@ -1057,26 +1569,26 @@ class _SessionsTable extends StatelessWidget {
     final selected = row.id == selectedId;
     final color = _rowColor(context, row, selected: selected);
     return InkWell(
+      excludeFromSemantics: true,
       onTap: () => onSelect(row.id),
       child: Container(
         height: _rowHeight,
         color: color,
         child: Row(
           children: [
-            _dateCell(row, selected: selected),
+            _dateCell(row),
             SizedBox(
-              width: 66,
+              width: _widthFor('actions'),
               child: _ActionsMenu(
                 row: row,
                 onAction: onAction,
                 settings: settings,
               ),
             ),
-            _cell(row.lastMessageAtUtc.shortDateTime, width: 120),
-            _cell(row.project, width: 112),
+            _cell('Project', row.project, width: _widthFor('project')),
             _PathCell(
               row: row,
-              width: 232,
+              width: _widthFor('path'),
               onCopy: () => onAction(
                 SessionActionRequest(
                   row: row,
@@ -1085,17 +1597,28 @@ class _SessionsTable extends StatelessWidget {
                 ),
               ),
             ),
-            _cell(row.title, width: 148),
-            _cell(row.summary, width: 180),
-            _cell(row.messageCount.toString(), width: 70),
-            _cell(row.totalTokens.toString(), width: 70),
-            _cell(row.model, width: 92),
-            _cell(row.tags.join(', '), width: 100),
+            _cell('Summary', row.summary, width: _widthFor('summary')),
+            _cell(
+              'Messages',
+              row.messageCount.toString(),
+              width: _widthFor('message_count'),
+            ),
+            _cell(
+              'Tokens',
+              row.totalTokens.toString(),
+              width: _widthFor('total_tokens'),
+            ),
+            _cell('Model', row.model, width: _widthFor('model')),
+            _cell('Tags', row.tags.join(', '), width: _widthFor('tags')),
             SizedBox(
-              width: 110,
+              width: _widthFor('status'),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: _StatusCell(row: row),
+                child: Semantics(
+                  label: 'Status ${_statusText(row)}',
+                  container: true,
+                  child: ExcludeSemantics(child: _StatusCell(row: row)),
+                ),
               ),
             ),
           ],
@@ -1104,46 +1627,62 @@ class _SessionsTable extends StatelessWidget {
     );
   }
 
-  Widget _cell(String text, {required double width}) => SizedBox(
+  Widget _cell(String label, String text, {required double width}) => SizedBox(
     width: width,
-    child: Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Text(text, overflow: TextOverflow.ellipsis),
+    child: Semantics(
+      label: '$label ${text.isEmpty ? 'empty' : text}',
+      container: true,
+      child: ExcludeSemantics(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Text(text, overflow: TextOverflow.ellipsis),
+        ),
+      ),
     ),
   );
 
-  Widget _dateCell(SessionRowViewModel row, {required bool selected}) {
-    final badges = [
-      if (row.isPinned) 'Pinned',
-      if (row.isArchived) 'Archived',
-      if (row.hasError) row.status,
-    ];
+  Widget _dateCell(SessionRowViewModel row) {
+    final display = row.lastMessageAtUtc.relativeDisplay();
     return Semantics(
-      label: 'Select session ${row.title}',
-      button: true,
-      selected: selected,
+      label: 'Last Message Date $display',
+      container: true,
       child: ExcludeSemantics(
         child: SizedBox(
-          width: 120,
+          width: _widthFor('last_message_at'),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(row.startedAtUtc.shortDateTime),
-                for (final badge in badges)
-                  Text(
-                    badge,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 11),
-                  ),
-              ],
-            ),
+            child: Text(display, overflow: TextOverflow.ellipsis),
           ),
         ),
       ),
     );
+  }
+
+  double _widthFor(String key) =>
+      columnWidths[key] ??
+      _columns.firstWhere((column) => column.key == key).defaultWidth;
+
+  SessionTableSortSettings? _sortFor(String key) {
+    for (final sort in sorts) {
+      if (sort.column == key) {
+        return sort;
+      }
+    }
+    return null;
+  }
+
+  int? _sortPriority(String key) {
+    final index = sorts.indexWhere((sort) => sort.column == key);
+    return index < 0 ? null : index + 1;
+  }
+
+  String _statusText(SessionRowViewModel row) {
+    final labels = <String>[
+      if (row.isPinned) 'Pinned',
+      if (row.isArchived) 'Archived',
+      row.status,
+    ];
+    return labels.join(' | ');
   }
 
   Color? _rowColor(
@@ -1181,6 +1720,7 @@ class _PathCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final rowLabel = _rowAccessibleLabel(row);
     return SizedBox(
       width: width,
       child: Padding(
@@ -1194,14 +1734,8 @@ class _PathCell extends StatelessWidget {
                 child: ExcludeSemantics(
                   child: Row(
                     children: [
-                      Icon(_platformIcon, size: 16),
-                      const SizedBox(width: 4),
-                      Text(
-                        row.platformLabel,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.labelSmall,
-                      ),
-                      const SizedBox(width: 6),
+                      _PlatformGlyph(platform: row.platform),
+                      const SizedBox(width: 8),
                       Expanded(
                         child: Text(row.path, overflow: TextOverflow.ellipsis),
                       ),
@@ -1211,7 +1745,7 @@ class _PathCell extends StatelessWidget {
               ),
             ),
             Semantics(
-              label: 'Copy path for ${row.title}',
+              label: 'Copy path for $rowLabel',
               button: true,
               child: IconButton(
                 tooltip: 'Copy path',
@@ -1229,12 +1763,31 @@ class _PathCell extends StatelessWidget {
       ),
     );
   }
+}
 
-  IconData get _platformIcon {
-    return switch (row.platform) {
-      SessionRowPlatform.windows => Icons.desktop_windows_outlined,
-      SessionRowPlatform.wsl => Icons.terminal_outlined,
-    };
+class _PlatformGlyph extends StatelessWidget {
+  const _PlatformGlyph({required this.platform});
+
+  final SessionRowPlatform platform;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = IconTheme.of(context).color ?? Colors.black87;
+    return SizedBox.square(
+      dimension: 16,
+      child: switch (platform) {
+        SessionRowPlatform.windows => _SvgIcon(
+          'assets/icons/platform_windows.svg',
+          size: 16,
+          color: color,
+        ),
+        SessionRowPlatform.wsl => _SvgIcon(
+          'assets/icons/platform_wsl.svg',
+          size: 16,
+          color: color,
+        ),
+      },
+    );
   }
 }
 
@@ -1268,8 +1821,9 @@ class _ActionsMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final commandSet = _commandSet(row);
+    final rowLabel = _rowAccessibleLabel(row);
     return Semantics(
-      label: 'Actions for ${row.title}',
+      label: 'Actions for $rowLabel',
       button: true,
       child: PopupMenuButton<SessionRowAction>(
         tooltip: 'More actions',
@@ -1362,8 +1916,7 @@ class _ActionsMenu extends StatelessWidget {
     SessionRowAction action,
   ) {
     return switch (action) {
-      SessionRowAction.openPath ||
-      SessionRowAction.copyPath => row.sourcePathForDisplay,
+      SessionRowAction.openPath || SessionRowAction.copyPath => row.path,
       SessionRowAction.copyPlainResumeCommand => commandSet.plainResumeCommand,
       SessionRowAction.copyPlatformResumeCommand =>
         commandSet.platformResumeCommand,
@@ -1436,8 +1989,77 @@ class _SessionDetailPlaceholder extends StatelessWidget {
   }
 }
 
-String _resultCountText(int count) =>
-    '$count ${count == 1 ? 'session' : 'sessions'} visible';
+class _SortOptionsDialog extends StatefulWidget {
+  const _SortOptionsDialog({required this.sorts});
+
+  final List<SessionTableSortSettings> sorts;
+
+  @override
+  State<_SortOptionsDialog> createState() => _SortOptionsDialogState();
+}
+
+class _SortOptionsDialogState extends State<_SortOptionsDialog> {
+  late List<SessionTableSortSettings> _sorts;
+
+  @override
+  void initState() {
+    super.initState();
+    _sorts = List.of(widget.sorts);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Sort options'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (var i = 0; i < _sorts.length; i++)
+              ListTile(
+                title: Text(_columnLabel(_sorts[i].column)),
+                subtitle: Text('Priority ${i + 1}'),
+                trailing: SegmentedButton<bool>(
+                  segments: const [
+                    ButtonSegment(value: true, label: Text('Asc')),
+                    ButtonSegment(value: false, label: Text('Desc')),
+                  ],
+                  selected: {_sorts[i].ascending},
+                  onSelectionChanged: (selection) {
+                    setState(() {
+                      _sorts[i] = SessionTableSortSettings(
+                        column: _sorts[i].column,
+                        ascending: selection.single,
+                      );
+                    });
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(_defaultSorts),
+          child: const Text('Default'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(_defaultSorts),
+          child: const Text('Clear'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_sorts),
+          child: const Text('Apply'),
+        ),
+      ],
+    );
+  }
+}
 
 extension on DateTime {
   String get shortDateTime {
@@ -1446,4 +2068,81 @@ extension on DateTime {
     return '${local.year}-${two(local.month)}-${two(local.day)} '
         '${two(local.hour)}:${two(local.minute)}';
   }
+
+  String relativeDisplay() {
+    final now = DateTime.now().toUtc();
+    final elapsed = now.difference(toUtc());
+    final absolute = '($shortDateTime)';
+    if (elapsed.inMinutes < 1) {
+      return 'just now';
+    }
+    if (elapsed.inHours < 1) {
+      return '${elapsed.inMinutes}m ago';
+    }
+    if (elapsed.inDays < 1) {
+      final minutes = elapsed.inMinutes % 60;
+      return minutes == 0
+          ? '${elapsed.inHours}h ago'
+          : '${elapsed.inHours}h ${minutes}m ago';
+    }
+    if (elapsed.inDays < 7) {
+      return '${elapsed.inDays} ${elapsed.inDays == 1 ? 'day' : 'days'} ago $absolute';
+    }
+    return shortDateTime;
+  }
+}
+
+String _rowAccessibleLabel(SessionRowViewModel row) {
+  final title = row.title.trim();
+  if (title.isNotEmpty) {
+    return title;
+  }
+  final sessionId = row.sessionId.trim();
+  if (sessionId.isNotEmpty) {
+    return sessionId;
+  }
+  return row.id;
+}
+
+const _defaultSorts = [
+  SessionTableSortSettings(column: 'last_message_at', ascending: false),
+];
+
+List<SessionTableSortSettings> _normalizedSorts(
+  List<SessionTableSortSettings> sorts,
+) {
+  final validColumns = {
+    'last_message_at',
+    'project',
+    'path',
+    'summary',
+    'message_count',
+    'total_tokens',
+    'model',
+    'tags',
+    'status',
+  };
+  final normalized = <SessionTableSortSettings>[];
+  for (final sort in sorts) {
+    if (validColumns.contains(sort.column) &&
+        !normalized.any((existing) => existing.column == sort.column)) {
+      normalized.add(sort);
+    }
+  }
+  return normalized.isEmpty ? List.of(_defaultSorts) : normalized;
+}
+
+String _columnLabel(String key) {
+  return switch (key) {
+    'last_message_at' => 'Last Message Date',
+    'project' => 'Project',
+    'path' => 'Path',
+    'summary' => 'Summary',
+    'message_count' => 'Messages',
+    'total_tokens' => 'Tokens',
+    'model' => 'Model',
+    'tags' => 'Tags',
+    'status' => 'Status',
+    _ => key,
+  };
 }
