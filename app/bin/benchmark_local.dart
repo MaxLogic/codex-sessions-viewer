@@ -3,10 +3,21 @@ import 'dart:io';
 import 'package:codex_sessions_viewer/src/benchmark/local_benchmark.dart';
 
 Future<void> main(List<String> args) async {
-  final fixtures = Directory(
-    _option(args, '--fixtures') ?? '../samples/sessions',
+  final copyFromSettings = args.contains('--copy-from-settings');
+  final privateCorpus = Directory(
+    _option(args, '--private-corpus') ?? '../.agents/private-session-corpus',
   );
-  final output = File(_option(args, '--out') ?? '../docs/benchmark-results.md');
+  final fixtures = Directory(
+    _option(args, '--fixtures') ??
+        (copyFromSettings ? privateCorpus.path : '../samples/sessions'),
+  );
+  final output = File(
+    _option(args, '--out') ??
+        (copyFromSettings
+            ? '../.agents/benchmark-results/session-scan-baseline.md'
+            : '../docs/benchmark-results.md'),
+  );
+  final settingsFile = File(_option(args, '--settings') ?? '../settings.toml');
   final includeReleaseSteps = !args.contains('--skip-release');
 
   try {
@@ -14,6 +25,9 @@ Future<void> main(List<String> args) async {
       options: LocalBenchmarkOptions(
         fixturesDirectory: fixtures,
         outputFile: output,
+        settingsFile: settingsFile,
+        privateCorpusDirectory: privateCorpus,
+        copyFromSettings: copyFromSettings,
         includeReleaseSteps: includeReleaseSteps,
       ),
     ).run();

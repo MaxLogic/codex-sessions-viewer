@@ -45,6 +45,18 @@ cd app
 dart run bin/benchmark_local.dart --fixtures ../samples/sessions --out ../docs/benchmark-results.md
 ```
 
+For realistic scan timing, copy local Codex session files into ignored private
+benchmark storage and write the aggregate report to ignored benchmark storage:
+
+```powershell
+cd app
+dart run bin/benchmark_local.dart --copy-from-settings --private-corpus ../.agents/private-session-corpus --out ../.agents/benchmark-results/session-scan-baseline.md --skip-release
+```
+
+Do not commit `.agents/private-session-corpus/` or
+`.agents/benchmark-results/`. The private benchmark report is designed to
+contain aggregate timings and counts only.
+
 ## Configuration
 
 Configuration lives in `settings.toml`. The packaged copy is a starting point;

@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added an ignored private-corpus benchmark mode for realistic aggregate session scan timing.
 - Added persisted Sessions table column widths, multi-column sorting, right-click sort options, per-cell screen-reader semantics, and minute-by-minute relative last-message dates.
 - Wired production session refresh to load settings, scan configured Codex roots, persist parsed sessions to SQLite, and show real Sessions rows.
 - Added Sessions empty states for no supported files, filter-empty results, unreachable paths, and refresh failures.
