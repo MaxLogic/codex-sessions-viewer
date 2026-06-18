@@ -1017,6 +1017,24 @@ void main() {
       expect(row.toolCallTokens, 0);
       expect(row.totalTokens, 70);
       expect(row.estimatedCostDisplay, '\$0.0875');
+
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      final stored = db
+          .select(
+            '''
+            select user_message_tokens,
+                   assistant_response_tokens,
+                   tool_call_tokens
+            from sessions
+            where id = ?
+            ''',
+            [row.id],
+          )
+          .single;
+      expect(stored['user_message_tokens'], 42);
+      expect(stored['assistant_response_tokens'], 21);
+      expect(stored['tool_call_tokens'], 0);
     },
   );
 

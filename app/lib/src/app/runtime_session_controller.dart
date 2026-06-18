@@ -697,6 +697,7 @@ void _upsertParsedSession(
     parsed.workingDirectoryDisplay,
     sourceType: scannedSession.sourceType,
   );
+  final tokenBuckets = _messageTokenBuckets(parsed);
   SessionSearchIndex(db).upsert(
     SessionSearchDocument(
       id: parsed.internalId,
@@ -750,6 +751,9 @@ void _upsertParsedSession(
       input_tokens = ?,
       output_tokens = ?,
       cached_input_tokens = ?,
+      user_message_tokens = ?,
+      assistant_response_tokens = ?,
+      tool_call_tokens = ?,
       project_id = case when project_override = 1 then project_id else ? end,
       project_name_snapshot = case
         when project_override = 1 then project_name_snapshot
@@ -782,6 +786,9 @@ void _upsertParsedSession(
       parsed.usage.inputTokens,
       parsed.usage.outputTokens,
       parsed.usage.cachedInputTokens,
+      tokenBuckets.user,
+      tokenBuckets.assistant,
+      tokenBuckets.tool,
       autoProject == null
           ? null
           : _upsertAutoProject(db, autoProject.name, now),
@@ -796,6 +803,36 @@ void _upsertParsedSession(
   }
   _replaceMessages(db, parsed, now);
   _replaceToolCalls(db, parsed);
+}
+
+({int user, int assistant, int tool}) _messageTokenBuckets(
+  CodexParsedSession parsed,
+) {
+  var user = 0;
+  var assistant = 0;
+  var tool = 0;
+  for (final message in parsed.messages) {
+    final totalTokens = message.usage.totalTokens ?? 0;
+    switch (message.authorType) {
+      case CodexMessageAuthorType.user:
+        user += totalTokens;
+      case CodexMessageAuthorType.assistant:
+        assistant += totalTokens;
+      case CodexMessageAuthorType.tool:
+        tool += totalTokens;
+      case CodexMessageAuthorType.system:
+      case CodexMessageAuthorType.unknown:
+        break;
+    }
+  }
+  if (user + assistant + tool == 0) {
+    return (
+      user: parsed.usage.inputTokens ?? 0,
+      assistant: parsed.usage.outputTokens ?? 0,
+      tool: 0,
+    );
+  }
+  return (user: user, assistant: assistant, tool: tool);
 }
 
 void _replaceMessages(Database db, CodexParsedSession parsed, String now) {
@@ -999,24 +1036,9 @@ List<SessionRowViewModel> _loadRows(
       s.output_tokens,
       s.cached_input_tokens,
       s.total_tokens,
-      coalesce((
-        select sum(coalesce(m.token_total, 0))
-        from messages m
-        where m.session_id = s.id
-          and m.author_type = 'user'
-      ), 0) as user_message_tokens,
-      coalesce((
-        select sum(coalesce(m.token_total, 0))
-        from messages m
-        where m.session_id = s.id
-          and m.author_type = 'assistant'
-      ), 0) as assistant_response_tokens,
-      coalesce((
-        select sum(coalesce(m.token_total, 0))
-        from messages m
-        where m.session_id = s.id
-          and m.author_type = 'tool'
-      ), 0) as tool_call_tokens,
+      s.user_message_tokens,
+      s.assistant_response_tokens,
+      s.tool_call_tokens,
       s.model_primary,
       s.models_used,
       s.project_name_snapshot,

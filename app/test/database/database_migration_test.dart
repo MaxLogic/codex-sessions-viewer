@@ -56,7 +56,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 3);
+    expect(versionRows.length, 4);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -69,6 +69,10 @@ void main() {
     expect(versionRows[2]['filename'], '003_project_override.sql');
     expect(versionRows[2]['checksum_length'], greaterThan(20));
     expect(versionRows[2]['success'], 1);
+    expect(versionRows[3]['version'], 4);
+    expect(versionRows[3]['filename'], '004_session_token_buckets.sql');
+    expect(versionRows[3]['checksum_length'], greaterThan(20));
+    expect(versionRows[3]['success'], 1);
   });
 
   test(
@@ -92,7 +96,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 3);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 4);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -373,6 +377,144 @@ void main() {
       expect(row['project_name_snapshot'], 'Manual Project');
     },
   );
+
+  test('migration 004 backfills persisted token bucket totals', () async {
+    final sqlRoot = await _copySqlRoot(tempDir);
+    final tokenBucketMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}004_session_token_buckets.sql',
+    );
+    if (await tokenBucketMigration.exists()) {
+      await tokenBucketMigration.delete();
+    }
+    final firstRun = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(firstRun.canStartNormalUi, isTrue);
+
+    final db = openFileBackedDatabase(dbFile);
+    db.execute('''
+      insert into sessions (
+        id,
+        source_type,
+        source_file_path,
+        display_path,
+        platform_path,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        'bucketed',
+        'windows',
+        'C:\\sessions\\bucketed.jsonl',
+        'C:\\sessions\\bucketed.jsonl',
+        'C:\\sessions\\bucketed.jsonl',
+        '2026-06-12T00:00:00Z',
+        '2026-06-12T00:00:00Z'
+      )
+      ''');
+    var messageIndex = 0;
+    for (final row in [
+      ('user', 11),
+      ('user', 7),
+      ('assistant', 13),
+      ('tool', 17),
+    ]) {
+      db.execute(
+        '''
+        insert into messages (
+          session_id,
+          message_index,
+          author_type,
+          first_line,
+          content_plain,
+          content_preview,
+          token_total,
+          created_at_db_utc,
+          updated_at_db_utc
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        [
+          'bucketed',
+          messageIndex++,
+          row.$1,
+          row.$1,
+          row.$1,
+          row.$1,
+          row.$2,
+          '2026-06-12T00:00:00Z',
+          '2026-06-12T00:00:00Z',
+        ],
+      );
+    }
+    db.execute('''
+      insert into sessions (
+        id,
+        source_type,
+        source_file_path,
+        display_path,
+        platform_path,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        'aggregate-only',
+        'windows',
+        'C:\\sessions\\aggregate-only.jsonl',
+        'C:\\sessions\\aggregate-only.jsonl',
+        'C:\\sessions\\aggregate-only.jsonl',
+        42,
+        21,
+        7,
+        '2026-06-12T00:00:00Z',
+        '2026-06-12T00:00:00Z'
+      )
+      ''');
+    db.close();
+
+    await File(
+      '../sql/migration/004_session_token_buckets.sql',
+    ).copy(tokenBucketMigration.path);
+
+    final result = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isTrue);
+
+    final migrated = openFileBackedDatabase(dbFile);
+    addTearDown(migrated.close);
+    final bucketed = migrated
+        .select(
+          '''
+          select user_message_tokens,
+                 assistant_response_tokens,
+                 tool_call_tokens
+          from sessions
+          where id = ?
+          ''',
+          ['bucketed'],
+        )
+        .single;
+    expect(bucketed['user_message_tokens'], 18);
+    expect(bucketed['assistant_response_tokens'], 13);
+    expect(bucketed['tool_call_tokens'], 17);
+    final aggregateOnly = migrated
+        .select(
+          '''
+          select user_message_tokens,
+                 assistant_response_tokens,
+                 tool_call_tokens
+          from sessions
+          where id = ?
+          ''',
+          ['aggregate-only'],
+        )
+        .single;
+    expect(aggregateOnly['user_message_tokens'], 42);
+    expect(aggregateOnly['assistant_response_tokens'], 21);
+    expect(aggregateOnly['tool_call_tokens'], 0);
+  });
 
   test('rolls back failed migrations and records failure metadata', () async {
     final sqlRoot = Directory(
