@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/path_mapping/path_mapper.dart';
 import 'package:codex_sessions_viewer/src/scanner/session_scanner.dart';
+import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -421,6 +422,34 @@ void main() {
     expect(events.length, lessThanOrEqualTo(8));
     expect(events.first.directoriesScanned, 0);
     expect(events.last.finishedAtUtc, isNotNull);
+  });
+
+  test('emits profiling spans for major scan phases', () async {
+    final root = Directory('${temp.path}${Platform.pathSeparator}win');
+    await root.create();
+    await File(
+      '${root.path}${Platform.pathSeparator}ok.json',
+    ).writeAsString(_validJsonSession('profiled'));
+    final events = <ProfilingEvent>[];
+    final scanner = SessionScanner(
+      parser: CodexSessionParser(),
+      pathMapper: mapper,
+      useParserIsolates: false,
+    );
+
+    await Profiling.captureAsync(events.add, () {
+      return scanner.scan(SessionScanRequest(windowsRoot: root.path));
+    });
+
+    final spanNames = {
+      for (final event in events)
+        if (event.kind == ProfilingEventKind.start) event.name,
+    };
+    expect(spanNames, contains('scan.scanner.scan'));
+    expect(spanNames, contains('scan.scanner.root_discovery'));
+    expect(spanNames, contains('scan.scanner.directory'));
+    expect(spanNames, contains('scan.scanner.parse_decision'));
+    expect(spanNames, contains('scan.scanner.parse_file'));
   });
 }
 

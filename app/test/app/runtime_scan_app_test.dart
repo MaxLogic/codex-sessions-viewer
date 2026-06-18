@@ -5,6 +5,7 @@ import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
+import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -55,7 +56,10 @@ void main() {
         databaseFile: databaseFile,
       );
       final progressEvents = <SessionsRefreshProgress>[];
-      final result = await controller.refresh(onProgress: progressEvents.add);
+      final profilingEvents = <ProfilingEvent>[];
+      final result = await Profiling.captureAsync(profilingEvents.add, () {
+        return controller.refresh(onProgress: progressEvents.add);
+      });
 
       expect(result.rows, hasLength(2));
       expect(
@@ -88,6 +92,15 @@ void main() {
         progressEvents.last.statusMessage,
         contains('estimated progress 100%'),
       );
+      final spanNames = {
+        for (final event in profilingEvents)
+          if (event.kind == ProfilingEventKind.start) event.name,
+      };
+      expect(spanNames, contains('scan.runtime.refresh'));
+      expect(spanNames, contains('scan.runtime.load_rows'));
+      expect(spanNames, contains('scan.runtime.persist_flush'));
+      expect(spanNames, contains('scan.runtime.persist_scan'));
+      expect(spanNames, contains('scan.runtime.resolve_wsl_project'));
     },
   );
 
@@ -192,10 +205,13 @@ void main() {
       await controller.refresh();
 
       final progressEvents = <SessionsRefreshProgress>[];
-      final result = await controller.loadCachedRowsInBackground(
-        onProgress: progressEvents.add,
-        batchSize: 1,
-      );
+      final profilingEvents = <ProfilingEvent>[];
+      final result = await Profiling.captureAsync(profilingEvents.add, () {
+        return controller.loadCachedRowsInBackground(
+          onProgress: progressEvents.add,
+          batchSize: 1,
+        );
+      });
 
       expect(progressEvents, hasLength(2));
       expect(progressEvents.first.rows, hasLength(1));
@@ -208,6 +224,12 @@ void main() {
         'WSL parser fixture',
         'Windows parser fixture',
       ]);
+      expect(
+        profilingEvents
+            .where((event) => event.kind == ProfilingEventKind.start)
+            .map((event) => event.name),
+        contains('scan.runtime.load_cached_rows'),
+      );
     },
   );
 

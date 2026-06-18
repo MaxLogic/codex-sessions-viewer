@@ -17,6 +17,7 @@ import '../search/session_search.dart';
 import '../usage/usage_summary.dart';
 import '../ui/models/conversation_message_view_model.dart';
 import '../ui/screens/sessions_screen.dart';
+import '../utils/profiling.dart';
 
 class RuntimeSessionController {
   RuntimeSessionController({
@@ -27,120 +28,126 @@ class RuntimeSessionController {
   final File settingsFile;
   final File databaseFile;
 
-  Future<SessionsRefreshResult> loadCachedRows() async {
-    final db = sqlite3.open(databaseFile.path);
-    try {
-      _cleanSessionMetadataPlaceholders(db);
-      _backfillAutomaticProjects(db);
-      final rows = _loadRows(db);
-      return SessionsRefreshResult(
-        rows: rows,
-        statusMessage: rows.isEmpty
-            ? ''
-            : 'Loaded ${rows.length} of ${rows.length} sessions from the previous scan.',
-      );
-    } finally {
-      db.close();
-    }
+  Future<SessionsRefreshResult> loadCachedRows() {
+    return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
+      final db = sqlite3.open(databaseFile.path);
+      try {
+        _cleanSessionMetadataPlaceholders(db);
+        _backfillAutomaticProjects(db);
+        final rows = _loadRowsProfiled(db);
+        return SessionsRefreshResult(
+          rows: rows,
+          statusMessage: rows.isEmpty
+              ? ''
+              : 'Loaded ${rows.length} of ${rows.length} sessions from the previous scan.',
+        );
+      } finally {
+        db.close();
+      }
+    });
   }
 
   Future<SessionsRefreshResult> loadCachedRowsInBackground({
     SessionsRefreshProgressCallback? onProgress,
     int batchSize = 250,
-  }) async {
-    final messages = ReceivePort();
-    final errors = ReceivePort();
-    final exits = ReceivePort();
-    Isolate? isolate;
-    try {
-      isolate = await Isolate.spawn<_BackgroundCachedRowsRequest>(
-        _backgroundCachedRowsEntry,
-        _BackgroundCachedRowsRequest(
-          databaseFilePath: databaseFile.path,
-          sendPort: messages.sendPort,
-          batchSize: batchSize,
-        ),
-        onError: errors.sendPort,
-        onExit: exits.sendPort,
-      );
-
-      final result = Completer<SessionsRefreshResult>();
-      late StreamSubscription<Object?> messageSubscription;
-      late StreamSubscription<Object?> errorSubscription;
-      late StreamSubscription<Object?> exitSubscription;
-
-      void finishError(Object error, [StackTrace? stackTrace]) {
-        if (!result.isCompleted) {
-          result.completeError(error, stackTrace);
-        }
-      }
-
-      messageSubscription = messages.listen((message) {
-        if (message is _BackgroundRefreshProgress) {
-          onProgress?.call(message.progress);
-          return;
-        }
-        if (message is _BackgroundRefreshDone) {
-          if (!result.isCompleted) {
-            result.complete(message.result);
-          }
-          return;
-        }
-        if (message is _BackgroundRefreshError) {
-          finishError(
-            StateError(message.error),
-            StackTrace.fromString(message.stackTrace),
-          );
-        }
-      });
-      errorSubscription = errors.listen((message) {
-        finishError(
-          StateError('Background cached session load failed. $message'),
+  }) {
+    return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
+      final messages = ReceivePort();
+      final errors = ReceivePort();
+      final exits = ReceivePort();
+      Isolate? isolate;
+      try {
+        isolate = await Isolate.spawn<_BackgroundCachedRowsRequest>(
+          _backgroundCachedRowsEntry,
+          _BackgroundCachedRowsRequest(
+            databaseFilePath: databaseFile.path,
+            sendPort: messages.sendPort,
+            batchSize: batchSize,
+          ),
+          onError: errors.sendPort,
+          onExit: exits.sendPort,
         );
-      });
-      exitSubscription = exits.listen((_) {
-        if (!result.isCompleted) {
-          finishError(
-            StateError(
-              'Background cached session load exited before completion.',
-            ),
-          );
-        }
-      });
 
-      return await result.future.whenComplete(() async {
-        await messageSubscription.cancel();
-        await errorSubscription.cancel();
-        await exitSubscription.cancel();
-      });
-    } finally {
-      messages.close();
-      errors.close();
-      exits.close();
-      isolate?.kill(priority: Isolate.immediate);
-    }
+        final result = Completer<SessionsRefreshResult>();
+        late StreamSubscription<Object?> messageSubscription;
+        late StreamSubscription<Object?> errorSubscription;
+        late StreamSubscription<Object?> exitSubscription;
+
+        void finishError(Object error, [StackTrace? stackTrace]) {
+          if (!result.isCompleted) {
+            result.completeError(error, stackTrace);
+          }
+        }
+
+        messageSubscription = messages.listen((message) {
+          if (message is _BackgroundRefreshProgress) {
+            onProgress?.call(message.progress);
+            return;
+          }
+          if (message is _BackgroundRefreshDone) {
+            if (!result.isCompleted) {
+              result.complete(message.result);
+            }
+            return;
+          }
+          if (message is _BackgroundRefreshError) {
+            finishError(
+              StateError(message.error),
+              StackTrace.fromString(message.stackTrace),
+            );
+          }
+        });
+        errorSubscription = errors.listen((message) {
+          finishError(
+            StateError('Background cached session load failed. $message'),
+          );
+        });
+        exitSubscription = exits.listen((_) {
+          if (!result.isCompleted) {
+            finishError(
+              StateError(
+                'Background cached session load exited before completion.',
+              ),
+            );
+          }
+        });
+
+        return await result.future.whenComplete(() async {
+          await messageSubscription.cancel();
+          await errorSubscription.cancel();
+          await exitSubscription.cancel();
+        });
+      } finally {
+        messages.close();
+        errors.close();
+        exits.close();
+        isolate?.kill(priority: Isolate.immediate);
+      }
+    });
   }
 
-  Future<SessionRowViewModel?> loadSessionDetail(String sessionId) async {
-    final settings = await SettingsRepository(settingsFile).loadOrCreate();
-    final db = sqlite3.open(databaseFile.path);
-    try {
-      _cleanSessionMetadataPlaceholders(db);
-      _backfillAutomaticProjects(db);
-      final pricing = PricingRepository(db).loadCached(settings.pricing);
-      final rows = _loadRows(
-        db,
-        sessionId: sessionId,
-        includeMessages: true,
-        pricing: pricing,
-      );
-      if (rows.isEmpty) {
-        return null;
+  Future<SessionRowViewModel?> loadSessionDetail(String sessionId) {
+    return Profiling.spanAsync('scan.runtime.load_session_detail', () async {
+      final settings = await SettingsRepository(settingsFile).loadOrCreate();
+      final db = sqlite3.open(databaseFile.path);
+      try {
+        _cleanSessionMetadataPlaceholders(db);
+        _backfillAutomaticProjects(db);
+        final pricing = PricingRepository(db).loadCached(settings.pricing);
+        final rows = _loadRowsProfiled(
+          db,
+          sessionId: sessionId,
+          includeMessages: true,
+          pricing: pricing,
+        );
+        if (rows.isEmpty) {
+          return null;
+        }
+        return rows.single;
+      } finally {
+        db.close();
       }
-      return rows.single;
-    } finally {
-      db.close();
-    }
+    });
   }
 
   Future<SessionsRefreshResult> refreshInBackground({
@@ -215,143 +222,157 @@ class RuntimeSessionController {
 
   Future<SessionsRefreshResult> refresh({
     SessionsRefreshProgressCallback? onProgress,
-  }) async {
-    final settings = await SettingsRepository(settingsFile).loadOrCreate();
-    final db = sqlite3.open(databaseFile.path);
-    final logger = StructuredLogger(db: db, settings: settings.logging);
-    final pricing = PricingRepository(db).loadCached(settings.pricing);
-    int? scanRunId;
-    var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
-    final pendingParsedSessions = <ScannedSessionFile>[];
-    try {
-      _cleanSessionMetadataPlaceholders(db);
-      scanRunId = _startScanRun(db);
-      final activeScanRunId = scanRunId;
+  }) {
+    return Profiling.spanAsync('scan.runtime.refresh', () async {
+      final settings = await SettingsRepository(settingsFile).loadOrCreate();
+      final db = sqlite3.open(databaseFile.path);
+      final logger = StructuredLogger(db: db, settings: settings.logging);
+      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      int? scanRunId;
+      var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
+      final pendingParsedSessions = <ScannedSessionFile>[];
+      try {
+        _cleanSessionMetadataPlaceholders(db);
+        scanRunId = _startScanRun(db);
+        final activeScanRunId = scanRunId;
 
-      void flushParsedSessions(ScanProgress progress) {
-        if (pendingParsedSessions.isEmpty) {
-          return;
+        void flushParsedSessions(ScanProgress progress) {
+          if (pendingParsedSessions.isEmpty) {
+            return;
+          }
+          Profiling.spanSync('scan.runtime.persist_flush', () {
+            _persistParsedSessions(db, pendingParsedSessions);
+          });
+          pendingParsedSessions.clear();
+          onProgress?.call(
+            SessionsRefreshProgress(
+              statusMessage: _progressStatusMessage(progress),
+              rows: _loadRowsProfiled(db, pricing: pricing),
+            ),
+          );
         }
-        _persistParsedSessions(db, pendingParsedSessions);
-        pendingParsedSessions.clear();
-        onProgress?.call(
-          SessionsRefreshProgress(
-            statusMessage: _progressStatusMessage(progress),
-            rows: _loadRows(db, pricing: pricing),
+
+        final cachedRows = _loadRowsProfiled(db, pricing: pricing);
+        if (onProgress != null && cachedRows.isNotEmpty) {
+          onProgress(
+            SessionsRefreshProgress(
+              rows: cachedRows,
+              statusMessage:
+                  'Loaded ${cachedRows.length} of ${cachedRows.length} sessions from the previous scan. Scanning started.',
+            ),
+          );
+        }
+
+        await logger.write(
+          LogEntryDraft(
+            level: LogLevel.info,
+            category: LogCategory.scanner,
+            message: 'Session scan started.',
+            details: {
+              'directory_workers': _defaultDirectoryWorkerCount(),
+              'parser_workers': _defaultParserWorkerCount(),
+              'parser_isolates': true,
+            },
           ),
         );
-      }
-
-      final cachedRows = _loadRows(db, pricing: pricing);
-      if (onProgress != null && cachedRows.isNotEmpty) {
-        onProgress(
-          SessionsRefreshProgress(
-            rows: cachedRows,
-            statusMessage:
-                'Loaded ${cachedRows.length} of ${cachedRows.length} sessions from the previous scan. Scanning started.',
+        final mapper = CodexPathMapper(
+          wslDistro: settings.wsl.distro,
+          wslLinuxHome: settings.wsl.linuxHome,
+          wslUncRoot: settings.wsl.linuxRootUnc,
+        );
+        final parserWorkerCount = _defaultParserWorkerCount();
+        final directoryWorkerCount = _defaultDirectoryWorkerCount();
+        final scanner = SessionScanner(
+          parser: CodexSessionParser(
+            maxToolOutputPreviewChars:
+                settings.toolOutput.maxToolOutputPreviewChars,
+          ),
+          pathMapper: mapper,
+          maxConcurrentParses: parserWorkerCount,
+          maxConcurrentDirectoryScans: directoryWorkerCount,
+          onProgress: onProgress == null
+              ? null
+              : (progress) {
+                  latestProgress = progress;
+                  _updateScanRun(db, activeScanRunId, progress);
+                  onProgress(
+                    SessionsRefreshProgress(
+                      statusMessage: _progressStatusMessage(progress),
+                    ),
+                  );
+                },
+          onSessionParsed: onProgress == null
+              ? null
+              : (session, progress) async {
+                  pendingParsedSessions.add(session);
+                  if (pendingParsedSessions.length >= 25) {
+                    flushParsedSessions(progress);
+                  }
+                },
+        );
+        final result = await Profiling.spanAsync(
+          'scan.runtime.scanner_scan',
+          () {
+            return scanner.scan(
+              SessionScanRequest(
+                windowsRoot: _sessionScanRoot(settings.paths.windowsCodexPath),
+                wslRoot: _sessionScanRoot(settings.paths.wslCodexUncPath),
+                cachedSessions: _cachedSessions(db),
+              ),
+            );
+          },
+        );
+        flushParsedSessions(result.progress);
+        Profiling.spanSync('scan.runtime.persist_scan', () {
+          _persistScan(
+            db,
+            result,
+            scanRunId: activeScanRunId,
+            persistSessions: onProgress == null,
+          );
+        });
+        final rows = _loadRowsProfiled(db, pricing: pricing);
+        await logger.write(
+          LogEntryDraft(
+            level: LogLevel.info,
+            category: LogCategory.scanner,
+            message: 'Session scan finished.',
+            details: {
+              ..._progressLogDetails(result.progress),
+              'visible_sessions': rows.length,
+              'directory_workers': directoryWorkerCount,
+              'parser_workers': parserWorkerCount,
+            },
           ),
         );
+        return SessionsRefreshResult(
+          rows: rows,
+          statusMessage: _statusMessage(
+            result,
+            visibleSessionCount: rows.length,
+          ),
+        );
+      } on Object catch (error) {
+        final progress = latestProgress.finish();
+        if (scanRunId != null) {
+          _updateScanRun(db, scanRunId, progress);
+        }
+        await logger.write(
+          LogEntryDraft(
+            level: LogLevel.error,
+            category: LogCategory.scanner,
+            message: 'Session scan failed.',
+            details: {
+              ..._progressLogDetails(progress),
+              'error_type': error.runtimeType.toString(),
+            },
+          ),
+        );
+        rethrow;
+      } finally {
+        db.close();
       }
-
-      await logger.write(
-        LogEntryDraft(
-          level: LogLevel.info,
-          category: LogCategory.scanner,
-          message: 'Session scan started.',
-          details: {
-            'directory_workers': _defaultDirectoryWorkerCount(),
-            'parser_workers': _defaultParserWorkerCount(),
-            'parser_isolates': true,
-          },
-        ),
-      );
-      final mapper = CodexPathMapper(
-        wslDistro: settings.wsl.distro,
-        wslLinuxHome: settings.wsl.linuxHome,
-        wslUncRoot: settings.wsl.linuxRootUnc,
-      );
-      final parserWorkerCount = _defaultParserWorkerCount();
-      final directoryWorkerCount = _defaultDirectoryWorkerCount();
-      final scanner = SessionScanner(
-        parser: CodexSessionParser(
-          maxToolOutputPreviewChars:
-              settings.toolOutput.maxToolOutputPreviewChars,
-        ),
-        pathMapper: mapper,
-        maxConcurrentParses: parserWorkerCount,
-        maxConcurrentDirectoryScans: directoryWorkerCount,
-        onProgress: onProgress == null
-            ? null
-            : (progress) {
-                latestProgress = progress;
-                _updateScanRun(db, activeScanRunId, progress);
-                onProgress(
-                  SessionsRefreshProgress(
-                    statusMessage: _progressStatusMessage(progress),
-                  ),
-                );
-              },
-        onSessionParsed: onProgress == null
-            ? null
-            : (session, progress) async {
-                pendingParsedSessions.add(session);
-                if (pendingParsedSessions.length >= 25) {
-                  flushParsedSessions(progress);
-                }
-              },
-      );
-      final result = await scanner.scan(
-        SessionScanRequest(
-          windowsRoot: _sessionScanRoot(settings.paths.windowsCodexPath),
-          wslRoot: _sessionScanRoot(settings.paths.wslCodexUncPath),
-          cachedSessions: _cachedSessions(db),
-        ),
-      );
-      flushParsedSessions(result.progress);
-      _persistScan(
-        db,
-        result,
-        scanRunId: activeScanRunId,
-        persistSessions: onProgress == null,
-      );
-      final rows = _loadRows(db, pricing: pricing);
-      await logger.write(
-        LogEntryDraft(
-          level: LogLevel.info,
-          category: LogCategory.scanner,
-          message: 'Session scan finished.',
-          details: {
-            ..._progressLogDetails(result.progress),
-            'visible_sessions': rows.length,
-            'directory_workers': directoryWorkerCount,
-            'parser_workers': parserWorkerCount,
-          },
-        ),
-      );
-      return SessionsRefreshResult(
-        rows: rows,
-        statusMessage: _statusMessage(result, visibleSessionCount: rows.length),
-      );
-    } on Object catch (error) {
-      final progress = latestProgress.finish();
-      if (scanRunId != null) {
-        _updateScanRun(db, scanRunId, progress);
-      }
-      await logger.write(
-        LogEntryDraft(
-          level: LogLevel.error,
-          category: LogCategory.scanner,
-          message: 'Session scan failed.',
-          details: {
-            ..._progressLogDetails(progress),
-            'error_type': error.runtimeType.toString(),
-          },
-        ),
-      );
-      rethrow;
-    } finally {
-      db.close();
-    }
+    });
   }
 }
 
@@ -386,7 +407,9 @@ Future<void> _backgroundCachedRowsEntry(
       final rows = <SessionRowViewModel>[];
       var offset = 0;
       while (offset < total) {
-        rows.addAll(_loadRows(db, limit: request.batchSize, offset: offset));
+        rows.addAll(
+          _loadRowsProfiled(db, limit: request.batchSize, offset: offset),
+        );
         offset = rows.length;
         request.sendPort.send(
           _BackgroundRefreshProgress(
@@ -414,6 +437,26 @@ Future<void> _backgroundCachedRowsEntry(
       _BackgroundRefreshError(error.toString(), stackTrace.toString()),
     );
   }
+}
+
+List<SessionRowViewModel> _loadRowsProfiled(
+  Database db, {
+  bool includeMessages = false,
+  String? sessionId,
+  int? limit,
+  int offset = 0,
+  UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+}) {
+  return Profiling.spanSync('scan.runtime.load_rows', () {
+    return _loadRows(
+      db,
+      includeMessages: includeMessages,
+      sessionId: sessionId,
+      limit: limit,
+      offset: offset,
+      pricing: pricing,
+    );
+  });
 }
 
 class _BackgroundRefreshRequest {
@@ -1319,26 +1362,28 @@ class _ProjectPathResolver {
   }
 
   _ResolvedProjectPath? _resolveWsl(String path) {
-    try {
-      final result = Process.runSync('wsl.exe', [
-        'sh',
-        '-lc',
-        'cd "\$1" 2>/dev/null && '
-            'root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd) && '
-            'basename "\$root"',
-        'sh',
-        path,
-      ]);
-      if (result.exitCode == 0) {
-        final name = result.stdout.toString().trim().split('\n').last.trim();
-        if (name.isNotEmpty) {
-          return _ResolvedProjectPath(name);
+    return Profiling.spanSync('scan.runtime.resolve_wsl_project', () {
+      try {
+        final result = Process.runSync('wsl.exe', [
+          'sh',
+          '-lc',
+          'cd "\$1" 2>/dev/null && '
+              'root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd) && '
+              'basename "\$root"',
+          'sh',
+          path,
+        ]);
+        if (result.exitCode == 0) {
+          final name = result.stdout.toString().trim().split('\n').last.trim();
+          if (name.isNotEmpty) {
+            return _ResolvedProjectPath(name);
+          }
         }
+      } on Object {
+        // WSL may be unavailable during tests/startup; use the path segment.
       }
-    } on Object {
-      // WSL may be unavailable during tests/startup; use the path segment.
-    }
-    return _projectFromPath(path);
+      return _projectFromPath(path);
+    });
   }
 
   _ResolvedProjectPath? _projectFromPath(String path) {

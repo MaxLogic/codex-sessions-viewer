@@ -8,6 +8,7 @@ import 'package:crypto/crypto.dart';
 
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
+import '../utils/profiling.dart';
 
 enum SessionFileStatus {
   available,
@@ -59,124 +60,133 @@ class SessionScanner {
   bool _isScanning = false;
   int _lastProgressWorkItems = 0;
 
-  Future<SessionScanResult> scan(SessionScanRequest request) async {
-    if (_isScanning) {
-      throw const ScanAlreadyRunningException();
-    }
-    _isScanning = true;
-    try {
-      final progress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
-      _lastProgressWorkItems = 0;
-      _emitProgress(progress, force: true);
-      final sessions = <ScannedSessionFile>[];
-      final errors = <ScanFileError>[];
-      final fileStatuses = <ScannedFileStatus>[];
-      final statusEvents = <ScannedFileStatus>[];
-      final skippedFiles = <ScannedFileStatus>[];
-      final candidates = <_ScanCandidate>[];
-      final parsed = <_ParsedCandidate>[];
-      final reachableRoots = <String>[];
-      final forcedReparse = request.forceReparsePlan.apply(
-        request.cachedSessions,
-      );
-      final cachedIndex = _CachedSessionIndex(request.cachedSessions);
-      final directoryQueue = _WorkQueue<_ScanDirectory>();
-      final parseQueue = _AsyncQueue<_ScanCandidate>();
-      final parserPool = await _createParserPool();
-
+  Future<SessionScanResult> scan(SessionScanRequest request) {
+    return Profiling.spanAsync('scan.scanner.scan', () async {
+      if (_isScanning) {
+        throw const ScanAlreadyRunningException();
+      }
+      _isScanning = true;
       try {
-        await _enqueueRoot(
-          rootPath: request.windowsRoot,
-          sourceType: SessionSourceType.windows,
-          progress: progress,
-          errors: errors,
-          fileStatuses: fileStatuses,
-          statusEvents: statusEvents,
-          reachableRoots: reachableRoots,
-          directoryQueue: directoryQueue,
+        final progress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
+        _lastProgressWorkItems = 0;
+        _emitProgress(progress, force: true);
+        final sessions = <ScannedSessionFile>[];
+        final errors = <ScanFileError>[];
+        final fileStatuses = <ScannedFileStatus>[];
+        final statusEvents = <ScannedFileStatus>[];
+        final skippedFiles = <ScannedFileStatus>[];
+        final candidates = <_ScanCandidate>[];
+        final parsed = <_ParsedCandidate>[];
+        final reachableRoots = <String>[];
+        final forcedReparse = request.forceReparsePlan.apply(
+          request.cachedSessions,
         );
-        await _enqueueRoot(
-          rootPath: request.wslRoot,
-          sourceType: SessionSourceType.wsl,
-          progress: progress,
-          errors: errors,
-          fileStatuses: fileStatuses,
-          statusEvents: statusEvents,
-          reachableRoots: reachableRoots,
-          directoryQueue: directoryQueue,
+        final cachedIndex = _CachedSessionIndex(request.cachedSessions);
+        final directoryQueue = _WorkQueue<_ScanDirectory>();
+        final parseQueue = _AsyncQueue<_ScanCandidate>();
+        final parserPool = await Profiling.spanAsync(
+          'scan.scanner.parser_pool.start',
+          _createParserPool,
         );
-        directoryQueue.closeWhenIdle();
 
-        final directoryWorkers = [
-          for (var i = 0; i < maxConcurrentDirectoryScans; i++)
-            _directoryWorker(
-              directoryQueue: directoryQueue,
-              parseQueue: parseQueue,
+        try {
+          await Profiling.spanAsync('scan.scanner.root_discovery', () async {
+            await _enqueueRoot(
+              rootPath: request.windowsRoot,
+              sourceType: SessionSourceType.windows,
               progress: progress,
               errors: errors,
               fileStatuses: fileStatuses,
               statusEvents: statusEvents,
-              candidates: candidates,
-            ),
-        ];
-        final parserWorkers = [
-          for (var i = 0; i < maxConcurrentParses; i++)
-            _parserWorker(
-              parseQueue: parseQueue,
+              reachableRoots: reachableRoots,
+              directoryQueue: directoryQueue,
+            );
+            await _enqueueRoot(
+              rootPath: request.wslRoot,
+              sourceType: SessionSourceType.wsl,
               progress: progress,
-              parsed: parsed,
+              errors: errors,
               fileStatuses: fileStatuses,
               statusEvents: statusEvents,
-              skippedFiles: skippedFiles,
-              cachedIndex: cachedIndex,
-              forcedReparse: forcedReparse,
-              parserPool: parserPool,
-            ),
-        ];
+              reachableRoots: reachableRoots,
+              directoryQueue: directoryQueue,
+            );
+          });
+          directoryQueue.closeWhenIdle();
 
-        await Future.wait(directoryWorkers);
-        parseQueue.close();
-        await Future.wait(parserWorkers);
-      } finally {
-        await parserPool?.close();
-      }
+          final directoryWorkers = [
+            for (var i = 0; i < maxConcurrentDirectoryScans; i++)
+              _directoryWorker(
+                directoryQueue: directoryQueue,
+                parseQueue: parseQueue,
+                progress: progress,
+                errors: errors,
+                fileStatuses: fileStatuses,
+                statusEvents: statusEvents,
+                candidates: candidates,
+              ),
+          ];
+          final parserWorkers = [
+            for (var i = 0; i < maxConcurrentParses; i++)
+              _parserWorker(
+                parseQueue: parseQueue,
+                progress: progress,
+                parsed: parsed,
+                fileStatuses: fileStatuses,
+                statusEvents: statusEvents,
+                skippedFiles: skippedFiles,
+                cachedIndex: cachedIndex,
+                forcedReparse: forcedReparse,
+                parserPool: parserPool,
+              ),
+          ];
 
-      for (final parsedFile in parsed) {
-        if (parsedFile.error == null) {
-          sessions.add(parsedFile.session!);
-        } else {
-          errors.add(parsedFile.error!);
+          await Future.wait(directoryWorkers);
+          parseQueue.close();
+          await Future.wait(parserWorkers);
+        } finally {
+          await parserPool?.close();
         }
-      }
-      if (reachableRoots.isNotEmpty) {
-        _recordMissingCachedSessions(
-          request.cachedSessions,
-          candidates,
-          reachableRoots,
-          progress,
-          errors,
-          fileStatuses,
-          statusEvents,
-        );
-      }
 
-      sessions.sort(_compareScannedSessions);
-      errors.sort(_compareErrors);
-      fileStatuses.sort(_compareStatuses);
-      final finishedProgress = progress.finish();
-      _emitProgress(finishedProgress, force: true);
-      return SessionScanResult(
-        progress: finishedProgress,
-        sessions: List.unmodifiable(sessions),
-        errors: List.unmodifiable(errors),
-        fileStatuses: List.unmodifiable(fileStatuses),
-        statusEvents: List.unmodifiable(statusEvents),
-        skippedFiles: List.unmodifiable(skippedFiles),
-        cachedSessions: List.unmodifiable(request.cachedSessions),
-      );
-    } finally {
-      _isScanning = false;
-    }
+        for (final parsedFile in parsed) {
+          if (parsedFile.error == null) {
+            sessions.add(parsedFile.session!);
+          } else {
+            errors.add(parsedFile.error!);
+          }
+        }
+        if (reachableRoots.isNotEmpty) {
+          Profiling.spanSync('scan.scanner.missing_cached', () {
+            _recordMissingCachedSessions(
+              request.cachedSessions,
+              candidates,
+              reachableRoots,
+              progress,
+              errors,
+              fileStatuses,
+              statusEvents,
+            );
+          });
+        }
+
+        sessions.sort(_compareScannedSessions);
+        errors.sort(_compareErrors);
+        fileStatuses.sort(_compareStatuses);
+        final finishedProgress = progress.finish();
+        _emitProgress(finishedProgress, force: true);
+        return SessionScanResult(
+          progress: finishedProgress,
+          sessions: List.unmodifiable(sessions),
+          errors: List.unmodifiable(errors),
+          fileStatuses: List.unmodifiable(fileStatuses),
+          statusEvents: List.unmodifiable(statusEvents),
+          skippedFiles: List.unmodifiable(skippedFiles),
+          cachedSessions: List.unmodifiable(request.cachedSessions),
+        );
+      } finally {
+        _isScanning = false;
+      }
+    });
   }
 
   Future<void> _enqueueRoot({
@@ -261,80 +271,82 @@ class SessionScanner {
     required List<ScannedFileStatus> fileStatuses,
     required List<ScannedFileStatus> statusEvents,
     required List<_ScanCandidate> candidates,
-  }) async {
-    final root = scanDirectory.directory;
-    try {
-      progress.directoriesScanned++;
-      _emitProgress(progress);
-      await for (final entity in root.list(followLinks: false)) {
-        if (entity is Directory) {
-          directoryQueue.add(
-            _ScanDirectory(
-              directory: entity,
-              sourceType: scanDirectory.sourceType,
-            ),
-          );
-          continue;
-        }
-        if (entity is! File) {
-          continue;
-        }
-        if (!_isSupportedSessionFile(entity.path)) {
-          progress.filesSkipped++;
-          _emitProgress(progress);
-          errors.add(
-            ScanFileError(
-              sourcePath: entity.path,
-              status: SessionFileStatus.unsupportedFormat,
-              message: 'Unsupported session file format.',
-            ),
-          );
-          fileStatuses.add(
-            ScannedFileStatus(
-              sourcePath: entity.path,
-              status: SessionFileStatus.unsupportedFormat,
-            ),
-          );
-          statusEvents.add(
-            ScannedFileStatus(
-              sourcePath: entity.path,
-              status: SessionFileStatus.unsupportedFormat,
-            ),
-          );
-          continue;
-        }
-        progress.filesFound++;
+  }) {
+    return Profiling.spanAsync('scan.scanner.directory', () async {
+      final root = scanDirectory.directory;
+      try {
+        progress.directoriesScanned++;
         _emitProgress(progress);
-        final candidate = _ScanCandidate(
-          file: entity,
-          sourceType: scanDirectory.sourceType,
+        await for (final entity in root.list(followLinks: false)) {
+          if (entity is Directory) {
+            directoryQueue.add(
+              _ScanDirectory(
+                directory: entity,
+                sourceType: scanDirectory.sourceType,
+              ),
+            );
+            continue;
+          }
+          if (entity is! File) {
+            continue;
+          }
+          if (!_isSupportedSessionFile(entity.path)) {
+            progress.filesSkipped++;
+            _emitProgress(progress);
+            errors.add(
+              ScanFileError(
+                sourcePath: entity.path,
+                status: SessionFileStatus.unsupportedFormat,
+                message: 'Unsupported session file format.',
+              ),
+            );
+            fileStatuses.add(
+              ScannedFileStatus(
+                sourcePath: entity.path,
+                status: SessionFileStatus.unsupportedFormat,
+              ),
+            );
+            statusEvents.add(
+              ScannedFileStatus(
+                sourcePath: entity.path,
+                status: SessionFileStatus.unsupportedFormat,
+              ),
+            );
+            continue;
+          }
+          progress.filesFound++;
+          _emitProgress(progress);
+          final candidate = _ScanCandidate(
+            file: entity,
+            sourceType: scanDirectory.sourceType,
+          );
+          candidates.add(candidate);
+          parseQueue.add(candidate);
+        }
+      } on FileSystemException catch (error) {
+        progress.filesFailed++;
+        _emitProgress(progress);
+        errors.add(
+          ScanFileError(
+            sourcePath: root.path,
+            status: _statusFromFileSystemError(error),
+            message: error.message,
+          ),
         );
-        candidates.add(candidate);
-        parseQueue.add(candidate);
+        fileStatuses.add(
+          ScannedFileStatus(
+            sourcePath: root.path,
+            status: _statusFromFileSystemError(error),
+          ),
+        );
+        statusEvents.add(
+          ScannedFileStatus(
+            sourcePath: root.path,
+            status: _statusFromFileSystemError(error),
+          ),
+        );
       }
-    } on FileSystemException catch (error) {
-      progress.filesFailed++;
-      _emitProgress(progress);
-      errors.add(
-        ScanFileError(
-          sourcePath: root.path,
-          status: _statusFromFileSystemError(error),
-          message: error.message,
-        ),
-      );
-      fileStatuses.add(
-        ScannedFileStatus(
-          sourcePath: root.path,
-          status: _statusFromFileSystemError(error),
-        ),
-      );
-      statusEvents.add(
-        ScannedFileStatus(
-          sourcePath: root.path,
-          status: _statusFromFileSystemError(error),
-        ),
-      );
-    }
+    });
   }
 
   Future<void> _parserWorker({
@@ -405,36 +417,38 @@ class SessionScanner {
     _ScanCandidate candidate,
     ScanProgress progress, {
     required _ParserIsolatePool? parserPool,
-  }) async {
-    final mappedPath = candidate.sourceType == SessionSourceType.windows
-        ? pathMapper.mapWindowsPath(candidate.file.path)
-        : pathMapper.mapWslUncPath(candidate.file.path);
-    final parseResult = parserPool == null
-        ? await parser.parseFile(candidate.file)
-        : await parserPool.parseFile(candidate.file.path);
-    if (!parseResult.isSuccess) {
-      progress.filesFailed++;
-      _emitProgress(progress);
-      final error = parseResult.error;
-      return _ParsedCandidate.error(
-        ScanFileError(
-          sourcePath: candidate.file.path,
-          status: _statusFromParseError(error),
-          message: _parseErrorMessage(error),
-        ),
+  }) {
+    return Profiling.spanAsync('scan.scanner.parse_file', () async {
+      final mappedPath = candidate.sourceType == SessionSourceType.windows
+          ? pathMapper.mapWindowsPath(candidate.file.path)
+          : pathMapper.mapWslUncPath(candidate.file.path);
+      final parseResult = parserPool == null
+          ? await parser.parseFile(candidate.file)
+          : await parserPool.parseFile(candidate.file.path);
+      if (!parseResult.isSuccess) {
+        progress.filesFailed++;
+        _emitProgress(progress);
+        final error = parseResult.error;
+        return _ParsedCandidate.error(
+          ScanFileError(
+            sourcePath: candidate.file.path,
+            status: _statusFromParseError(error),
+            message: _parseErrorMessage(error),
+          ),
+        );
+      }
+      progress.filesParsed++;
+      final session = ScannedSessionFile(
+        sourcePath: candidate.file.path,
+        sourceType: candidate.sourceType,
+        status: SessionFileStatus.available,
+        mappedPath: mappedPath,
+        parsedSession: parseResult.session!,
       );
-    }
-    progress.filesParsed++;
-    final session = ScannedSessionFile(
-      sourcePath: candidate.file.path,
-      sourceType: candidate.sourceType,
-      status: SessionFileStatus.available,
-      mappedPath: mappedPath,
-      parsedSession: parseResult.session!,
-    );
-    await onSessionParsed?.call(session, progress.snapshot());
-    _emitProgress(progress);
-    return _ParsedCandidate.session(session);
+      await onSessionParsed?.call(session, progress.snapshot());
+      _emitProgress(progress);
+      return _ParsedCandidate.session(session);
+    });
   }
 
   void _recordMissingCachedSessions(
@@ -490,43 +504,45 @@ class SessionScanner {
     File file,
     _CachedSessionIndex cachedSessions,
     ForceReparseSelection forcedReparse,
-  ) async {
-    if (forcedReparse.shouldForceParse(file.path)) {
-      return const _ParseDecision.parse();
-    }
-    final cached = cachedSessions.lookup(file.path);
-    if (cached == null || !cached.hasCompleteInvalidationMetadata) {
-      return const _ParseDecision.parse();
-    }
-    if (cached.status != SessionFileStatus.available) {
-      return const _ParseDecision.parse();
-    }
-    if (cached.parserVersion != CodexSessionParser.currentVersion) {
-      return const _ParseDecision.parse();
-    }
+  ) {
+    return Profiling.spanAsync('scan.scanner.parse_decision', () async {
+      if (forcedReparse.shouldForceParse(file.path)) {
+        return const _ParseDecision.parse();
+      }
+      final cached = cachedSessions.lookup(file.path);
+      if (cached == null || !cached.hasCompleteInvalidationMetadata) {
+        return const _ParseDecision.parse();
+      }
+      if (cached.status != SessionFileStatus.available) {
+        return const _ParseDecision.parse();
+      }
+      if (cached.parserVersion != CodexSessionParser.currentVersion) {
+        return const _ParseDecision.parse();
+      }
 
-    final FileStat stat;
-    final String currentHash;
-    try {
-      stat = await file.stat();
-    } on Object {
-      return const _ParseDecision.parse();
-    }
-    final currentSize = stat.size;
-    final sizeChanged = currentSize != cached.sourceFileSize;
-    if (sizeChanged) {
-      return const _ParseDecision.parse();
-    }
-    try {
-      currentHash = await _contentHash(file);
-    } on Object {
-      return const _ParseDecision.parse();
-    }
-    final hashChanged = currentHash != cached.sourceContentHash;
-    if (hashChanged) {
-      return const _ParseDecision.parse();
-    }
-    return const _ParseDecision.skip();
+      final FileStat stat;
+      final String currentHash;
+      try {
+        stat = await file.stat();
+      } on Object {
+        return const _ParseDecision.parse();
+      }
+      final currentSize = stat.size;
+      final sizeChanged = currentSize != cached.sourceFileSize;
+      if (sizeChanged) {
+        return const _ParseDecision.parse();
+      }
+      try {
+        currentHash = await _contentHash(file);
+      } on Object {
+        return const _ParseDecision.parse();
+      }
+      final hashChanged = currentHash != cached.sourceContentHash;
+      if (hashChanged) {
+        return const _ParseDecision.parse();
+      }
+      return const _ParseDecision.skip();
+    });
   }
 
   Future<_ParserIsolatePool?> _createParserPool() async {
