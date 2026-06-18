@@ -796,6 +796,7 @@ class SessionsRefreshResult {
   const SessionsRefreshResult({
     required this.rows,
     required this.statusMessage,
+    this.cancelled = false,
     this.persistenceFlushCount = 0,
     this.fullRowSnapshotCount = 0,
   });
@@ -810,6 +811,7 @@ class SessionsRefreshResult {
 
   final List<SessionRowViewModel> rows;
   final String statusMessage;
+  final bool cancelled;
   final int persistenceFlushCount;
   final int fullRowSnapshotCount;
 }

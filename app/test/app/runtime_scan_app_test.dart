@@ -992,6 +992,212 @@ void main() {
     },
   );
 
+  test('runtime cancellable refresh preserves partial cached rows', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_cancel_scan_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    for (var i = 0; i < 5; i++) {
+      await _writeJsonFixture(windowsRoot, 'cancel-$i');
+    }
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      scanBatchingPolicy: const ScanBatchingPolicy(
+        parsedSessionFlushBatchSize: 1,
+        fullRowSnapshotBatchSize: 1,
+      ),
+    );
+    late CancellableSessionScanOperation operation;
+    Future<void>? cancelAck;
+    operation = controller.startRefreshOperation(
+      onProgress: (progress) {
+        if ((progress.rows?.isNotEmpty ?? false) && cancelAck == null) {
+          cancelAck = operation.cancel();
+        }
+      },
+    );
+
+    final result = await operation.result;
+    await cancelAck;
+
+    expect(result.cancelled, isTrue);
+    expect(result.statusMessage, contains('cancelled'));
+    expect(result.rows, isNotEmpty);
+    expect(result.rows.length, lessThan(5));
+
+    final cached = await controller.loadCachedRows();
+    expect(cached.rows, hasLength(result.rows.length));
+  });
+
+  test(
+    'runtime cancellable rescan keeps prior cached rows available',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_cancel_cached_scan_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      const sessionCount = 120;
+      for (var i = 0; i < sessionCount; i++) {
+        await _writeJsonFixture(windowsRoot, 'cached-cancel-$i');
+      }
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      final first = await controller.refresh();
+      expect(first.cancelled, isFalse);
+      expect(first.rows, hasLength(sessionCount));
+
+      late CancellableSessionScanOperation operation;
+      Future<void>? cancelAck;
+      operation = controller.startRefreshOperation(
+        onProgress: (progress) {
+          if (cancelAck != null) {
+            return;
+          }
+          if (progress.statusMessage.startsWith('Scanning...') &&
+              !progress.statusMessage.contains('found 0 JSON files')) {
+            cancelAck = operation.cancel();
+          }
+        },
+      );
+
+      final result = await operation.result;
+      await cancelAck;
+
+      expect(result.cancelled, isTrue);
+      expect(result.rows, hasLength(sessionCount));
+
+      final cached = await controller.loadCachedRows();
+      expect(cached.rows, hasLength(sessionCount));
+
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      expect(
+        db.select('''
+            select count(*) as count
+            from sessions
+            where scan_status != 'available'
+            ''').single['count'],
+        0,
+      );
+      final scanRunStatuses = db
+          .select('select status from scan_runs order by id')
+          .map((row) => row['status'])
+          .toList(growable: false);
+      expect(scanRunStatuses.first, 'succeeded');
+      expect(scanRunStatuses.last, 'cancelled');
+    },
+  );
+
+  test('background cancellable refresh acknowledges cancellation', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_background_cancel_scan_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    for (var i = 0; i < 200; i++) {
+      await _writeJsonFixture(windowsRoot, 'background-cancel-$i');
+    }
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final operation = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      scanBatchingPolicy: const ScanBatchingPolicy(
+        parsedSessionFlushBatchSize: 1,
+        fullRowSnapshotBatchSize: 1,
+      ),
+    ).startRefreshInBackgroundOperation();
+    final cancelAck = operation.cancel();
+    final result = await operation.result;
+    await cancelAck;
+
+    expect(result.cancelled, isTrue);
+    expect(result.statusMessage, contains('cancelled'));
+    final cached = await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).loadCachedRows();
+    expect(cached.rows.length, result.rows.length);
+  });
+
   test('auto project assignment keeps manual overrides on rescan', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_auto_project_',

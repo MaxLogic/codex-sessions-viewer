@@ -41,6 +41,7 @@ class SessionScanner {
     this.useParserIsolates = true,
     this.onProgress,
     this.onSessionParsed,
+    this.onParserPoolClosing,
     this.progressEveryWorkItems = 100,
     this.cacheModifiedTolerance = const Duration(seconds: 2),
   }) : assert(maxConcurrentParses > 0),
@@ -58,6 +59,7 @@ class SessionScanner {
     ScanProgress progress,
   )?
   onSessionParsed;
+  final Future<void> Function()? onParserPoolClosing;
   final int progressEveryWorkItems;
   final Duration cacheModifiedTolerance;
   bool _isScanning = false;
@@ -85,15 +87,41 @@ class SessionScanner {
           request.cachedSessions,
         );
         final cachedIndex = _CachedSessionIndex(request.cachedSessions);
+        final cancellationToken = request.cancellationToken;
         final directoryQueue = _WorkQueue<_ScanDirectory>();
         final parseQueue = _AsyncQueue<_ScanCandidate>();
-        final parserPool = await Profiling.spanAsync(
+        _ParserIsolatePool? parserPool;
+        Future<void>? parserPoolCloseFuture;
+        Future<void> closeParserPool() {
+          final pool = parserPool;
+          if (pool == null) {
+            return Future.value();
+          }
+          return parserPoolCloseFuture ??= pool.close();
+        }
+
+        void stopQueues() {
+          directoryQueue.cancel();
+          parseQueue.cancel();
+          unawaited(closeParserPool());
+        }
+
+        final removeCancelListener = cancellationToken?._addListener(
+          stopQueues,
+        );
+        parserPool = await Profiling.spanAsync(
           'scan.scanner.parser_pool.start',
           _createParserPool,
         );
+        if (cancellationToken?.isCancellationRequested ?? false) {
+          stopQueues();
+        }
 
         try {
           await Profiling.spanAsync('scan.scanner.root_discovery', () async {
+            if (cancellationToken?.isCancellationRequested ?? false) {
+              return;
+            }
             await _enqueueRoot(
               rootPath: request.windowsRoot,
               sourceType: SessionSourceType.windows,
@@ -103,7 +131,11 @@ class SessionScanner {
               statusEvents: statusEvents,
               reachableRoots: reachableRoots,
               directoryQueue: directoryQueue,
+              cancellationToken: cancellationToken,
             );
+            if (cancellationToken?.isCancellationRequested ?? false) {
+              return;
+            }
             await _enqueueRoot(
               rootPath: request.wslRoot,
               sourceType: SessionSourceType.wsl,
@@ -113,6 +145,7 @@ class SessionScanner {
               statusEvents: statusEvents,
               reachableRoots: reachableRoots,
               directoryQueue: directoryQueue,
+              cancellationToken: cancellationToken,
             );
           });
           directoryQueue.closeWhenIdle();
@@ -127,6 +160,7 @@ class SessionScanner {
                 fileStatuses: fileStatuses,
                 statusEvents: statusEvents,
                 candidates: candidates,
+                cancellationToken: cancellationToken,
               ),
           ];
           final parserWorkers = [
@@ -141,6 +175,7 @@ class SessionScanner {
                 cachedIndex: cachedIndex,
                 forcedReparse: forcedReparse,
                 parserPool: parserPool,
+                cancellationToken: cancellationToken,
               ),
           ];
 
@@ -148,7 +183,8 @@ class SessionScanner {
           parseQueue.close();
           await Future.wait(parserWorkers);
         } finally {
-          await parserPool?.close();
+          removeCancelListener?.call();
+          await closeParserPool();
         }
 
         for (final parsedFile in parsed) {
@@ -158,7 +194,8 @@ class SessionScanner {
             errors.add(parsedFile.error!);
           }
         }
-        if (reachableRoots.isNotEmpty) {
+        final cancelled = cancellationToken?.isCancellationRequested ?? false;
+        if (!cancelled && reachableRoots.isNotEmpty) {
           Profiling.spanSync('scan.scanner.missing_cached', () {
             _recordMissingCachedSessions(
               request.cachedSessions,
@@ -175,10 +212,11 @@ class SessionScanner {
         sessions.sort(_compareScannedSessions);
         errors.sort(_compareErrors);
         fileStatuses.sort(_compareStatuses);
-        final finishedProgress = progress.finish();
+        final finishedProgress = progress.finish(cancelled: cancelled);
         _emitProgress(finishedProgress, force: true);
-        return SessionScanResult(
+        final result = SessionScanResult(
           progress: finishedProgress,
+          cancelled: finishedProgress.cancelled,
           sessions: List.unmodifiable(sessions),
           errors: List.unmodifiable(errors),
           fileStatuses: List.unmodifiable(fileStatuses),
@@ -186,6 +224,10 @@ class SessionScanner {
           skippedFiles: List.unmodifiable(skippedFiles),
           cachedSessions: List.unmodifiable(request.cachedSessions),
         );
+        if (finishedProgress.cancelled) {
+          cancellationToken?._acknowledge();
+        }
+        return result;
       } finally {
         _isScanning = false;
       }
@@ -201,7 +243,11 @@ class SessionScanner {
     required List<ScannedFileStatus> statusEvents,
     required List<String> reachableRoots,
     required _WorkQueue<_ScanDirectory> directoryQueue,
+    required ScanCancellationToken? cancellationToken,
   }) async {
+    if (cancellationToken?.isCancellationRequested ?? false) {
+      return;
+    }
     if (rootPath == null || rootPath.isEmpty) {
       return;
     }
@@ -231,6 +277,9 @@ class SessionScanner {
       return;
     }
     reachableRoots.add(rootPath);
+    if (cancellationToken?.isCancellationRequested ?? false) {
+      return;
+    }
     directoryQueue.add(_ScanDirectory(directory: root, sourceType: sourceType));
   }
 
@@ -242,8 +291,12 @@ class SessionScanner {
     required List<ScannedFileStatus> fileStatuses,
     required List<ScannedFileStatus> statusEvents,
     required List<_ScanCandidate> candidates,
+    required ScanCancellationToken? cancellationToken,
   }) async {
     while (true) {
+      if (cancellationToken?.isCancellationRequested ?? false) {
+        return;
+      }
       final scanDirectory = await directoryQueue.take();
       if (scanDirectory == null) {
         return;
@@ -258,6 +311,7 @@ class SessionScanner {
           fileStatuses: fileStatuses,
           statusEvents: statusEvents,
           candidates: candidates,
+          cancellationToken: cancellationToken,
         );
       } finally {
         directoryQueue.completeItem();
@@ -274,6 +328,7 @@ class SessionScanner {
     required List<ScannedFileStatus> fileStatuses,
     required List<ScannedFileStatus> statusEvents,
     required List<_ScanCandidate> candidates,
+    required ScanCancellationToken? cancellationToken,
   }) {
     return Profiling.spanAsync('scan.scanner.directory', () async {
       final root = scanDirectory.directory;
@@ -281,13 +336,23 @@ class SessionScanner {
         progress.directoriesScanned++;
         _emitProgress(progress);
         await for (final entity in root.list(followLinks: false)) {
+          if (cancellationToken?.isCancellationRequested ?? false) {
+            break;
+          }
           if (entity is Directory) {
-            directoryQueue.add(
-              _ScanDirectory(
-                directory: entity,
-                sourceType: scanDirectory.sourceType,
-              ),
-            );
+            try {
+              directoryQueue.add(
+                _ScanDirectory(
+                  directory: entity,
+                  sourceType: scanDirectory.sourceType,
+                ),
+              );
+            } on StateError {
+              if (cancellationToken?.isCancellationRequested ?? false) {
+                break;
+              }
+              rethrow;
+            }
             continue;
           }
           if (entity is! File) {
@@ -324,7 +389,14 @@ class SessionScanner {
             sourceType: scanDirectory.sourceType,
           );
           candidates.add(candidate);
-          parseQueue.add(candidate);
+          try {
+            parseQueue.add(candidate);
+          } on StateError {
+            if (cancellationToken?.isCancellationRequested ?? false) {
+              break;
+            }
+            rethrow;
+          }
         }
       } on FileSystemException catch (error) {
         progress.filesFailed++;
@@ -362,10 +434,17 @@ class SessionScanner {
     required _CachedSessionIndex cachedIndex,
     required ForceReparseSelection forcedReparse,
     required _ParserIsolatePool? parserPool,
+    required ScanCancellationToken? cancellationToken,
   }) async {
     while (true) {
+      if (cancellationToken?.isCancellationRequested ?? false) {
+        return;
+      }
       final candidate = await parseQueue.take();
       if (candidate == null) {
+        return;
+      }
+      if (cancellationToken?.isCancellationRequested ?? false) {
         return;
       }
       final decision = await _parseDecision(
@@ -373,6 +452,9 @@ class SessionScanner {
         cachedIndex,
         forcedReparse,
       );
+      if (cancellationToken?.isCancellationRequested ?? false) {
+        return;
+      }
       if (!decision.shouldParse) {
         progress.filesSkipped++;
         _emitProgress(progress);
@@ -392,11 +474,19 @@ class SessionScanner {
           status: SessionFileStatus.changedPendingParse,
         ),
       );
-      final parsedFile = await _parseCandidate(
-        candidate,
-        progress,
-        parserPool: parserPool,
-      );
+      final _ParsedCandidate parsedFile;
+      try {
+        parsedFile = await _parseCandidate(
+          candidate,
+          progress,
+          parserPool: parserPool,
+        );
+      } on StateError {
+        if (cancellationToken?.isCancellationRequested ?? false) {
+          return;
+        }
+        rethrow;
+      }
       parsed.add(parsedFile);
       if (parsedFile.error == null) {
         final status = ScannedFileStatus(
@@ -553,6 +643,7 @@ class SessionScanner {
       workerCount: maxConcurrentParses,
       maxToolOutputPreviewChars: parser.maxToolOutputPreviewChars,
       maxMessageContentChars: parser.maxMessageContentChars,
+      onClosing: onParserPoolClosing,
     );
     await pool.start();
     return pool;
@@ -579,17 +670,20 @@ class SessionScanRequest {
     this.wslRoot,
     this.cachedSessions = const [],
     this.forceReparsePlan = const ForceReparsePlan.none(),
+    this.cancellationToken,
   });
 
   final String? windowsRoot;
   final String? wslRoot;
   final List<CachedSessionSnapshot> cachedSessions;
   final ForceReparsePlan forceReparsePlan;
+  final ScanCancellationToken? cancellationToken;
 }
 
 class SessionScanResult {
   const SessionScanResult({
     required this.progress,
+    this.cancelled = false,
     required this.sessions,
     required this.errors,
     required this.fileStatuses,
@@ -599,6 +693,7 @@ class SessionScanResult {
   });
 
   final ScanProgress progress;
+  final bool cancelled;
   final List<ScannedSessionFile> sessions;
   final List<ScanFileError> errors;
   final List<ScannedFileStatus> fileStatuses;
@@ -612,6 +707,7 @@ class ScanProgress {
 
   final DateTime startedAtUtc;
   DateTime? finishedAtUtc;
+  bool cancelled = false;
   int directoriesScanned = 0;
   int filesFound = 0;
   int filesSkipped = 0;
@@ -629,8 +725,9 @@ class ScanProgress {
       filesFailed +
       sessionsMissing;
 
-  ScanProgress finish() {
+  ScanProgress finish({bool cancelled = false}) {
     finishedAtUtc = DateTime.now().toUtc();
+    this.cancelled = cancelled;
     sessionsAdded = filesParsed;
     return this;
   }
@@ -638,6 +735,7 @@ class ScanProgress {
   ScanProgress snapshot() {
     final copy = ScanProgress(startedAtUtc: startedAtUtc)
       ..finishedAtUtc = finishedAtUtc
+      ..cancelled = cancelled
       ..directoriesScanned = directoriesScanned
       ..filesFound = filesFound
       ..filesSkipped = filesSkipped
@@ -841,6 +939,61 @@ class ForceReparseSelection {
 
 enum _ForceReparseMode { none, selected, all, filtered }
 
+class ScanCancellationController {
+  ScanCancellationController() : token = ScanCancellationToken._();
+
+  final ScanCancellationToken token;
+
+  bool get isCancellationRequested => token.isCancellationRequested;
+
+  Future<void> get acknowledged => token.acknowledged;
+
+  void cancel() {
+    token._requestCancellation();
+  }
+}
+
+class ScanCancellationToken {
+  ScanCancellationToken._();
+
+  final _acknowledged = Completer<void>();
+  final _listeners = <void Function()>[];
+  var _isCancellationRequested = false;
+
+  bool get isCancellationRequested => _isCancellationRequested;
+
+  Future<void> get acknowledged => _acknowledged.future;
+
+  void _requestCancellation() {
+    if (_isCancellationRequested) {
+      return;
+    }
+    _isCancellationRequested = true;
+    final listeners = List<void Function()>.of(_listeners);
+    _listeners.clear();
+    for (final listener in listeners) {
+      listener();
+    }
+  }
+
+  void _acknowledge() {
+    if (!_acknowledged.isCompleted) {
+      _acknowledged.complete();
+    }
+  }
+
+  void Function() _addListener(void Function() listener) {
+    if (_isCancellationRequested) {
+      listener();
+      return () {};
+    }
+    _listeners.add(listener);
+    return () {
+      _listeners.remove(listener);
+    };
+  }
+}
+
 class ScanAlreadyRunningException implements Exception {
   const ScanAlreadyRunningException();
 
@@ -935,6 +1088,11 @@ class _AsyncQueue<T> {
       _waiters.removeFirst().complete();
     }
   }
+
+  void cancel() {
+    _items.clear();
+    close();
+  }
 }
 
 class _WorkQueue<T> {
@@ -970,7 +1128,9 @@ class _WorkQueue<T> {
   }
 
   void completeItem() {
-    _activeItems--;
+    if (_activeItems > 0) {
+      _activeItems--;
+    }
     _closeIfIdle();
   }
 
@@ -988,6 +1148,18 @@ class _WorkQueue<T> {
       _waiters.removeFirst().complete();
     }
   }
+
+  void cancel() {
+    if (_closed) {
+      return;
+    }
+    _items.clear();
+    _closeRequested = true;
+    _closed = true;
+    while (_waiters.isNotEmpty) {
+      _waiters.removeFirst().complete();
+    }
+  }
 }
 
 class _ParserIsolatePool {
@@ -995,11 +1167,13 @@ class _ParserIsolatePool {
     required this.workerCount,
     required this.maxToolOutputPreviewChars,
     required this.maxMessageContentChars,
+    this.onClosing,
   });
 
   final int workerCount;
   final int maxToolOutputPreviewChars;
   final int maxMessageContentChars;
+  final Future<void> Function()? onClosing;
   final Queue<_ParserWorker> _available = Queue<_ParserWorker>();
   final Queue<_ParserJob> _pending = Queue<_ParserJob>();
   final Map<int, Completer<CodexParseResult>> _completers = {};
@@ -1007,6 +1181,7 @@ class _ParserIsolatePool {
   final List<_ParserWorker> _workers = [];
   var _nextJobId = 0;
   var _closed = false;
+  Future<void>? _closeFuture;
 
   Future<void> start() async {
     final count = math.max(1, workerCount);
@@ -1033,7 +1208,11 @@ class _ParserIsolatePool {
     return completer.future;
   }
 
-  Future<void> close() async {
+  Future<void> close() {
+    return _closeFuture ??= _close();
+  }
+
+  Future<void> _close() async {
     if (_closed) {
       return;
     }
@@ -1045,6 +1224,7 @@ class _ParserIsolatePool {
     }
     _completers.clear();
     _pending.clear();
+    await onClosing?.call();
     for (final worker in _workers) {
       await worker.close();
     }

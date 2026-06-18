@@ -345,6 +345,102 @@ void main() {
     await firstScan;
   });
 
+  test('cancels active scans and stops queued parse work', () async {
+    final root = Directory('${temp.path}${Platform.pathSeparator}win');
+    await root.create();
+    for (var i = 0; i < 5; i++) {
+      await File(
+        '${root.path}${Platform.pathSeparator}$i.json',
+      ).writeAsString(_validJsonSession('cancel-$i'));
+    }
+    final cancellation = ScanCancellationController();
+    var parsedCallbacks = 0;
+    final scanner = SessionScanner(
+      parser: CodexSessionParser(),
+      pathMapper: mapper,
+      maxConcurrentParses: 1,
+      useParserIsolates: false,
+      onSessionParsed: (_, _) async {
+        parsedCallbacks++;
+        cancellation.cancel();
+      },
+    );
+
+    final result = await scanner.scan(
+      SessionScanRequest(
+        windowsRoot: root.path,
+        cancellationToken: cancellation.token,
+      ),
+    );
+
+    expect(result.cancelled, isTrue);
+    expect(result.progress.cancelled, isTrue);
+    expect(parsedCallbacks, 1);
+    expect(result.sessions, hasLength(1));
+    await expectLater(cancellation.acknowledged, completes);
+
+    final followUp = await scanner.scan(
+      SessionScanRequest(windowsRoot: root.path),
+    );
+    expect(followUp.cancelled, isFalse);
+    expect(followUp.sessions, hasLength(5));
+  });
+
+  test(
+    'cancellation acknowledgement waits for parser isolate pool close',
+    () async {
+      final root = Directory('${temp.path}${Platform.pathSeparator}win');
+      await root.create();
+      for (var i = 0; i < 20; i++) {
+        await File(
+          '${root.path}${Platform.pathSeparator}$i.json',
+        ).writeAsString(_validJsonSession('isolate-cancel-$i'));
+      }
+      final cancellation = ScanCancellationController();
+      final closeStarted = Completer<void>();
+      final releaseClose = Completer<void>();
+      var cancelRequested = false;
+      final scanner = SessionScanner(
+        parser: CodexSessionParser(),
+        pathMapper: mapper,
+        maxConcurrentParses: 1,
+        progressEveryWorkItems: 1,
+        onParserPoolClosing: () async {
+          if (!closeStarted.isCompleted) {
+            closeStarted.complete();
+          }
+          await releaseClose.future;
+        },
+        onProgress: (progress) {
+          if (!cancelRequested && progress.filesFound > 0) {
+            cancelRequested = true;
+            cancellation.cancel();
+          }
+        },
+      );
+
+      final scan = scanner.scan(
+        SessionScanRequest(
+          windowsRoot: root.path,
+          cancellationToken: cancellation.token,
+        ),
+      );
+
+      await closeStarted.future;
+      var acknowledged = false;
+      unawaited(cancellation.acknowledged.then((_) => acknowledged = true));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(acknowledged, isFalse);
+
+      releaseClose.complete();
+      final result = await scan;
+      await cancellation.acknowledged;
+
+      expect(result.cancelled, isTrue);
+      expect(acknowledged, isTrue);
+    },
+  );
+
   test('parses changed files with bounded concurrency', () async {
     final root = Directory('${temp.path}${Platform.pathSeparator}win');
     await root.create();

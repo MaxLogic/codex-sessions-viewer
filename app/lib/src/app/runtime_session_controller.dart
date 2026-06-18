@@ -34,6 +34,28 @@ class RuntimeSessionController {
   final ScanBatchingPolicy scanBatchingPolicy;
   final WslProjectResolver wslProjectResolver;
 
+  CancellableSessionScanOperation startRefreshOperation({
+    SessionsRefreshProgressCallback? onProgress,
+  }) {
+    final cancellation = ScanCancellationController();
+    final result = _refresh(
+      onProgress: onProgress,
+      cancellationToken: cancellation.token,
+    );
+    return CancellableSessionScanOperation._(result, cancellation.cancel);
+  }
+
+  CancellableSessionScanOperation startRefreshInBackgroundOperation({
+    SessionsRefreshProgressCallback? onProgress,
+  }) {
+    return _BackgroundSessionScanOperation.start(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      scanBatchingPolicy: scanBatchingPolicy,
+      onProgress: onProgress,
+    );
+  }
+
   Future<SessionsRefreshResult> loadCachedRows() {
     return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
       final db = openFileBackedDatabase(databaseFile);
@@ -164,6 +186,13 @@ class RuntimeSessionController {
 
   Future<SessionsRefreshResult> refreshInBackground({
     SessionsRefreshProgressCallback? onProgress,
+  }) {
+    return startRefreshInBackgroundOperation(onProgress: onProgress).result;
+  }
+
+  Future<SessionsRefreshResult> _refreshInBackground({
+    SessionsRefreshProgressCallback? onProgress,
+    required _BackgroundScanCancellationHandle cancellationHandle,
   }) async {
     final messages = ReceivePort();
     final errors = ReceivePort();
@@ -198,6 +227,10 @@ class RuntimeSessionController {
       messageSubscription = messages.listen((message) {
         if (message is _BackgroundRefreshProgress) {
           onProgress?.call(message.progress);
+          return;
+        }
+        if (message is _BackgroundRefreshControl) {
+          cancellationHandle.attach(message.cancelPort);
           return;
         }
         if (message is _BackgroundRefreshDone) {
@@ -237,6 +270,13 @@ class RuntimeSessionController {
 
   Future<SessionsRefreshResult> refresh({
     SessionsRefreshProgressCallback? onProgress,
+  }) {
+    return startRefreshOperation(onProgress: onProgress).result;
+  }
+
+  Future<SessionsRefreshResult> _refresh({
+    SessionsRefreshProgressCallback? onProgress,
+    required ScanCancellationToken cancellationToken,
   }) {
     return Profiling.spanAsync('scan.runtime.refresh', () async {
       final settings = await SettingsRepository(settingsFile).loadOrCreate();
@@ -367,7 +407,12 @@ class RuntimeSessionController {
               ? null
               : (progress) {
                   latestProgress = progress;
-                  _updateScanRun(db, activeScanRunId, progress);
+                  _updateScanRun(
+                    db,
+                    activeScanRunId,
+                    progress,
+                    status: _ScanRunStatus.running,
+                  );
                   onProgress(
                     SessionsRefreshProgress(
                       statusMessage: _progressStatusMessage(progress),
@@ -392,6 +437,7 @@ class RuntimeSessionController {
                 windowsRoot: _sessionScanRoot(settings.paths.windowsCodexPath),
                 wslRoot: _sessionScanRoot(settings.paths.wslCodexUncPath),
                 cachedSessions: _cachedSessions(db),
+                cancellationToken: cancellationToken,
               ),
             );
           },
@@ -421,9 +467,12 @@ class RuntimeSessionController {
           LogEntryDraft(
             level: LogLevel.info,
             category: LogCategory.scanner,
-            message: 'Session scan finished.',
+            message: result.cancelled
+                ? 'Session scan cancelled.'
+                : 'Session scan finished.',
             details: {
               ..._progressLogDetails(result.progress),
+              'cancelled': result.cancelled,
               'visible_sessions': rows.length,
               'directory_workers': directoryWorkerCount,
               'parser_workers': parserWorkerCount,
@@ -436,13 +485,19 @@ class RuntimeSessionController {
             result,
             visibleSessionCount: rows.length,
           ),
+          cancelled: result.cancelled,
           persistenceFlushCount: persistenceFlushCount,
           fullRowSnapshotCount: fullRowSnapshotCount,
         );
       } on Object catch (error) {
         final progress = latestProgress.finish();
         if (scanRunId != null) {
-          _updateScanRun(db, scanRunId, progress);
+          _updateScanRun(
+            db,
+            scanRunId,
+            progress,
+            status: _ScanRunStatus.failed,
+          );
         }
         await logger.write(
           LogEntryDraft(
@@ -553,25 +608,37 @@ Map<String, String> _parseWslProjectResolutionOutput(
 }
 
 Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
+  final cancelPort = ReceivePort();
+  StreamSubscription<Object?>? cancelSubscription;
   try {
-    final result =
-        await RuntimeSessionController(
+    request.sendPort.send(_BackgroundRefreshControl(cancelPort.sendPort));
+    final operation =
+        RuntimeSessionController(
           settingsFile: File(request.settingsFilePath),
           databaseFile: File(request.databaseFilePath),
           scanBatchingPolicy: ScanBatchingPolicy(
             parsedSessionFlushBatchSize: request.parsedSessionFlushBatchSize,
             fullRowSnapshotBatchSize: request.fullRowSnapshotBatchSize,
           ),
-        ).refresh(
+        ).startRefreshOperation(
           onProgress: (progress) {
             request.sendPort.send(_BackgroundRefreshProgress(progress));
           },
         );
+    cancelSubscription = cancelPort.listen((message) {
+      if (message is _BackgroundRefreshCancel) {
+        unawaited(operation.cancel());
+      }
+    });
+    final result = await operation.result;
     request.sendPort.send(_BackgroundRefreshDone(result));
   } on Object catch (error, stackTrace) {
     request.sendPort.send(
       _BackgroundRefreshError(error.toString(), stackTrace.toString()),
     );
+  } finally {
+    await cancelSubscription?.cancel();
+    cancelPort.close();
   }
 }
 
@@ -691,6 +758,77 @@ class _BackgroundRefreshError {
   final String stackTrace;
 }
 
+class CancellableSessionScanOperation {
+  CancellableSessionScanOperation._(this.result, void Function() requestCancel)
+    : _requestCancel = requestCancel {
+    _done = result.then<void>((_) {}, onError: (_) {});
+  }
+
+  final Future<SessionsRefreshResult> result;
+  final void Function() _requestCancel;
+  late final Future<void> _done;
+  var _cancelRequested = false;
+
+  Future<void> cancel() {
+    if (!_cancelRequested) {
+      _cancelRequested = true;
+      _requestCancel();
+    }
+    return _done;
+  }
+}
+
+class _BackgroundSessionScanOperation {
+  static CancellableSessionScanOperation start({
+    required File settingsFile,
+    required File databaseFile,
+    required ScanBatchingPolicy scanBatchingPolicy,
+    SessionsRefreshProgressCallback? onProgress,
+  }) {
+    final cancellationHandle = _BackgroundScanCancellationHandle();
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      scanBatchingPolicy: scanBatchingPolicy,
+    );
+    final result = controller._refreshInBackground(
+      onProgress: onProgress,
+      cancellationHandle: cancellationHandle,
+    );
+    return CancellableSessionScanOperation._(
+      result,
+      cancellationHandle.requestCancel,
+    );
+  }
+}
+
+class _BackgroundScanCancellationHandle {
+  SendPort? _cancelPort;
+  var _cancelRequested = false;
+
+  void attach(SendPort cancelPort) {
+    _cancelPort = cancelPort;
+    if (_cancelRequested) {
+      cancelPort.send(const _BackgroundRefreshCancel());
+    }
+  }
+
+  void requestCancel() {
+    _cancelRequested = true;
+    _cancelPort?.send(const _BackgroundRefreshCancel());
+  }
+}
+
+class _BackgroundRefreshControl {
+  const _BackgroundRefreshControl(this.cancelPort);
+
+  final SendPort cancelPort;
+}
+
+class _BackgroundRefreshCancel {
+  const _BackgroundRefreshCancel();
+}
+
 Future<void> _persistParsedSessions(
   Database db,
   List<ScannedSessionFile> sessions, {
@@ -721,6 +859,7 @@ int _startScanRun(Database db) {
     '''
     insert into scan_runs (
       started_at_utc,
+      status,
       files_found,
       files_skipped,
       files_parsed,
@@ -728,19 +867,25 @@ int _startScanRun(Database db) {
       sessions_added,
       sessions_changed,
       sessions_missing
-    ) values (?, 0, 0, 0, 0, 0, 0, 0)
+    ) values (?, ?, 0, 0, 0, 0, 0, 0, 0)
     ''',
-    [DateTime.now().toUtc().toIso8601String()],
+    [DateTime.now().toUtc().toIso8601String(), _ScanRunStatus.running.name],
   );
   return db.lastInsertRowId;
 }
 
-void _updateScanRun(Database db, int scanRunId, ScanProgress progress) {
+void _updateScanRun(
+  Database db,
+  int scanRunId,
+  ScanProgress progress, {
+  required _ScanRunStatus status,
+}) {
   db.execute(
     '''
     update scan_runs
     set
       finished_at_utc = ?,
+      status = ?,
       files_found = ?,
       files_skipped = ?,
       files_parsed = ?,
@@ -752,6 +897,7 @@ void _updateScanRun(Database db, int scanRunId, ScanProgress progress) {
     ''',
     [
       progress.finishedAtUtc?.toIso8601String(),
+      status.name,
       progress.filesFound,
       progress.filesSkipped,
       progress.filesParsed,
@@ -763,6 +909,8 @@ void _updateScanRun(Database db, int scanRunId, ScanProgress progress) {
     ],
   );
 }
+
+enum _ScanRunStatus { running, succeeded, cancelled, failed }
 
 List<CachedSessionSnapshot> _cachedSessions(Database db) {
   final rows = db.select('''
@@ -810,7 +958,14 @@ Future<void> _persistScan(
   db.execute('begin immediate');
   try {
     final now = DateTime.now().toUtc().toIso8601String();
-    _updateScanRun(db, scanRunId, result.progress);
+    _updateScanRun(
+      db,
+      scanRunId,
+      result.progress,
+      status: result.cancelled
+          ? _ScanRunStatus.cancelled
+          : _ScanRunStatus.succeeded,
+    );
     for (final error in result.errors) {
       db.execute(
         '''
@@ -1759,6 +1914,9 @@ String _statusMessage(
 }) {
   final visible = _plural(visibleSessionCount, 'session');
   final parsed = _plural(result.progress.filesParsed, 'new or changed session');
+  if (result.cancelled) {
+    return 'Scan cancelled. $visible visible. $parsed parsed before cancellation.';
+  }
   if (result.errors.any(
     (error) => error.status == SessionFileStatus.pathUnreachable,
   )) {

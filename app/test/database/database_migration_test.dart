@@ -56,7 +56,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 4);
+    expect(versionRows.length, 5);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -73,6 +73,11 @@ void main() {
     expect(versionRows[3]['filename'], '004_session_token_buckets.sql');
     expect(versionRows[3]['checksum_length'], greaterThan(20));
     expect(versionRows[3]['success'], 1);
+    expect(versionRows[4]['version'], 5);
+    expect(versionRows[4]['filename'], '005_scan_run_status.sql');
+    expect(versionRows[4]['checksum_length'], greaterThan(20));
+    expect(versionRows[4]['success'], 1);
+    expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
   });
 
   test(
@@ -96,7 +101,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 4);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 5);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -516,6 +521,71 @@ void main() {
     expect(aggregateOnly['tool_call_tokens'], 0);
   });
 
+  test(
+    'migration 005 adds scan run status without rewriting old rows',
+    () async {
+      final sqlRoot = await _copySqlRoot(tempDir);
+      final scanRunStatusMigration = File(
+        '${sqlRoot.path}${Platform.pathSeparator}migration'
+        '${Platform.pathSeparator}005_scan_run_status.sql',
+      );
+      if (await scanRunStatusMigration.exists()) {
+        await scanRunStatusMigration.delete();
+      }
+      final firstRun = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+        supportedSchemaVersion: 4,
+      ).openAndMigrate(dbFile);
+      expect(firstRun.canStartNormalUi, isTrue);
+
+      final db = openFileBackedDatabase(dbFile);
+      db.execute(
+        '''
+      insert into scan_runs (
+        started_at_utc,
+        finished_at_utc,
+        files_found
+      ) values (?, ?, ?)
+      ''',
+        ['2026-06-18T10:00:00Z', '2026-06-18T10:00:01Z', 7],
+      );
+      db.close();
+
+      await File(
+        '../sql/migration/005_scan_run_status.sql',
+      ).copy(scanRunStatusMigration.path);
+
+      final result = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+      expect(result.canStartNormalUi, isTrue);
+
+      final migrated = openFileBackedDatabase(dbFile);
+      addTearDown(migrated.close);
+      expect(_columnExists(migrated, 'scan_runs', 'status'), isTrue);
+      final existing = migrated.select(
+        'select status from scan_runs where files_found = ?',
+        [7],
+      ).single;
+      expect(existing['status'], 'succeeded');
+      migrated.execute(
+        '''
+      insert into scan_runs (
+        started_at_utc,
+        status
+      ) values (?, ?)
+      ''',
+        ['2026-06-18T10:01:00Z', 'cancelled'],
+      );
+      expect(
+        migrated
+            .select('select status from scan_runs order by id desc limit 1')
+            .single['status'],
+        'cancelled',
+      );
+    },
+  );
+
   test('rolls back failed migrations and records failure metadata', () async {
     final sqlRoot = Directory(
       '${tempDir.path}${Platform.pathSeparator}bad_sql',
@@ -554,6 +624,11 @@ bool _tableExists(Database db, String tableName) {
     [tableName],
   );
   return result.isNotEmpty;
+}
+
+bool _columnExists(Database db, String tableName, String columnName) {
+  final result = db.select('pragma table_info($tableName)');
+  return result.any((row) => row['name'] == columnName);
 }
 
 Future<Directory> _copySqlRoot(Directory tempDir) async {
