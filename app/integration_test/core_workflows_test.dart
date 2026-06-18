@@ -166,8 +166,12 @@ void main() {
         home: SessionsScreen(
           initialRows: [_row('windows', SessionRowPlatform.windows)],
           onRefresh: () async => [
-            _row('windows-2', SessionRowPlatform.windows),
-            _row('wsl-2', SessionRowPlatform.wsl),
+            _row(
+              'windows-2',
+              SessionRowPlatform.windows,
+              project: 'Windows refreshed',
+            ),
+            _row('wsl-2', SessionRowPlatform.wsl, project: 'WSL refreshed'),
           ],
         ),
       ),
@@ -180,8 +184,8 @@ void main() {
     await tester.tap(find.text('Refresh'));
     await tester.pumpAndSettle();
 
-    expect(find.text('windows-2'), findsOneWidget);
-    expect(find.text('wsl-2'), findsNothing);
+    expect(find.text('Windows refreshed'), findsOneWidget);
+    expect(find.text('WSL refreshed'), findsNothing);
   });
 }
 
@@ -192,13 +196,17 @@ Future<File> _copyFixture(String name, Directory destination) async {
   return target;
 }
 
-SessionRowViewModel _row(String title, SessionRowPlatform platform) {
+SessionRowViewModel _row(
+  String title,
+  SessionRowPlatform platform, {
+  String project = 'Codex Viewer',
+}) {
   return SessionRowViewModel(
     id: title,
     startedAtUtc: DateTime.utc(2026, 6, 13, 9),
     lastMessageAtUtc: DateTime.utc(2026, 6, 13, 10),
     platform: platform,
-    project: 'Codex Viewer',
+    project: project,
     path: platform == SessionRowPlatform.windows
         ? r'F:\projects\MaxLogic\codex-sessions-viewer'
         : '/home/pawel/.codex/sessions/2026/06/13/session.jsonl',
