@@ -3,7 +3,8 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
-import 'package:sqlite3/sqlite3.dart';
+
+import 'database_connection.dart';
 
 File defaultDatabaseFile() {
   final appData = Platform.environment['APPDATA'];
@@ -37,7 +38,7 @@ class DatabaseMigrator {
     Database? db;
     try {
       await databaseFile.parent.create(recursive: true);
-      db = sqlite3.open(databaseFile.path);
+      db = openFileBackedDatabase(databaseFile);
       final ftsResult = _verifyFts5(db, databaseFile.path);
       if (ftsResult != null) {
         return DatabaseStartupResult.blocked(ftsResult);

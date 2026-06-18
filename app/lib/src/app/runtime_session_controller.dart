@@ -5,9 +5,9 @@ import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
-import 'package:sqlite3/sqlite3.dart';
 
 import '../config/app_settings.dart';
+import '../database/database_connection.dart';
 import '../logging/structured_logger.dart';
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
@@ -30,7 +30,7 @@ class RuntimeSessionController {
 
   Future<SessionsRefreshResult> loadCachedRows() {
     return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
-      final db = sqlite3.open(databaseFile.path);
+      final db = openFileBackedDatabase(databaseFile);
       try {
         _cleanSessionMetadataPlaceholders(db);
         _backfillAutomaticProjects(db);
@@ -129,7 +129,7 @@ class RuntimeSessionController {
   Future<SessionRowViewModel?> loadSessionDetail(String sessionId) {
     return Profiling.spanAsync('scan.runtime.load_session_detail', () async {
       final settings = await SettingsRepository(settingsFile).loadOrCreate();
-      final db = sqlite3.open(databaseFile.path);
+      final db = openFileBackedDatabase(databaseFile);
       try {
         _cleanSessionMetadataPlaceholders(db);
         _backfillAutomaticProjects(db);
@@ -225,7 +225,7 @@ class RuntimeSessionController {
   }) {
     return Profiling.spanAsync('scan.runtime.refresh', () async {
       final settings = await SettingsRepository(settingsFile).loadOrCreate();
-      final db = sqlite3.open(databaseFile.path);
+      final db = openFileBackedDatabase(databaseFile);
       final logger = StructuredLogger(db: db, settings: settings.logging);
       final pricing = PricingRepository(db).loadCached(settings.pricing);
       int? scanRunId;
@@ -399,7 +399,7 @@ Future<void> _backgroundCachedRowsEntry(
   _BackgroundCachedRowsRequest request,
 ) async {
   try {
-    final db = sqlite3.open(request.databaseFilePath);
+    final db = openFileBackedDatabase(File(request.databaseFilePath));
     try {
       _cleanSessionMetadataPlaceholders(db);
       _backfillAutomaticProjects(db);

@@ -1,9 +1,9 @@
 import 'dart:io';
 
+import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/sqlite3.dart';
 
 void main() {
   late Directory tempDir;
@@ -28,7 +28,7 @@ void main() {
     expect(result.canStartNormalUi, isTrue);
     expect(result.fatalError, isNull);
 
-    final db = sqlite3.open(dbFile.path);
+    final db = openFileBackedDatabase(dbFile);
     addTearDown(db.close);
 
     for (final table in [
@@ -128,7 +128,7 @@ void main() {
     ).openAndMigrate(dbFile);
     expect(firstRun.canStartNormalUi, isTrue);
 
-    final db = sqlite3.open(dbFile.path);
+    final db = openFileBackedDatabase(dbFile);
     db.execute('''
       insert into projects (id, name, created_at_utc, updated_at_utc)
       values (1, 'Migrated Project', '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z')
@@ -258,7 +258,7 @@ void main() {
     ).openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue);
 
-    final migrated = sqlite3.open(dbFile.path);
+    final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
 
     expect(
@@ -294,7 +294,7 @@ void main() {
       ).openAndMigrate(dbFile);
       expect(firstRun.canStartNormalUi, isTrue);
 
-      final db = sqlite3.open(dbFile.path);
+      final db = openFileBackedDatabase(dbFile);
       db.execute('''
       insert into projects (id, name, created_at_utc, updated_at_utc)
       values (1, 'Manual Project', '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z')
@@ -354,7 +354,7 @@ void main() {
       ).openAndMigrate(dbFile);
       expect(result.canStartNormalUi, isTrue);
 
-      final migrated = sqlite3.open(dbFile.path);
+      final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
       expect(
         migrated.select('select project_override from sessions where id = ?', [
@@ -392,7 +392,7 @@ void main() {
     expect(result.fatalError?.summary, contains('migration failed'));
     expect(result.fatalError?.failingMigrationFile, '001_bad.sql');
 
-    final db = sqlite3.open(dbFile.path);
+    final db = openFileBackedDatabase(dbFile);
     addTearDown(db.close);
     expect(_tableExists(db, 'broken'), isFalse);
     final rows = db.select(

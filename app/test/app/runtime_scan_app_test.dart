@@ -3,13 +3,13 @@ import 'dart:io';
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
 import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
-import 'package:sqlite3/sqlite3.dart';
 
 void main() {
   test(
@@ -68,7 +68,7 @@ void main() {
       );
       expect(result.statusMessage, contains('Scan finished'));
 
-      final db = sqlite3.open(databaseFile.path);
+      final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
       expect(
         db.select('select count(*) as count from sessions').single['count'],
@@ -331,7 +331,7 @@ void main() {
       final secondResult = await controller.refresh();
 
       expect(secondResult.rows, isEmpty);
-      final db = sqlite3.open(databaseFile.path);
+      final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
       final row = db.select(
         'select scan_status from sessions where source_file_path = ?',
@@ -385,7 +385,7 @@ void main() {
       ).refresh();
 
       expect(result.rows, hasLength(1));
-      final db = sqlite3.open(databaseFile.path);
+      final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
       expect(
         db.select('select count(*) as count from scan_errors').single['count'],
@@ -697,7 +697,7 @@ void main() {
     );
     await controller.refresh();
 
-    final db = sqlite3.open(databaseFile.path);
+    final db = openFileBackedDatabase(databaseFile);
     addTearDown(db.close);
     db.execute('''
       update sessions
@@ -767,7 +767,7 @@ void main() {
     final first = await controller.refresh();
     expect(first.rows.single.project, 'codex-sessions-viewer');
 
-    final db = sqlite3.open(databaseFile.path);
+    final db = openFileBackedDatabase(databaseFile);
     addTearDown(db.close);
     db.execute(
       '''

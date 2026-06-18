@@ -3,9 +3,9 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:sqlite3/sqlite3.dart';
 
 import '../config/app_settings.dart';
+import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
 import '../app/runtime_session_controller.dart';
 import '../ui/app_shell.dart';
@@ -194,7 +194,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
     required bool value,
   }) {
     assert(column == 'is_pinned' || column == 'is_archived');
-    final db = sqlite3.open(databaseFile.path);
+    final db = openFileBackedDatabase(databaseFile);
     try {
       db.execute(
         'update sessions set $column = ?, updated_at_utc = ? where id = ?',
