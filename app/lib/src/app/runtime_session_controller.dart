@@ -12,6 +12,7 @@ import '../logging/structured_logger.dart';
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
 import '../pricing/pricing_repository.dart';
+import '../scanner/scan_batching.dart';
 import '../scanner/session_scanner.dart';
 import '../search/session_search.dart';
 import '../usage/usage_summary.dart';
@@ -23,10 +24,12 @@ class RuntimeSessionController {
   RuntimeSessionController({
     required this.settingsFile,
     required this.databaseFile,
+    this.scanBatchingPolicy = defaultScanBatchingPolicy,
   });
 
   final File settingsFile;
   final File databaseFile;
+  final ScanBatchingPolicy scanBatchingPolicy;
 
   Future<SessionsRefreshResult> loadCachedRows() {
     return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
@@ -164,6 +167,9 @@ class RuntimeSessionController {
           settingsFilePath: settingsFile.path,
           databaseFilePath: databaseFile.path,
           sendPort: messages.sendPort,
+          parsedSessionFlushBatchSize:
+              scanBatchingPolicy.parsedSessionFlushBatchSize,
+          fullRowSnapshotBatchSize: scanBatchingPolicy.fullRowSnapshotBatchSize,
         ),
         onError: errors.sendPort,
         onExit: exits.sendPort,
@@ -231,25 +237,41 @@ class RuntimeSessionController {
       int? scanRunId;
       var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
       final pendingParsedSessions = <ScannedSessionFile>[];
+      var persistenceFlushCount = 0;
+      var fullRowSnapshotCount = 0;
+      var lastFullRowSnapshotParsedCount = 0;
       try {
         _cleanSessionMetadataPlaceholders(db);
         scanRunId = _startScanRun(db);
         final activeScanRunId = scanRunId;
 
-        void flushParsedSessions(ScanProgress progress) {
-          if (pendingParsedSessions.isEmpty) {
-            return;
+        void flushParsedSessions(
+          ScanProgress progress, {
+          bool forceFullRowSnapshot = false,
+        }) {
+          if (pendingParsedSessions.isNotEmpty) {
+            Profiling.spanSync('scan.runtime.persist_flush', () {
+              _persistParsedSessions(db, pendingParsedSessions);
+            });
+            persistenceFlushCount++;
+            pendingParsedSessions.clear();
           }
-          Profiling.spanSync('scan.runtime.persist_flush', () {
-            _persistParsedSessions(db, pendingParsedSessions);
-          });
-          pendingParsedSessions.clear();
-          onProgress?.call(
-            SessionsRefreshProgress(
-              statusMessage: _progressStatusMessage(progress),
-              rows: _loadRowsProfiled(db, pricing: pricing),
-            ),
-          );
+
+          if (onProgress != null &&
+              scanBatchingPolicy.shouldEmitFullRowSnapshot(
+                parsedCount: progress.filesParsed,
+                lastSnapshotParsedCount: lastFullRowSnapshotParsedCount,
+                force: forceFullRowSnapshot,
+              )) {
+            fullRowSnapshotCount++;
+            lastFullRowSnapshotParsedCount = progress.filesParsed;
+            onProgress(
+              SessionsRefreshProgress(
+                statusMessage: _progressStatusMessage(progress),
+                rows: _loadRowsProfiled(db, pricing: pricing),
+              ),
+            );
+          }
         }
 
         final cachedRows = _loadRowsProfiled(db, pricing: pricing);
@@ -305,7 +327,8 @@ class RuntimeSessionController {
               ? null
               : (session, progress) async {
                   pendingParsedSessions.add(session);
-                  if (pendingParsedSessions.length >= 25) {
+                  if (pendingParsedSessions.length >=
+                      scanBatchingPolicy.parsedSessionFlushBatchSize) {
                     flushParsedSessions(progress);
                   }
                 },
@@ -322,7 +345,7 @@ class RuntimeSessionController {
             );
           },
         );
-        flushParsedSessions(result.progress);
+        flushParsedSessions(result.progress, forceFullRowSnapshot: true);
         Profiling.spanSync('scan.runtime.persist_scan', () {
           _persistScan(
             db,
@@ -351,6 +374,8 @@ class RuntimeSessionController {
             result,
             visibleSessionCount: rows.length,
           ),
+          persistenceFlushCount: persistenceFlushCount,
+          fullRowSnapshotCount: fullRowSnapshotCount,
         );
       } on Object catch (error) {
         final progress = latestProgress.finish();
@@ -382,6 +407,10 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
         await RuntimeSessionController(
           settingsFile: File(request.settingsFilePath),
           databaseFile: File(request.databaseFilePath),
+          scanBatchingPolicy: ScanBatchingPolicy(
+            parsedSessionFlushBatchSize: request.parsedSessionFlushBatchSize,
+            fullRowSnapshotBatchSize: request.fullRowSnapshotBatchSize,
+          ),
         ).refresh(
           onProgress: (progress) {
             request.sendPort.send(_BackgroundRefreshProgress(progress));
@@ -464,11 +493,15 @@ class _BackgroundRefreshRequest {
     required this.settingsFilePath,
     required this.databaseFilePath,
     required this.sendPort,
+    required this.parsedSessionFlushBatchSize,
+    required this.fullRowSnapshotBatchSize,
   });
 
   final String settingsFilePath;
   final String databaseFilePath;
   final SendPort sendPort;
+  final int parsedSessionFlushBatchSize;
+  final int fullRowSnapshotBatchSize;
 }
 
 class _BackgroundCachedRowsRequest {

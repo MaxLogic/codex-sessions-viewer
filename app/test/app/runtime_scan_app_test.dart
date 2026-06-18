@@ -5,6 +5,7 @@ import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter/material.dart';
@@ -280,6 +281,180 @@ void main() {
       expect(
         secondResult.statusMessage,
         contains('0 new or changed sessions parsed'),
+      );
+    },
+  );
+
+  test(
+    'runtime refresh coalesces persistence flushes and row snapshots',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_scan_batching_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      for (var i = 0; i < 5; i++) {
+        await _writeJsonFixture(windowsRoot, 'batched-$i');
+      }
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final progressEvents = <SessionsRefreshProgress>[];
+      final result = await RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+        scanBatchingPolicy: const ScanBatchingPolicy(
+          parsedSessionFlushBatchSize: 2,
+          fullRowSnapshotBatchSize: 4,
+        ),
+      ).refresh(onProgress: progressEvents.add);
+
+      expect(result.rows, hasLength(5));
+      expect(result.persistenceFlushCount, 3);
+      expect(result.fullRowSnapshotCount, 2);
+      expect(
+        progressEvents
+            .where((event) => event.rows != null)
+            .map((event) => event.rows!.length),
+        [4, 5],
+      );
+      expect(progressEvents.any((event) => event.rows == null), isTrue);
+    },
+  );
+
+  test(
+    'runtime refresh emits final snapshot after an exact flush boundary',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_scan_final_snapshot_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      for (var i = 0; i < 2; i++) {
+        await _writeJsonFixture(windowsRoot, 'final-batch-$i');
+      }
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final progressEvents = <SessionsRefreshProgress>[];
+      final result = await RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+        scanBatchingPolicy: const ScanBatchingPolicy(
+          parsedSessionFlushBatchSize: 2,
+          fullRowSnapshotBatchSize: 4,
+        ),
+      ).refresh(onProgress: progressEvents.add);
+
+      expect(result.persistenceFlushCount, 1);
+      expect(result.fullRowSnapshotCount, 1);
+      expect(
+        progressEvents
+            .where((event) => event.rows != null)
+            .map((event) => event.rows!.length),
+        [2],
+      );
+    },
+  );
+
+  test(
+    'background runtime refresh preserves injected batching policy',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_background_batching_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      for (var i = 0; i < 5; i++) {
+        await _writeJsonFixture(windowsRoot, 'background-batched-$i');
+      }
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final progressEvents = <SessionsRefreshProgress>[];
+      final result = await RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+        scanBatchingPolicy: const ScanBatchingPolicy(
+          parsedSessionFlushBatchSize: 2,
+          fullRowSnapshotBatchSize: 4,
+        ),
+      ).refreshInBackground(onProgress: progressEvents.add);
+
+      expect(result.rows, hasLength(5));
+      expect(result.persistenceFlushCount, 3);
+      expect(result.fullRowSnapshotCount, 2);
+      expect(
+        progressEvents
+            .where((event) => event.rows != null)
+            .map((event) => event.rows!.length),
+        [4, 5],
       );
     },
   );
@@ -898,6 +1073,20 @@ Future<void> _pumpFrames(WidgetTester tester, {int count = 5}) async {
 Future<File> _copyFixture(String name, Directory destination) async {
   final source = File(p.normalize(p.join('..', 'samples', 'sessions', name)));
   return source.copy(p.join(destination.path, name));
+}
+
+Future<File> _writeJsonFixture(Directory destination, String id) async {
+  final file = File(p.join(destination.path, '$id.json'));
+  await file.writeAsString('''
+{
+  "session_id": "$id",
+  "source_type": "windows",
+  "messages": [
+    { "type": "user", "content": "hello $id" }
+  ]
+}
+''');
+  return file;
 }
 
 Future<File> _writeAggregateJsonlFixture(Directory destination) async {

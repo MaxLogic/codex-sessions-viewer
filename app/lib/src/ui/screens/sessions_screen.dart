@@ -796,6 +796,8 @@ class SessionsRefreshResult {
   const SessionsRefreshResult({
     required this.rows,
     required this.statusMessage,
+    this.persistenceFlushCount = 0,
+    this.fullRowSnapshotCount = 0,
   });
 
   factory SessionsRefreshResult.scanFinished(List<SessionRowViewModel> rows) {
@@ -808,6 +810,8 @@ class SessionsRefreshResult {
 
   final List<SessionRowViewModel> rows;
   final String statusMessage;
+  final int persistenceFlushCount;
+  final int fullRowSnapshotCount;
 }
 
 class SessionsRefreshProgress {

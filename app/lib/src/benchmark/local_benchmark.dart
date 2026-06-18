@@ -6,6 +6,7 @@ import 'package:sqlite3/sqlite3.dart';
 import '../config/app_settings.dart';
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
+import '../scanner/scan_batching.dart';
 import '../scanner/session_scanner.dart';
 import '../search/session_search.dart';
 
@@ -145,11 +146,17 @@ class LocalBenchmarkRunner {
     final release = options.includeReleaseSteps
         ? await _runReleaseBenchmarks(options.repoRoot ?? Directory('..'))
         : const ReleaseBenchmarkResult.skipped();
+    final persistenceFlushCount = defaultScanBatchingPolicy
+        .estimatedPersistenceFlushCount(scanResult.progress.filesParsed);
+    final fullRowSnapshotCount = defaultScanBatchingPolicy
+        .estimatedFullRowSnapshotCount(scanResult.progress.filesParsed);
 
     final report = LocalBenchmarkReport(
       generatedAtUtc: DateTime.now().toUtc(),
       privateCorpus: privateCorpus,
       fullContentHashReadCount: 0,
+      persistenceFlushCount: persistenceFlushCount,
+      fullRowSnapshotCount: fullRowSnapshotCount,
       fixtures: FixtureBenchmarkSummary(totalFiles: fixtureFiles.length),
       scan: ScanBenchmarkResult(
         elapsed: scanMeasurement.elapsed,
@@ -302,6 +309,8 @@ class LocalBenchmarkReport {
     this.privateCorpus,
     this.fullContentHashReadCount = 0,
     this.wslProcessInvocationCount,
+    this.persistenceFlushCount = 0,
+    this.fullRowSnapshotCount = 0,
     required this.fixtures,
     required this.scan,
     required this.parser,
@@ -315,6 +324,8 @@ class LocalBenchmarkReport {
   final PrivateCorpusBenchmarkSummary? privateCorpus;
   final int fullContentHashReadCount;
   final int? wslProcessInvocationCount;
+  final int persistenceFlushCount;
+  final int fullRowSnapshotCount;
   final FixtureBenchmarkSummary fixtures;
   final ScanBenchmarkResult scan;
   final ParserBenchmarkResult parser;
@@ -406,8 +417,8 @@ class LocalBenchmarkReport {
       ..writeln('- full_content_hash_read_count: $fullContentHashReadCount')
       ..writeln('- wsl_process_invocation_count: $wslProcessMetric')
       ..writeln('- unique_wsl_path_count: not_available')
-      ..writeln('- persistence_flush_count: not_available')
-      ..writeln('- full_row_snapshot_count: not_available')
+      ..writeln('- persistence_flush_count: $persistenceFlushCount')
+      ..writeln('- full_row_snapshot_count: $fullRowSnapshotCount')
       ..writeln('- row_load_elapsed_ms: ${rowLoad.elapsed.inMilliseconds}')
       ..writeln('- cancel_request_to_idle_ms: not_available')
       ..writeln()

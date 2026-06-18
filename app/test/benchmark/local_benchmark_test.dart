@@ -161,8 +161,8 @@ void main() {
         'skipped_count',
         'full_content_hash_read_count: 0',
         'wsl_process_invocation_count: not_available',
-        'persistence_flush_count',
-        'full_row_snapshot_count',
+        'persistence_flush_count: 1',
+        'full_row_snapshot_count: 1',
         'row_load_elapsed_ms',
         'cancel_request_to_idle_ms',
       ]) {
