@@ -51,7 +51,7 @@ void main() {
 
     await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
     await tester.pump();
-    expect(find.widgetWithText(ElevatedButton, 'Scanning...'), findsOneWidget);
+    expect(find.widgetWithText(ElevatedButton, 'Cancel scan'), findsOneWidget);
     expect(find.text('Scanning started'), findsOneWidget);
 
     refresh.complete([
@@ -85,7 +85,7 @@ void main() {
 
     await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
     await tester.pump();
-    expect(find.widgetWithText(ElevatedButton, 'Scanning...'), findsOneWidget);
+    expect(find.widgetWithText(ElevatedButton, 'Cancel scan'), findsOneWidget);
 
     progressCallback!(
       SessionsRefreshProgress(
@@ -113,6 +113,108 @@ void main() {
     expect(find.widgetWithText(ElevatedButton, 'Refresh'), findsOneWidget);
   });
 
+  testWidgets(
+    'refresh button cancels active scan without clearing cached rows',
+    (tester) async {
+      final refresh = Completer<SessionsRefreshResult>();
+      var refreshCalls = 0;
+      var cancelCalls = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionsScreen(
+            initialRows: [
+              _row(id: 'cached', title: 'Cached row', project: 'Viewer'),
+            ],
+            onRefreshOperation: (_) {
+              refreshCalls++;
+              return SessionsRefreshOperation(
+                result: refresh.future,
+                cancel: () {
+                  cancelCalls++;
+                  return refresh.future.then<void>((_) {});
+                },
+              );
+            },
+          ),
+        ),
+      );
+
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+      await tester.pump();
+
+      expect(refreshCalls, 1);
+      expect(find.text('Cached row'), findsWidgets);
+      expect(
+        find.widgetWithText(ElevatedButton, 'Cancel scan'),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Cancel scan'));
+      await tester.pump();
+
+      expect(cancelCalls, 1);
+      expect(refreshCalls, 1);
+      expect(
+        tester
+            .widget<ElevatedButton>(
+              find.widgetWithText(ElevatedButton, 'Cancelling scan...'),
+            )
+            .onPressed,
+        isNull,
+      );
+      expect(find.text('Cached row'), findsWidgets);
+
+      refresh.complete(
+        SessionsRefreshResult(
+          rows: [_row(id: 'cached', title: 'Cached row', project: 'Viewer')],
+          statusMessage: 'Scan cancelled. 1 session visible.',
+          cancelled: true,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.widgetWithText(ElevatedButton, 'Refresh'), findsOneWidget);
+      expect(find.text('Scan cancelled. 1 session visible.'), findsOneWidget);
+      expect(find.text('Cached row'), findsWidgets);
+    },
+  );
+
+  testWidgets('dispose requests cancellation of an active scan', (
+    tester,
+  ) async {
+    final refresh = Completer<SessionsRefreshResult>();
+    var cancelCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          onRefreshOperation: (_) => SessionsRefreshOperation(
+            result: refresh.future,
+            cancel: () {
+              cancelCalls++;
+              return refresh.future.then<void>((_) {});
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+    await tester.pump();
+    expect(find.widgetWithText(ElevatedButton, 'Cancel scan'), findsOneWidget);
+
+    await tester.pumpWidget(const MaterialApp(home: SizedBox.shrink()));
+    await tester.pump();
+
+    expect(cancelCalls, 1);
+    refresh.complete(
+      const SessionsRefreshResult(
+        rows: [],
+        statusMessage: 'Scan cancelled.',
+        cancelled: true,
+      ),
+    );
+  });
+
   testWidgets('starts refresh when auto refresh token changes', (tester) async {
     var refreshCalls = 0;
     final refresh = Completer<SessionsRefreshResult>();
@@ -138,7 +240,7 @@ void main() {
     await tester.pump();
 
     expect(refreshCalls, 1);
-    expect(find.widgetWithText(ElevatedButton, 'Scanning...'), findsOneWidget);
+    expect(find.widgetWithText(ElevatedButton, 'Cancel scan'), findsOneWidget);
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
 
     refresh.complete(

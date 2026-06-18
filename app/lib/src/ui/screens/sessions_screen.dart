@@ -35,6 +35,8 @@ typedef SessionsRefreshWithProgress =
     Future<SessionsRefreshResult> Function(
       SessionsRefreshProgressCallback onProgress,
     );
+typedef SessionsRefreshOperationFactory =
+    SessionsRefreshOperation Function(SessionsRefreshProgressCallback);
 typedef SessionDetailLoader =
     Future<SessionRowViewModel?> Function(String sessionId);
 typedef SessionTableStateChanged = void Function(SessionTableSettings);
@@ -59,6 +61,7 @@ class SessionsScreen extends StatefulWidget {
     this.onRefresh,
     this.onRefreshResult,
     this.onRefreshWithProgress,
+    this.onRefreshOperation,
     this.onOpenSettings,
     this.onTestWslPath,
     this.onSessionAction,
@@ -74,6 +77,7 @@ class SessionsScreen extends StatefulWidget {
   final Future<List<SessionRowViewModel>> Function()? onRefresh;
   final Future<SessionsRefreshResult> Function()? onRefreshResult;
   final SessionsRefreshWithProgress? onRefreshWithProgress;
+  final SessionsRefreshOperationFactory? onRefreshOperation;
   final VoidCallback? onOpenSettings;
   final VoidCallback? onTestWslPath;
   final SessionActionCallback? onSessionAction;
@@ -95,6 +99,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
   var _newestPerProjectOnly = false;
   var _isScanning = false;
+  var _isCancellingRefresh = false;
   var _scanAnnouncement = '';
   var _hasRefreshOwnedRows = false;
   String? _selectedId;
@@ -104,6 +109,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   late List<SessionTableSortSettings> _sorts;
   late int _handledAutoRefreshToken;
   Timer? _relativeDateTimer;
+  SessionsRefreshOperation? _activeRefreshOperation;
 
   @override
   void initState() {
@@ -150,6 +156,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
 
   @override
   void dispose() {
+    _requestRefreshCancel(updateUi: false);
     _searchController
       ..removeListener(_filtersChanged)
       ..dispose();
@@ -176,6 +183,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
               archivedFilter: _archivedFilter,
               newestPerProjectOnly: _newestPerProjectOnly,
               isScanning: _isScanning,
+              isCancellingRefresh: _isCancellingRefresh,
               onPlatformChanged: (value) {
                 setState(() {
                   _platformFilter = value;
@@ -518,15 +526,20 @@ class _SessionsScreenState extends State<SessionsScreen> {
 
   Future<void> _refresh() async {
     if (_isScanning) {
+      _requestRefreshCancel();
       return;
     }
     setState(() {
       _isScanning = true;
+      _isCancellingRefresh = false;
       _hasRefreshOwnedRows = true;
       _scanAnnouncement = 'Scanning started';
     });
+    SessionsRefreshOperation? operation;
     try {
-      final refreshResult = await _refreshResult(_handleRefreshProgress);
+      operation = _refreshOperation(_handleRefreshProgress);
+      _activeRefreshOperation = operation;
+      final refreshResult = await operation.result;
       if (!mounted) {
         return;
       }
@@ -544,12 +557,33 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _scanAnnouncement = 'Refresh failed. $error';
       });
     } finally {
+      if (operation != null && identical(_activeRefreshOperation, operation)) {
+        _activeRefreshOperation = null;
+      }
       if (mounted) {
         setState(() {
           _isScanning = false;
+          _isCancellingRefresh = false;
         });
       }
     }
+  }
+
+  void _requestRefreshCancel({bool updateUi = true}) {
+    final operation = _activeRefreshOperation;
+    if (operation == null || _isCancellingRefresh) {
+      return;
+    }
+    if (updateUi && mounted) {
+      setState(() {
+        _isCancellingRefresh = true;
+        _scanAnnouncement = 'Cancelling scan...';
+      });
+    } else {
+      _isCancellingRefresh = true;
+      _scanAnnouncement = 'Cancelling scan...';
+    }
+    unawaited(operation.cancel().catchError((Object _) {}));
   }
 
   void _handleRefreshProgress(SessionsRefreshProgress progress) {
@@ -565,6 +599,16 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _scanAnnouncement = progress.statusMessage;
       _retainSelection();
     });
+  }
+
+  SessionsRefreshOperation _refreshOperation(
+    SessionsRefreshProgressCallback onProgress,
+  ) {
+    final refreshOperation = widget.onRefreshOperation;
+    if (refreshOperation != null) {
+      return refreshOperation(onProgress);
+    }
+    return SessionsRefreshOperation.fromFuture(_refreshResult(onProgress));
   }
 
   Future<SessionsRefreshResult> _refreshResult(
@@ -816,6 +860,22 @@ class SessionsRefreshResult {
   final int fullRowSnapshotCount;
 }
 
+class SessionsRefreshOperation {
+  const SessionsRefreshOperation({required this.result, required this.cancel});
+
+  factory SessionsRefreshOperation.fromFuture(
+    Future<SessionsRefreshResult> result,
+  ) {
+    return SessionsRefreshOperation(
+      result: result,
+      cancel: () => result.then<void>((_) {}, onError: (_) {}),
+    );
+  }
+
+  final Future<SessionsRefreshResult> result;
+  final Future<void> Function() cancel;
+}
+
 class SessionsRefreshProgress {
   const SessionsRefreshProgress({required this.statusMessage, this.rows});
 
@@ -935,6 +995,7 @@ class _FilterBar extends StatelessWidget {
     required this.archivedFilter,
     required this.newestPerProjectOnly,
     required this.isScanning,
+    required this.isCancellingRefresh,
     required this.onPlatformChanged,
     required this.onArchivedChanged,
     required this.onNewestPerProjectOnlyChanged,
@@ -948,6 +1009,7 @@ class _FilterBar extends StatelessWidget {
   final SessionsArchivedFilter archivedFilter;
   final bool newestPerProjectOnly;
   final bool isScanning;
+  final bool isCancellingRefresh;
   final ValueChanged<SessionsPlatformFilter> onPlatformChanged;
   final ValueChanged<SessionsArchivedFilter> onArchivedChanged;
   final ValueChanged<bool> onNewestPerProjectOnlyChanged;
@@ -956,6 +1018,11 @@ class _FilterBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final refreshLabel = isCancellingRefresh
+        ? 'Cancelling scan...'
+        : isScanning
+        ? 'Cancel scan'
+        : 'Refresh';
     return Material(
       color: Theme.of(context).colorScheme.surface,
       child: Padding(
@@ -1109,8 +1176,8 @@ class _FilterBar extends StatelessWidget {
               spacing: 8,
               children: [
                 ElevatedButton(
-                  onPressed: isScanning ? null : onRefresh,
-                  child: Text(isScanning ? 'Scanning...' : 'Refresh'),
+                  onPressed: isCancellingRefresh ? null : onRefresh,
+                  child: Text(refreshLabel),
                 ),
                 OutlinedButton(
                   onPressed: onClearFilters,

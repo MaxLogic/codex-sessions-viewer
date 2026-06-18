@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
@@ -769,6 +770,45 @@ void main() {
 
     expect(refreshCalls, 1);
     expect(find.text('Loaded from runtime scan'), findsOneWidget);
+  });
+
+  testWidgets('app shell cancels active refresh operation on dispose', (
+    tester,
+  ) async {
+    final refresh = Completer<SessionsRefreshResult>();
+    var cancelCalls = 0;
+    await tester.pumpWidget(
+      CodexSessionsViewerApp(
+        databaseStartup: Future.value(
+          DatabaseStartupResult.ready(lastAppliedSchemaVersion: 5),
+        ),
+        settingsStartup: Future.value(AppSettings.defaults()),
+        sessionRefreshOperation: (_) => SessionsRefreshOperation(
+          result: refresh.future,
+          cancel: () {
+            cancelCalls++;
+            return refresh.future.then<void>((_) {});
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.text('Refresh'));
+    await tester.pump();
+    expect(find.text('Cancel scan'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+
+    expect(cancelCalls, 1);
+    refresh.complete(
+      const SessionsRefreshResult(
+        rows: [],
+        statusMessage: 'Scan cancelled.',
+        cancelled: true,
+      ),
+    );
   });
 
   test('runtime loads cached sessions before refresh is clicked', () async {

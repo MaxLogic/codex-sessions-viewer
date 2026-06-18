@@ -23,6 +23,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
     File? databaseFile,
     Future<AppSettings>? settingsStartup,
     this.sessionRefresh,
+    this.sessionRefreshOperation,
   }) : databaseStartup =
            databaseStartup ??
            Future.value(
@@ -44,6 +45,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
   final File settingsFile;
   final File databaseFile;
   final Future<SessionsRefreshResult> Function()? sessionRefresh;
+  final SessionsRefreshOperationFactory? sessionRefreshOperation;
 
   @override
   Widget build(BuildContext context) {
@@ -97,7 +99,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
                       settings: settings,
                       settingsFile: settingsFile,
                       databaseFile: databaseFile,
-                      onRefreshWithProgress: _sessionRefresh,
+                      onRefreshOperation: _sessionRefreshOperation,
                       onOpenSettings: onOpenSettings,
                       onSessionAction: (request) =>
                           _handleSessionAction(request),
@@ -116,17 +118,25 @@ class CodexSessionsViewerApp extends StatelessWidget {
     );
   }
 
-  Future<SessionsRefreshResult> _sessionRefresh([
-    SessionsRefreshProgressCallback? onProgress,
-  ]) {
+  SessionsRefreshOperation _sessionRefreshOperation(
+    SessionsRefreshProgressCallback onProgress,
+  ) {
+    final refreshOperation = sessionRefreshOperation;
+    if (refreshOperation != null) {
+      return refreshOperation(onProgress);
+    }
     final refresh = sessionRefresh;
     if (refresh != null) {
-      return refresh();
+      return SessionsRefreshOperation.fromFuture(refresh());
     }
-    return RuntimeSessionController(
+    final operation = RuntimeSessionController(
       settingsFile: settingsFile,
       databaseFile: databaseFile,
-    ).refreshInBackground(onProgress: onProgress);
+    ).startRefreshInBackgroundOperation(onProgress: onProgress);
+    return SessionsRefreshOperation(
+      result: operation.result,
+      cancel: operation.cancel,
+    );
   }
 
   Future<void> _handleSessionAction(SessionActionRequest request) async {
@@ -219,7 +229,7 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.settings,
     required this.settingsFile,
     required this.databaseFile,
-    required this.onRefreshWithProgress,
+    required this.onRefreshOperation,
     required this.onOpenSettings,
     required this.onSessionAction,
     required this.onTableStateChanged,
@@ -228,7 +238,7 @@ class _SessionsScreenLoader extends StatefulWidget {
   final AppSettings settings;
   final File settingsFile;
   final File databaseFile;
-  final SessionsRefreshWithProgress onRefreshWithProgress;
+  final SessionsRefreshOperationFactory onRefreshOperation;
   final VoidCallback onOpenSettings;
   final SessionActionCallback onSessionAction;
   final SessionTableStateChanged onTableStateChanged;
@@ -310,7 +320,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       initialRows: _cachedRows,
       initialStatusMessage: _cachedStatusMessage,
       autoRefreshToken: _autoRefreshToken,
-      onRefreshWithProgress: widget.onRefreshWithProgress,
+      onRefreshOperation: widget.onRefreshOperation,
       onOpenSettings: widget.onOpenSettings,
       onSessionAction: widget.onSessionAction,
       onLoadSessionDetail: _controller.loadSessionDetail,
