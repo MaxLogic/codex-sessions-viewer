@@ -903,6 +903,95 @@ void main() {
     expect(row['project_override'], 0);
   });
 
+  test(
+    'runtime batches WSL project resolution for refresh and cached backfill',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_wsl_project_batch_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      const sharedPath = '/home/pawel/projects/shared';
+      const unresolvedPath = '/home/pawel/projects/unresolved';
+      await _writeWslJsonFixture(wslRoot, 'wsl-shared-a', sharedPath);
+      await _writeWslJsonFixture(wslRoot, 'wsl-shared-b', sharedPath);
+      await _writeWslJsonFixture(wslRoot, 'wsl-unresolved', unresolvedPath);
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final resolver = _RecordingWslProjectResolver({
+        sharedPath: 'shared-root',
+      });
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+        scanBatchingPolicy: const ScanBatchingPolicy(
+          parsedSessionFlushBatchSize: 1,
+          fullRowSnapshotBatchSize: 1,
+        ),
+        wslProjectResolver: resolver,
+      );
+
+      final progressEvents = <SessionsRefreshProgress>[];
+      final refreshed = await controller.refresh(
+        onProgress: progressEvents.add,
+      );
+      expect(refreshed.persistenceFlushCount, greaterThan(1));
+      expect(refreshed.rows.map((row) => row.project).toSet(), {
+        'shared-root',
+        'unresolved',
+      });
+      expect(refreshed.rows, hasLength(3));
+      expect(resolver.calls, [
+        {sharedPath, unresolvedPath},
+      ]);
+
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      db.execute('''
+      update sessions
+      set project_id = null,
+          project_name_snapshot = null,
+          project_override = 0
+      ''');
+      db.execute('update session_search set project_name = ?', ['']);
+
+      resolver.results[sharedPath] = 'cached-root';
+      final cached = await controller.loadCachedRows();
+
+      expect(cached.rows.map((row) => row.project).toSet(), {
+        'cached-root',
+        'unresolved',
+      });
+      expect(resolver.calls, [
+        {sharedPath, unresolvedPath},
+        {sharedPath, unresolvedPath},
+      ]);
+    },
+  );
+
   test('auto project assignment keeps manual overrides on rescan', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_auto_project_',
@@ -1119,6 +1208,49 @@ Future<File> _writeAggregateJsonlFixture(Directory destination) async {
     ].join('\n'),
   );
   return file;
+}
+
+Future<File> _writeWslJsonFixture(
+  Directory destination,
+  String id,
+  String workingDirectory,
+) async {
+  final file = File(p.join(destination.path, '$id.json'));
+  await file.writeAsString('''
+{
+  "session_id": "$id",
+  "source_type": "wsl",
+  "source_file_path": "\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\pawel\\\\.codex\\\\sessions\\\\$id.json",
+  "source_file_unc_path": "\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\pawel\\\\.codex\\\\sessions\\\\$id.json",
+  "display_path": "/home/pawel/.codex/sessions/$id.json",
+  "platform_path": "/home/pawel/.codex/sessions/$id.json",
+  "working_directory": "$workingDirectory",
+  "created_at": "2026-06-10T09:00:00Z",
+  "messages": [
+    { "type": "user", "content": "hello $id" }
+  ]
+}
+''');
+  return file;
+}
+
+class _RecordingWslProjectResolver implements WslProjectResolver {
+  _RecordingWslProjectResolver(this.results);
+
+  final Map<String, String> results;
+  final calls = <Set<String>>[];
+
+  @override
+  Future<Map<String, String>> resolveProjectNames(
+    Iterable<String> workingDirectories,
+  ) async {
+    final paths = workingDirectories.toSet();
+    calls.add(paths);
+    return {
+      for (final path in paths)
+        if ((results[path] ?? '').trim().isNotEmpty) path: results[path]!,
+    };
+  }
 }
 
 LoggingSettings _testLogging(Directory temp) => LoggingSettings(

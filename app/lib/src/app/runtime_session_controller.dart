@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
@@ -25,18 +26,23 @@ class RuntimeSessionController {
     required this.settingsFile,
     required this.databaseFile,
     this.scanBatchingPolicy = defaultScanBatchingPolicy,
+    this.wslProjectResolver = const ProcessWslProjectResolver(),
   });
 
   final File settingsFile;
   final File databaseFile;
   final ScanBatchingPolicy scanBatchingPolicy;
+  final WslProjectResolver wslProjectResolver;
 
   Future<SessionsRefreshResult> loadCachedRows() {
     return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
       final db = openFileBackedDatabase(databaseFile);
       try {
         _cleanSessionMetadataPlaceholders(db);
-        _backfillAutomaticProjects(db);
+        await _backfillAutomaticProjects(
+          db,
+          wslProjects: _WslProjectResolutionCache(wslProjectResolver),
+        );
         final rows = _loadRowsProfiled(db);
         return SessionsRefreshResult(
           rows: rows,
@@ -135,7 +141,10 @@ class RuntimeSessionController {
       final db = openFileBackedDatabase(databaseFile);
       try {
         _cleanSessionMetadataPlaceholders(db);
-        _backfillAutomaticProjects(db);
+        await _backfillAutomaticProjects(
+          db,
+          wslProjects: _WslProjectResolutionCache(wslProjectResolver),
+        );
         final pricing = PricingRepository(db).loadCached(settings.pricing);
         final rows = _loadRowsProfiled(
           db,
@@ -240,21 +249,63 @@ class RuntimeSessionController {
       var persistenceFlushCount = 0;
       var fullRowSnapshotCount = 0;
       var lastFullRowSnapshotParsedCount = 0;
+      var persistenceFlushQueue = Future<void>.value();
+      final projectResolutionCache = _WslProjectResolutionCache(
+        wslProjectResolver,
+      );
       try {
         _cleanSessionMetadataPlaceholders(db);
         scanRunId = _startScanRun(db);
         final activeScanRunId = scanRunId;
 
-        void flushParsedSessions(
+        Future<void> persistParsedBatch(List<ScannedSessionFile> batch) async {
+          if (batch.isEmpty) {
+            return;
+          }
+          final currentFlush = persistenceFlushQueue.then((_) {
+            return Profiling.spanAsync('scan.runtime.persist_flush', () {
+              return _persistParsedSessions(
+                db,
+                batch,
+                wslProjects: projectResolutionCache,
+                resolveWslProjects: false,
+              );
+            });
+          });
+          persistenceFlushQueue = currentFlush;
+          await currentFlush;
+          persistenceFlushCount++;
+        }
+
+        Future<void> flushParsedSessions(
           ScanProgress progress, {
           bool forceFullRowSnapshot = false,
-        }) {
+          Future<void> Function()? beforeFullRowSnapshot,
+        }) async {
           if (pendingParsedSessions.isNotEmpty) {
-            Profiling.spanSync('scan.runtime.persist_flush', () {
-              _persistParsedSessions(db, pendingParsedSessions);
-            });
-            persistenceFlushCount++;
+            final batch = List<ScannedSessionFile>.of(pendingParsedSessions);
             pendingParsedSessions.clear();
+            await persistParsedBatch(batch);
+          } else if (forceFullRowSnapshot) {
+            await persistenceFlushQueue;
+          }
+
+          if (forceFullRowSnapshot) {
+            await persistenceFlushQueue;
+          }
+          if (forceFullRowSnapshot && pendingParsedSessions.isNotEmpty) {
+            final finalBatch = List<ScannedSessionFile>.of(
+              pendingParsedSessions,
+            );
+            pendingParsedSessions.clear();
+            await persistParsedBatch(finalBatch);
+          }
+          if (forceFullRowSnapshot) {
+            await persistenceFlushQueue;
+          }
+
+          if (forceFullRowSnapshot) {
+            await beforeFullRowSnapshot?.call();
           }
 
           if (onProgress != null &&
@@ -329,7 +380,7 @@ class RuntimeSessionController {
                   pendingParsedSessions.add(session);
                   if (pendingParsedSessions.length >=
                       scanBatchingPolicy.parsedSessionFlushBatchSize) {
-                    flushParsedSessions(progress);
+                    await flushParsedSessions(progress);
                   }
                 },
         );
@@ -345,13 +396,24 @@ class RuntimeSessionController {
             );
           },
         );
-        flushParsedSessions(result.progress, forceFullRowSnapshot: true);
-        Profiling.spanSync('scan.runtime.persist_scan', () {
-          _persistScan(
+        await flushParsedSessions(
+          result.progress,
+          forceFullRowSnapshot: true,
+          beforeFullRowSnapshot: onProgress == null
+              ? null
+              : () => _applyResolvedProjectsForParsedSessions(
+                  db,
+                  result.sessions,
+                  wslProjects: projectResolutionCache,
+                ),
+        );
+        await Profiling.spanAsync('scan.runtime.persist_scan', () {
+          return _persistScan(
             db,
             result,
             scanRunId: activeScanRunId,
             persistSessions: onProgress == null,
+            wslProjects: projectResolutionCache,
           );
         });
         final rows = _loadRowsProfiled(db, pricing: pricing);
@@ -401,6 +463,95 @@ class RuntimeSessionController {
   }
 }
 
+abstract class WslProjectResolver {
+  const WslProjectResolver();
+
+  Future<Map<String, String>> resolveProjectNames(
+    Iterable<String> workingDirectories,
+  );
+}
+
+class ProcessWslProjectResolver extends WslProjectResolver {
+  const ProcessWslProjectResolver();
+
+  @override
+  Future<Map<String, String>> resolveProjectNames(
+    Iterable<String> workingDirectories,
+  ) async {
+    final paths = workingDirectories
+        .map((path) => path.trim())
+        .where((path) => path.isNotEmpty)
+        .toSet()
+        .toList(growable: false);
+    if (paths.isEmpty) {
+      return const {};
+    }
+
+    Process process;
+    try {
+      process = await Process.start('wsl.exe', [
+        'sh',
+        '-lc',
+        _wslProjectResolutionScript,
+      ]);
+    } on Object {
+      return const {};
+    }
+
+    try {
+      final stdoutText = process.stdout.transform(utf8.decoder).join();
+      final stderrDrain = process.stderr.drain<void>();
+      for (final path in paths) {
+        process.stdin.writeln(path);
+      }
+      await process.stdin.close();
+      final exitCode = await process.exitCode;
+      await stderrDrain;
+      if (exitCode != 0) {
+        return const {};
+      }
+      return _parseWslProjectResolutionOutput(await stdoutText, paths.toSet());
+    } on Object {
+      process.kill();
+      return const {};
+    }
+  }
+}
+
+const _wslProjectResolutionScript = r'''
+while IFS= read -r path; do
+  if [ -z "$path" ]; then
+    continue
+  fi
+  if cd "$path" 2>/dev/null; then
+    root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    name=$(basename "$root")
+    if [ -n "$name" ]; then
+      printf '%s\t%s\n' "$path" "$name"
+    fi
+  fi
+done
+''';
+
+Map<String, String> _parseWslProjectResolutionOutput(
+  String output,
+  Set<String> requestedPaths,
+) {
+  final resolved = <String, String>{};
+  for (final line in const LineSplitter().convert(output)) {
+    final separator = line.indexOf('\t');
+    if (separator <= 0) {
+      continue;
+    }
+    final path = line.substring(0, separator);
+    final name = line.substring(separator + 1).trim();
+    if (requestedPaths.contains(path) && name.isNotEmpty) {
+      resolved[path] = name;
+    }
+  }
+  return resolved;
+}
+
 Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
   try {
     final result =
@@ -431,7 +582,12 @@ Future<void> _backgroundCachedRowsEntry(
     final db = openFileBackedDatabase(File(request.databaseFilePath));
     try {
       _cleanSessionMetadataPlaceholders(db);
-      _backfillAutomaticProjects(db);
+      await _backfillAutomaticProjects(
+        db,
+        wslProjects: _WslProjectResolutionCache(
+          const ProcessWslProjectResolver(),
+        ),
+      );
       final total = _visibleRowCount(db);
       final rows = <SessionRowViewModel>[];
       var offset = 0;
@@ -535,11 +691,21 @@ class _BackgroundRefreshError {
   final String stackTrace;
 }
 
-void _persistParsedSessions(Database db, List<ScannedSessionFile> sessions) {
+Future<void> _persistParsedSessions(
+  Database db,
+  List<ScannedSessionFile> sessions, {
+  required _WslProjectResolutionCache wslProjects,
+  bool resolveWslProjects = true,
+}) async {
+  final resolver = resolveWslProjects
+      ? await _ProjectPathResolver.create(
+          _projectPathCandidatesForSessions(sessions),
+          wslProjects: wslProjects,
+        )
+      : _ProjectPathResolver();
   db.execute('begin immediate');
   try {
     final now = DateTime.now().toUtc().toIso8601String();
-    final resolver = _ProjectPathResolver();
     for (final session in sessions) {
       _upsertParsedSession(db, session, now, resolver);
     }
@@ -628,12 +794,19 @@ List<CachedSessionSnapshot> _cachedSessions(Database db) {
   ];
 }
 
-void _persistScan(
+Future<void> _persistScan(
   Database db,
   SessionScanResult result, {
   required int scanRunId,
   required bool persistSessions,
-}) {
+  required _WslProjectResolutionCache wslProjects,
+}) async {
+  final resolver = persistSessions
+      ? await _ProjectPathResolver.create(
+          _projectPathCandidatesForSessions(result.sessions),
+          wslProjects: wslProjects,
+        )
+      : null;
   db.execute('begin immediate');
   try {
     final now = DateTime.now().toUtc().toIso8601String();
@@ -659,9 +832,8 @@ void _persistScan(
       );
     }
     if (persistSessions) {
-      final resolver = _ProjectPathResolver();
       for (final session in result.sessions) {
-        _upsertParsedSession(db, session, now, resolver);
+        _upsertParsedSession(db, session, now, resolver!);
       }
     }
     for (final status in result.fileStatuses) {
@@ -1310,7 +1482,10 @@ void _updateSearchProjectIfAutomatic(
   ]);
 }
 
-void _backfillAutomaticProjects(Database db) {
+Future<void> _backfillAutomaticProjects(
+  Database db, {
+  required _WslProjectResolutionCache wslProjects,
+}) async {
   final rows = db.select('''
     select id, source_type, working_directory_display
     from sessions
@@ -1323,15 +1498,26 @@ void _backfillAutomaticProjects(Database db) {
   if (rows.isEmpty) {
     return;
   }
-  final resolver = _ProjectPathResolver();
+  final candidates = [
+    for (final row in rows)
+      _ProjectPathCandidate(
+        row['working_directory_display'] as String?,
+        (row['source_type'] as String?) == 'wsl'
+            ? SessionSourceType.wsl
+            : SessionSourceType.windows,
+      ),
+  ];
+  final resolver = await _ProjectPathResolver.create(
+    candidates,
+    wslProjects: wslProjects,
+  );
   final resolvedRows = <({String sessionId, String projectName})>[];
-  for (final row in rows) {
-    final sourceType = (row['source_type'] as String?) == 'wsl'
-        ? SessionSourceType.wsl
-        : SessionSourceType.windows;
+  for (var i = 0; i < rows.length; i++) {
+    final row = rows[i];
+    final candidate = candidates[i];
     final autoProject = resolver.resolve(
-      row['working_directory_display'] as String?,
-      sourceType: sourceType,
+      candidate.workingDirectory,
+      sourceType: candidate.sourceType,
     );
     final projectName = autoProject?.name.trim() ?? '';
     if (projectName.isNotEmpty) {
@@ -1344,6 +1530,46 @@ void _backfillAutomaticProjects(Database db) {
   if (resolvedRows.isEmpty) {
     return;
   }
+  _applyResolvedProjectRows(db, resolvedRows);
+}
+
+Future<void> _applyResolvedProjectsForParsedSessions(
+  Database db,
+  Iterable<ScannedSessionFile> sessions, {
+  required _WslProjectResolutionCache wslProjects,
+}) async {
+  final sessionList = sessions.toList(growable: false);
+  if (sessionList.isEmpty) {
+    return;
+  }
+  final resolver = await _ProjectPathResolver.create(
+    _projectPathCandidatesForSessions(sessionList),
+    wslProjects: wslProjects,
+  );
+  final resolvedRows = <({String sessionId, String projectName})>[];
+  for (final session in sessionList) {
+    final autoProject = resolver.resolve(
+      session.parsedSession.workingDirectoryDisplay,
+      sourceType: session.sourceType,
+    );
+    final projectName = autoProject?.name.trim() ?? '';
+    if (projectName.isNotEmpty) {
+      resolvedRows.add((
+        sessionId: session.parsedSession.internalId,
+        projectName: projectName,
+      ));
+    }
+  }
+  if (resolvedRows.isEmpty) {
+    return;
+  }
+  _applyResolvedProjectRows(db, resolvedRows);
+}
+
+void _applyResolvedProjectRows(
+  Database db,
+  List<({String sessionId, String projectName})> resolvedRows,
+) {
   db.execute('begin immediate');
   try {
     final now = DateTime.now().toUtc().toIso8601String();
@@ -1377,8 +1603,90 @@ class _ResolvedProjectPath {
   final String name;
 }
 
+class _ProjectPathCandidate {
+  const _ProjectPathCandidate(this.workingDirectory, this.sourceType);
+
+  final String? workingDirectory;
+  final SessionSourceType sourceType;
+}
+
+Iterable<_ProjectPathCandidate> _projectPathCandidatesForSessions(
+  Iterable<ScannedSessionFile> sessions,
+) sync* {
+  for (final session in sessions) {
+    yield _ProjectPathCandidate(
+      session.parsedSession.workingDirectoryDisplay,
+      session.sourceType,
+    );
+  }
+}
+
+class _WslProjectResolutionCache {
+  _WslProjectResolutionCache(this._resolver);
+
+  final WslProjectResolver _resolver;
+  final _attemptedPaths = <String>{};
+  final _resolvedNames = <String, String>{};
+
+  Future<Map<String, String>> resolve(
+    Iterable<String> workingDirectories,
+  ) async {
+    final requestedPaths = workingDirectories
+        .map((path) => path.trim())
+        .where((path) => path.isNotEmpty)
+        .toSet();
+    final unresolvedPaths = requestedPaths
+        .where((path) => !_attemptedPaths.contains(path))
+        .toSet();
+    if (unresolvedPaths.isNotEmpty) {
+      _attemptedPaths.addAll(unresolvedPaths);
+      try {
+        final resolved = await Profiling.spanAsync(
+          'scan.runtime.resolve_wsl_project',
+          () => _resolver.resolveProjectNames(unresolvedPaths),
+        );
+        for (final entry in resolved.entries) {
+          final path = entry.key.trim();
+          final name = entry.value.trim();
+          if (unresolvedPaths.contains(path) && name.isNotEmpty) {
+            _resolvedNames[path] = name;
+          }
+        }
+      } on Object {
+        // WSL can be unavailable during startup/tests. Callers use path fallback.
+      }
+    }
+    return {
+      for (final path in requestedPaths)
+        if ((_resolvedNames[path] ?? '').isNotEmpty)
+          path: _resolvedNames[path]!,
+    };
+  }
+}
+
 class _ProjectPathResolver {
+  _ProjectPathResolver({this.resolvedWslProjectNames = const {}});
+
+  final Map<String, String> resolvedWslProjectNames;
   final _cache = <String, _ResolvedProjectPath?>{};
+
+  static Future<_ProjectPathResolver> create(
+    Iterable<_ProjectPathCandidate> candidates, {
+    required _WslProjectResolutionCache wslProjects,
+  }) async {
+    final wslPaths = <String>{};
+    for (final candidate in candidates) {
+      final path = candidate.workingDirectory?.trim();
+      if (candidate.sourceType == SessionSourceType.wsl &&
+          path != null &&
+          path.isNotEmpty) {
+        wslPaths.add(path);
+      }
+    }
+    return _ProjectPathResolver(
+      resolvedWslProjectNames: await wslProjects.resolve(wslPaths),
+    );
+  }
 
   _ResolvedProjectPath? resolve(
     String? workingDirectory, {
@@ -1417,28 +1725,11 @@ class _ProjectPathResolver {
   }
 
   _ResolvedProjectPath? _resolveWsl(String path) {
-    return Profiling.spanSync('scan.runtime.resolve_wsl_project', () {
-      try {
-        final result = Process.runSync('wsl.exe', [
-          'sh',
-          '-lc',
-          'cd "\$1" 2>/dev/null && '
-              'root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd) && '
-              'basename "\$root"',
-          'sh',
-          path,
-        ]);
-        if (result.exitCode == 0) {
-          final name = result.stdout.toString().trim().split('\n').last.trim();
-          if (name.isNotEmpty) {
-            return _ResolvedProjectPath(name);
-          }
-        }
-      } on Object {
-        // WSL may be unavailable during tests/startup; use the path segment.
-      }
-      return _projectFromPath(path);
-    });
+    final name = resolvedWslProjectNames[path]?.trim() ?? '';
+    if (name.isNotEmpty) {
+      return _ResolvedProjectPath(name);
+    }
+    return _projectFromPath(path);
   }
 
   _ResolvedProjectPath? _projectFromPath(String path) {
