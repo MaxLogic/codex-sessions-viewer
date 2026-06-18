@@ -8,6 +8,7 @@ import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
+import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -810,6 +811,109 @@ void main() {
       ),
     );
   });
+
+  testWidgets(
+    'settings save and reload update periodic rescans without restart',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 1200));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final temp = Directory.systemTemp.createTempSync(
+        'csv_runtime_settings_rescan_',
+      );
+      addTearDown(() async {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        await tester.runAsync(() async {
+          if (!await temp.exists()) {
+            return;
+          }
+          await temp.delete(recursive: true);
+        });
+      });
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final disabledSettings = AppSettings.defaults().copyWith(
+        scanner: const ScannerSettings(
+          backgroundRescanEnabled: false,
+          backgroundRescanIntervalSeconds: 1,
+        ),
+      );
+      var storedSettings = disabledSettings;
+      var refreshCalls = 0;
+
+      await tester.pumpWidget(
+        CodexSessionsViewerApp(
+          databaseStartup: Future.value(
+            DatabaseStartupResult.ready(lastAppliedSchemaVersion: 5),
+          ),
+          settingsFile: settingsFile,
+          databaseFile: databaseFile,
+          settingsStartup: Future.value(disabledSettings),
+          settingsSave: (settings) async {
+            storedSettings = settings;
+          },
+          settingsReload: () async => storedSettings,
+          sessionRefreshOperation: (_) {
+            refreshCalls++;
+            return SessionsRefreshOperation.fromFuture(
+              Future.value(
+                const SessionsRefreshResult(
+                  rows: [],
+                  statusMessage: 'Scan finished.',
+                ),
+              ),
+            );
+          },
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 2));
+      expect(refreshCalls, 0);
+
+      await tester.tap(find.bySemanticsLabel('Settings navigation'));
+      await _pumpFrames(tester);
+      await tester.tap(find.byType(Switch).first);
+      await tester.pump();
+      await tester.tap(find.text('Save settings'));
+      await _pumpFrames(tester);
+      expect(storedSettings.scanner.backgroundRescanEnabled, isTrue);
+      expect(
+        tester
+            .widget<SettingsScreen>(find.byType(SettingsScreen))
+            .initialSettings!
+            .scanner
+            .backgroundRescanEnabled,
+        isTrue,
+      );
+
+      await tester.tap(find.bySemanticsLabel('Sessions navigation'));
+      await tester.pump();
+      expect(
+        tester
+            .widget<SessionsScreen>(find.byType(SessionsScreen))
+            .settings!
+            .scanner
+            .backgroundRescanEnabled,
+        isTrue,
+      );
+      await tester.pump(const Duration(milliseconds: 1001));
+      expect(refreshCalls, 1);
+
+      storedSettings = disabledSettings;
+      await tester.tap(find.bySemanticsLabel('Settings navigation'));
+      await _pumpFrames(tester);
+      await tester.tap(find.text('Reload from file'));
+      await _pumpFrames(tester);
+
+      await tester.tap(find.bySemanticsLabel('Sessions navigation'));
+      await tester.pump();
+      final callsAfterReload = refreshCalls;
+      await tester.pump(const Duration(milliseconds: 1001));
+      expect(refreshCalls, callsAfterReload);
+    },
+  );
 
   test('runtime loads cached sessions before refresh is clicked', () async {
     final temp = await Directory.systemTemp.createTemp(

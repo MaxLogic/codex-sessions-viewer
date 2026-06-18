@@ -15,7 +15,7 @@ import '../ui/screens/settings_screen.dart';
 import '../ui/screens/usage_screen.dart';
 import '../ui/themes.dart';
 
-class CodexSessionsViewerApp extends StatelessWidget {
+class CodexSessionsViewerApp extends StatefulWidget {
   CodexSessionsViewerApp({
     super.key,
     Future<DatabaseStartupResult>? databaseStartup,
@@ -24,6 +24,8 @@ class CodexSessionsViewerApp extends StatelessWidget {
     Future<AppSettings>? settingsStartup,
     this.sessionRefresh,
     this.sessionRefreshOperation,
+    this.settingsSave,
+    this.settingsReload,
   }) : databaseStartup =
            databaseStartup ??
            Future.value(
@@ -46,11 +48,20 @@ class CodexSessionsViewerApp extends StatelessWidget {
   final File databaseFile;
   final Future<SessionsRefreshResult> Function()? sessionRefresh;
   final SessionsRefreshOperationFactory? sessionRefreshOperation;
+  final SettingsSaveCallback? settingsSave;
+  final SettingsReloadCallback? settingsReload;
+
+  @override
+  State<CodexSessionsViewerApp> createState() => _CodexSessionsViewerAppState();
+}
+
+class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
+  AppSettings? _settings;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: appTitle,
+      title: CodexSessionsViewerApp.appTitle,
       debugShowCheckedModeBanner: false,
       theme: CodexAppTheme.themeData(CodexThemeMode.light),
       darkTheme: CodexAppTheme.themeData(CodexThemeMode.dark),
@@ -62,7 +73,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
       ),
       themeMode: CodexAppTheme.themeMode(CodexThemeMode.system),
       home: FutureBuilder<DatabaseStartupResult>(
-        future: databaseStartup,
+        future: widget.databaseStartup,
         builder: (context, snapshot) {
           if (snapshot.hasError) {
             return FatalDatabaseScreen(
@@ -79,26 +90,31 @@ class CodexSessionsViewerApp extends StatelessWidget {
             return FatalDatabaseScreen(error: result.fatalError!);
           }
           return FutureBuilder<AppSettings>(
-            future: settingsStartup,
+            future: widget.settingsStartup,
             initialData: AppSettings.defaults(),
             builder: (context, settingsSnapshot) {
               if (settingsSnapshot.hasError) {
                 return FatalDatabaseScreen(
                   error: DatabaseFatalError(
                     summary: 'Settings startup failed.',
-                    databasePath: settingsFile.path,
+                    databasePath: widget.settingsFile.path,
                     lastAppliedSchemaVersion: result.lastAppliedSchemaVersion,
                     details: settingsSnapshot.error.toString(),
                   ),
                 );
               }
-              final settings = settingsSnapshot.requireData;
+              final settings =
+                  _settings ?? settingsSnapshot.data ?? AppSettings.defaults();
+              if (_settings == null &&
+                  settingsSnapshot.connectionState == ConnectionState.done) {
+                _settings = settings;
+              }
               return CodexAppShell(
                 sessionsScreenBuilder: (context, onOpenSettings) =>
                     _SessionsScreenLoader(
                       settings: settings,
-                      settingsFile: settingsFile,
-                      databaseFile: databaseFile,
+                      settingsFile: widget.settingsFile,
+                      databaseFile: widget.databaseFile,
                       onRefreshOperation: _sessionRefreshOperation,
                       onOpenSettings: onOpenSettings,
                       onSessionAction: (request) =>
@@ -108,7 +124,11 @@ class CodexSessionsViewerApp extends StatelessWidget {
                       },
                     ),
                 usageScreen: UsageScreen(),
-                settingsScreen: SettingsScreen(initialSettings: settings),
+                settingsScreen: SettingsScreen(
+                  initialSettings: settings,
+                  onSave: _saveSettings,
+                  onReload: _reloadSettings,
+                ),
                 logsScreen: LogsScreen(),
               );
             },
@@ -121,22 +141,50 @@ class CodexSessionsViewerApp extends StatelessWidget {
   SessionsRefreshOperation _sessionRefreshOperation(
     SessionsRefreshProgressCallback onProgress,
   ) {
-    final refreshOperation = sessionRefreshOperation;
+    final refreshOperation = widget.sessionRefreshOperation;
     if (refreshOperation != null) {
       return refreshOperation(onProgress);
     }
-    final refresh = sessionRefresh;
+    final refresh = widget.sessionRefresh;
     if (refresh != null) {
       return SessionsRefreshOperation.fromFuture(refresh());
     }
     final operation = RuntimeSessionController(
-      settingsFile: settingsFile,
-      databaseFile: databaseFile,
+      settingsFile: widget.settingsFile,
+      databaseFile: widget.databaseFile,
     ).startRefreshInBackgroundOperation(onProgress: onProgress);
     return SessionsRefreshOperation(
       result: operation.result,
       cancel: operation.cancel,
     );
+  }
+
+  Future<void> _saveSettings(AppSettings settings) async {
+    final save = widget.settingsSave;
+    if (save == null) {
+      await SettingsRepository(widget.settingsFile).save(settings);
+    } else {
+      await save(settings);
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _settings = settings;
+    });
+  }
+
+  Future<AppSettings> _reloadSettings() async {
+    final reload = widget.settingsReload;
+    final settings = reload == null
+        ? await SettingsRepository(widget.settingsFile).loadOrCreate()
+        : await reload();
+    if (mounted) {
+      setState(() {
+        _settings = settings;
+      });
+    }
+    return settings;
   }
 
   Future<void> _handleSessionAction(SessionActionRequest request) async {
@@ -174,8 +222,8 @@ class CodexSessionsViewerApp extends StatelessWidget {
         return;
       case SessionRowAction.reparse:
         await RuntimeSessionController(
-          settingsFile: settingsFile,
-          databaseFile: databaseFile,
+          settingsFile: widget.settingsFile,
+          databaseFile: widget.databaseFile,
         ).refresh();
         return;
     }
@@ -204,7 +252,7 @@ class CodexSessionsViewerApp extends StatelessWidget {
     required bool value,
   }) {
     assert(column == 'is_pinned' || column == 'is_archived');
-    final db = openFileBackedDatabase(databaseFile);
+    final db = openFileBackedDatabase(widget.databaseFile);
     try {
       db.execute(
         'update sessions set $column = ?, updated_at_utc = ? where id = ?',
@@ -216,11 +264,18 @@ class CodexSessionsViewerApp extends StatelessWidget {
   }
 
   Future<void> _saveSessionTableState(SessionTableSettings tableState) async {
-    final repository = SettingsRepository(settingsFile);
+    final repository = SettingsRepository(widget.settingsFile);
     final settings = await repository.loadOrCreate();
-    await repository.save(
-      settings.copyWith(ui: settings.ui.copyWith(sessionTable: tableState)),
+    final next = settings.copyWith(
+      ui: settings.ui.copyWith(sessionTable: tableState),
     );
+    await repository.save(next);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _settings = next;
+    });
   }
 }
 

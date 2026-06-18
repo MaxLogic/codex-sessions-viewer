@@ -109,6 +109,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   late List<SessionTableSortSettings> _sorts;
   late int _handledAutoRefreshToken;
   Timer? _relativeDateTimer;
+  Timer? _backgroundRescanTimer;
   SessionsRefreshOperation? _activeRefreshOperation;
 
   @override
@@ -129,6 +130,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         setState(() {});
       }
     });
+    _configureBackgroundRescanTimer();
   }
 
   @override
@@ -152,11 +154,15 @@ class _SessionsScreenState extends State<SessionsScreen> {
         });
       }
     }
+    if (_settingsFor(oldWidget).scanner != _settingsFor(widget).scanner) {
+      _configureBackgroundRescanTimer();
+    }
   }
 
   @override
   void dispose() {
     _requestRefreshCancel(updateUi: false);
+    _backgroundRescanTimer?.cancel();
     _searchController
       ..removeListener(_filtersChanged)
       ..dispose();
@@ -165,6 +171,28 @@ class _SessionsScreenState extends State<SessionsScreen> {
       ..dispose();
     _relativeDateTimer?.cancel();
     super.dispose();
+  }
+
+  AppSettings _settingsFor(SessionsScreen widget) =>
+      widget.settings ?? AppSettings.defaults();
+
+  void _configureBackgroundRescanTimer() {
+    _backgroundRescanTimer?.cancel();
+    _backgroundRescanTimer = null;
+    final scanner = (widget.settings ?? AppSettings.defaults()).scanner;
+    if (!scanner.backgroundRescanEnabled ||
+        scanner.backgroundRescanIntervalSeconds <= 0) {
+      return;
+    }
+    _backgroundRescanTimer = Timer.periodic(
+      Duration(seconds: scanner.backgroundRescanIntervalSeconds),
+      (_) {
+        if (!mounted || _isScanning) {
+          return;
+        }
+        unawaited(_refresh());
+      },
+    );
   }
 
   @override
