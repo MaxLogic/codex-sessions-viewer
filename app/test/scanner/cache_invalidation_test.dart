@@ -47,7 +47,7 @@ void main() {
     expect(result.fileStatuses.single.status, SessionFileStatus.available);
   });
 
-  test('parses when size, hash, or parser version changes', () async {
+  test('parses when size, modified time, or parser version changes', () async {
     final root = await _createRootWithSession('changed', temp);
     final file = File('${root.path}${Platform.pathSeparator}changed.json');
     final actual = await CachedSessionSnapshot.fromFile(
@@ -55,11 +55,15 @@ void main() {
       status: SessionFileStatus.available,
       parserVersion: CodexSessionParser.currentVersion,
     );
-    await file.writeAsString(_validJsonSession('changed-updated'));
     final staleSnapshots = [
-      actual,
+      actual.copyWith(sourceFileSize: actual.sourceFileSize! - 1),
+      actual.copyWith(
+        sourceModifiedUtc: actual.sourceModifiedUtc!.subtract(
+          const Duration(seconds: 3),
+        ),
+      ),
       actual.copyWith(sourceFileSize: null),
-      actual.copyWith(sourceContentHash: 'different'),
+      actual.copyWith(sourceModifiedUtc: null),
       actual.copyWith(parserVersion: CodexSessionParser.currentVersion - 1),
     ];
 
@@ -78,7 +82,7 @@ void main() {
   });
 
   test(
-    'parses same-size same-timestamp files when content hash changes',
+    'skips same-size files inside timestamp tolerance without hashing content',
     () async {
       final root = await _createRootWithSession('same-size-a', temp);
       final file = File(
@@ -90,18 +94,48 @@ void main() {
         parserVersion: CodexSessionParser.currentVersion,
       );
       await file.writeAsString(_validJsonSession('same-size-b'));
-      await file.setLastModified(actual.sourceModifiedUtc!);
+      await file.setLastModified(
+        actual.sourceModifiedUtc!.add(const Duration(seconds: 1)),
+      );
       final parser = _CountingParser();
       final scanner = SessionScanner(parser: parser, pathMapper: mapper);
 
       final result = await scanner.scan(
-        SessionScanRequest(windowsRoot: root.path, cachedSessions: [actual]),
+        SessionScanRequest(
+          windowsRoot: root.path,
+          cachedSessions: [
+            actual.copyWith(sourceContentHash: 'definitely-stale'),
+          ],
+        ),
       );
 
-      expect(parser.parseCount, 1);
-      expect(result.progress.filesParsed, 1);
+      expect(parser.parseCount, 0);
+      expect(result.progress.filesSkipped, 1);
+      expect(result.progress.filesParsed, 0);
     },
   );
+
+  test('skips unchanged cached files when content hash is absent', () async {
+    final root = await _createRootWithSession('no-hash', temp);
+    final file = File('${root.path}${Platform.pathSeparator}no-hash.json');
+    final actual = await CachedSessionSnapshot.fromFile(
+      file,
+      status: SessionFileStatus.available,
+      parserVersion: CodexSessionParser.currentVersion,
+    );
+    final parser = _CountingParser();
+    final scanner = SessionScanner(parser: parser, pathMapper: mapper);
+
+    final result = await scanner.scan(
+      SessionScanRequest(
+        windowsRoot: root.path,
+        cachedSessions: [actual.copyWith(sourceContentHash: null)],
+      ),
+    );
+
+    expect(parser.parseCount, 0);
+    expect(result.progress.filesSkipped, 1);
+  });
 
   test('parses cached files whose source status is not available', () async {
     final root = await _createRootWithSession('pending', temp);
@@ -145,30 +179,27 @@ void main() {
     expect(result.progress.filesSkipped, 1);
   });
 
-  test(
-    'hashes timestamp-only changes and skips when content is unchanged',
-    () async {
-      final root = await _createRootWithSession('touched', temp);
-      final file = File('${root.path}${Platform.pathSeparator}touched.json');
-      final actual = await CachedSessionSnapshot.fromFile(
-        file,
-        status: SessionFileStatus.available,
-        parserVersion: CodexSessionParser.currentVersion,
-      );
-      await file.setLastModified(
-        actual.sourceModifiedUtc!.add(const Duration(minutes: 1)),
-      );
-      final parser = _CountingParser();
-      final scanner = SessionScanner(parser: parser, pathMapper: mapper);
+  test('parses timestamp-only changes outside tolerance', () async {
+    final root = await _createRootWithSession('touched', temp);
+    final file = File('${root.path}${Platform.pathSeparator}touched.json');
+    final actual = await CachedSessionSnapshot.fromFile(
+      file,
+      status: SessionFileStatus.available,
+      parserVersion: CodexSessionParser.currentVersion,
+    );
+    await file.setLastModified(
+      actual.sourceModifiedUtc!.add(const Duration(minutes: 1)),
+    );
+    final parser = _CountingParser();
+    final scanner = SessionScanner(parser: parser, pathMapper: mapper);
 
-      final result = await scanner.scan(
-        SessionScanRequest(windowsRoot: root.path, cachedSessions: [actual]),
-      );
+    final result = await scanner.scan(
+      SessionScanRequest(windowsRoot: root.path, cachedSessions: [actual]),
+    );
 
-      expect(parser.parseCount, 0);
-      expect(result.progress.filesSkipped, 1);
-    },
-  );
+    expect(parser.parseCount, 1);
+    expect(result.progress.filesParsed, 1);
+  });
 }
 
 Future<Directory> _createRootWithSession(String id, Directory temp) async {

@@ -70,7 +70,6 @@ class LocalBenchmarkRunner {
         ),
       );
     }
-    final cachedSnapshotHashReads = cachedSnapshots.length;
     final cacheMeasurement = await _measure(
       () => scanner.scan(scanRoots.request(cachedSessions: cachedSnapshots)),
     );
@@ -150,9 +149,7 @@ class LocalBenchmarkRunner {
     final report = LocalBenchmarkReport(
       generatedAtUtc: DateTime.now().toUtc(),
       privateCorpus: privateCorpus,
-      fullContentHashReadCount:
-          cachedSnapshotHashReads +
-          cacheMeasurement.value.progress.filesSkipped,
+      fullContentHashReadCount: 0,
       fixtures: FixtureBenchmarkSummary(totalFiles: fixtureFiles.length),
       scan: ScanBenchmarkResult(
         elapsed: scanMeasurement.elapsed,

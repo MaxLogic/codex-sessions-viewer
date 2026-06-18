@@ -42,8 +42,10 @@ class SessionScanner {
     this.onProgress,
     this.onSessionParsed,
     this.progressEveryWorkItems = 100,
+    this.cacheModifiedTolerance = const Duration(seconds: 2),
   }) : assert(maxConcurrentParses > 0),
-       assert(maxConcurrentDirectoryScans > 0);
+       assert(maxConcurrentDirectoryScans > 0),
+       assert(!cacheModifiedTolerance.isNegative);
 
   final CodexSessionParser parser;
   final CodexPathMapper pathMapper;
@@ -57,6 +59,7 @@ class SessionScanner {
   )?
   onSessionParsed;
   final int progressEveryWorkItems;
+  final Duration cacheModifiedTolerance;
   bool _isScanning = false;
   int _lastProgressWorkItems = 0;
 
@@ -521,7 +524,6 @@ class SessionScanner {
       }
 
       final FileStat stat;
-      final String currentHash;
       try {
         stat = await file.stat();
       } on Object {
@@ -532,13 +534,11 @@ class SessionScanner {
       if (sizeChanged) {
         return const _ParseDecision.parse();
       }
-      try {
-        currentHash = await _contentHash(file);
-      } on Object {
-        return const _ParseDecision.parse();
-      }
-      final hashChanged = currentHash != cached.sourceContentHash;
-      if (hashChanged) {
+      if (!_isModifiedWithinTolerance(
+        stat.modified.toUtc(),
+        cached.sourceModifiedUtc!,
+        cacheModifiedTolerance,
+      )) {
         return const _ParseDecision.parse();
       }
       return const _ParseDecision.skip();
@@ -733,7 +733,6 @@ class CachedSessionSnapshot {
   bool get hasCompleteInvalidationMetadata =>
       sourceFileSize != null &&
       sourceModifiedUtc != null &&
-      sourceContentHash != null &&
       parserVersion != null;
 
   CachedSessionSnapshot copyWith({
@@ -1210,6 +1209,18 @@ Set<String> _snapshotPathKeys(CachedSessionSnapshot snapshot) => {
 Future<String> _contentHash(File file) async {
   final bytes = await file.readAsBytes();
   return sha256.convert(bytes).toString();
+}
+
+bool _isModifiedWithinTolerance(
+  DateTime currentModifiedUtc,
+  DateTime cachedModifiedUtc,
+  Duration tolerance,
+) {
+  return currentModifiedUtc
+          .toUtc()
+          .difference(cachedModifiedUtc.toUtc())
+          .abs() <=
+      tolerance;
 }
 
 int _compareScannedSessions(

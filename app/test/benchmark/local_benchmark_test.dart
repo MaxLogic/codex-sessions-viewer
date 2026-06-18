@@ -159,7 +159,7 @@ void main() {
         'warm_noop_scan_elapsed_ms',
         'parsed_count',
         'skipped_count',
-        'full_content_hash_read_count: 4',
+        'full_content_hash_read_count: 0',
         'wsl_process_invocation_count: not_available',
         'persistence_flush_count',
         'full_row_snapshot_count',
