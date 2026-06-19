@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/accessibility/announcement_service.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/conversation_view.dart';
 import 'package:flutter/material.dart';
@@ -94,6 +95,42 @@ void main() {
     await tester.tap(find.widgetWithText(OutlinedButton, 'Expand tool output'));
     await tester.pumpAndSettle();
     expect(find.text('line 1\nline 2\nline 3'), findsOneWidget);
+  });
+
+  testWidgets('announces tool output expansion and collapse', (tester) async {
+    final announcer = RecordingScreenReaderAnnouncer();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            announcer: announcer,
+            messages: [
+              ConversationMessageViewModel(
+                id: 'tool',
+                number: 1,
+                author: ConversationAuthor.tool,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'shell_command',
+                body: 'line 1\nline 2\nline 3',
+                tokenCount: 30,
+                hasToolOutput: true,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Expand tool output'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Collapse'));
+    await tester.pumpAndSettle();
+
+    expect(announcer.messages, [
+      'Tool output expanded for message 1.',
+      'Tool output collapsed for message 1.',
+    ]);
   });
 
   testWidgets('copy message Markdown uses injected copy callback', (

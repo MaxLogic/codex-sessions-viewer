@@ -15,10 +15,16 @@ void main() {
     expect(commands.canResume, isTrue);
     expect(commands.disabledReason, isNull);
     expect(commands.plainResumeCommand, 'codex resume abc123');
+    expect(commands.plainForkCommand, 'codex fork abc123');
     expect(commands.platformResumeCommand, 'codex resume abc123');
+    expect(commands.platformForkCommand, 'codex fork abc123');
     expect(
       commands.terminalLaunchCommand,
       r'"C:\Program Files\Alacritty\alacritty.exe" --working-directory "C:\Projects\Client App" -e powershell.exe -NoExit -Command "codex resume abc123"',
+    );
+    expect(
+      commands.terminalForkCommand,
+      r'"C:\Program Files\Alacritty\alacritty.exe" --working-directory "C:\Projects\Client App" -e powershell.exe -NoExit -Command "codex fork abc123"',
     );
     expect(
       commands.terminalLaunchCommandFor('windows_terminal'),
@@ -38,6 +44,10 @@ void main() {
     expect(
       commands.platformResumeCommand,
       'wsl.exe -d Ubuntu --cd "/home/pawel/project with spaces" bash -lc "\'codex\' \'resume\' \'abc123\'"',
+    );
+    expect(
+      commands.platformForkCommand,
+      'wsl.exe -d Ubuntu --cd "/home/pawel/project with spaces" bash -lc "\'codex\' \'fork\' \'abc123\'"',
     );
     expect(
       commands.terminalLaunchCommand,
@@ -64,8 +74,11 @@ void main() {
       'Resume unavailable: this session has no parsed Codex session ID.',
     );
     expect(commands.plainResumeCommand, isNull);
+    expect(commands.plainForkCommand, isNull);
     expect(commands.platformResumeCommand, isNull);
+    expect(commands.platformForkCommand, isNull);
     expect(commands.terminalLaunchCommand, isNull);
+    expect(commands.terminalForkCommand, isNull);
   });
 
   test('reports disabled terminal profiles without disabling plain resume', () {

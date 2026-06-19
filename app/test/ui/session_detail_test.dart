@@ -1,4 +1,5 @@
-import 'package:codex_sessions_viewer/src/ui/models/session_row_view_model.dart';
+import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -43,12 +44,7 @@ void main() {
     for (final action in const [
       'Copy session path',
       'Copy working directory',
-      'Copy plain resume command',
-      'Copy platform resume command',
       'Open containing folder',
-      'Open terminal here',
-      'Open in terminal and resume',
-      'Copy terminal launch command',
       'Export Markdown',
       'Copy conversation Markdown',
       'Re-parse this session',
@@ -56,6 +52,22 @@ void main() {
       'Unarchive session',
       'Add/remove tags',
       'Assign/change project',
+    ]) {
+      expect(find.widgetWithText(OutlinedButton, action), findsOneWidget);
+    }
+
+    await tester.ensureVisible(find.text('Commands'));
+    await tester.tap(find.text('Commands'));
+    await tester.pumpAndSettle();
+
+    for (final action in const [
+      'Copy plain resume command',
+      'Copy platform resume command',
+      'Open terminal here',
+      'Open in terminal and resume',
+      'Copy terminal launch command',
+      'Run',
+      'Edit and run',
     ]) {
       expect(find.widgetWithText(OutlinedButton, action), findsOneWidget);
     }
@@ -83,6 +95,8 @@ void main() {
     );
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Copy session path'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Commands'));
     await tester.pumpAndSettle();
     final copyResume = find.widgetWithText(
       OutlinedButton,
@@ -122,6 +136,7 @@ void main() {
       await tester.tap(find.text('Commands'));
       await tester.pumpAndSettle();
 
+      expect(find.byType(AnimatedSize), findsWidgets);
       expect(find.text('Plain resume command:'), findsOneWidget);
     },
   );
@@ -140,17 +155,114 @@ void main() {
     expect(find.text('Selected: '), findsNothing);
     expect(find.text('Platform: WSL'), findsOneWidget);
   });
+
+  testWidgets('session detail transitions between selected sessions', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _detailRow(
+              id: 'row-1',
+              title: 'First detail',
+              project: 'First project',
+              isArchived: false,
+            ),
+            _detailRow(
+              id: 'row-2',
+              title: 'Second detail',
+              project: 'Second project',
+              isArchived: false,
+            ),
+          ],
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.normal),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('First project').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Selected: First detail'), findsOneWidget);
+
+    await tester.tap(find.text('Second project').first);
+    await tester.pump();
+
+    expect(find.byType(AnimatedSwitcher), findsWidgets);
+    expect(find.byType(FadeTransition), findsWidgets);
+    expect(find.byType(SlideTransition), findsWidgets);
+    expect(find.bySemanticsLabel('Selected: First detail'), findsNothing);
+    expect(find.text('Selected: First detail'), findsWidgets);
+    expect(find.text('Selected: Second detail'), findsWidgets);
+
+    await tester.pumpAndSettle();
+    expect(find.text('Selected: Second detail'), findsOneWidget);
+  });
+
+  testWidgets('session detail reduced motion avoids pane movement', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _detailRow(
+              id: 'row-1',
+              title: 'First detail',
+              project: 'First project',
+              isArchived: false,
+            ),
+            _detailRow(
+              id: 'row-2',
+              title: 'Second detail',
+              project: 'Second project',
+              isArchived: false,
+            ),
+          ],
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.reduced),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('First project').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Second project').first);
+    await tester.pump();
+
+    expect(
+      find.descendant(
+        of: find.byType(AnimatedSwitcher),
+        matching: find.byType(SlideTransition),
+      ),
+      findsNothing,
+    );
+  });
 }
 
-SessionRowViewModel _detailRow({String title = 'Flutter accessibility spike'}) {
+SessionRowViewModel _detailRow({
+  String id = 'row-1',
+  String title = 'Flutter accessibility spike',
+  String project = 'Codex Viewer',
+  bool isArchived = true,
+}) {
   return SessionRowViewModel(
-    id: 'row-1',
+    id: id,
     sessionId: 'abc123',
     startedAtUtc: DateTime.utc(2026, 6, 12, 9),
     lastMessageAtUtc: DateTime.utc(2026, 6, 12, 10, 30),
     duration: const Duration(minutes: 90),
     platform: SessionRowPlatform.wsl,
-    project: 'Codex Viewer',
+    project: project,
     path: '/home/pawel/.codex/sessions/session.jsonl',
     sourceFilePath: '/home/pawel/.codex/sessions/session.jsonl',
     displayPath: '/home/pawel/.codex/sessions/session.jsonl',
@@ -175,6 +287,6 @@ SessionRowViewModel _detailRow({String title = 'Flutter accessibility spike'}) {
     tags: const ['Flutter', 'accessibility'],
     status: 'Available',
     isPinned: true,
-    isArchived: true,
+    isArchived: isArchived,
   );
 }

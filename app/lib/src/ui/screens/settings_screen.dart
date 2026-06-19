@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../accessibility/announcement_service.dart';
 import '../../config/app_settings.dart';
 import '../../config/settings_diagnostics.dart';
+import '../widgets/svg_icon.dart';
 
 typedef SettingsSaveCallback = Future<void> Function(AppSettings settings);
 typedef SettingsReloadCallback = Future<AppSettings> Function();
@@ -177,6 +178,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         useSystemAccentColor: _settings.ui.useSystemAccentColor,
         fontSize: int.tryParse(_fontSize.text) ?? _settings.ui.fontSize,
         density: _settings.ui.density,
+        motion: _settings.ui.motion,
         showTextOnButtons: _settings.ui.showTextOnButtons,
         showIcons: _settings.ui.showIcons,
         nativeTitleBar: _settings.ui.nativeTitleBar,
@@ -232,17 +234,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               children: [
                 FilledButton.icon(
                   onPressed: _save,
-                  icon: const Icon(Icons.save),
+                  icon: const AppSvgIcon(AppIcons.save),
                   label: const Text('Save settings'),
                 ),
                 OutlinedButton.icon(
                   onPressed: _cancel,
-                  icon: const Icon(Icons.undo),
+                  icon: const AppSvgIcon(AppIcons.cancel),
                   label: const Text('Cancel changes'),
                 ),
                 OutlinedButton.icon(
                   onPressed: _reload,
-                  icon: const Icon(Icons.refresh),
+                  icon: const AppSvgIcon(AppIcons.refresh),
                   label: const Text('Reload from file'),
                 ),
               ],
@@ -374,6 +376,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               _settings = _settings.copyWith(
                                 ui: _settings.ui.copyWithDensity(
                                   UiDensity.parse(value),
+                                ),
+                              );
+                            });
+                          },
+                        ),
+                        _ChoiceSetting(
+                          label: 'Motion',
+                          value: _settings.ui.motion.tomlValue,
+                          values: AppMotionMode.values
+                              .map((mode) => mode.tomlValue)
+                              .toList(growable: false),
+                          onChanged: (value) {
+                            setState(() {
+                              _settings = _settings.copyWith(
+                                ui: _settings.ui.copyWithMotion(
+                                  AppMotionMode.parse(value),
                                 ),
                               );
                             });
@@ -531,6 +549,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           useSystemAccentColor: ui.useSystemAccentColor,
           fontSize: ui.fontSize,
           density: ui.density,
+          motion: ui.motion,
           showTextOnButtons: showTextOnButtons ?? ui.showTextOnButtons,
           showIcons: showIcons ?? ui.showIcons,
           nativeTitleBar: nativeTitleBar ?? ui.nativeTitleBar,
@@ -654,18 +673,22 @@ class _ChoiceSetting extends StatelessWidget {
         children: [
           SizedBox(width: 220, child: Text(label)),
           Expanded(
-            child: DropdownButton<String>(
-              value: value,
-              isExpanded: true,
-              items: [
-                for (final item in values)
-                  DropdownMenuItem(value: item, child: Text(item)),
-              ],
-              onChanged: (value) {
-                if (value != null) {
-                  onChanged(value);
-                }
-              },
+            child: Semantics(
+              label: '$label setting',
+              button: true,
+              child: DropdownButton<String>(
+                value: value,
+                isExpanded: true,
+                items: [
+                  for (final item in values)
+                    DropdownMenuItem(value: item, child: Text(item)),
+                ],
+                onChanged: (value) {
+                  if (value != null) {
+                    onChanged(value);
+                  }
+                },
+              ),
             ),
           ),
         ],

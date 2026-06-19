@@ -3,7 +3,9 @@ import 'dart:async';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -112,6 +114,227 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.widgetWithText(ElevatedButton, 'Refresh'), findsOneWidget);
+  });
+
+  testWidgets('newly visible rows use bounded motion feedback', (tester) async {
+    final refresh = Completer<List<SessionRowViewModel>>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'existing', title: 'Existing row', project: 'Viewer'),
+          ],
+          onRefresh: () => refresh.future,
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.normal),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+    await tester.pump();
+
+    refresh.complete([
+      _row(id: 'existing', title: 'Existing row', project: 'Viewer'),
+      _row(id: 'new-row', title: 'New animated row', project: 'Viewer'),
+    ]);
+    await tester.pump();
+
+    final animatedRow = find.byKey(const Key('session-row-motion-new-row-v1'));
+    expect(animatedRow, findsOneWidget);
+    expect(
+      find.descendant(of: animatedRow, matching: find.byType(SlideTransition)),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const Key('session-row-motion-existing-v1')),
+      findsNothing,
+    );
+
+    await tester.pumpAndSettle();
+    expect(find.text('New animated row'), findsWidgets);
+  });
+
+  testWidgets('row motion cap follows visible sorted rows', (tester) async {
+    final refresh = Completer<List<SessionRowViewModel>>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'visible', title: 'Visible old', project: 'Viewer'),
+          ],
+          onRefresh: () => refresh.future,
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.normal),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+    await tester.pump();
+
+    refresh.complete([
+      for (var i = 0; i < 45; i++)
+        _row(
+          id: 'hidden-$i',
+          title: 'Hidden changed $i',
+          project: 'Hidden',
+          isArchived: true,
+        ),
+      _row(id: 'visible', title: 'Visible changed', project: 'Viewer'),
+    ]);
+    await tester.pump();
+
+    expect(
+      find.byKey(const Key('session-row-motion-visible-v1')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('filter changes animate newly visible rows', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'alpha', title: 'Alpha row', project: 'Viewer'),
+            _row(id: 'beta', title: 'Beta row', project: 'Viewer'),
+          ],
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.normal),
+          ),
+        ),
+      ),
+    );
+
+    await tester.enterText(find.bySemanticsLabel('Session search'), 'Alpha');
+    await tester.pumpAndSettle();
+    expect(find.text('Beta row'), findsNothing);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
+    await tester.pump();
+
+    expect(_rowMotionKeyFor('beta'), findsOneWidget);
+  });
+
+  testWidgets('repeated row updates replay motion with a new key', (
+    tester,
+  ) async {
+    final refreshes = <Completer<List<SessionRowViewModel>>>[
+      Completer<List<SessionRowViewModel>>(),
+      Completer<List<SessionRowViewModel>>(),
+    ];
+    var refreshIndex = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'repeat', title: 'Repeat v1', project: 'Viewer'),
+          ],
+          onRefresh: () => refreshes[refreshIndex++].future,
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.normal),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+    await tester.pump();
+    refreshes[0].complete([
+      _row(id: 'repeat', title: 'Repeat v2', project: 'Viewer'),
+    ]);
+    await tester.pump();
+    expect(
+      find.byKey(const Key('session-row-motion-repeat-v1')),
+      findsOneWidget,
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+    await tester.pump();
+    refreshes[1].complete([
+      _row(id: 'repeat', title: 'Repeat v3', project: 'Viewer'),
+    ]);
+    await tester.pump();
+
+    expect(
+      find.byKey(const Key('session-row-motion-repeat-v2')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('reduced row motion keeps non-spatial feedback', (tester) async {
+    final refresh = Completer<List<SessionRowViewModel>>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'existing', title: 'Existing row', project: 'Viewer'),
+          ],
+          onRefresh: () => refresh.future,
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.reduced),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+    await tester.pump();
+    refresh.complete([
+      _row(id: 'existing', title: 'Existing row', project: 'Viewer'),
+      _row(id: 'reduced-new', title: 'Reduced new row', project: 'Viewer'),
+    ]);
+    await tester.pump();
+
+    final animatedRow = find.byKey(
+      const Key('session-row-motion-reduced-new-v1'),
+    );
+    expect(animatedRow, findsOneWidget);
+    expect(
+      find.descendant(of: animatedRow, matching: find.byType(SlideTransition)),
+      findsNothing,
+    );
+    expect(
+      find.descendant(of: animatedRow, matching: find.byType(FadeTransition)),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('sort options dialog remains keyboard accessible', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [_row(id: 'sort', title: 'Sort row', project: 'Viewer')],
+          settings: AppSettings.defaults().copyWith(
+            ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.normal),
+          ),
+        ),
+      ),
+    );
+
+    final header = find.bySemanticsLabel(
+      'Last Message Date column descending priority 1',
+    );
+    await tester.tap(header, buttons: kSecondaryButton);
+    await tester.pump();
+
+    expect(find.text('Sort options'), findsOneWidget);
+    expect(find.byType(FadeTransition), findsWidgets);
+    expect(find.byType(ScaleTransition), findsWidgets);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Sort options'), findsNothing);
   });
 
   testWidgets(
@@ -321,10 +544,12 @@ void main() {
   testWidgets('can show only the newest session per project', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
+    final tableStates = <SessionTableSettings>[];
 
     await tester.pumpWidget(
       MaterialApp(
         home: SessionsScreen(
+          onTableStateChanged: tableStates.add,
           initialRows: [
             _row(
               id: 'viewer-old',
@@ -363,6 +588,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    expect(tableStates.last.newestPerProjectOnly, isTrue);
     expect(find.bySemanticsLabel('Sessions, 3 visible'), findsOneWidget);
     expect(find.text('Newest viewer session'), findsWidgets);
     expect(find.text('Tools session'), findsWidgets);
@@ -372,9 +598,53 @@ void main() {
     await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
     await tester.pumpAndSettle();
 
+    expect(tableStates.last.newestPerProjectOnly, isFalse);
     expect(find.bySemanticsLabel('Sessions, 4 visible'), findsOneWidget);
     expect(find.text('Older viewer session'), findsWidgets);
   });
+
+  testWidgets(
+    'restores newest session per project filter from table settings',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1600, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionsScreen(
+            initialTableState: const SessionTableSettings(
+              columnWidths: {},
+              newestPerProjectOnly: true,
+              sorts: [
+                SessionTableSortSettings(
+                  column: 'last_message_at',
+                  ascending: false,
+                ),
+              ],
+            ),
+            initialRows: [
+              _row(
+                id: 'viewer-old',
+                title: 'Older viewer session',
+                project: 'Viewer',
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9),
+              ),
+              _row(
+                id: 'viewer-new',
+                title: 'Newest viewer session',
+                project: 'Viewer',
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 11),
+              ),
+            ],
+          ),
+        ),
+      );
+
+      expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+      expect(find.text('Newest viewer session'), findsWidgets);
+      expect(find.text('Older viewer session'), findsNothing);
+    },
+  );
 
   testWidgets('large session lists are rendered lazily', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
@@ -437,6 +707,120 @@ void main() {
     expect(loadCalls, 1);
     expect(find.text('Prompt body loaded lazily'), findsWidgets);
   });
+
+  testWidgets('conversation view hides injected environment context messages', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'context',
+              title: 'Context detail',
+              project: 'Viewer',
+              messages: [
+                ConversationMessageViewModel(
+                  id: 'msg-1',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 18, 10),
+                  preview: '<environment_context>',
+                  body: '''
+<environment_context>
+  <current_date>2026-06-18</current_date>
+  <filesystem><workspace_roots><root>F:\\repo</root></workspace_roots></filesystem>
+</environment_context>''',
+                  tokenCount: 12,
+                ),
+                ConversationMessageViewModel(
+                  id: 'msg-2',
+                  number: 2,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 18, 10, 1),
+                  preview: 'Please explain this environment_context tag.',
+                  body: 'Please explain this environment_context tag.',
+                  tokenCount: 8,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Context detail').first);
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('<environment_context>'), findsNothing);
+    expect(
+      find.textContaining('Please explain this environment_context tag.'),
+      findsWidgets,
+    );
+  });
+
+  testWidgets('conversation index shows message-kind icons', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(2200, 1600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'icons',
+              title: 'Icon detail',
+              project: 'Viewer',
+              messages: [
+                ConversationMessageViewModel(
+                  id: 'msg-1',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 18, 10),
+                  preview: 'Prompt',
+                  body: 'Prompt',
+                  tokenCount: 8,
+                ),
+                ConversationMessageViewModel(
+                  id: 'msg-2',
+                  number: 2,
+                  author: ConversationAuthor.assistant,
+                  createdAtUtc: DateTime.utc(2026, 6, 18, 10, 1),
+                  preview: 'Answer',
+                  body: 'Answer',
+                  tokenCount: 12,
+                ),
+                ConversationMessageViewModel(
+                  id: 'msg-3',
+                  number: 3,
+                  author: ConversationAuthor.tool,
+                  createdAtUtc: DateTime.utc(2026, 6, 18, 10, 2),
+                  preview: 'Tool',
+                  body: 'Tool',
+                  tokenCount: 4,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Icon detail').first);
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('message-index-icon-1')), findsOneWidget);
+    expect(find.byKey(const Key('message-index-icon-2')), findsOneWidget);
+    expect(find.byKey(const Key('message-index-icon-3')), findsOneWidget);
+    expect(find.byKey(const Key('message-card-icon-1')), findsOneWidget);
+    expect(find.byKey(const Key('message-card-icon-2')), findsOneWidget);
+
+    await tester.tap(find.bySemanticsLabel('#3 Tool, 4 tokens'));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('message-card-icon-3')), findsOneWidget);
+  });
 }
 
 SessionRowViewModel _row({
@@ -464,4 +848,12 @@ SessionRowViewModel _row({
     isArchived: isArchived,
     conversationMessages: messages,
   );
+}
+
+Finder _rowMotionKeyFor(String id) {
+  return find.byWidgetPredicate((widget) {
+    final key = widget.key;
+    return key is ValueKey<String> &&
+        key.value.startsWith('session-row-motion-$id-v');
+  });
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../commands/resume_command_generator.dart';
+import 'svg_icon.dart';
 
 typedef TerminalCommandCallback = Future<void> Function(String command);
 
@@ -11,11 +12,13 @@ class CommandPreview extends StatelessWidget {
     required this.commandSet,
     this.onRunTerminalCommand,
     this.onEditTerminalCommand,
+    this.showInlineActions = true,
   });
 
   final ResumeCommandSet commandSet;
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
+  final bool showInlineActions;
 
   @override
   Widget build(BuildContext context) {
@@ -35,6 +38,7 @@ class CommandPreview extends StatelessWidget {
             copySemanticsLabel: 'Copy plain resume command',
             onRunTerminalCommand: onRunTerminalCommand,
             onEditTerminalCommand: onEditTerminalCommand,
+            showInlineActions: showInlineActions,
           ),
           _CommandBlock(
             label: 'Platform resume command:',
@@ -43,6 +47,7 @@ class CommandPreview extends StatelessWidget {
             copySemanticsLabel: 'Copy platform resume command',
             onRunTerminalCommand: onRunTerminalCommand,
             onEditTerminalCommand: onEditTerminalCommand,
+            showInlineActions: showInlineActions,
           ),
           _CommandBlock(
             label: 'Terminal launch command:',
@@ -54,6 +59,7 @@ class CommandPreview extends StatelessWidget {
             copySemanticsLabel: 'Copy terminal launch command',
             onRunTerminalCommand: onRunTerminalCommand,
             onEditTerminalCommand: onEditTerminalCommand,
+            showInlineActions: showInlineActions,
           ),
         ],
       ],
@@ -70,6 +76,7 @@ class _CommandBlock extends StatelessWidget {
     required this.onRunTerminalCommand,
     required this.onEditTerminalCommand,
     this.showRunActions = false,
+    this.showInlineActions = true,
   });
 
   final String label;
@@ -77,6 +84,7 @@ class _CommandBlock extends StatelessWidget {
   final bool copyEnabled;
   final String copySemanticsLabel;
   final bool showRunActions;
+  final bool showInlineActions;
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
 
@@ -91,35 +99,39 @@ class _CommandBlock extends StatelessWidget {
           const SizedBox(height: 4),
           SelectableText(command ?? 'Unavailable'),
           const SizedBox(height: 4),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _LabeledCommandButton(
-                label: copySemanticsLabel,
-                text: 'Copy',
-                onPressed: copyEnabled && command != null
-                    ? () => _copyCommand(context, command!)
-                    : null,
-              ),
-              if (showRunActions) ...[
+          if (showInlineActions)
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
                 _LabeledCommandButton(
-                  label: 'Run terminal launch command',
-                  text: 'Run',
+                  label: copySemanticsLabel,
+                  text: 'Copy',
+                  iconAsset: AppIcons.copy,
                   onPressed: copyEnabled && command != null
-                      ? () => _runTerminalCommand(context, command!)
+                      ? () => _copyCommand(context, command!)
                       : null,
                 ),
-                _LabeledCommandButton(
-                  label: 'Edit terminal launch command before running',
-                  text: 'Edit and run',
-                  onPressed: copyEnabled && command != null
-                      ? () => _editTerminalCommand(context, command!)
-                      : null,
-                ),
+                if (showRunActions) ...[
+                  _LabeledCommandButton(
+                    label: 'Run terminal launch command',
+                    text: 'Run',
+                    iconAsset: AppIcons.play,
+                    onPressed: copyEnabled && command != null
+                        ? () => _runTerminalCommand(context, command!)
+                        : null,
+                  ),
+                  _LabeledCommandButton(
+                    label: 'Edit terminal launch command before running',
+                    text: 'Edit and run',
+                    iconAsset: AppIcons.edit,
+                    onPressed: copyEnabled && command != null
+                        ? () => _editTerminalCommand(context, command!)
+                        : null,
+                  ),
+                ],
               ],
-            ],
-          ),
+            ),
         ],
       ),
     );
@@ -167,9 +179,10 @@ class _CommandBlock extends StatelessWidget {
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('Cancel'),
           ),
-          FilledButton(
+          FilledButton.icon(
             onPressed: () => Navigator.of(context).pop(controller.text),
-            child: const Text('Run'),
+            icon: const AppSvgIcon(AppIcons.play),
+            label: const Text('Run'),
           ),
         ],
       ),
@@ -194,11 +207,13 @@ class _LabeledCommandButton extends StatelessWidget {
   const _LabeledCommandButton({
     required this.label,
     required this.text,
+    required this.iconAsset,
     required this.onPressed,
   });
 
   final String label;
   final String text;
+  final String iconAsset;
   final VoidCallback? onPressed;
 
   @override
@@ -208,7 +223,11 @@ class _LabeledCommandButton extends StatelessWidget {
       child: Semantics(
         label: label,
         button: true,
-        child: OutlinedButton(onPressed: onPressed, child: Text(text)),
+        child: OutlinedButton.icon(
+          onPressed: onPressed,
+          icon: AppSvgIcon(iconAsset),
+          label: Text(text),
+        ),
       ),
     );
   }

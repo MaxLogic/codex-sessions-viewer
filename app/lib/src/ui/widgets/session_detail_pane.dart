@@ -3,12 +3,18 @@ import 'package:flutter/services.dart';
 
 import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
+import '../../utils/injected_context_filter.dart';
+import '../models/conversation_message_view_model.dart';
 import '../models/session_row_view_model.dart';
+import '../motion.dart';
 import 'command_preview.dart';
 import 'conversation_view.dart';
 import 'focus_reader_view.dart';
+import 'svg_icon.dart';
 
 typedef DetailCopyCallback = Future<void> Function(String text);
+typedef DetailMarkdownExportCallback =
+    Future<void> Function(SessionRowViewModel row, String markdown);
 typedef SessionDetailActionCallback =
     Future<void> Function(SessionDetailAction action);
 
@@ -16,6 +22,7 @@ enum SessionDetailAction {
   openContainingFolder,
   openTerminalHere,
   openTerminalResume,
+  openTerminalFork,
   exportMarkdown,
   reparse,
   togglePin,
@@ -30,6 +37,7 @@ class SessionDetailPane extends StatelessWidget {
     required this.row,
     this.settings,
     this.onCopyText,
+    this.onExportMarkdown,
     this.onSessionAction,
     this.onRunTerminalCommand,
     this.onEditTerminalCommand,
@@ -39,6 +47,7 @@ class SessionDetailPane extends StatelessWidget {
   final SessionRowViewModel row;
   final AppSettings? settings;
   final DetailCopyCallback? onCopyText;
+  final DetailMarkdownExportCallback? onExportMarkdown;
   final SessionDetailActionCallback? onSessionAction;
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
@@ -46,10 +55,13 @@ class SessionDetailPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final commandSet =
-        ResumeCommandGenerator(
-          settings: settings ?? AppSettings.defaults(),
-        ).build(
+    final effectiveSettings = settings ?? AppSettings.defaults();
+    final motionPolicy = CodexMotionPolicy.fromContext(
+      context,
+      mode: effectiveSettings.ui.motion,
+    );
+    final commandSet = ResumeCommandGenerator(settings: effectiveSettings)
+        .build(
           ResumeCommandSession(
             sessionId: row.sessionId,
             sourceType: switch (row.platform) {
@@ -59,6 +71,9 @@ class SessionDetailPane extends StatelessWidget {
             workingDirectory: row.workingDirectoryForCommands,
           ),
         );
+    final visibleMessages = row.conversationMessages
+        .where((message) => !_isInjectedContextMessage(message))
+        .toList(growable: false);
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
       child: Column(
@@ -76,6 +91,7 @@ class SessionDetailPane extends StatelessWidget {
             row: row,
             commandSet: commandSet,
             onCopyText: onCopyText,
+            onExportMarkdown: onExportMarkdown,
             onSessionAction: onSessionAction,
           ),
           const SizedBox(height: 8),
@@ -87,10 +103,27 @@ class SessionDetailPane extends StatelessWidget {
               style: Theme.of(context).textTheme.titleMedium,
             ),
             children: [
-              CommandPreview(
-                commandSet: commandSet,
-                onRunTerminalCommand: onRunTerminalCommand,
-                onEditTerminalCommand: onEditTerminalCommand,
+              CodexMotion.expandCollapse(
+                policy: motionPolicy,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _CommandActionPanel(
+                      commandSet: commandSet,
+                      onCopyText: onCopyText,
+                      onSessionAction: onSessionAction,
+                      onRunTerminalCommand: onRunTerminalCommand,
+                      onEditTerminalCommand: onEditTerminalCommand,
+                    ),
+                    const SizedBox(height: 8),
+                    CommandPreview(
+                      commandSet: commandSet,
+                      onRunTerminalCommand: onRunTerminalCommand,
+                      onEditTerminalCommand: onEditTerminalCommand,
+                      showInlineActions: false,
+                    ),
+                  ],
+                ),
               ),
             ],
           ),
@@ -105,8 +138,9 @@ class SessionDetailPane extends StatelessWidget {
           SizedBox(
             height: 420,
             child: ConversationView(
-              messages: row.conversationMessages,
+              messages: visibleMessages,
               onCopyMessageMarkdown: onCopyText,
+              motionMode: effectiveSettings.ui.motion,
             ),
           ),
           const SizedBox(height: 16),
@@ -114,7 +148,7 @@ class SessionDetailPane extends StatelessWidget {
           const SizedBox(height: 8),
           SizedBox(
             height: 420,
-            child: FocusReaderView(messages: row.conversationMessages),
+            child: FocusReaderView(messages: visibleMessages),
           ),
         ],
       ),
@@ -211,86 +245,79 @@ class _ActionArea extends StatelessWidget {
     required this.row,
     required this.commandSet,
     required this.onCopyText,
+    required this.onExportMarkdown,
     required this.onSessionAction,
   });
 
   final SessionRowViewModel row;
   final ResumeCommandSet commandSet;
   final DetailCopyCallback? onCopyText;
+  final DetailMarkdownExportCallback? onExportMarkdown;
   final SessionDetailActionCallback? onSessionAction;
 
   @override
   Widget build(BuildContext context) {
-    final canResume = commandSet.canResume;
-    final terminalEnabled = commandSet.terminalLaunchCommand != null;
+    final hasConversation = row.conversationMessages.isNotEmpty;
     return Wrap(
       spacing: 6,
       runSpacing: 6,
       children: [
-        _copyAction(context, 'Copy session path', row.sourcePathForDisplay),
+        _copyAction(
+          context,
+          'Copy session path',
+          row.sourcePathForDisplay,
+          iconAsset: AppIcons.copy,
+        ),
         _copyAction(
           context,
           'Copy working directory',
           row.workingDirectoryForCommands,
-        ),
-        _copyAction(
-          context,
-          'Copy plain resume command',
-          commandSet.plainResumeCommand,
-          enabled: canResume,
-        ),
-        _copyAction(
-          context,
-          'Copy platform resume command',
-          commandSet.platformResumeCommand,
-          enabled: commandSet.platformResumeCommand != null,
+          iconAsset: AppIcons.copy,
         ),
         _callbackAction(
           'Open containing folder',
           SessionDetailAction.openContainingFolder,
-        ),
-        _callbackAction(
-          'Open terminal here',
-          SessionDetailAction.openTerminalHere,
-          enabled: false,
+          enabled: row.canOpenContainingFolder,
+          iconAsset: AppIcons.folderOpen,
           disabledReason:
-              'Opening a terminal without resume is not available yet.',
-        ),
-        _callbackAction(
-          'Open in terminal and resume',
-          SessionDetailAction.openTerminalResume,
-          enabled: terminalEnabled,
-        ),
-        _copyAction(
-          context,
-          'Copy terminal launch command',
-          commandSet.terminalLaunchCommand,
-          enabled: terminalEnabled,
+              'This WSL path cannot be opened from Windows Explorer.',
         ),
         _callbackAction(
           'Export Markdown',
           SessionDetailAction.exportMarkdown,
-          enabled: false,
-          disabledReason: 'Markdown file export is not available yet.',
+          enabled: hasConversation && onExportMarkdown != null,
+          iconAsset: AppIcons.export,
+          disabledReason: hasConversation
+              ? 'Markdown file export is not available yet.'
+              : 'Conversation messages are not loaded yet.',
         ),
         _copyAction(
           context,
           'Copy conversation Markdown',
           _conversationMarkdown(row),
+          enabled: hasConversation,
+          iconAsset: AppIcons.copy,
         ),
-        _callbackAction('Re-parse this session', SessionDetailAction.reparse),
+        _callbackAction(
+          'Re-parse this session',
+          SessionDetailAction.reparse,
+          iconAsset: AppIcons.reparse,
+        ),
         _callbackAction(
           row.isPinned ? 'Unpin session' : 'Pin session',
           SessionDetailAction.togglePin,
+          iconAsset: AppIcons.pin,
         ),
         _callbackAction(
           row.isArchived ? 'Unarchive session' : 'Archive session',
           SessionDetailAction.toggleArchive,
+          iconAsset: AppIcons.archive,
         ),
         _callbackAction(
           'Add/remove tags',
           SessionDetailAction.editTags,
           enabled: false,
+          iconAsset: AppIcons.tag,
           disabledReason: 'Tag editing is not available yet.',
         ),
         _callbackAction(
@@ -308,12 +335,14 @@ class _ActionArea extends StatelessWidget {
     String label,
     String? text, {
     bool enabled = true,
+    required String iconAsset,
   }) {
-    return OutlinedButton(
+    return OutlinedButton.icon(
       onPressed: enabled && text != null
           ? () => _copyText(context, _copySuccessMessage(label), text)
           : null,
-      child: Text(label),
+      icon: AppSvgIcon(iconAsset),
+      label: Text(label),
     );
   }
 
@@ -322,13 +351,18 @@ class _ActionArea extends StatelessWidget {
     SessionDetailAction action, {
     bool enabled = true,
     String? disabledReason,
+    String? iconAsset,
   }) {
-    final button = OutlinedButton(
-      onPressed: enabled && onSessionAction != null
-          ? () => _invokeAction(action)
-          : null,
-      child: Text(label),
-    );
+    final onPressed = enabled && onSessionAction != null
+        ? () => _invokeAction(action)
+        : null;
+    final button = iconAsset == null
+        ? OutlinedButton(onPressed: onPressed, child: Text(label))
+        : OutlinedButton.icon(
+            onPressed: onPressed,
+            icon: AppSvgIcon(iconAsset),
+            label: Text(label),
+          );
     if (enabled || disabledReason == null) {
       return button;
     }
@@ -354,21 +388,33 @@ class _ActionArea extends StatelessWidget {
   }
 
   Future<void> _invokeAction(SessionDetailAction action) async {
+    if (action == SessionDetailAction.exportMarkdown) {
+      await _exportMarkdown();
+      return;
+    }
     final callback = onSessionAction;
     if (callback != null) {
       await callback(action);
     }
   }
 
+  Future<void> _exportMarkdown() async {
+    final callback = onExportMarkdown;
+    if (callback != null) {
+      await callback(row, _conversationMarkdown(row));
+    }
+  }
+
   String _conversationMarkdown(SessionRowViewModel row) {
     return [
       if (row.title.trim().isNotEmpty) ...['# ${row.title}', ''],
-      for (final message in row.conversationMessages) ...[
-        '## Message ${message.number} - ${message.authorLabel}',
-        '',
-        message.body,
-        '',
-      ],
+      for (final message in row.conversationMessages)
+        if (!_isInjectedContextMessage(message)) ...[
+          '## Message ${message.number} - ${message.authorLabel}',
+          '',
+          message.body,
+          '',
+        ],
     ].join('\n');
   }
 
@@ -383,6 +429,239 @@ class _ActionArea extends StatelessWidget {
       _ => 'Copied.',
     };
   }
+}
+
+class _CommandActionPanel extends StatelessWidget {
+  const _CommandActionPanel({
+    required this.commandSet,
+    required this.onCopyText,
+    required this.onSessionAction,
+    required this.onRunTerminalCommand,
+    required this.onEditTerminalCommand,
+  });
+
+  final ResumeCommandSet commandSet;
+  final DetailCopyCallback? onCopyText;
+  final SessionDetailActionCallback? onSessionAction;
+  final TerminalCommandCallback? onRunTerminalCommand;
+  final TerminalCommandCallback? onEditTerminalCommand;
+
+  @override
+  Widget build(BuildContext context) {
+    final canResume = commandSet.canResume;
+    final terminalEnabled = commandSet.terminalLaunchCommand != null;
+    final terminalForkEnabled = commandSet.terminalForkCommand != null;
+    final duplicatePlatformResumeCommand =
+        commandSet.plainResumeCommand != null &&
+        commandSet.plainResumeCommand == commandSet.platformResumeCommand;
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      children: [
+        _copyAction(
+          context,
+          'Copy plain resume command',
+          commandSet.plainResumeCommand,
+          enabled: canResume,
+          iconAsset: AppIcons.copy,
+        ),
+        if (!duplicatePlatformResumeCommand)
+          _copyAction(
+            context,
+            'Copy platform resume command',
+            commandSet.platformResumeCommand,
+            enabled: commandSet.platformResumeCommand != null,
+            iconAsset: AppIcons.copy,
+          ),
+        _callbackAction(
+          'Open terminal here',
+          SessionDetailAction.openTerminalHere,
+          enabled: false,
+          iconAsset: AppIcons.terminal,
+          disabledReason:
+              'Opening a terminal without resume is not available yet.',
+        ),
+        _callbackAction(
+          'Open in terminal and resume',
+          SessionDetailAction.openTerminalResume,
+          enabled: terminalEnabled,
+          iconAsset: AppIcons.terminal,
+        ),
+        _callbackAction(
+          'Open in terminal and fork',
+          SessionDetailAction.openTerminalFork,
+          enabled: terminalForkEnabled,
+          iconAsset: AppIcons.fork,
+        ),
+        _copyAction(
+          context,
+          'Copy terminal launch command',
+          commandSet.terminalLaunchCommand,
+          enabled: terminalEnabled,
+          iconAsset: AppIcons.copy,
+        ),
+        _commandAction(
+          'Run',
+          enabled: terminalEnabled,
+          iconAsset: AppIcons.play,
+          onPressed: () => _runTerminalCommand(context),
+        ),
+        _commandAction(
+          'Edit and run',
+          enabled: terminalEnabled,
+          iconAsset: AppIcons.edit,
+          onPressed: () => _editTerminalCommand(context),
+        ),
+      ],
+    );
+  }
+
+  Widget _copyAction(
+    BuildContext context,
+    String label,
+    String? text, {
+    bool enabled = true,
+    required String iconAsset,
+  }) {
+    return OutlinedButton.icon(
+      onPressed: enabled && text != null
+          ? () => _copyText(context, _copySuccessMessage(label), text)
+          : null,
+      icon: AppSvgIcon(iconAsset),
+      label: Text(label),
+    );
+  }
+
+  Widget _callbackAction(
+    String label,
+    SessionDetailAction action, {
+    bool enabled = true,
+    String? disabledReason,
+    String? iconAsset,
+  }) {
+    final onPressed = enabled && onSessionAction != null
+        ? () => onSessionAction!(action)
+        : null;
+    final button = iconAsset == null
+        ? OutlinedButton(onPressed: onPressed, child: Text(label))
+        : OutlinedButton.icon(
+            onPressed: onPressed,
+            icon: AppSvgIcon(iconAsset),
+            label: Text(label),
+          );
+    if (enabled || disabledReason == null) {
+      return button;
+    }
+    return Tooltip(message: disabledReason, child: button);
+  }
+
+  Widget _commandAction(
+    String label, {
+    required bool enabled,
+    required String iconAsset,
+    required Future<void> Function() onPressed,
+  }) {
+    return OutlinedButton.icon(
+      onPressed: enabled ? () => onPressed() : null,
+      icon: AppSvgIcon(iconAsset),
+      label: Text(label),
+    );
+  }
+
+  Future<void> _copyText(
+    BuildContext context,
+    String message,
+    String text,
+  ) async {
+    final callback = onCopyText;
+    if (callback != null) {
+      await callback(text);
+    } else {
+      await Clipboard.setData(ClipboardData(text: text));
+    }
+    if (context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  Future<void> _runTerminalCommand(BuildContext context) async {
+    final command = commandSet.terminalLaunchCommand;
+    if (command == null) {
+      return;
+    }
+    final callback = onRunTerminalCommand;
+    if (callback != null) {
+      await callback(command);
+    } else {
+      final actionCallback = onSessionAction;
+      if (actionCallback != null) {
+        await actionCallback(SessionDetailAction.openTerminalResume);
+      }
+    }
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Terminal command run requested.')),
+      );
+    }
+  }
+
+  Future<void> _editTerminalCommand(BuildContext context) async {
+    final command = commandSet.terminalLaunchCommand;
+    if (command == null) {
+      return;
+    }
+    final controller = TextEditingController(text: command);
+    final edited = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit terminal command'),
+        content: TextField(
+          controller: controller,
+          maxLines: 4,
+          decoration: const InputDecoration(labelText: 'Command'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            icon: const AppSvgIcon(AppIcons.play),
+            label: const Text('Run'),
+          ),
+        ],
+      ),
+    );
+    if (edited == null) {
+      return;
+    }
+    final callback = onEditTerminalCommand ?? onRunTerminalCommand;
+    if (callback != null) {
+      await callback(edited);
+    }
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Edited terminal command run requested.')),
+      );
+    }
+  }
+
+  String _copySuccessMessage(String label) {
+    return switch (label) {
+      'Copy plain resume command' => 'Copied plain resume command.',
+      'Copy platform resume command' => 'Copied platform resume command.',
+      'Copy terminal launch command' => 'Copied terminal launch command.',
+      _ => 'Copied.',
+    };
+  }
+}
+
+bool _isInjectedContextMessage(ConversationMessageViewModel message) {
+  return message.author == ConversationAuthor.user &&
+      isInjectedEnvironmentContextMessage(message.body);
 }
 
 extension on DateTime {

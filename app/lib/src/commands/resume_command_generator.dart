@@ -36,21 +36,41 @@ class ResumeCommandGenerator {
       );
     }
 
-    final plainCommand = 'codex resume $sessionId';
-    final bashResumeCommand = _bashCommand(['codex', 'resume', sessionId]);
-    final platformCommand = _platformCommand(session, plainCommand);
+    final plainCommand = _plainCodexCommand('resume', sessionId);
+    final plainForkCommand = _plainCodexCommand('fork', sessionId);
+    final bashResumeCommand = _bashCodexCommand('resume', sessionId);
+    final bashForkCommand = _bashCodexCommand('fork', sessionId);
+    final platformCommand = _platformCommand(
+      session,
+      plainCommand,
+      bashResumeCommand,
+    );
+    final platformForkCommand = _platformCommand(
+      session,
+      plainForkCommand,
+      bashForkCommand,
+    );
     final terminalCommand = _terminalCommand(
       settings.terminal.defaultTerminal,
       session,
       plainCommand,
       bashResumeCommand,
     );
+    final terminalForkCommand = _terminalCommand(
+      settings.terminal.defaultTerminal,
+      session,
+      plainForkCommand,
+      bashForkCommand,
+    );
 
     return ResumeCommandSet(
       plainResumeCommand: plainCommand,
+      plainForkCommand: plainForkCommand,
       platformResumeCommand: platformCommand,
+      platformForkCommand: platformForkCommand,
       defaultTerminalProfile: settings.terminal.defaultTerminal,
       terminalLaunchCommand: terminalCommand.command,
+      terminalForkCommand: terminalForkCommand.command,
       terminalDisabledReason: terminalCommand.disabledReason,
       terminalLaunchCommandFor: (profileName) => _terminalCommand(
         profileName,
@@ -61,12 +81,11 @@ class ResumeCommandGenerator {
     );
   }
 
-  String? _platformCommand(ResumeCommandSession session, String plainCommand) {
-    final bashResumeCommand = _bashCommand([
-      'codex',
-      'resume',
-      session.sessionId.trim(),
-    ]);
+  String? _platformCommand(
+    ResumeCommandSession session,
+    String plainCommand,
+    String bashCommand,
+  ) {
     return switch (session.sourceType) {
       ResumeSessionSourceType.windows => plainCommand,
       ResumeSessionSourceType.wsl =>
@@ -75,7 +94,7 @@ class ResumeCommandGenerator {
             ? null
             : 'wsl.exe -d ${_quoteWindowsArg(settings.wsl.distro)} '
                   '--cd ${_quoteWindowsArg(session.workingDirectory)} '
-                  'bash -lc ${_quoteWindowsArg(bashResumeCommand)}',
+                  'bash -lc ${_quoteWindowsArg(bashCommand)}',
     };
   }
 
@@ -129,9 +148,12 @@ class ResumeCommandGenerator {
 class ResumeCommandSet {
   const ResumeCommandSet({
     required this.plainResumeCommand,
+    required this.plainForkCommand,
     required this.platformResumeCommand,
+    required this.platformForkCommand,
     required this.defaultTerminalProfile,
     required this.terminalLaunchCommand,
+    required this.terminalForkCommand,
     required this.terminalDisabledReason,
     required String? Function(String profileName) terminalLaunchCommandFor,
   }) : disabledReason = null,
@@ -139,17 +161,23 @@ class ResumeCommandSet {
 
   const ResumeCommandSet.unavailable({required this.disabledReason})
     : plainResumeCommand = null,
+      plainForkCommand = null,
       platformResumeCommand = null,
+      platformForkCommand = null,
       defaultTerminalProfile = null,
       terminalLaunchCommand = null,
+      terminalForkCommand = null,
       terminalDisabledReason = null,
       _terminalLaunchCommandFor = null;
 
   final String? disabledReason;
   final String? plainResumeCommand;
+  final String? plainForkCommand;
   final String? platformResumeCommand;
+  final String? platformForkCommand;
   final String? defaultTerminalProfile;
   final String? terminalLaunchCommand;
+  final String? terminalForkCommand;
   final String? terminalDisabledReason;
   final String? Function(String profileName)? _terminalLaunchCommandFor;
 
@@ -212,6 +240,12 @@ bool _hasUnsafeShellActiveChars(String value) =>
     RegExp(r'["$`\r\n]').hasMatch(value);
 
 String _bashCommand(List<String> args) => args.map(_quoteBashArg).join(' ');
+
+String _plainCodexCommand(String action, String sessionId) =>
+    'codex $action $sessionId';
+
+String _bashCodexCommand(String action, String sessionId) =>
+    _bashCommand(['codex', action, sessionId]);
 
 String _quoteBashArg(String value) => "'${value.replaceAll("'", "'\"'\"'")}'";
 

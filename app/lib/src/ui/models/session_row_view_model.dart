@@ -21,6 +21,7 @@ class SessionRowViewModel {
     this.sourceFilePath = '',
     this.displayPath = '',
     this.workingDirectory = '',
+    this.openablePath = '',
     this.duration,
     this.userMessageCount = 0,
     this.assistantMessageCount = 0,
@@ -57,6 +58,7 @@ class SessionRowViewModel {
   final String sourceFilePath;
   final String displayPath;
   final String workingDirectory;
+  final String openablePath;
   final Duration? duration;
   final int userMessageCount;
   final int assistantMessageCount;
@@ -87,6 +89,18 @@ class SessionRowViewModel {
 
   String get workingDirectoryForCommands =>
       workingDirectory.isEmpty ? displayPathForDetail : workingDirectory;
+
+  String get containingFolderTarget {
+    final trimmed = openablePath.trim();
+    return trimmed.isEmpty ? workingDirectoryForCommands : trimmed;
+  }
+
+  bool get canOpenContainingFolder {
+    if (platform == SessionRowPlatform.windows) {
+      return true;
+    }
+    return _isWindowsOpenablePath(containingFolderTarget);
+  }
 
   List<String> get modelsUsedForDetail {
     if (modelsUsed.isNotEmpty) {
@@ -127,6 +141,7 @@ class SessionRowViewModel {
       sourceFilePath: sourceFilePath,
       displayPath: displayPath,
       workingDirectory: workingDirectory,
+      openablePath: openablePath,
       startedAtUtc: startedAtUtc,
       lastMessageAtUtc: lastMessageAtUtc,
       duration: duration,
@@ -158,4 +173,12 @@ class SessionRowViewModel {
       hasError: hasError,
     );
   }
+}
+
+bool _isWindowsOpenablePath(String path) {
+  final trimmed = path.trim();
+  if (trimmed.startsWith(r'\\')) {
+    return true;
+  }
+  return RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(trimmed);
 }

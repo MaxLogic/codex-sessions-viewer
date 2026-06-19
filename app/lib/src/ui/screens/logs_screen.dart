@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../logging/structured_logger.dart';
+import '../widgets/svg_icon.dart';
 
 typedef LogEntryAction = Future<void> Function(LogEntry entry);
 typedef LogsAction = Future<void> Function();
@@ -68,9 +69,10 @@ class _LogsScreenState extends State<LogsScreen> {
               onPressed: () => Navigator.of(context).pop(false),
               child: const Text('Cancel'),
             ),
-            FilledButton(
+            FilledButton.icon(
               onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Clear logs'),
+              icon: const AppSvgIcon(AppIcons.deleteSweep),
+              label: const Text('Clear logs'),
             ),
           ],
         ),
@@ -136,22 +138,22 @@ class _LogsScreenState extends State<LogsScreen> {
               children: [
                 OutlinedButton.icon(
                   onPressed: _selected == null ? null : _copySelected,
-                  icon: const Icon(Icons.copy),
+                  icon: const AppSvgIcon(AppIcons.copy),
                   label: const Text('Copy selected'),
                 ),
                 OutlinedButton.icon(
                   onPressed: widget.onOpenLogFile,
-                  icon: const Icon(Icons.description),
+                  icon: const AppSvgIcon(AppIcons.file),
                   label: const Text('Open log file'),
                 ),
                 OutlinedButton.icon(
                   onPressed: widget.onOpenLogsFolder,
-                  icon: const Icon(Icons.folder_open),
+                  icon: const AppSvgIcon(AppIcons.folderOpen),
                   label: const Text('Open logs folder'),
                 ),
                 FilledButton.icon(
                   onPressed: _confirmClearOldLogs,
-                  icon: const Icon(Icons.delete_sweep),
+                  icon: const AppSvgIcon(AppIcons.deleteSweep),
                   label: const Text('Clear old logs'),
                 ),
               ],

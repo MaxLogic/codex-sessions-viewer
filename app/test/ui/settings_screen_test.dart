@@ -120,4 +120,63 @@ void main() {
     expect(find.text('Settings reloaded.'), findsOneWidget);
     expect(find.text(r'E:\Reloaded'), findsOneWidget);
   });
+
+  testWidgets('settings screen edits motion preference', (tester) async {
+    AppSettings? saved;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          initialSettings: AppSettings.defaults(),
+          onSave: (settings) async {
+            saved = settings;
+          },
+        ),
+      ),
+    );
+
+    expect(find.text('Motion'), findsOneWidget);
+    expect(find.text('system'), findsWidgets);
+
+    await tester.ensureVisible(find.text('Motion'));
+    await tester.pumpAndSettle();
+
+    final motionRow = find.ancestor(
+      of: find.text('Motion'),
+      matching: find.byType(Row),
+    );
+    final motionDropdown = find.descendant(
+      of: motionRow,
+      matching: find.byType(DropdownButton<String>),
+    );
+
+    await tester.tap(motionDropdown);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('normal').last);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Save settings'));
+    await tester.pump();
+
+    expect(saved?.ui.motion, AppMotionMode.normal);
+  });
+
+  testWidgets('motion choice exposes an accessible control name', (
+    tester,
+  ) async {
+    final semantics = tester.ensureSemantics();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(initialSettings: AppSettings.defaults()),
+      ),
+    );
+
+    await tester.ensureVisible(find.text('Motion'));
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Motion setting'), findsOneWidget);
+
+    semantics.dispose();
+  });
 }

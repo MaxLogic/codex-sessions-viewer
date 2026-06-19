@@ -2,13 +2,14 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
+import '../motion.dart';
 import '../models/session_row_view_model.dart';
 import '../widgets/command_preview.dart';
 import '../widgets/session_detail_pane.dart';
+import '../widgets/svg_icon.dart';
 
 export '../models/session_row_view_model.dart';
 
@@ -22,6 +23,7 @@ enum SessionRowAction {
   copyPlainResumeCommand,
   copyPlatformResumeCommand,
   openTerminalResume,
+  openTerminalFork,
   copyTerminalCommand,
   togglePin,
   toggleArchive,
@@ -40,6 +42,8 @@ typedef SessionsRefreshOperationFactory =
 typedef SessionDetailLoader =
     Future<SessionRowViewModel?> Function(String sessionId);
 typedef SessionTableStateChanged = void Function(SessionTableSettings);
+typedef SessionMarkdownExportCallback =
+    Future<void> Function(SessionRowViewModel row, String markdown);
 
 class SessionActionRequest {
   const SessionActionRequest({
@@ -65,6 +69,8 @@ class SessionsScreen extends StatefulWidget {
     this.onOpenSettings,
     this.onTestWslPath,
     this.onSessionAction,
+    this.onCopyText,
+    this.onExportMarkdown,
     this.onLoadSessionDetail,
     this.settings,
     this.initialTableState,
@@ -81,6 +87,8 @@ class SessionsScreen extends StatefulWidget {
   final VoidCallback? onOpenSettings;
   final VoidCallback? onTestWslPath;
   final SessionActionCallback? onSessionAction;
+  final DetailCopyCallback? onCopyText;
+  final SessionMarkdownExportCallback? onExportMarkdown;
   final SessionDetailLoader? onLoadSessionDetail;
   final AppSettings? settings;
   final SessionTableSettings? initialTableState;
@@ -104,6 +112,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _hasRefreshOwnedRows = false;
   String? _selectedId;
   String? _loadingDetailId;
+  var _rowMotionIds = <String>{};
+  var _rowMotionGeneration = 0;
   late List<SessionRowViewModel> _rows;
   late Map<String, double> _columnWidths;
   late List<SessionTableSortSettings> _sorts;
@@ -121,6 +131,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         (widget.settings ?? AppSettings.defaults()).ui.sessionTable;
     _columnWidths = Map.of(tableState.columnWidths);
     _sorts = _normalizedSorts(tableState.sorts);
+    _newestPerProjectOnly = tableState.newestPerProjectOnly;
     _scanAnnouncement = widget.initialStatusMessage;
     _handledAutoRefreshToken = widget.autoRefreshToken;
     _searchController.addListener(_filtersChanged);
@@ -216,19 +227,23 @@ class _SessionsScreenState extends State<SessionsScreen> {
                 setState(() {
                   _platformFilter = value;
                   _retainSelection();
+                  _markVisibleRowsForMotion();
                 });
               },
               onArchivedChanged: (value) {
                 setState(() {
                   _archivedFilter = value;
                   _retainSelection();
+                  _markVisibleRowsForMotion();
                 });
               },
               onNewestPerProjectOnlyChanged: (value) {
                 setState(() {
                   _newestPerProjectOnly = value;
                   _retainSelection();
+                  _markVisibleRowsForMotion();
                 });
+                _emitTableState();
               },
               onClearFilters: _clearFilters,
               onRefresh: _refresh,
@@ -264,6 +279,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
                             onShowSortOptions: _showSortOptions,
                             statusMessage: _scanAnnouncement,
                             isScanning: _isScanning,
+                            animatedRowIds: _rowMotionIds,
+                            rowMotionGeneration: _rowMotionGeneration,
                           ),
                   ),
                   VerticalDivider(
@@ -280,6 +297,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
                           ? null
                           : (action) =>
                                 _handleDetailAction(selectedRow, action),
+                      onCopyText: widget.onCopyText,
+                      onExportMarkdown: widget.onExportMarkdown,
                       onRunTerminalCommand: selectedRow == null
                           ? null
                           : (command) => _handleSessionAction(
@@ -521,7 +540,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   void _filtersChanged() {
-    setState(_retainSelection);
+    setState(() {
+      _retainSelection();
+      _markVisibleRowsForMotion();
+    });
   }
 
   void _retainSelection() {
@@ -545,7 +567,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _archivedFilter = SessionsArchivedFilter.activeOnly;
         _newestPerProjectOnly = false;
         _retainSelection();
+        _markVisibleRowsForMotion();
       });
+      _emitTableState();
     } finally {
       _searchController.addListener(_filtersChanged);
       _pathController.addListener(_filtersChanged);
@@ -701,12 +725,17 @@ class _SessionsScreenState extends State<SessionsScreen> {
       SessionDetailAction.openContainingFolder => SessionActionRequest(
         row: row,
         action: SessionRowAction.openPath,
-        payload: row.sourcePathForDisplay,
+        payload: row.containingFolderTarget,
       ),
       SessionDetailAction.openTerminalResume => SessionActionRequest(
         row: row,
         action: SessionRowAction.openTerminalResume,
         payload: commandSet.terminalLaunchCommand,
+      ),
+      SessionDetailAction.openTerminalFork => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.openTerminalFork,
+        payload: commandSet.terminalForkCommand,
       ),
       SessionDetailAction.reparse => SessionActionRequest(
         row: row,
@@ -787,9 +816,22 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   Future<void> _showSortOptions(BuildContext context) async {
-    final result = await showDialog<List<SessionTableSortSettings>>(
+    final policy = CodexMotionPolicy.fromContext(
+      context,
+      mode: (widget.settings ?? AppSettings.defaults()).ui.motion,
+    );
+    final result = await showGeneralDialog<List<SessionTableSortSettings>>(
       context: context,
-      builder: (context) => _SortOptionsDialog(sorts: _sorts),
+      barrierDismissible: true,
+      barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+      transitionDuration: policy.dialogDuration,
+      pageBuilder: (context, _, _) => _SortOptionsDialog(sorts: _sorts),
+      transitionBuilder: (context, animation, _, child) =>
+          CodexMotion.dialogTransition(
+            policy: policy,
+            animation: animation,
+            child: child,
+          ),
     );
     if (result == null) {
       return;
@@ -805,6 +847,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       SessionTableSettings(
         columnWidths: Map.unmodifiable(_columnWidths),
         sorts: List.unmodifiable(_sorts),
+        newestPerProjectOnly: _newestPerProjectOnly,
       ),
     );
   }
@@ -848,12 +891,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   void _replaceRows(List<SessionRowViewModel> rows) {
+    final previousById = {for (final row in _rows) row.id: row};
     final loadedMessagesById = {
       for (final row in _rows)
         if (row.conversationMessages.isNotEmpty)
           row.id: row.conversationMessages,
     };
-    _rows = [
+    final nextRows = [
       for (final row in rows)
         if (row.conversationMessages.isEmpty &&
             loadedMessagesById.containsKey(row.id))
@@ -861,6 +905,44 @@ class _SessionsScreenState extends State<SessionsScreen> {
         else
           row,
     ];
+    final changedIds = {
+      for (final row in nextRows)
+        if (_rowChangedForMotion(previousById[row.id], row)) row.id,
+    };
+    _rows = nextRows;
+    _markVisibleRowsForMotion(changedIds);
+  }
+
+  void _markVisibleRowsForMotion([Set<String>? changedIds]) {
+    final candidates = changedIds ?? {for (final row in _visibleRows) row.id};
+    final visibleIds = <String>{};
+    for (final row in _visibleRows) {
+      if (candidates.contains(row.id)) {
+        visibleIds.add(row.id);
+        if (visibleIds.length >= 40) {
+          break;
+        }
+      }
+    }
+    _rowMotionIds = visibleIds;
+    if (visibleIds.isNotEmpty) {
+      _rowMotionGeneration++;
+    }
+  }
+
+  bool _rowChangedForMotion(
+    SessionRowViewModel? previous,
+    SessionRowViewModel next,
+  ) {
+    return previous == null ||
+        previous.title != next.title ||
+        previous.summary != next.summary ||
+        previous.project != next.project ||
+        previous.path != next.path ||
+        previous.status != next.status ||
+        previous.lastMessageAtUtc != next.lastMessageAtUtc ||
+        previous.messageCount != next.messageCount ||
+        previous.totalTokens != next.totalTokens;
   }
 }
 
@@ -978,30 +1060,34 @@ class _SessionsEmptyState extends StatelessWidget {
                   Wrap(
                     spacing: 8,
                     children: [
-                      OutlinedButton(
+                      OutlinedButton.icon(
                         onPressed: onTestWslPath,
-                        child: const Text('Test WSL path'),
+                        icon: const AppSvgIcon(AppIcons.terminal),
+                        label: const Text('Test WSL path'),
                       ),
-                      OutlinedButton(
+                      OutlinedButton.icon(
                         onPressed: onOpenSettings,
-                        child: const Text('Open Settings'),
+                        icon: const AppSvgIcon(AppIcons.settings),
+                        label: const Text('Open Settings'),
                       ),
                     ],
                   ),
                 ] else if (hasRows && hasActiveFilters) ...[
                   const SizedBox(height: 12),
-                  OutlinedButton(
+                  OutlinedButton.icon(
                     onPressed: onClearFilters,
-                    child: const Text('Clear filters'),
+                    icon: const AppSvgIcon(AppIcons.filterClear),
+                    label: const Text('Clear filters'),
                   ),
                 ] else ...[
                   const SizedBox(height: 12),
                   Wrap(
                     spacing: 8,
                     children: [
-                      OutlinedButton(
+                      OutlinedButton.icon(
                         onPressed: onOpenSettings,
-                        child: const Text('Open Settings'),
+                        icon: const AppSvgIcon(AppIcons.settings),
+                        label: const Text('Open Settings'),
                       ),
                     ],
                   ),
@@ -1203,23 +1289,28 @@ class _FilterBar extends StatelessWidget {
             Wrap(
               spacing: 8,
               children: [
-                ElevatedButton(
+                ElevatedButton.icon(
                   onPressed: isCancellingRefresh ? null : onRefresh,
-                  child: Text(refreshLabel),
+                  icon: AppSvgIcon(
+                    isScanning ? AppIcons.cancel : AppIcons.refresh,
+                  ),
+                  label: Text(refreshLabel),
                 ),
-                OutlinedButton(
+                OutlinedButton.icon(
                   onPressed: onClearFilters,
-                  child: const Text('Clear filters'),
+                  icon: const AppSvgIcon(AppIcons.filterClear),
+                  label: const Text('Clear filters'),
                 ),
                 _NewestPerProjectFilter(
                   value: newestPerProjectOnly,
                   onChanged: onNewestPerProjectOnlyChanged,
                 ),
-                const Tooltip(
+                Tooltip(
                   message: 'Advanced filters are not available yet.',
-                  child: OutlinedButton(
+                  child: OutlinedButton.icon(
                     onPressed: null,
-                    child: Text('Advanced filters'),
+                    icon: const AppSvgIcon(AppIcons.filter),
+                    label: const Text('Advanced filters'),
                   ),
                 ),
               ],
@@ -1538,12 +1629,8 @@ class _SvgIcon extends StatelessWidget {
   final Color color;
 
   @override
-  Widget build(BuildContext context) => SvgPicture.asset(
-    assetName,
-    width: size,
-    height: size,
-    colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
-  );
+  Widget build(BuildContext context) =>
+      AppSvgIcon(assetName, size: size, color: color);
 }
 
 class _SessionsTable extends StatelessWidget {
@@ -1560,6 +1647,8 @@ class _SessionsTable extends StatelessWidget {
     required this.onShowSortOptions,
     required this.statusMessage,
     required this.isScanning,
+    required this.animatedRowIds,
+    required this.rowMotionGeneration,
   });
 
   final List<SessionRowViewModel> rows;
@@ -1574,6 +1663,8 @@ class _SessionsTable extends StatelessWidget {
   final Future<void> Function(BuildContext context) onShowSortOptions;
   final String statusMessage;
   final bool isScanning;
+  final Set<String> animatedRowIds;
+  final int rowMotionGeneration;
 
   static const _rowHeight = 80.0;
   static const _columns = <_SessionColumn>[
@@ -1669,7 +1760,7 @@ class _SessionsTable extends StatelessWidget {
   Widget _sessionRow(BuildContext context, SessionRowViewModel row) {
     final selected = row.id == selectedId;
     final color = _rowColor(context, row, selected: selected);
-    return InkWell(
+    final child = InkWell(
       excludeFromSemantics: true,
       onTap: () => onSelect(row.id),
       child: Container(
@@ -1725,6 +1816,27 @@ class _SessionsTable extends StatelessWidget {
           ],
         ),
       ),
+    );
+    if (!animatedRowIds.contains(row.id)) {
+      return child;
+    }
+    final policy = CodexMotionPolicy.fromContext(
+      context,
+      mode: settings.ui.motion,
+    );
+    return TweenAnimationBuilder<double>(
+      key: Key('session-row-motion-${row.id}-v$rowMotionGeneration'),
+      tween: Tween(begin: 0, end: 1),
+      duration: policy.isReduced
+          ? CodexMotionDurations.fast
+          : policy.rowUpdateDuration,
+      curve: policy.standardCurve,
+      builder: (context, value, child) => CodexMotion.rowUpdateTransition(
+        policy: policy,
+        animation: AlwaysStoppedAnimation(value),
+        child: child!,
+      ),
+      child: child,
     );
   }
 
@@ -1850,7 +1962,7 @@ class _PathCell extends StatelessWidget {
               button: true,
               child: IconButton(
                 tooltip: 'Copy path',
-                icon: const Icon(Icons.copy, size: 16),
+                icon: const AppSvgIcon(AppIcons.copy),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints.tightFor(
                   width: 32,
@@ -1936,30 +2048,51 @@ class _ActionsMenu extends StatelessWidget {
           ),
         ),
         itemBuilder: (context) => [
-          _item(SessionRowAction.openPath, 'Open path'),
-          _item(SessionRowAction.copyPath, 'Copy path'),
+          if (_canOpenContainingFolder(row))
+            _item(
+              SessionRowAction.openPath,
+              'Open containing folder',
+              iconAsset: AppIcons.folderOpen,
+            ),
+          _item(
+            SessionRowAction.copyPath,
+            'Copy path',
+            iconAsset: AppIcons.copy,
+          ),
           _item(
             SessionRowAction.copyPlainResumeCommand,
             'Copy plain resume command',
+            iconAsset: AppIcons.copy,
             enabled: commandSet.plainResumeCommand != null,
             disabledReason: commandSet.disabledReason,
           ),
           _item(
             SessionRowAction.copyPlatformResumeCommand,
             'Copy platform resume command',
+            iconAsset: AppIcons.copy,
             enabled: commandSet.platformResumeCommand != null,
             disabledReason: commandSet.disabledReason,
           ),
           _item(
             SessionRowAction.openTerminalResume,
             'Open terminal and resume',
+            iconAsset: AppIcons.terminal,
             enabled: commandSet.terminalLaunchCommand != null,
+            disabledReason:
+                commandSet.terminalDisabledReason ?? commandSet.disabledReason,
+          ),
+          _item(
+            SessionRowAction.openTerminalFork,
+            'Open terminal and fork',
+            iconAsset: AppIcons.fork,
+            enabled: commandSet.terminalForkCommand != null,
             disabledReason:
                 commandSet.terminalDisabledReason ?? commandSet.disabledReason,
           ),
           _item(
             SessionRowAction.copyTerminalCommand,
             'Copy terminal command',
+            iconAsset: AppIcons.copy,
             enabled: commandSet.terminalLaunchCommand != null,
             disabledReason:
                 commandSet.terminalDisabledReason ?? commandSet.disabledReason,
@@ -1967,12 +2100,18 @@ class _ActionsMenu extends StatelessWidget {
           _item(
             SessionRowAction.togglePin,
             row.isPinned ? 'Unpin session' : 'Pin session',
+            iconAsset: AppIcons.pin,
           ),
           _item(
             SessionRowAction.toggleArchive,
             row.isArchived ? 'Unarchive session' : 'Archive session',
+            iconAsset: AppIcons.archive,
           ),
-          _item(SessionRowAction.reparse, 'Re-parse session'),
+          _item(
+            SessionRowAction.reparse,
+            'Re-parse session',
+            iconAsset: AppIcons.reparse,
+          ),
         ],
       ),
     );
@@ -1983,16 +2122,27 @@ class _ActionsMenu extends StatelessWidget {
     String label, {
     bool enabled = true,
     String? disabledReason,
+    String? iconAsset,
   }) {
+    final labelWidget = iconAsset == null
+        ? Text(label)
+        : Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AppSvgIcon(iconAsset),
+              const SizedBox(width: 10),
+              Flexible(child: Text(label)),
+            ],
+          );
     return PopupMenuItem<SessionRowAction>(
       value: action,
       enabled: enabled,
       child: enabled || disabledReason == null
-          ? Text(label)
+          ? labelWidget
           : Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(label),
+                labelWidget,
                 Text(disabledReason, style: const TextStyle(fontSize: 12)),
               ],
             ),
@@ -2017,28 +2167,34 @@ class _ActionsMenu extends StatelessWidget {
     SessionRowAction action,
   ) {
     return switch (action) {
-      SessionRowAction.openPath || SessionRowAction.copyPath => row.path,
+      SessionRowAction.openPath => row.containingFolderTarget,
+      SessionRowAction.copyPath => row.path,
       SessionRowAction.copyPlainResumeCommand => commandSet.plainResumeCommand,
       SessionRowAction.copyPlatformResumeCommand =>
         commandSet.platformResumeCommand,
-      SessionRowAction.openTerminalResume ||
+      SessionRowAction.openTerminalResume => commandSet.terminalLaunchCommand,
+      SessionRowAction.openTerminalFork => commandSet.terminalForkCommand,
       SessionRowAction.copyTerminalCommand => commandSet.terminalLaunchCommand,
       SessionRowAction.togglePin ||
       SessionRowAction.toggleArchive ||
       SessionRowAction.reparse => null,
     };
   }
+
+  bool _canOpenContainingFolder(SessionRowViewModel row) =>
+      row.canOpenContainingFolder;
 }
 
 extension on SessionRowAction {
   String get label {
     return switch (this) {
-      SessionRowAction.openPath => 'Open path',
+      SessionRowAction.openPath => 'Open containing folder',
       SessionRowAction.copyPath => 'Copy path',
       SessionRowAction.copyPlainResumeCommand => 'Copy plain resume command',
       SessionRowAction.copyPlatformResumeCommand =>
         'Copy platform resume command',
       SessionRowAction.openTerminalResume => 'Open terminal and resume',
+      SessionRowAction.openTerminalFork => 'Open terminal and fork',
       SessionRowAction.copyTerminalCommand => 'Copy terminal command',
       SessionRowAction.togglePin => 'Pin or unpin session',
       SessionRowAction.toggleArchive => 'Archive or unarchive session',
@@ -2052,6 +2208,8 @@ class _SessionDetailPlaceholder extends StatelessWidget {
     required this.row,
     required this.settings,
     required this.onSessionAction,
+    required this.onCopyText,
+    required this.onExportMarkdown,
     required this.onRunTerminalCommand,
     required this.onEditTerminalCommand,
     required this.isLoadingMessages,
@@ -2060,17 +2218,56 @@ class _SessionDetailPlaceholder extends StatelessWidget {
   final SessionRowViewModel? row;
   final AppSettings settings;
   final SessionDetailActionCallback? onSessionAction;
+  final DetailCopyCallback? onCopyText;
+  final SessionMarkdownExportCallback? onExportMarkdown;
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
   final bool isLoadingMessages;
 
   @override
   Widget build(BuildContext context) {
+    final policy = CodexMotionPolicy.fromContext(
+      context,
+      mode: settings.ui.motion,
+    );
+    final detailKey = row == null
+        ? 'empty'
+        : '${row!.id}:${isLoadingMessages ? 'loading' : 'loaded'}';
+    return AnimatedSwitcher(
+      duration: policy.paneDuration,
+      reverseDuration: policy.paneDuration,
+      switchInCurve: policy.standardCurve,
+      switchOutCurve: policy.emphasizedCurve,
+      transitionBuilder: (child, animation) => CodexMotion.paneFadeSlide(
+        policy: policy,
+        animation: animation,
+        child: child,
+      ),
+      layoutBuilder: (currentChild, previousChildren) => Stack(
+        alignment: Alignment.topLeft,
+        children: [
+          for (final child in previousChildren)
+            IgnorePointer(
+              child: ExcludeFocus(child: ExcludeSemantics(child: child)),
+            ),
+          ?currentChild,
+        ],
+      ),
+      child: KeyedSubtree(
+        key: ValueKey(detailKey),
+        child: _buildDetail(context),
+      ),
+    );
+  }
+
+  Widget _buildDetail(BuildContext context) {
     if (row != null) {
       return SessionDetailPane(
         row: row!,
         settings: settings,
+        onCopyText: onCopyText,
         onSessionAction: onSessionAction,
+        onExportMarkdown: onExportMarkdown,
         onRunTerminalCommand: onRunTerminalCommand,
         onEditTerminalCommand: onEditTerminalCommand,
         isLoadingMessages: isLoadingMessages,
@@ -2141,21 +2338,25 @@ class _SortOptionsDialogState extends State<_SortOptionsDialog> {
         ),
       ),
       actions: [
-        TextButton(
+        TextButton.icon(
           onPressed: () => Navigator.of(context).pop(_defaultSorts),
-          child: const Text('Default'),
+          icon: const AppSvgIcon(AppIcons.refresh),
+          label: const Text('Default'),
         ),
-        TextButton(
+        TextButton.icon(
           onPressed: () => Navigator.of(context).pop(_defaultSorts),
-          child: const Text('Clear'),
+          icon: const AppSvgIcon(AppIcons.filterClear),
+          label: const Text('Clear'),
         ),
-        TextButton(
+        TextButton.icon(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
+          icon: const AppSvgIcon(AppIcons.cancel),
+          label: const Text('Cancel'),
         ),
-        FilledButton(
+        FilledButton.icon(
           onPressed: () => Navigator.of(context).pop(_sorts),
-          child: const Text('Apply'),
+          icon: const AppSvgIcon(AppIcons.check),
+          label: const Text('Apply'),
         ),
       ],
     );
