@@ -19,6 +19,7 @@ theme = 'system'
 use_system_accent_color = true
 font_size = 14
 density = 'comfortable'
+motion = 'system'
 show_text_on_buttons = true
 show_icons = true
 native_title_bar = true

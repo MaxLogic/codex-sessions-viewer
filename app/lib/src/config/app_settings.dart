@@ -56,6 +56,24 @@ enum UiDensity {
   );
 }
 
+enum AppMotionMode {
+  system('system'),
+  reduced('reduced'),
+  normal('normal');
+
+  const AppMotionMode(this.tomlValue);
+
+  final String tomlValue;
+
+  static AppMotionMode parse(String value) => AppMotionMode.values.firstWhere(
+    (mode) => mode.tomlValue == value,
+    orElse: () => throw SettingsValidationException(
+      'ui.motion',
+      'Unsupported motion mode: $value',
+    ),
+  );
+}
+
 class SettingsValidationException implements Exception {
   const SettingsValidationException(this.field, this.message);
 
@@ -141,12 +159,14 @@ class AppSettings {
       useSystemAccentColor: true,
       fontSize: 14,
       density: UiDensity.comfortable,
+      motion: AppMotionMode.system,
       showTextOnButtons: true,
       showIcons: true,
       nativeTitleBar: true,
       window: null,
       sessionTable: SessionTableSettings(
         columnWidths: {},
+        newestPerProjectOnly: false,
         sorts: [
           SessionTableSortSettings(column: 'last_message_at', ascending: false),
         ],
@@ -500,12 +520,14 @@ class UiSettings {
     required this.nativeTitleBar,
     required this.window,
     required this.sessionTable,
+    this.motion = AppMotionMode.system,
   });
 
   final AppThemeMode theme;
   final bool useSystemAccentColor;
   final int fontSize;
   final UiDensity density;
+  final AppMotionMode motion;
   final bool showTextOnButtons;
   final bool showIcons;
   final bool nativeTitleBar;
@@ -517,6 +539,7 @@ class UiSettings {
     bool? useSystemAccentColor,
     int? fontSize,
     UiDensity? density,
+    AppMotionMode? motion,
     bool? showTextOnButtons,
     bool? showIcons,
     bool? nativeTitleBar,
@@ -527,6 +550,7 @@ class UiSettings {
     useSystemAccentColor: useSystemAccentColor ?? this.useSystemAccentColor,
     fontSize: fontSize ?? this.fontSize,
     density: density ?? this.density,
+    motion: motion ?? this.motion,
     showTextOnButtons: showTextOnButtons ?? this.showTextOnButtons,
     showIcons: showIcons ?? this.showIcons,
     nativeTitleBar: nativeTitleBar ?? this.nativeTitleBar,
@@ -535,6 +559,8 @@ class UiSettings {
         : window as WindowPlacementSettings?,
     sessionTable: sessionTable ?? this.sessionTable,
   );
+
+  UiSettings copyWithMotion(AppMotionMode motion) => copyWith(motion: motion);
 
   factory UiSettings.fromMap(
     Map<String, dynamic> map,
@@ -552,6 +578,9 @@ class UiSettings {
     fontSize: _positiveInt(map, 'font_size', defaults.fontSize, 'ui.font_size'),
     density: UiDensity.parse(
       _string(map, 'density', defaults.density.tomlValue, 'ui.density'),
+    ),
+    motion: AppMotionMode.parse(
+      _string(map, 'motion', defaults.motion.tomlValue, 'ui.motion'),
     ),
     showTextOnButtons: _bool(
       map,
@@ -578,6 +607,7 @@ class UiSettings {
     'use_system_accent_color': useSystemAccentColor,
     'font_size': fontSize,
     'density': density.tomlValue,
+    'motion': motion.tomlValue,
     'show_text_on_buttons': showTextOnButtons,
     'show_icons': showIcons,
     'native_title_bar': nativeTitleBar,
@@ -592,6 +622,7 @@ class UiSettings {
       useSystemAccentColor == other.useSystemAccentColor &&
       fontSize == other.fontSize &&
       density == other.density &&
+      motion == other.motion &&
       showTextOnButtons == other.showTextOnButtons &&
       showIcons == other.showIcons &&
       nativeTitleBar == other.nativeTitleBar &&
@@ -604,6 +635,7 @@ class UiSettings {
     useSystemAccentColor,
     fontSize,
     density,
+    motion,
     showTextOnButtons,
     showIcons,
     nativeTitleBar,
@@ -613,10 +645,15 @@ class UiSettings {
 }
 
 class SessionTableSettings {
-  const SessionTableSettings({required this.columnWidths, required this.sorts});
+  const SessionTableSettings({
+    required this.columnWidths,
+    required this.sorts,
+    this.newestPerProjectOnly = false,
+  });
 
   final Map<String, double> columnWidths;
   final List<SessionTableSortSettings> sorts;
+  final bool newestPerProjectOnly;
 
   factory SessionTableSettings.fromMap(
     Map<String, dynamic> map,
@@ -638,11 +675,18 @@ class SessionTableSettings {
     return SessionTableSettings(
       columnWidths: Map.unmodifiable(widths),
       sorts: sorts.isEmpty ? defaults.sorts : List.unmodifiable(sorts),
+      newestPerProjectOnly: _bool(
+        map,
+        'newest_per_project_only',
+        defaults.newestPerProjectOnly,
+        'ui.session_table.newest_per_project_only',
+      ),
     );
   }
 
   Map<String, Object?> toTomlMap() => {
     'column_widths': columnWidths,
+    'newest_per_project_only': newestPerProjectOnly,
     'sorts': [for (final sort in sorts) sort.toTomlMap()],
   };
 
@@ -650,11 +694,15 @@ class SessionTableSettings {
   bool operator ==(Object other) =>
       other is SessionTableSettings &&
       _mapEquals(columnWidths, other.columnWidths) &&
-      _listEquals(sorts, other.sorts);
+      _listEquals(sorts, other.sorts) &&
+      newestPerProjectOnly == other.newestPerProjectOnly;
 
   @override
-  int get hashCode =>
-      Object.hash(_mapHash(columnWidths), Object.hashAll(sorts));
+  int get hashCode => Object.hash(
+    _mapHash(columnWidths),
+    Object.hashAll(sorts),
+    newestPerProjectOnly,
+  );
 }
 
 class SessionTableSortSettings {

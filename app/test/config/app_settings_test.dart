@@ -85,6 +85,7 @@ void main() {
         ),
         sessionTable: SessionTableSettings(
           columnWidths: {'path': 320},
+          newestPerProjectOnly: true,
           sorts: [
             SessionTableSortSettings(
               column: 'last_message_at',
@@ -178,6 +179,44 @@ theme = "sepia"
           (error) => error.field,
           'field',
           'ui.theme',
+        ),
+      ),
+    );
+  });
+
+  test('parses and saves ui motion preference', () async {
+    await settingsFile.writeAsString('''
+[ui]
+motion = "normal"
+''');
+
+    final repository = SettingsRepository(settingsFile);
+    final loaded = await repository.loadOrCreate();
+
+    expect(loaded.ui.motion, AppMotionMode.normal);
+
+    await repository.save(
+      loaded.copyWith(ui: loaded.ui.copyWithMotion(AppMotionMode.reduced)),
+    );
+    final savedText = await settingsFile.readAsString();
+    expect(savedText, contains("motion = 'reduced'"));
+
+    await settingsFile.writeAsString('[ui]\n');
+    final defaulted = await repository.loadOrCreate();
+    expect(defaulted.ui.motion, AppMotionMode.system);
+
+    await settingsFile.writeAsString('''
+[ui]
+motion = "spinning"
+''');
+
+    expect(
+      repository.loadOrCreate,
+      throwsA(
+        isA<SettingsValidationException>().having(
+          (error) => error.field,
+          'field',
+          'ui.motion',
         ),
       ),
     );

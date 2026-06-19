@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../config/app_settings.dart';
+import 'motion.dart';
+
 typedef SessionsScreenBuilder =
     Widget Function(BuildContext context, VoidCallback onOpenSettings);
 
@@ -23,6 +26,7 @@ class CodexAppShell extends StatefulWidget {
     required this.usageScreen,
     required this.settingsScreen,
     required this.logsScreen,
+    this.motionMode = AppMotionMode.system,
   });
 
   final String title;
@@ -30,6 +34,7 @@ class CodexAppShell extends StatefulWidget {
   final Widget usageScreen;
   final Widget settingsScreen;
   final Widget logsScreen;
+  final AppMotionMode motionMode;
 
   @override
   State<CodexAppShell> createState() => _CodexAppShellState();
@@ -37,6 +42,7 @@ class CodexAppShell extends StatefulWidget {
 
 class _CodexAppShellState extends State<CodexAppShell> {
   var _selectedIndex = 0;
+  var _previousIndex = 0;
 
   @override
   Widget build(BuildContext context) {
@@ -60,6 +66,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
                 ),
                 onDestinationSelected: (index) {
                   setState(() {
+                    _previousIndex = _selectedIndex;
                     _selectedIndex = index;
                   });
                 },
@@ -98,8 +105,11 @@ class _CodexAppShellState extends State<CodexAppShell> {
                 usageScreen: widget.usageScreen,
                 settingsScreen: widget.settingsScreen,
                 logsScreen: widget.logsScreen,
+                motionMode: widget.motionMode,
+                previousIndex: _previousIndex,
                 onOpenSettings: () {
                   setState(() {
+                    _previousIndex = _selectedIndex;
                     _selectedIndex = CodexAppSection.settings.index;
                   });
                 },
@@ -119,6 +129,8 @@ class _SectionContent extends StatelessWidget {
     required this.usageScreen,
     required this.settingsScreen,
     required this.logsScreen,
+    required this.motionMode,
+    required this.previousIndex,
     required this.onOpenSettings,
   });
 
@@ -127,10 +139,45 @@ class _SectionContent extends StatelessWidget {
   final Widget usageScreen;
   final Widget settingsScreen;
   final Widget logsScreen;
+  final AppMotionMode motionMode;
+  final int previousIndex;
   final VoidCallback onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
+    final policy = CodexMotionPolicy.fromContext(context, mode: motionMode);
+    final direction = section.index >= previousIndex
+        ? AxisDirection.left
+        : AxisDirection.right;
+    return AnimatedSwitcher(
+      duration: policy.pageDuration,
+      reverseDuration: policy.pageDuration,
+      switchInCurve: policy.standardCurve,
+      switchOutCurve: policy.emphasizedCurve,
+      transitionBuilder: (child, animation) => CodexMotion.pageFadeSlide(
+        policy: policy,
+        animation: animation,
+        direction: direction,
+        child: child,
+      ),
+      layoutBuilder: (currentChild, previousChildren) => Stack(
+        alignment: Alignment.topLeft,
+        children: [
+          for (final child in previousChildren)
+            IgnorePointer(
+              child: ExcludeFocus(child: ExcludeSemantics(child: child)),
+            ),
+          ?currentChild,
+        ],
+      ),
+      child: KeyedSubtree(
+        key: ValueKey(section),
+        child: _buildSection(context),
+      ),
+    );
+  }
+
+  Widget _buildSection(BuildContext context) {
     if (section == CodexAppSection.sessions) {
       return sessionsScreenBuilder(context, onOpenSettings);
     }
