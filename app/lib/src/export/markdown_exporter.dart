@@ -1,4 +1,5 @@
 import '../parser/codex_session_parser.dart';
+import '../utils/injected_context_filter.dart';
 
 class MarkdownSessionExporter {
   const MarkdownSessionExporter();
@@ -69,14 +70,17 @@ class MarkdownSessionExporter {
     MarkdownExportOptions options,
     Set<int> selectedMessageIndexes,
   ) {
+    final visibleMessages = messages
+        .where(_isVisibleExportMessage)
+        .toList(growable: false);
     final scoped = switch (scope.kind) {
-      MarkdownExportScopeKind.all => messages,
+      MarkdownExportScopeKind.all => visibleMessages,
       MarkdownExportScopeKind.selectedMessage =>
-        messages
+        visibleMessages
             .where((message) => message.index == scope.startIndex)
             .toList(growable: false),
       MarkdownExportScopeKind.range =>
-        messages
+        visibleMessages
             .where(
               (message) =>
                   message.index >= scope.startIndex &&
@@ -84,7 +88,7 @@ class MarkdownSessionExporter {
             )
             .toList(growable: false),
       MarkdownExportScopeKind.fromMessageOnward =>
-        messages
+        visibleMessages
             .where((message) => message.index >= scope.startIndex)
             .toList(growable: false),
     };
@@ -94,6 +98,11 @@ class MarkdownSessionExporter {
     return scoped
         .where((message) => selectedMessageIndexes.contains(message.index))
         .toList(growable: false);
+  }
+
+  bool _isVisibleExportMessage(CodexParsedMessage message) {
+    return message.authorType != CodexMessageAuthorType.user ||
+        !isInjectedEnvironmentContextMessage(message.contentPlain);
   }
 }
 

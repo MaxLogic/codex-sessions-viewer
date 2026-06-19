@@ -159,6 +159,31 @@ void main() {
     );
   });
 
+  test(
+    'does not classify injected environment context as user prompt',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+      addTearDown(() => temp.delete(recursive: true));
+      final source = File('${temp.path}${Platform.pathSeparator}context.jsonl');
+      await source.writeAsString('''
+{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"context-session","cwd":"F:\\\\repo"}}
+{"timestamp":"2026-06-18T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\\n  <current_date>2026-06-18</current_date>\\n  <filesystem><workspace_roots><root>F:\\\\repo</root></workspace_roots></filesystem>\\n</environment_context>"}]}}
+{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please explain this environment_context tag."}]}}
+''');
+
+      final result = await parser.parseFile(source);
+
+      expect(result.isSuccess, isTrue);
+      final messages = result.session!.messages;
+      expect(messages, hasLength(1));
+      expect(messages.single.authorType, CodexMessageAuthorType.user);
+      expect(
+        messages.single.contentPlain,
+        'Please explain this environment_context tag.',
+      );
+    },
+  );
+
   test('captures observed token usage fields and custom tool calls', () async {
     final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
     addTearDown(() => temp.delete(recursive: true));

@@ -464,6 +464,69 @@ void main() {
     expect(parser.maxActiveParses, 2);
   });
 
+  test(
+    'checks cached file metadata without occupying parser workers',
+    () async {
+      final root = Directory('${temp.path}${Platform.pathSeparator}win');
+      await root.create();
+      final cached = <CachedSessionSnapshot>[];
+      for (var i = 0; i < 20; i++) {
+        final file = File(
+          '${root.path}${Platform.pathSeparator}cached-$i.json',
+        );
+        await file.writeAsString(_validJsonSession('cached-$i'));
+        cached.add(
+          await CachedSessionSnapshot.fromFile(
+            file,
+            status: SessionFileStatus.available,
+            parserVersion: CodexSessionParser.currentVersion,
+          ),
+        );
+      }
+      await File(
+        '${root.path}${Platform.pathSeparator}changed.json',
+      ).writeAsString(_validJsonSession('changed'));
+
+      var activeStats = 0;
+      var maxActiveStats = 0;
+      final statRelease = Completer<void>();
+      final parser = _CountingParser();
+      final scanner = SessionScanner(
+        parser: parser,
+        pathMapper: mapper,
+        useParserIsolates: false,
+        maxConcurrentParses: 1,
+        maxConcurrentMetadataChecks: 5,
+        fileStatReader: (file) async {
+          activeStats++;
+          if (activeStats > maxActiveStats) {
+            maxActiveStats = activeStats;
+          }
+          await statRelease.future;
+          try {
+            return await file.stat();
+          } finally {
+            activeStats--;
+          }
+        },
+      );
+
+      final scan = scanner.scan(
+        SessionScanRequest(windowsRoot: root.path, cachedSessions: cached),
+      );
+      while (maxActiveStats < 5) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      statRelease.complete();
+      final result = await scan;
+
+      expect(maxActiveStats, 5);
+      expect(parser.maxActiveParses, 1);
+      expect(result.progress.filesSkipped, 20);
+      expect(result.progress.filesParsed, 1);
+    },
+  );
+
   test('starts parsing before directory discovery completes', () async {
     final root = Directory('${temp.path}${Platform.pathSeparator}win');
     await root.create();

@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 
+import '../utils/injected_context_filter.dart';
+
 enum CodexSessionSourceType { windows, wsl, unknown }
 
 enum CodexMessageAuthorType { user, assistant, system, tool, unknown }
@@ -107,6 +109,10 @@ class CodexSessionParser {
       final createdAtUtc = _dateTime(messageMap['created_at']);
       lastMessageAtUtc = _maxDateTime(lastMessageAtUtc, createdAtUtc);
       final content = _content(messageMap);
+      if (authorType == CodexMessageAuthorType.user &&
+          isInjectedEnvironmentContextMessage(content)) {
+        continue;
+      }
       final storedContent = _truncate(content, maxMessageContentChars);
       messages.add(
         CodexParsedMessage(
@@ -234,6 +240,10 @@ class CodexSessionParser {
         final content = _contentFromResponsePayload(payload);
         final role = _string(payload['role']);
         final authorType = _authorType(role);
+        if (authorType == CodexMessageAuthorType.user &&
+            isInjectedEnvironmentContextMessage(content)) {
+          continue;
+        }
         final messageUsage = CodexUsage.fromJson(payload['usage']);
         if (!hasAggregateUsage) {
           usage = usage + messageUsage;
@@ -268,6 +278,10 @@ class CodexSessionParser {
         final authorType = payloadType == 'user_message'
             ? CodexMessageAuthorType.user
             : CodexMessageAuthorType.assistant;
+        if (authorType == CodexMessageAuthorType.user &&
+            isInjectedEnvironmentContextMessage(content)) {
+          continue;
+        }
         final storedContent = _truncate(content, maxMessageContentChars);
         messages.add(
           CodexParsedMessage(

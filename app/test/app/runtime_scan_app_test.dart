@@ -762,6 +762,7 @@ void main() {
             _row('runtime-row', SessionRowPlatform.windows),
           ]);
         },
+        deferInitialSessionLoad: (_) {},
       ),
     );
     await tester.pump();
@@ -978,6 +979,69 @@ void main() {
     expect(detail?.modelsUsedForDetail, ['gpt-5.5-thinking']);
   });
 
+  test(
+    'warm unchanged refresh does not rewrite skipped cached session rows',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_warm_skip_no_rewrite_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      await windowsRoot.create();
+      await _copyFixture('sample_windows_session.json', windowsRoot);
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: p.join(temp.path, 'missing-wsl'),
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      await controller.refresh();
+
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      Map<String, Object?> sessionTimestamps() => db.select('''
+      select updated_at_utc, last_scanned_utc
+      from sessions
+      where id not like 'source-status:%'
+      ''').single;
+      final before = sessionTimestamps();
+
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      await controller.refresh();
+      final after = sessionTimestamps();
+      final scanRun = db.select('''
+      select files_parsed, files_skipped
+      from scan_runs
+      order by id desc
+      limit 1
+      ''').single;
+
+      expect(scanRun['files_parsed'], 0);
+      expect(scanRun['files_skipped'], 1);
+      expect(after, before);
+    },
+  );
+
   test('cached loading backfills auto projects for older sessions', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_cached_auto_project_',
@@ -1133,6 +1197,163 @@ void main() {
         {sharedPath, unresolvedPath},
         {sharedPath, unresolvedPath},
       ]);
+    },
+  );
+
+  test('resolved WSL paths expose containing-folder actions', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_wsl_openable_path_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writeWslJsonFixture(
+      wslRoot,
+      'wsl-resolved-openable',
+      '/home/pawel/project',
+      workingDirectoryUnc: r'\\wsl.localhost\Ubuntu\home\pawel\project',
+    );
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final result = await controller.refresh();
+    final wslRow = result.rows.singleWhere(
+      (row) => row.platform == SessionRowPlatform.wsl,
+    );
+
+    expect(wslRow.path, '/home/pawel/project');
+    expect(wslRow.openablePath, r'\\wsl.localhost\Ubuntu\home\pawel\project');
+  });
+
+  test(
+    'runtime Windows containing-folder target prefers working directory',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_windows_openable_path_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      await _copyFixture('sample_windows_session.json', windowsRoot);
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      final result = await controller.refresh();
+      final windowsRow = result.rows.singleWhere(
+        (row) => row.platform == SessionRowPlatform.windows,
+      );
+
+      expect(
+        windowsRow.sourcePathForDisplay,
+        isNot(windowsRow.containingFolderTarget),
+      );
+      expect(
+        windowsRow.containingFolderTarget,
+        r'F:\projects\MaxLogic\codex-sessions-viewer',
+      );
+    },
+  );
+
+  test(
+    'unresolved WSL working directories do not fall back to session file UNC',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_wsl_unresolved_openable_path_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      await _writeWslJsonFixture(
+        wslRoot,
+        'wsl-unresolved-openable',
+        '/mnt/f/projects/oec/te5/maxtdb',
+      );
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      final result = await controller.refresh();
+      final wslRow = result.rows.singleWhere(
+        (row) => row.platform == SessionRowPlatform.wsl,
+      );
+
+      expect(wslRow.path, '/mnt/f/projects/oec/te5/maxtdb');
+      expect(wslRow.openablePath, isEmpty);
+      expect(wslRow.canOpenContainingFolder, isFalse);
     },
   );
 
@@ -1563,8 +1784,9 @@ Future<File> _writeAggregateJsonlFixture(Directory destination) async {
 Future<File> _writeWslJsonFixture(
   Directory destination,
   String id,
-  String workingDirectory,
-) async {
+  String workingDirectory, {
+  String? workingDirectoryUnc,
+}) async {
   final file = File(p.join(destination.path, '$id.json'));
   await file.writeAsString('''
 {
@@ -1575,6 +1797,7 @@ Future<File> _writeWslJsonFixture(
   "display_path": "/home/pawel/.codex/sessions/$id.json",
   "platform_path": "/home/pawel/.codex/sessions/$id.json",
   "working_directory": "$workingDirectory",
+  ${workingDirectoryUnc == null ? '' : '"working_directory_unc": "${_escapedJsonString(workingDirectoryUnc)}",'}
   "created_at": "2026-06-10T09:00:00Z",
   "messages": [
     { "type": "user", "content": "hello $id" }
@@ -1583,6 +1806,9 @@ Future<File> _writeWslJsonFixture(
 ''');
   return file;
 }
+
+String _escapedJsonString(String value) =>
+    value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
 
 class _RecordingWslProjectResolver implements WslProjectResolver {
   _RecordingWslProjectResolver(this.results);

@@ -19,6 +19,7 @@ import '../search/session_search.dart';
 import '../usage/usage_summary.dart';
 import '../ui/models/conversation_message_view_model.dart';
 import '../ui/screens/sessions_screen.dart';
+import '../utils/injected_context_filter.dart';
 import '../utils/profiling.dart';
 
 class RuntimeSessionController {
@@ -383,6 +384,7 @@ class RuntimeSessionController {
             message: 'Session scan started.',
             details: {
               'directory_workers': _defaultDirectoryWorkerCount(),
+              'metadata_workers': _defaultMetadataWorkerCount(),
               'parser_workers': _defaultParserWorkerCount(),
               'parser_isolates': true,
             },
@@ -395,6 +397,7 @@ class RuntimeSessionController {
         );
         final parserWorkerCount = _defaultParserWorkerCount();
         final directoryWorkerCount = _defaultDirectoryWorkerCount();
+        final metadataWorkerCount = _defaultMetadataWorkerCount();
         final scanner = SessionScanner(
           parser: CodexSessionParser(
             maxToolOutputPreviewChars:
@@ -403,6 +406,7 @@ class RuntimeSessionController {
           pathMapper: mapper,
           maxConcurrentParses: parserWorkerCount,
           maxConcurrentDirectoryScans: directoryWorkerCount,
+          maxConcurrentMetadataChecks: metadataWorkerCount,
           onProgress: onProgress == null
               ? null
               : (progress) {
@@ -442,17 +446,25 @@ class RuntimeSessionController {
             );
           },
         );
-        await flushParsedSessions(
-          result.progress,
-          forceFullRowSnapshot: true,
-          beforeFullRowSnapshot: onProgress == null
-              ? null
-              : () => _applyResolvedProjectsForParsedSessions(
-                  db,
-                  result.sessions,
-                  wslProjects: projectResolutionCache,
-                ),
+        onProgress?.call(
+          const SessionsRefreshProgress(statusMessage: 'Finalizing scan...'),
         );
+        await Profiling.spanAsync('scan.runtime.final_flush', () {
+          return flushParsedSessions(
+            result.progress,
+            forceFullRowSnapshot: true,
+            beforeFullRowSnapshot: onProgress == null
+                ? null
+                : () => Profiling.spanAsync(
+                    'scan.runtime.apply_resolved_projects',
+                    () => _applyResolvedProjectsForParsedSessions(
+                      db,
+                      result.sessions,
+                      wslProjects: projectResolutionCache,
+                    ),
+                  ),
+          );
+        });
         await Profiling.spanAsync('scan.runtime.persist_scan', () {
           return _persistScan(
             db,
@@ -462,23 +474,29 @@ class RuntimeSessionController {
             wslProjects: projectResolutionCache,
           );
         });
-        final rows = _loadRowsProfiled(db, pricing: pricing);
-        await logger.write(
-          LogEntryDraft(
-            level: LogLevel.info,
-            category: LogCategory.scanner,
-            message: result.cancelled
-                ? 'Session scan cancelled.'
-                : 'Session scan finished.',
-            details: {
-              ..._progressLogDetails(result.progress),
-              'cancelled': result.cancelled,
-              'visible_sessions': rows.length,
-              'directory_workers': directoryWorkerCount,
-              'parser_workers': parserWorkerCount,
-            },
-          ),
+        final rows = Profiling.spanSync(
+          'scan.runtime.final_load_rows',
+          () => _loadRowsProfiled(db, pricing: pricing),
         );
+        await Profiling.spanAsync('scan.runtime.write_finish_log', () {
+          return logger.write(
+            LogEntryDraft(
+              level: LogLevel.info,
+              category: LogCategory.scanner,
+              message: result.cancelled
+                  ? 'Session scan cancelled.'
+                  : 'Session scan finished.',
+              details: {
+                ..._progressLogDetails(result.progress),
+                'cancelled': result.cancelled,
+                'visible_sessions': rows.length,
+                'directory_workers': directoryWorkerCount,
+                'metadata_workers': metadataWorkerCount,
+                'parser_workers': parserWorkerCount,
+              },
+            ),
+          );
+        });
         return SessionsRefreshResult(
           rows: rows,
           statusMessage: _statusMessage(
@@ -991,14 +1009,16 @@ Future<void> _persistScan(
         _upsertParsedSession(db, session, now, resolver!);
       }
     }
-    for (final status in result.fileStatuses) {
-      if (result.sessions.any(
-        (session) => session.sourcePath == status.sourcePath,
-      )) {
-        continue;
-      }
-      _upsertScanStatusOnly(db, status, now);
-    }
+    final parsedSessionPaths = {
+      for (final session in result.sessions) session.sourcePath,
+    };
+    final statusesToPersist = [
+      for (final status in result.fileStatuses)
+        if (!parsedSessionPaths.contains(status.sourcePath) &&
+            status.status != SessionFileStatus.available)
+          status,
+    ];
+    _upsertScanStatusesOnly(db, statusesToPersist, now);
     db.execute('commit');
   } on Object {
     db.execute('rollback');
@@ -1248,44 +1268,79 @@ void _replaceToolCalls(Database db, CodexParsedSession parsed) {
   }
 }
 
-void _upsertScanStatusOnly(Database db, ScannedFileStatus status, String now) {
-  final existingSessionIds = db.select(
-    '''
-    select id
-    from sessions
-    where source_file_path = ?
-       or source_file_unc_path = ?
-    ''',
-    [status.sourcePath, status.sourcePath],
-  );
-  if (existingSessionIds.isNotEmpty) {
-    for (final row in existingSessionIds) {
-      db.execute(
-        '''
-        update sessions
-        set
-          scan_status = ?,
-          parse_status = case
-            when ? = 'parse_error' then 'parse_error'
-            else parse_status
-          end,
-          updated_at_utc = ?,
-          last_scanned_utc = ?
-        where id = ?
-        ''',
-        [
-          status.status.wireName,
-          status.status.wireName,
-          now,
-          now,
-          row['id'] as String,
-        ],
-      );
-    }
+void _upsertScanStatusesOnly(
+  Database db,
+  List<ScannedFileStatus> statuses,
+  String now,
+) {
+  if (statuses.isEmpty) {
     return;
   }
+
+  db.execute('''
+    create temp table if not exists temp_scan_statuses (
+      source_path text primary key,
+      status text not null
+    )
+    ''');
+  db.execute('delete from temp_scan_statuses');
+
+  final insertStatus = db.prepare('''
+    insert or replace into temp_scan_statuses (source_path, status)
+    values (?, ?)
+    ''');
+  try {
+    for (final status in statuses) {
+      insertStatus.execute([status.sourcePath, status.status.wireName]);
+    }
+  } finally {
+    insertStatus.close();
+  }
+
   db.execute(
     '''
+    update sessions
+    set
+      scan_status = (
+        select t.status
+        from temp_scan_statuses t
+        where t.source_path = sessions.source_file_path
+           or t.source_path = sessions.source_file_unc_path
+        limit 1
+      ),
+      parse_status = case
+        when (
+          select t.status
+          from temp_scan_statuses t
+          where t.source_path = sessions.source_file_path
+             or t.source_path = sessions.source_file_unc_path
+          limit 1
+        ) = 'parse_error' then 'parse_error'
+        else parse_status
+      end,
+      updated_at_utc = ?,
+      last_scanned_utc = ?
+    where exists (
+      select 1
+      from temp_scan_statuses t
+      where t.source_path = sessions.source_file_path
+         or t.source_path = sessions.source_file_unc_path
+    )
+    ''',
+    [now, now],
+  );
+
+  final missingStatuses = db.select('''
+    select t.source_path, t.status
+    from temp_scan_statuses t
+    where not exists (
+      select 1
+      from sessions s
+      where s.source_file_path = t.source_path
+         or s.source_file_unc_path = t.source_path
+    )
+    ''');
+  final insertMissing = db.prepare('''
     insert into sessions (
       id,
       source_type,
@@ -1302,22 +1357,30 @@ void _upsertScanStatusOnly(Database db, ScannedFileStatus status, String now) {
       scan_status = excluded.scan_status,
       updated_at_utc = excluded.updated_at_utc,
       last_scanned_utc = excluded.last_scanned_utc
-    ''',
-    [
-      _sourceStatusId(status.sourcePath),
-      _sourceTypeLabel(status.sourcePath),
-      status.sourcePath,
-      status.sourcePath,
-      status.sourcePath,
-      status.status.wireName,
-      status.status == SessionFileStatus.parseError
-          ? 'parse_error'
-          : 'available',
-      now,
-      now,
-      now,
-    ],
-  );
+    ''');
+  try {
+    for (final row in missingStatuses) {
+      final sourcePath = row['source_path'] as String;
+      final status = row['status'] as String;
+      insertMissing.execute([
+        _sourceStatusId(sourcePath),
+        _sourceTypeLabel(sourcePath),
+        sourcePath,
+        sourcePath,
+        sourcePath,
+        status,
+        status == SessionFileStatus.parseError.wireName
+            ? 'parse_error'
+            : 'available',
+        now,
+        now,
+        now,
+      ]);
+    }
+  } finally {
+    insertMissing.close();
+    db.execute('delete from temp_scan_statuses');
+  }
 }
 
 List<SessionRowViewModel> _loadRows(
@@ -1347,9 +1410,11 @@ List<SessionRowViewModel> _loadRows(
       s.session_id,
       s.source_type,
       s.source_file_path,
+      s.source_file_unc_path,
       s.display_path,
       s.platform_path,
       s.working_directory_display,
+      s.working_directory_unc,
       s.started_at_utc,
       s.last_message_at_utc,
       nullif(trim(s.title), '') as row_title,
@@ -1432,19 +1497,29 @@ SessionRowViewModel _loadRow(
     model: model.isEmpty ? null : model,
     pricing: pricing,
   );
+  final sourceType = row['source_type'] as String?;
+  final workingDirectoryDisplay = row['working_directory_display'] as String?;
+  final openablePath = sourceType == 'wsl'
+      ? row['working_directory_unc'] as String? ?? ''
+      : row['working_directory_unc'] as String? ??
+            workingDirectoryDisplay ??
+            row['source_file_unc_path'] as String? ??
+            row['source_file_path'] as String? ??
+            '';
   return SessionRowViewModel(
     id: row['id'] as String,
     sessionId: row['session_id'] as String? ?? '',
     sourceFilePath: row['source_file_path'] as String? ?? '',
     displayPath: row['display_path'] as String? ?? '',
-    workingDirectory: row['working_directory_display'] as String? ?? '',
+    workingDirectory: workingDirectoryDisplay ?? '',
+    openablePath: openablePath,
     startedAtUtc:
         _dateTime(row['started_at_utc'] as String?) ??
         DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
     lastMessageAtUtc:
         _dateTime(row['last_message_at_utc'] as String?) ??
         DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
-    platform: (row['source_type'] as String?) == 'wsl'
+    platform: sourceType == 'wsl'
         ? SessionRowPlatform.wsl
         : SessionRowPlatform.windows,
     project: row['project_name_snapshot'] as String? ?? '',
@@ -1533,23 +1608,33 @@ List<ConversationMessageViewModel> _loadMessages(
   );
   return [
     for (final row in rows)
-      ConversationMessageViewModel(
-        id: '$sessionId:${row['message_index']}',
-        number: row['message_index'] as int,
-        author: _messageAuthor(row['author_type'] as String?),
-        createdAtUtc:
-            _dateTime(row['created_at_utc'] as String?) ??
-            DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
-        preview: row['content_preview'] as String? ?? '',
-        body:
-            row['content_plain'] as String? ??
+      if (!_isInjectedContextRow(row))
+        ConversationMessageViewModel(
+          id: '$sessionId:${row['message_index']}',
+          number: row['message_index'] as int,
+          author: _messageAuthor(row['author_type'] as String?),
+          createdAtUtc:
+              _dateTime(row['created_at_utc'] as String?) ??
+              DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+          preview: row['content_preview'] as String? ?? '',
+          body:
+              row['content_plain'] as String? ??
+              row['content_preview'] as String? ??
+              '',
+          tokenCount: row['token_total'] as int? ?? 0,
+          hasError: (row['has_error'] as int? ?? 0) == 1,
+          hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
+        ),
+  ];
+}
+
+bool _isInjectedContextRow(Row row) {
+  return row['author_type'] == 'user' &&
+      isInjectedEnvironmentContextMessage(
+        row['content_plain'] as String? ??
             row['content_preview'] as String? ??
             '',
-        tokenCount: row['token_total'] as int? ?? 0,
-        hasError: (row['has_error'] as int? ?? 0) == 1,
-        hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
-      ),
-  ];
+      );
 }
 
 int _upsertAutoProject(Database db, String name, String now) {
@@ -1993,6 +2078,11 @@ int _defaultParserWorkerCount() {
 int _defaultDirectoryWorkerCount() {
   final processors = Platform.numberOfProcessors;
   return math.min(8, math.max(2, processors ~/ 2));
+}
+
+int _defaultMetadataWorkerCount() {
+  final processors = Platform.numberOfProcessors;
+  return math.min(64, math.max(16, processors * 4));
 }
 
 String _estimatedEta(ScanProgress progress) {

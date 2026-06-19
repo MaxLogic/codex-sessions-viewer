@@ -171,6 +171,62 @@ void main() {
       contains('_Message content is truncated in parsed data._'),
     );
   });
+
+  test(
+    'markdown export does not label injected environment context as user',
+    () {
+      final session = _session(
+        messages: [
+          CodexParsedMessage(
+            index: 0,
+            authorType: CodexMessageAuthorType.user,
+            rawType: 'message',
+            createdAtUtc: DateTime.utc(2026, 6, 18, 10),
+            firstLine: '<environment_context>',
+            contentPlain: '''
+<environment_context>
+  <current_date>2026-06-18</current_date>
+  <filesystem><workspace_roots><root>F:\\repo</root></workspace_roots></filesystem>
+</environment_context>''',
+            contentPreview: '<environment_context>',
+            contentTruncated: false,
+            usage: const CodexUsage.empty(),
+            model: null,
+            hasToolCalls: false,
+            hasError: false,
+          ),
+          CodexParsedMessage(
+            index: 1,
+            authorType: CodexMessageAuthorType.user,
+            rawType: 'message',
+            createdAtUtc: DateTime.utc(2026, 6, 18, 10, 1),
+            firstLine: 'Please explain this environment_context tag.',
+            contentPlain: 'Please explain this environment_context tag.',
+            contentPreview: 'Please explain this environment_context tag.',
+            contentTruncated: false,
+            usage: const CodexUsage.empty(),
+            model: null,
+            hasToolCalls: false,
+            hasError: false,
+          ),
+        ],
+        toolCalls: const [],
+      );
+
+      final markdown = const MarkdownSessionExporter().exportMarkdown(
+        session,
+        const MarkdownExportRequest(scope: MarkdownExportScope.all()),
+      );
+
+      expect(markdown, isNot(contains('<environment_context>')));
+      expect(markdown, isNot(contains('### 1. User')));
+      expect(markdown, contains('### 2. User'));
+      expect(
+        markdown,
+        contains('Please explain this environment_context tag.'),
+      );
+    },
+  );
 }
 
 CodexParsedSession _session({

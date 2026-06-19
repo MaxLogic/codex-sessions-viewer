@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -8,12 +9,22 @@ import '../config/app_settings.dart';
 import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
 import '../app/runtime_session_controller.dart';
+import '../pricing/pricing_repository.dart';
 import '../ui/app_shell.dart';
 import '../ui/screens/logs_screen.dart';
 import '../ui/screens/sessions_screen.dart';
 import '../ui/screens/settings_screen.dart';
 import '../ui/screens/usage_screen.dart';
 import '../ui/themes.dart';
+import '../usage/usage_summary.dart';
+
+typedef SessionCachedRowsLoader =
+    Future<SessionsRefreshResult> Function(
+      SessionsRefreshProgressCallback onProgress,
+    );
+typedef FrameDeferredCallback = void Function(VoidCallback callback);
+typedef UsageSummaryLoader =
+    Future<UsageSummary?> Function(AppSettings settings);
 
 class CodexSessionsViewerApp extends StatefulWidget {
   CodexSessionsViewerApp({
@@ -24,8 +35,11 @@ class CodexSessionsViewerApp extends StatefulWidget {
     Future<AppSettings>? settingsStartup,
     this.sessionRefresh,
     this.sessionRefreshOperation,
+    this.sessionCachedRowsLoader,
+    this.deferInitialSessionLoad = _deferUntilAfterFirstFrame,
     this.settingsSave,
     this.settingsReload,
+    this.usageSummaryLoader,
   }) : databaseStartup =
            databaseStartup ??
            Future.value(
@@ -48,8 +62,11 @@ class CodexSessionsViewerApp extends StatefulWidget {
   final File databaseFile;
   final Future<SessionsRefreshResult> Function()? sessionRefresh;
   final SessionsRefreshOperationFactory? sessionRefreshOperation;
+  final SessionCachedRowsLoader? sessionCachedRowsLoader;
+  final FrameDeferredCallback deferInitialSessionLoad;
   final SettingsSaveCallback? settingsSave;
   final SettingsReloadCallback? settingsReload;
+  final UsageSummaryLoader? usageSummaryLoader;
 
   @override
   State<CodexSessionsViewerApp> createState() => _CodexSessionsViewerAppState();
@@ -57,6 +74,9 @@ class CodexSessionsViewerApp extends StatefulWidget {
 
 class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   AppSettings? _settings;
+  UsageSummary? _usageSummary;
+  var _usageLoadGeneration = 0;
+  var _usageLoadScheduled = false;
 
   @override
   Widget build(BuildContext context) {
@@ -109,21 +129,26 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                   settingsSnapshot.connectionState == ConnectionState.done) {
                 _settings = settings;
               }
+              _startUsageSummaryLoad(settings);
               return CodexAppShell(
+                motionMode: settings.ui.motion,
                 sessionsScreenBuilder: (context, onOpenSettings) =>
                     _SessionsScreenLoader(
                       settings: settings,
                       settingsFile: widget.settingsFile,
                       databaseFile: widget.databaseFile,
                       onRefreshOperation: _sessionRefreshOperation,
+                      onLoadCachedRows: widget.sessionCachedRowsLoader,
+                      deferInitialLoad: widget.deferInitialSessionLoad,
                       onOpenSettings: onOpenSettings,
                       onSessionAction: (request) =>
                           _handleSessionAction(request),
+                      onExportMarkdown: _exportConversationMarkdown,
                       onTableStateChanged: (state) {
                         unawaited(_saveSessionTableState(state));
                       },
                     ),
-                usageScreen: UsageScreen(),
+                usageScreen: UsageScreen(summary: _usageSummary),
                 settingsScreen: SettingsScreen(
                   initialSettings: settings,
                   onSave: _saveSettings,
@@ -142,19 +167,29 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     SessionsRefreshProgressCallback onProgress,
   ) {
     final refreshOperation = widget.sessionRefreshOperation;
+    SessionsRefreshOperation operation;
     if (refreshOperation != null) {
-      return refreshOperation(onProgress);
+      operation = refreshOperation(onProgress);
+    } else {
+      final refresh = widget.sessionRefresh;
+      if (refresh != null) {
+        operation = SessionsRefreshOperation.fromFuture(refresh());
+      } else {
+        final runtimeOperation = RuntimeSessionController(
+          settingsFile: widget.settingsFile,
+          databaseFile: widget.databaseFile,
+        ).startRefreshInBackgroundOperation(onProgress: onProgress);
+        operation = SessionsRefreshOperation(
+          result: runtimeOperation.result,
+          cancel: runtimeOperation.cancel,
+        );
+      }
     }
-    final refresh = widget.sessionRefresh;
-    if (refresh != null) {
-      return SessionsRefreshOperation.fromFuture(refresh());
-    }
-    final operation = RuntimeSessionController(
-      settingsFile: widget.settingsFile,
-      databaseFile: widget.databaseFile,
-    ).startRefreshInBackgroundOperation(onProgress: onProgress);
     return SessionsRefreshOperation(
-      result: operation.result,
+      result: operation.result.then((result) async {
+        await _loadUsageSummary(_settings ?? AppSettings.defaults());
+        return result;
+      }),
       cancel: operation.cancel,
     );
   }
@@ -172,6 +207,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     setState(() {
       _settings = settings;
     });
+    unawaited(_loadUsageSummary(settings));
   }
 
   Future<AppSettings> _reloadSettings() async {
@@ -183,8 +219,69 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       setState(() {
         _settings = settings;
       });
+      unawaited(_loadUsageSummary(settings));
     }
     return settings;
+  }
+
+  void _startUsageSummaryLoad(AppSettings settings) {
+    if (_usageSummary != null || _usageLoadScheduled) {
+      return;
+    }
+    _usageLoadScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        unawaited(_loadUsageSummary(settings));
+      }
+    });
+  }
+
+  Future<void> _loadUsageSummary(AppSettings settings) async {
+    final generation = ++_usageLoadGeneration;
+    final loader = widget.usageSummaryLoader;
+    if (loader != null) {
+      final summary = await loader(settings);
+      if (!mounted || generation != _usageLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _usageSummary = summary;
+      });
+      return;
+    }
+    await _loadUsageSummaryFromDatabase(settings, generation);
+  }
+
+  Future<void> _loadUsageSummaryFromDatabase(
+    AppSettings settings,
+    int generation,
+  ) async {
+    final db = openFileBackedDatabase(widget.databaseFile);
+    try {
+      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      final summary = UsageSummaryRepository(db).summarize(
+        UsageSummaryRequest(
+          period: UsagePeriod.last30Days,
+          nowUtc: DateTime.now().toUtc(),
+        ),
+        pricing: pricing,
+      );
+      if (!mounted || generation != _usageLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _usageSummary = summary;
+      });
+    } on Object {
+      if (!mounted || generation != _usageLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _usageSummary = null;
+      });
+    } finally {
+      db.close();
+    }
   }
 
   Future<void> _handleSessionAction(SessionActionRequest request) async {
@@ -202,6 +299,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         await _openPath(payload ?? request.row.sourcePathForDisplay);
         return;
       case SessionRowAction.openTerminalResume:
+      case SessionRowAction.openTerminalFork:
         if (payload != null) {
           await _runDetachedCommand(payload);
         }
@@ -230,10 +328,47 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   }
 
   Future<void> _openPath(String path) async {
-    if (path.trim().isEmpty) {
+    final trimmed = path.trim();
+    if (trimmed.isEmpty) {
       return;
     }
-    await Process.start('explorer.exe', ['/select,', path]);
+    final targetType = await FileSystemEntity.type(trimmed);
+    if (targetType == FileSystemEntityType.directory) {
+      await Process.start('explorer.exe', [trimmed]);
+      return;
+    }
+    await Process.start('explorer.exe', ['/select,', trimmed]);
+  }
+
+  Future<void> _exportConversationMarkdown(
+    SessionRowViewModel row,
+    String markdown,
+  ) async {
+    final destination = await getSaveLocation(
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'Markdown', extensions: ['md', 'markdown']),
+      ],
+      suggestedName: _exportFileName(row),
+      confirmButtonText: 'Export',
+    );
+    if (destination == null) {
+      return;
+    }
+    await File(destination.path).writeAsString(markdown);
+  }
+
+  String _exportFileName(SessionRowViewModel row) {
+    final base = [
+      row.lastMessageAtUtc.toUtc().toIso8601String().replaceAll(':', '-'),
+      row.project.trim(),
+      row.title.trim(),
+      row.sessionId.trim(),
+    ].where((part) => part.isNotEmpty).join('-');
+    final sanitized = base
+        .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '-')
+        .replaceAll(RegExp(r'-+'), '-')
+        .trim();
+    return '${sanitized.isEmpty ? row.id : sanitized}.md';
   }
 
   Future<void> _runDetachedCommand(String command) async {
@@ -285,8 +420,11 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.settingsFile,
     required this.databaseFile,
     required this.onRefreshOperation,
+    this.onLoadCachedRows,
+    required this.deferInitialLoad,
     required this.onOpenSettings,
     required this.onSessionAction,
+    required this.onExportMarkdown,
     required this.onTableStateChanged,
   });
 
@@ -294,8 +432,11 @@ class _SessionsScreenLoader extends StatefulWidget {
   final File settingsFile;
   final File databaseFile;
   final SessionsRefreshOperationFactory onRefreshOperation;
+  final SessionCachedRowsLoader? onLoadCachedRows;
+  final FrameDeferredCallback deferInitialLoad;
   final VoidCallback onOpenSettings;
   final SessionActionCallback onSessionAction;
+  final SessionMarkdownExportCallback onExportMarkdown;
   final SessionTableStateChanged onTableStateChanged;
 
   @override
@@ -311,7 +452,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
   @override
   void initState() {
     super.initState();
-    _startCachedLoad();
+    widget.deferInitialLoad(_startCachedLoad);
   }
 
   @override
@@ -329,6 +470,9 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
   );
 
   void _startCachedLoad() {
+    if (!mounted) {
+      return;
+    }
     final generation = ++_cachedLoadGeneration;
     setState(() {
       _cachedRows = const [];
@@ -339,7 +483,9 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
 
   Future<void> _loadCachedRows(int generation) async {
     try {
-      final result = await _controller.loadCachedRowsInBackground(
+      final cachedRowsLoader =
+          widget.onLoadCachedRows ?? _controller.loadCachedRowsInBackground;
+      final result = await cachedRowsLoader(
         onProgress: (progress) {
           if (!mounted || generation != _cachedLoadGeneration) {
             return;
@@ -383,6 +529,12 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onTableStateChanged: widget.onTableStateChanged,
     );
   }
+}
+
+void _deferUntilAfterFirstFrame(VoidCallback callback) {
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    Future<void>.microtask(callback);
+  });
 }
 
 DatabaseFatalError _fatalErrorFromSnapshot(

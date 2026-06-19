@@ -10,6 +10,8 @@ import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
 import '../utils/profiling.dart';
 
+typedef SessionFileStatReader = Future<FileStat> Function(File file);
+
 enum SessionFileStatus {
   available,
   missing,
@@ -38,20 +40,25 @@ class SessionScanner {
     required this.pathMapper,
     this.maxConcurrentParses = 4,
     this.maxConcurrentDirectoryScans = 4,
+    this.maxConcurrentMetadataChecks = 32,
     this.useParserIsolates = true,
     this.onProgress,
     this.onSessionParsed,
     this.onParserPoolClosing,
+    SessionFileStatReader? fileStatReader,
     this.progressEveryWorkItems = 100,
     this.cacheModifiedTolerance = const Duration(seconds: 2),
   }) : assert(maxConcurrentParses > 0),
        assert(maxConcurrentDirectoryScans > 0),
+       assert(maxConcurrentMetadataChecks > 0),
+       fileStatReader = fileStatReader ?? _defaultFileStatReader,
        assert(!cacheModifiedTolerance.isNegative);
 
   final CodexSessionParser parser;
   final CodexPathMapper pathMapper;
   final int maxConcurrentParses;
   final int maxConcurrentDirectoryScans;
+  final int maxConcurrentMetadataChecks;
   final bool useParserIsolates;
   final void Function(ScanProgress progress)? onProgress;
   final Future<void> Function(
@@ -60,6 +67,7 @@ class SessionScanner {
   )?
   onSessionParsed;
   final Future<void> Function()? onParserPoolClosing;
+  final SessionFileStatReader fileStatReader;
   final int progressEveryWorkItems;
   final Duration cacheModifiedTolerance;
   bool _isScanning = false;
@@ -89,6 +97,7 @@ class SessionScanner {
         final cachedIndex = _CachedSessionIndex(request.cachedSessions);
         final cancellationToken = request.cancellationToken;
         final directoryQueue = _WorkQueue<_ScanDirectory>();
+        final metadataQueue = _AsyncQueue<_ScanCandidate>();
         final parseQueue = _AsyncQueue<_ScanCandidate>();
         _ParserIsolatePool? parserPool;
         Future<void>? parserPoolCloseFuture;
@@ -102,6 +111,7 @@ class SessionScanner {
 
         void stopQueues() {
           directoryQueue.cancel();
+          metadataQueue.cancel();
           parseQueue.cancel();
           unawaited(closeParserPool());
         }
@@ -154,12 +164,25 @@ class SessionScanner {
             for (var i = 0; i < maxConcurrentDirectoryScans; i++)
               _directoryWorker(
                 directoryQueue: directoryQueue,
-                parseQueue: parseQueue,
+                metadataQueue: metadataQueue,
                 progress: progress,
                 errors: errors,
                 fileStatuses: fileStatuses,
                 statusEvents: statusEvents,
                 candidates: candidates,
+                cancellationToken: cancellationToken,
+              ),
+          ];
+          final metadataWorkers = [
+            for (var i = 0; i < maxConcurrentMetadataChecks; i++)
+              _metadataWorker(
+                metadataQueue: metadataQueue,
+                parseQueue: parseQueue,
+                progress: progress,
+                fileStatuses: fileStatuses,
+                skippedFiles: skippedFiles,
+                cachedIndex: cachedIndex,
+                forcedReparse: forcedReparse,
                 cancellationToken: cancellationToken,
               ),
           ];
@@ -171,15 +194,14 @@ class SessionScanner {
                 parsed: parsed,
                 fileStatuses: fileStatuses,
                 statusEvents: statusEvents,
-                skippedFiles: skippedFiles,
-                cachedIndex: cachedIndex,
-                forcedReparse: forcedReparse,
                 parserPool: parserPool,
                 cancellationToken: cancellationToken,
               ),
           ];
 
           await Future.wait(directoryWorkers);
+          metadataQueue.close();
+          await Future.wait(metadataWorkers);
           parseQueue.close();
           await Future.wait(parserWorkers);
         } finally {
@@ -285,7 +307,7 @@ class SessionScanner {
 
   Future<void> _directoryWorker({
     required _WorkQueue<_ScanDirectory> directoryQueue,
-    required _AsyncQueue<_ScanCandidate> parseQueue,
+    required _AsyncQueue<_ScanCandidate> metadataQueue,
     required ScanProgress progress,
     required List<ScanFileError> errors,
     required List<ScannedFileStatus> fileStatuses,
@@ -305,7 +327,7 @@ class SessionScanner {
         await _scanDirectory(
           scanDirectory: scanDirectory,
           directoryQueue: directoryQueue,
-          parseQueue: parseQueue,
+          metadataQueue: metadataQueue,
           progress: progress,
           errors: errors,
           fileStatuses: fileStatuses,
@@ -322,7 +344,7 @@ class SessionScanner {
   Future<void> _scanDirectory({
     required _ScanDirectory scanDirectory,
     required _WorkQueue<_ScanDirectory> directoryQueue,
-    required _AsyncQueue<_ScanCandidate> parseQueue,
+    required _AsyncQueue<_ScanCandidate> metadataQueue,
     required ScanProgress progress,
     required List<ScanFileError> errors,
     required List<ScannedFileStatus> fileStatuses,
@@ -390,7 +412,7 @@ class SessionScanner {
           );
           candidates.add(candidate);
           try {
-            parseQueue.add(candidate);
+            metadataQueue.add(candidate);
           } on StateError {
             if (cancellationToken?.isCancellationRequested ?? false) {
               break;
@@ -424,23 +446,21 @@ class SessionScanner {
     });
   }
 
-  Future<void> _parserWorker({
+  Future<void> _metadataWorker({
+    required _AsyncQueue<_ScanCandidate> metadataQueue,
     required _AsyncQueue<_ScanCandidate> parseQueue,
     required ScanProgress progress,
-    required List<_ParsedCandidate> parsed,
     required List<ScannedFileStatus> fileStatuses,
-    required List<ScannedFileStatus> statusEvents,
     required List<ScannedFileStatus> skippedFiles,
     required _CachedSessionIndex cachedIndex,
     required ForceReparseSelection forcedReparse,
-    required _ParserIsolatePool? parserPool,
     required ScanCancellationToken? cancellationToken,
   }) async {
     while (true) {
       if (cancellationToken?.isCancellationRequested ?? false) {
         return;
       }
-      final candidate = await parseQueue.take();
+      final candidate = await metadataQueue.take();
       if (candidate == null) {
         return;
       }
@@ -465,6 +485,37 @@ class SessionScanner {
         skippedFiles.add(status);
         fileStatuses.add(status);
         continue;
+      }
+      try {
+        parseQueue.add(candidate);
+      } on StateError {
+        if (cancellationToken?.isCancellationRequested ?? false) {
+          return;
+        }
+        rethrow;
+      }
+    }
+  }
+
+  Future<void> _parserWorker({
+    required _AsyncQueue<_ScanCandidate> parseQueue,
+    required ScanProgress progress,
+    required List<_ParsedCandidate> parsed,
+    required List<ScannedFileStatus> fileStatuses,
+    required List<ScannedFileStatus> statusEvents,
+    required _ParserIsolatePool? parserPool,
+    required ScanCancellationToken? cancellationToken,
+  }) async {
+    while (true) {
+      if (cancellationToken?.isCancellationRequested ?? false) {
+        return;
+      }
+      final candidate = await parseQueue.take();
+      if (candidate == null) {
+        return;
+      }
+      if (cancellationToken?.isCancellationRequested ?? false) {
+        return;
       }
       progress.sessionsChanged++;
       _emitProgress(progress);
@@ -615,7 +666,7 @@ class SessionScanner {
 
       final FileStat stat;
       try {
-        stat = await file.stat();
+        stat = await fileStatReader(file);
       } on Object {
         return const _ParseDecision.parse();
       }
@@ -663,6 +714,8 @@ class SessionScanner {
     onProgress?.call(progress.snapshot());
   }
 }
+
+Future<FileStat> _defaultFileStatReader(File file) => file.stat();
 
 class SessionScanRequest {
   const SessionScanRequest({
