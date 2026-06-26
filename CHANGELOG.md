@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added subagent-aware session grouping, main/subagent usage rollups, and origin breakdowns in Usage statistics.
 - Added a persisted `ui.motion` setting with `system`, `reduced`, and `normal` choices exposed in Settings.
 - Added an ignored private-corpus benchmark mode for realistic aggregate session scan timing.
 - Added persisted Sessions table column widths, multi-column sorting, right-click sort options, per-cell screen-reader semantics, and minute-by-minute relative last-message dates.
@@ -15,6 +16,7 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- Hid injected AGENTS.md instruction blocks from conversation messages, collapsed duplicated echoed user prompts, and show missing per-message token counts as unknown instead of `0 tokens`.
 - Made startup cached session loading lighter and non-blocking by streaming newest-first cached rows from a background isolate, skipping list-level pricing work, batching tag reads, and keeping richer cost/token detail loading lazy per selected session.
 - Moved the Sessions visible count into the header, added a cached-load progress line with a compact spinner and total count, and auto-detected project names from each session working directory while preserving manual project overrides.
 - Backfilled auto-detected project names for older cached sessions, removed placeholder values from Sessions table cells, animated active load/scan status, and started a scan automatically after cached startup rows finish loading.
