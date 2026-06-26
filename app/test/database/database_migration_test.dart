@@ -56,7 +56,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 5);
+    expect(versionRows.length, 7);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -77,7 +77,21 @@ void main() {
     expect(versionRows[4]['filename'], '005_scan_run_status.sql');
     expect(versionRows[4]['checksum_length'], greaterThan(20));
     expect(versionRows[4]['success'], 1);
+    expect(versionRows[5]['version'], 6);
+    expect(versionRows[5]['filename'], '006_session_origin.sql');
+    expect(versionRows[5]['checksum_length'], greaterThan(20));
+    expect(versionRows[5]['success'], 1);
+    expect(versionRows[6]['version'], 7);
+    expect(versionRows[6]['filename'], '007_session_thread_name.sql');
+    expect(versionRows[6]['checksum_length'], greaterThan(20));
+    expect(versionRows[6]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
+    expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
+    expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
+    expect(_columnExists(db, 'sessions', 'parent_thread_id'), isTrue);
+    expect(_columnExists(db, 'sessions', 'agent_nickname'), isTrue);
+    expect(_columnExists(db, 'sessions', 'agent_role'), isTrue);
+    expect(_columnExists(db, 'sessions', 'subagent_depth'), isTrue);
   });
 
   test(
@@ -101,7 +115,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 5);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 7);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',

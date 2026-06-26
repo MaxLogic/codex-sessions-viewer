@@ -152,11 +152,32 @@ void main() {
 
     expect(result.isSuccess, isTrue);
     expect(result.session!.title, 'Renamed session');
+    expect(result.session!.threadName, 'Renamed session');
     expect(result.session!.summary, isNull);
     expect(
       result.session!.messages.single.firstLine,
       '# AGENTS.md instructions',
     );
+  });
+
+  test('extracts subagent origin metadata from JSONL session_meta', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}subagent.jsonl');
+    await source.writeAsString('''
+{"timestamp":"2026-06-18T22:06:02Z","type":"session_meta","payload":{"id":"child-session","parent_thread_id":"parent-session","cwd":"F:\\\\projects\\\\OEC\\\\_git\\\\TE5","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"Russell","agent_role":"default"}}},"thread_source":"subagent","agent_nickname":"Russell","agent_role":"default"}}
+{"timestamp":"2026-06-18T22:06:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Subagent report."}]}}
+''');
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    final session = result.session!;
+    expect(session.threadSource, 'subagent');
+    expect(session.parentThreadId, 'parent-session');
+    expect(session.agentNickname, 'Russell');
+    expect(session.agentRole, 'default');
+    expect(session.subagentDepth, 1);
   });
 
   test(
@@ -181,6 +202,74 @@ void main() {
         messages.single.contentPlain,
         'Please explain this environment_context tag.',
       );
+    },
+  );
+
+  test(
+    'hides injected AGENTS instructions and deduplicates echoed user messages',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+      addTearDown(() => temp.delete(recursive: true));
+      final source = File('${temp.path}${Platform.pathSeparator}agents.jsonl');
+      await source.writeAsString('''
+{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"agents-session","cwd":"F:\\\\repo"}}
+{"timestamp":"2026-06-18T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for F:\\\\repo\\n\\n<INSTRUCTIONS>\\nPreserve secrets.\\n</INSTRUCTIONS>"}]}}
+{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please explain the parser output."}]}}
+{"timestamp":"2026-06-18T10:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"Please explain the parser output."}}
+{"timestamp":"2026-06-18T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Parser explanation."}]}}
+''');
+
+      final result = await parser.parseFile(source);
+
+      expect(result.isSuccess, isTrue);
+      final messages = result.session!.messages;
+      expect(messages.map((message) => message.contentPlain), [
+        'Please explain the parser output.',
+        'Parser explanation.',
+      ]);
+      expect(messages.first.authorType, CodexMessageAuthorType.user);
+      expect(messages.last.authorType, CodexMessageAuthorType.assistant);
+    },
+  );
+
+  test(
+    'shows encrypted reasoning as unavailable and keeps message indexes unique',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+      addTearDown(() => temp.delete(recursive: true));
+      final source = File(
+        '${temp.path}${Platform.pathSeparator}reasoning.jsonl',
+      );
+      await source.writeAsString('''
+{"timestamp":"2026-06-18T10:00:00Z","type":"session_meta","payload":{"id":"reasoning-session","cwd":"F:\\\\repo"}}
+{"timestamp":"2026-06-18T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Find the bug."}}
+{"timestamp":"2026-06-18T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Find the bug."}]}}
+{"timestamp":"2026-06-18T10:00:03Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"opaque"}}
+{"timestamp":"2026-06-18T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Found it."}]}}
+''');
+
+      final result = await parser.parseFile(source);
+
+      expect(result.isSuccess, isTrue);
+      final messages = result.session!.messages;
+      expect(messages.map((message) => message.contentPlain), [
+        'Find the bug.',
+        'Reasoning content is encrypted and cannot be displayed.',
+        'Found it.',
+      ]);
+      expect(messages.map((message) => message.index), [0, 1, 2]);
+      expect(messages.map((message) => message.rawType), [
+        'message',
+        'reasoning',
+        'message',
+      ]);
+      expect(messages.map((message) => message.authorType), [
+        CodexMessageAuthorType.user,
+        CodexMessageAuthorType.reasoning,
+        CodexMessageAuthorType.assistant,
+      ]);
+      expect(messages[1].hasToolCalls, isFalse);
+      expect(result.session!.warnings, isEmpty);
     },
   );
 

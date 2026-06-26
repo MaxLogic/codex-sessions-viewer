@@ -303,6 +303,7 @@ String _authorLabel(CodexMessageAuthorType authorType) {
     CodexMessageAuthorType.assistant => 'Assistant',
     CodexMessageAuthorType.system => 'System',
     CodexMessageAuthorType.tool => 'Tool',
+    CodexMessageAuthorType.reasoning => 'Reasoning',
     CodexMessageAuthorType.unknown => 'Unknown',
   };
 }

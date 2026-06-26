@@ -174,6 +174,11 @@ class _UsageScreenState extends State<UsageScreen>
                                   valueLabel: 'tokens',
                                 ),
                                 _UsageChartSpec(
+                                  title: 'Usage by origin',
+                                  rows: summary.byOrigin,
+                                  valueLabel: 'tokens',
+                                ),
+                                _UsageChartSpec(
                                   title: 'Usage by archived state',
                                   rows: summary.byArchiveState,
                                   valueLabel: 'tokens',
@@ -310,7 +315,7 @@ class _UsageChartSection extends StatelessWidget {
         for (final row in visibleRows) Text(spec.rowSummary(row)),
         const SizedBox(height: 12),
         Semantics(
-          label: 'Usage chart',
+          label: '${spec.title} chart',
           container: true,
           child: ExcludeSemantics(
             child: Column(
@@ -327,7 +332,10 @@ class _UsageChartSection extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 16),
-        _BreakdownTable(rows: visibleRows),
+        _BreakdownTable(
+          rows: visibleRows,
+          semanticLabel: '${spec.title} table equivalent',
+        ),
       ],
     );
   }
@@ -400,14 +408,15 @@ class _UsageBarRow extends StatelessWidget {
 }
 
 class _BreakdownTable extends StatelessWidget {
-  const _BreakdownTable({required this.rows});
+  const _BreakdownTable({required this.rows, required this.semanticLabel});
 
   final List<UsageBreakdownRow> rows;
+  final String semanticLabel;
 
   @override
   Widget build(BuildContext context) {
     return Semantics(
-      label: 'Usage table equivalent',
+      label: semanticLabel,
       container: true,
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
@@ -511,7 +520,7 @@ class _TopSessionSection extends StatelessWidget {
         Text(_topSessionsSummary(title, rows, summaryValue)),
         const SizedBox(height: 12),
         Semantics(
-          label: 'Usage chart',
+          label: '$title chart',
           container: true,
           child: ExcludeSemantics(
             child: Column(
@@ -520,7 +529,7 @@ class _TopSessionSection extends StatelessWidget {
                 for (final session in rows.take(6))
                   Padding(
                     padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: Text('${session.title}, ${summaryValue(session)}'),
+                    child: Text(_topSessionRowSummary(session, summaryValue)),
                   ),
               ],
             ),
@@ -528,13 +537,14 @@ class _TopSessionSection extends StatelessWidget {
         ),
         const SizedBox(height: 16),
         Semantics(
-          label: 'Usage table equivalent',
+          label: '$title table equivalent',
           container: true,
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: DataTable(
               columns: const [
                 DataColumn(label: Text('Title')),
+                DataColumn(label: Text('Origin')),
                 DataColumn(label: Text('Messages')),
                 DataColumn(label: Text('Tokens')),
                 DataColumn(label: Text('Cost')),
@@ -544,6 +554,7 @@ class _TopSessionSection extends StatelessWidget {
                   DataRow(
                     cells: [
                       DataCell(Text(session.title)),
+                      DataCell(Text(session.originLabel)),
                       DataCell(Text(_formatInt(session.messageCount))),
                       DataCell(Text(_formatInt(session.totalTokens))),
                       DataCell(
@@ -668,9 +679,16 @@ String _topSessionsSummary(
   }
   final details = rows
       .take(6)
-      .map((row) => '${row.title}, ${summaryValue(row)}')
+      .map((row) => _topSessionRowSummary(row, summaryValue))
       .join('; ');
   return '$title: $details.';
+}
+
+String _topSessionRowSummary(
+  UsageTopSession row,
+  String Function(UsageTopSession session) summaryValue,
+) {
+  return '${row.title}, Origin: ${row.originLabel}, ${summaryValue(row)}';
 }
 
 String _sessionText(int count) => count == 1 ? '1 session' : '$count sessions';
@@ -711,6 +729,7 @@ final _emptySummary = UsageSummary(
   byModel: const [],
   byProject: const [],
   byPlatform: const [],
+  byOrigin: const [],
   byArchiveState: const [],
   topSessionsByTokens: const [],
   topSessionsByMessageCount: const [],

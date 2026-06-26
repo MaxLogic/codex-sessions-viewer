@@ -82,7 +82,7 @@ void main() {
     );
     expect(
       find.bySemanticsLabel(
-        'Tool output collapsed, 3 lines. Press Enter to expand.',
+        'Tool output collapsed, 3 lines. Use the Expand tool output button to show it.',
       ),
       findsOneWidget,
     );
@@ -167,6 +167,34 @@ void main() {
 
     expect(copied.single, contains('Full message body'));
     expect(find.text('Message Markdown copied.'), findsOneWidget);
+  });
+
+  testWidgets('message index reports unknown tokens instead of zero', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'missing-usage',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Prompt without message usage',
+                body: 'Prompt without message usage',
+                tokenCount: null,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining('tokens unknown'), findsOneWidget);
+    expect(find.textContaining('0 tokens'), findsNothing);
+    expect(find.bySemanticsLabel('#1 User, tokens unknown'), findsOneWidget);
   });
 
   testWidgets('message cards expose readable per-message semantics', (

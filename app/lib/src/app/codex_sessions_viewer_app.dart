@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import '../config/app_settings.dart';
 import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
+import '../database/project_tag_state.dart';
 import '../app/runtime_session_controller.dart';
 import '../pricing/pricing_repository.dart';
 import '../ui/app_shell.dart';
@@ -295,6 +296,9 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           await Clipboard.setData(ClipboardData(text: payload));
         }
         return;
+      case SessionRowAction.editTags:
+        await _editSessionTags(request.row);
+        return;
       case SessionRowAction.openPath:
         await _openPath(payload ?? request.row.sourcePathForDisplay);
         return;
@@ -325,6 +329,53 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         ).refresh();
         return;
     }
+  }
+
+  Future<void> _editSessionTags(SessionRowViewModel row) async {
+    final controller = TextEditingController(text: row.tags.join(', '));
+    final tags = await showDialog<List<String>>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit tags'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Tags',
+            helperText: 'Separate tags with commas.',
+          ),
+          onSubmitted: (_) =>
+              Navigator.of(context).pop(_parseTagInput(controller.text)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(context).pop(_parseTagInput(controller.text)),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (tags == null) {
+      return;
+    }
+    final db = openFileBackedDatabase(widget.databaseFile);
+    try {
+      ProjectTagStateStore(db).setSessionTags(row.id, tags);
+    } finally {
+      db.close();
+    }
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Session tags updated.')));
   }
 
   Future<void> _openPath(String path) async {
@@ -523,11 +574,19 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       autoRefreshToken: _autoRefreshToken,
       onRefreshOperation: widget.onRefreshOperation,
       onOpenSettings: widget.onOpenSettings,
-      onSessionAction: widget.onSessionAction,
+      onSessionAction: _handleSessionAction,
       onLoadSessionDetail: _controller.loadSessionDetail,
       initialTableState: widget.settings.ui.sessionTable,
       onTableStateChanged: widget.onTableStateChanged,
     );
+  }
+
+  Future<void> _handleSessionAction(SessionActionRequest request) async {
+    await widget.onSessionAction(request);
+    if (!mounted || request.action != SessionRowAction.editTags) {
+      return;
+    }
+    _startCachedLoad();
   }
 }
 
@@ -535,6 +594,14 @@ void _deferUntilAfterFirstFrame(VoidCallback callback) {
   WidgetsBinding.instance.addPostFrameCallback((_) {
     Future<void>.microtask(callback);
   });
+}
+
+List<String> _parseTagInput(String value) {
+  final tags = {
+    for (final tag in value.split(',').map((tag) => tag.trim()))
+      if (tag.isNotEmpty) tag,
+  }.toList()..sort();
+  return tags;
 }
 
 DatabaseFatalError _fatalErrorFromSnapshot(

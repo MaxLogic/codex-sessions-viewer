@@ -124,6 +124,7 @@ UsageSummary _summary({
     byModel: const [],
     byProject: const [],
     byPlatform: const [],
+    byOrigin: const [],
     byArchiveState: const [],
     topSessionsByTokens: [
       UsageTopSession(
@@ -133,6 +134,7 @@ UsageSummary _summary({
         totalTokens: totalTokens,
         estimatedCostText: '0',
         costUnknown: false,
+        originLabel: 'User',
       ),
     ],
     topSessionsByMessageCount: const [],

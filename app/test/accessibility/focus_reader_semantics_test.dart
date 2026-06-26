@@ -36,7 +36,7 @@ void main() {
         ),
       );
 
-      await tester.tap(find.widgetWithText(OutlinedButton, 'Next'));
+      await tester.tap(find.widgetWithText(OutlinedButton, 'Next (N)'));
       await tester.pumpAndSettle();
 
       final announcement = tester.getSemantics(
@@ -51,4 +51,39 @@ void main() {
       expect(readable.label, isNot(contains('First prompt body')));
     },
   );
+
+  testWidgets('collapsed tool output semantics match the visible shortcut', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: FocusReaderView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'tool',
+                number: 1,
+                author: ConversationAuthor.tool,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Tool output',
+                body: 'line 1\nline 2\nline 3',
+                tokenCount: null,
+                hasToolOutput: true,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    final readable = tester.getSemantics(
+      find.byKey(const Key('focus-reader-message')),
+    );
+    expect(readable.label, contains('Press X to expand'));
+    expect(readable.label, isNot(contains('Press Enter')));
+    expect(
+      find.widgetWithText(OutlinedButton, 'Expand tool output (X)'),
+      findsOneWidget,
+    );
+  });
 }

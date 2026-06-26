@@ -116,7 +116,7 @@ class UsageSummaryRepository {
       select
         id, source_type, started_at_utc, title, message_count, input_tokens,
         output_tokens, cached_input_tokens, total_tokens, model_primary,
-        project_id, project_name_snapshot, is_archived
+        project_id, project_name_snapshot, is_archived, thread_source
       from sessions
       where ${where.join(' and ')}
       order by started_at_utc, id
@@ -235,6 +235,21 @@ UsageCostEstimate estimateUsageCost({
   );
 }
 
+String? sumEstimatedCostTexts(Iterable<String?> values) {
+  var total = _DecimalAmount.zero;
+  for (final value in values) {
+    if (value == null) {
+      return null;
+    }
+    try {
+      total += _DecimalAmount.parse(value);
+    } on FormatException {
+      return null;
+    }
+  }
+  return total.toDecimalString();
+}
+
 class UsageSummary {
   const UsageSummary({
     required this.period,
@@ -255,6 +270,7 @@ class UsageSummary {
     required this.byModel,
     required this.byProject,
     required this.byPlatform,
+    required this.byOrigin,
     required this.byArchiveState,
     required this.topSessionsByTokens,
     required this.topSessionsByMessageCount,
@@ -279,6 +295,7 @@ class UsageSummary {
   final List<UsageBreakdownRow> byModel;
   final List<UsageBreakdownRow> byProject;
   final List<UsageBreakdownRow> byPlatform;
+  final List<UsageBreakdownRow> byOrigin;
   final List<UsageBreakdownRow> byArchiveState;
   final List<UsageTopSession> topSessionsByTokens;
   final List<UsageTopSession> topSessionsByMessageCount;
@@ -320,6 +337,7 @@ class UsageTopSession {
     required this.totalTokens,
     required this.estimatedCostText,
     required this.costUnknown,
+    required this.originLabel,
   });
 
   final String sessionId;
@@ -328,6 +346,7 @@ class UsageTopSession {
   final int totalTokens;
   final String? estimatedCostText;
   final bool costUnknown;
+  final String originLabel;
 }
 
 UsageSummary _summarizeSessions(
@@ -351,6 +370,7 @@ UsageSummary _summarizeSessions(
     pricing,
     (session) => session.sourceType,
   );
+  final byOrigin = _breakdown(sessions, pricing, _originLabel);
   return UsageSummary(
     period: range,
     totalSessions: aggregate.sessionCount,
@@ -382,6 +402,7 @@ UsageSummary _summarizeSessions(
     byModel: byModel,
     byProject: byProject,
     byPlatform: byPlatform,
+    byOrigin: byOrigin,
     byArchiveState: _breakdown(
       sessions,
       pricing,
@@ -567,6 +588,7 @@ List<UsageTopSession> _topSessions(
           totalTokens: session.totalTokens ?? 0,
           estimatedCostText: cost?.toDecimalString(),
           costUnknown: cost == null,
+          originLabel: _originLabel(session),
         );
       })
       .toList(growable: false);
@@ -605,9 +627,19 @@ List<UsageTopSession> _topSessionsByCost(
           totalTokens: row.session.totalTokens ?? 0,
           estimatedCostText: row.cost?.toDecimalString(),
           costUnknown: row.cost == null,
+          originLabel: _originLabel(row.session),
         );
       })
       .toList(growable: false);
+}
+
+String _originLabel(_UsageSession session) {
+  final source = session.threadSource?.trim().toLowerCase();
+  return switch (source) {
+    'subagent' => 'Subagent',
+    null || '' || 'user' => 'User',
+    _ => 'Unknown',
+  };
 }
 
 String? _mostActive(List<UsageBreakdownRow> rows) =>
@@ -692,6 +724,7 @@ class _UsageSession {
     required this.projectId,
     required this.projectName,
     required this.isArchived,
+    required this.threadSource,
   });
 
   factory _UsageSession.fromRow(Row row) {
@@ -709,6 +742,7 @@ class _UsageSession {
       projectId: row['project_id'] as int?,
       projectName: row['project_name_snapshot'] as String?,
       isArchived: _rowInt(row['is_archived']) == 1,
+      threadSource: row['thread_source'] as String?,
     );
   }
 
@@ -725,6 +759,7 @@ class _UsageSession {
   final int? projectId;
   final String? projectName;
   final bool isArchived;
+  final String? threadSource;
 }
 
 class _UsageAggregate {

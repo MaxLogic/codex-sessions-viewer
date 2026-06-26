@@ -17,6 +17,9 @@ void main() {
     db.execute(
       File('../sql/migration/003_project_override.sql').readAsStringSync(),
     );
+    db.execute(
+      File('../sql/migration/006_session_origin.sql').readAsStringSync(),
+    );
     repository = UsageSummaryRepository(db);
   });
 
@@ -106,6 +109,79 @@ void main() {
     expect(summary.topSessionsByEstimatedCost.first.sessionId, 'beta');
   });
 
+  test('breaks down origin without double-counting raw totals', () {
+    _insertSession(
+      db,
+      id: 'main',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12, 8),
+      title: 'Main',
+      messageCount: 4,
+      inputTokens: 50,
+      outputTokens: 30,
+      cachedInputTokens: 20,
+      totalTokens: 100,
+      modelPrimary: 'openai/model',
+      projectName: 'Viewer',
+      threadSource: 'user',
+    );
+    _insertSession(
+      db,
+      id: 'subagent',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12, 9),
+      title: 'Subagent',
+      messageCount: 2,
+      inputTokens: 30,
+      outputTokens: 15,
+      cachedInputTokens: 5,
+      totalTokens: 50,
+      modelPrimary: 'openai/model',
+      projectName: 'Viewer',
+      threadSource: 'subagent',
+    );
+    _insertSession(
+      db,
+      id: 'unknown-origin',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12, 10),
+      title: 'Unknown origin',
+      messageCount: 1,
+      inputTokens: 10,
+      outputTokens: 10,
+      cachedInputTokens: 5,
+      totalTokens: 25,
+      modelPrimary: 'openai/model',
+      projectName: 'Viewer',
+      threadSource: 'custom-agent',
+    );
+
+    final summary = repository.summarize(
+      UsageSummaryRequest(
+        period: UsagePeriod.today,
+        nowUtc: DateTime.utc(2026, 6, 12, 12),
+      ),
+      pricing: const UsagePricingCatalog({
+        'openai/model': UsageModelPricing(
+          promptPricePerToken: '0.01',
+          completionPricePerToken: '0.02',
+          cachedInputPricePerToken: '0.005',
+        ),
+      }),
+    );
+
+    expect(summary.totalSessions, 3);
+    expect(summary.totalTokens, 175);
+    expect(summary.byProject.single.totalTokens, 175);
+    expect(
+      summary.byOrigin.map(
+        (row) => (row.key, row.sessionCount, row.totalTokens),
+      ),
+      [('User', 1, 100), ('Subagent', 1, 50), ('Unknown', 1, 25)],
+    );
+    expect(summary.topSessionsByTokens[1].originLabel, 'Subagent');
+  });
+
   test(
     'uses exact decimal arithmetic and reports unknown incomplete pricing',
     () {
@@ -168,6 +244,19 @@ void main() {
       expect(withUnknown.estimatedCostDisplay, 'Cost unknown');
     },
   );
+
+  test('aggregates decimal costs without double rounding', () {
+    expect(
+      sumEstimatedCostTexts(const [
+        '0.000000000000000014',
+        '0.000000000000000006',
+        '1.25',
+      ]),
+      '1.25000000000000002',
+    );
+    expect(sumEstimatedCostTexts(const ['0.1', null]), isNull);
+    expect(sumEstimatedCostTexts(const ['0.1', 'not-a-decimal']), isNull);
+  });
 
   test('estimates a single session cost from cached model pricing', () {
     final estimate = estimateUsageCost(
@@ -328,6 +417,7 @@ void _insertSession(
   int? projectId,
   String? projectName,
   bool isArchived = false,
+  String? threadSource,
 }) {
   final now = DateTime.utc(2026, 6, 12, 12).toIso8601String();
   db.execute(
@@ -337,8 +427,9 @@ void _insertSession(
       parse_status, scan_status, started_at_utc, last_message_at_utc,
       title, message_count, input_tokens, output_tokens, cached_input_tokens,
       total_tokens, model_primary, models_used, project_id,
-      project_name_snapshot, is_archived, created_at_utc, updated_at_utc
-    ) values (?, ?, ?, ?, ?, 'available', 'available', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      project_name_snapshot, is_archived, thread_source, created_at_utc,
+      updated_at_utc
+    ) values (?, ?, ?, ?, ?, 'available', 'available', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''',
     [
       id,
@@ -359,6 +450,7 @@ void _insertSession(
       projectId,
       projectName,
       isArchived ? 1 : 0,
+      threadSource,
       now,
       now,
     ],

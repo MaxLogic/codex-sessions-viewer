@@ -1,4 +1,4 @@
-enum ConversationAuthor { user, assistant, tool }
+enum ConversationAuthor { user, assistant, tool, reasoning, system }
 
 class ConversationMessageViewModel {
   const ConversationMessageViewModel({
@@ -20,7 +20,7 @@ class ConversationMessageViewModel {
   final DateTime createdAtUtc;
   final String preview;
   final String body;
-  final int tokenCount;
+  final int? tokenCount;
   final bool hasError;
   final bool hasToolOutput;
   final bool isLong;
@@ -29,7 +29,14 @@ class ConversationMessageViewModel {
     ConversationAuthor.user => 'User',
     ConversationAuthor.assistant => 'Assistant',
     ConversationAuthor.tool => 'Tool',
+    ConversationAuthor.reasoning => 'Reasoning',
+    ConversationAuthor.system => 'System',
   };
+
+  String get tokenLabel {
+    final count = tokenCount;
+    return count == null ? 'tokens unknown' : '$count tokens';
+  }
 
   int get lineCount => body.isEmpty ? 0 : body.split('\n').length;
 }

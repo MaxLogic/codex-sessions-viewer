@@ -408,6 +408,9 @@ void main() {
         find.widgetWithText(OutlinedButton, 'Copy terminal launch command'),
         findsOneWidget,
       );
+      expect(find.text('Plain resume command:'), findsNothing);
+      await tester.tap(find.text('Show command preview'));
+      await tester.pumpAndSettle();
       expect(find.text('Plain resume command:'), findsOneWidget);
     },
   );
@@ -530,9 +533,9 @@ void main() {
 
     await tester.tap(find.text('Parser cache').first);
     await tester.pumpAndSettle();
-    await tester.tap(
-      find.widgetWithText(OutlinedButton, 'Copy conversation Markdown'),
-    );
+    await tester.tap(find.text('More'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Copy conversation Markdown'));
     await tester.pumpAndSettle();
 
     expect(copied.single, contains('# Parser cache'));

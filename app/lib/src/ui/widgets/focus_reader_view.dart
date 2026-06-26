@@ -4,9 +4,10 @@ import 'package:flutter/services.dart';
 import '../models/conversation_message_view_model.dart';
 
 class FocusReaderView extends StatefulWidget {
-  const FocusReaderView({super.key, required this.messages});
+  const FocusReaderView({super.key, required this.messages, this.onCopyText});
 
   final List<ConversationMessageViewModel> messages;
+  final FocusReaderCopyCallback? onCopyText;
 
   @override
   State<FocusReaderView> createState() => _FocusReaderViewState();
@@ -63,14 +64,10 @@ class _FocusReaderViewState extends State<FocusReaderView> {
               onPreviousError: () => _moveToPrevious(_isToolOrError),
               onNextError: () => _moveToNext(_isToolOrError),
               onToggleToolOutput: message.hasToolOutput
-                  ? () {
-                      setState(() {
-                        if (!_expanded.add(message.id)) {
-                          _expanded.remove(message.id);
-                        }
-                      });
-                    }
+                  ? () => _toggleExpanded(message)
                   : null,
+              onCopyMarkdown: () => _copyMarkdown(message),
+              onCopyText: () => _copyText(message),
               expanded: _expanded.contains(message.id),
             ),
           ],
@@ -84,6 +81,14 @@ class _FocusReaderViewState extends State<FocusReaderView> {
       return KeyEventResult.ignored;
     }
     final shift = HardwareKeyboard.instance.isShiftPressed;
+    if (event.logicalKey == LogicalKeyboardKey.keyP) {
+      _moveRelative(-1);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyN) {
+      _moveRelative(1);
+      return KeyEventResult.handled;
+    }
     if (event.logicalKey == LogicalKeyboardKey.keyU) {
       shift ? _moveToPrevious(_isUser) : _moveToNext(_isUser);
       return KeyEventResult.handled;
@@ -100,7 +105,51 @@ class _FocusReaderViewState extends State<FocusReaderView> {
       shift ? _moveToPrevious(_isToolOrError) : _moveToNext(_isToolOrError);
       return KeyEventResult.handled;
     }
+    final message = widget.messages[_selectedIndex];
+    if (event.logicalKey == LogicalKeyboardKey.keyX && message.hasToolOutput) {
+      _toggleExpanded(message);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyM) {
+      _copyMarkdown(message);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyC) {
+      _copyText(message);
+      return KeyEventResult.handled;
+    }
     return KeyEventResult.ignored;
+  }
+
+  void _toggleExpanded(ConversationMessageViewModel message) {
+    setState(() {
+      if (!_expanded.add(message.id)) {
+        _expanded.remove(message.id);
+      }
+    });
+  }
+
+  Future<void> _copyMarkdown(ConversationMessageViewModel message) async {
+    await _copy(_messageMarkdown(message), 'Message Markdown copied.');
+  }
+
+  Future<void> _copyText(ConversationMessageViewModel message) async {
+    await _copy(message.body, 'Message text copied.');
+  }
+
+  Future<void> _copy(String text, String snackbarText) async {
+    final callback = widget.onCopyText;
+    if (callback != null) {
+      await callback(text);
+    } else {
+      await Clipboard.setData(ClipboardData(text: text));
+    }
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(snackbarText)));
   }
 
   void _moveRelative(int delta) {
@@ -133,6 +182,8 @@ class _FocusReaderViewState extends State<FocusReaderView> {
   }
 }
 
+typedef FocusReaderCopyCallback = Future<void> Function(String text);
+
 class _Metadata extends StatelessWidget {
   const _Metadata({required this.message});
 
@@ -146,7 +197,7 @@ class _Metadata extends StatelessWidget {
       children: [
         Text('Author: ${message.authorLabel}'),
         Text('Time: ${message.createdAtUtc.shortDateTime}'),
-        Text('Tokens: ${message.tokenCount}'),
+        Text('Tokens: ${message.tokenCount ?? 'unknown'}'),
       ],
     );
   }
@@ -164,7 +215,7 @@ class _MessageBody extends StatelessWidget {
       return Semantics(
         key: const Key('focus-reader-message'),
         label:
-            'Tool output collapsed, ${message.lineCount} lines. Press Enter to expand.',
+            'Tool output collapsed, ${message.lineCount} lines. Press X to expand.',
         button: true,
         child: ExcludeSemantics(
           child: Align(
@@ -195,6 +246,8 @@ class _NavigationButtons extends StatelessWidget {
     required this.onPreviousError,
     required this.onNextError,
     required this.onToggleToolOutput,
+    required this.onCopyMarkdown,
+    required this.onCopyText,
     required this.expanded,
   });
 
@@ -209,37 +262,93 @@ class _NavigationButtons extends StatelessWidget {
   final VoidCallback onPreviousError;
   final VoidCallback onNextError;
   final VoidCallback? onToggleToolOutput;
+  final VoidCallback onCopyMarkdown;
+  final VoidCallback onCopyText;
   final bool expanded;
 
   @override
   Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _button('Previous', onPrevious),
-        _button('Next', onNext),
-        _button('Previous user', onPreviousUser),
-        _button('Next user', onNextUser),
-        _button('Previous assistant', onPreviousAssistant),
-        _button('Next assistant', onNextAssistant),
-        _button('Previous tool', onPreviousTool),
-        _button('Next tool', onNextTool),
-        _button('Previous error', onPreviousError),
-        _button('Next error', onNextError),
-        if (onToggleToolOutput != null)
-          _button(
-            expanded ? 'Collapse tool output' : 'Expand tool output',
-            onToggleToolOutput!,
+        _buttonRow([
+          _FocusReaderAction('Previous', 'P', onPrevious),
+          _FocusReaderAction('Next', 'N', onNext),
+        ]),
+        const SizedBox(height: 8),
+        _buttonRow([
+          _FocusReaderAction('Previous user', 'Shift+U', onPreviousUser),
+          _FocusReaderAction('Next user', 'U', onNextUser),
+          _FocusReaderAction(
+            'Previous assistant',
+            'Shift+A',
+            onPreviousAssistant,
           ),
-        _button('Copy Markdown', () {}),
-        _button('Copy text', () {}),
+          _FocusReaderAction('Next assistant', 'A', onNextAssistant),
+        ]),
+        const SizedBox(height: 8),
+        _buttonRow([
+          _FocusReaderAction('Previous tool', 'Shift+T', onPreviousTool),
+          _FocusReaderAction('Next tool', 'T', onNextTool),
+          _FocusReaderAction('Previous error', 'Shift+E', onPreviousError),
+          _FocusReaderAction('Next error', 'E', onNextError),
+        ]),
+        const SizedBox(height: 8),
+        _buttonRow(
+          [
+            if (onToggleToolOutput != null)
+              _FocusReaderAction(
+                expanded ? 'Collapse tool output' : 'Expand tool output',
+                'X',
+                onToggleToolOutput!,
+              )
+            else
+              null,
+            _FocusReaderAction('Copy Markdown', 'M', onCopyMarkdown),
+            _FocusReaderAction('Copy text', 'C', onCopyText),
+          ].whereType<_FocusReaderAction>().toList(growable: false),
+        ),
       ],
     );
   }
 
-  Widget _button(String label, VoidCallback onPressed) =>
-      OutlinedButton(onPressed: onPressed, child: Text(label));
+  Widget _buttonRow(List<_FocusReaderAction> actions) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        for (final action in actions)
+          SizedBox(
+            width: 228,
+            child: OutlinedButton(
+              onPressed: action.onPressed,
+              child: Text(
+                '${action.label} (${action.shortcut})',
+                textAlign: TextAlign.center,
+                softWrap: true,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _FocusReaderAction {
+  const _FocusReaderAction(this.label, this.shortcut, this.onPressed);
+
+  final String label;
+  final String shortcut;
+  final VoidCallback onPressed;
+}
+
+String _messageMarkdown(ConversationMessageViewModel message) {
+  return [
+    '### Message ${message.number} - ${message.authorLabel}',
+    '',
+    message.body,
+    '',
+  ].join('\n');
 }
 
 bool _isUser(ConversationMessageViewModel message) =>

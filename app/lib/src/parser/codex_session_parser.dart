@@ -7,7 +7,14 @@ import '../utils/injected_context_filter.dart';
 
 enum CodexSessionSourceType { windows, wsl, unknown }
 
-enum CodexMessageAuthorType { user, assistant, system, tool, unknown }
+enum CodexMessageAuthorType {
+  user,
+  assistant,
+  system,
+  tool,
+  reasoning,
+  unknown,
+}
 
 class CodexSessionParser {
   CodexSessionParser({
@@ -137,6 +144,14 @@ class CodexSessionParser {
           .convert(utf8.encode('$sourcePath\n$rawText'))
           .toString(),
       sessionId: _string(json['session_id']),
+      threadName: _cleanThreadName(
+        _string(json['thread_name']) ?? _string(json['session_name']),
+      ),
+      threadSource: _string(json['thread_source']),
+      parentThreadId: _string(json['parent_thread_id']),
+      agentNickname: _string(json['agent_nickname']),
+      agentRole: _string(json['agent_role']),
+      subagentDepth: _int(json['subagent_depth']),
       sourceType: sourceType,
       sourcePath: sourcePath,
       sourceFileUncPath: _string(json['source_file_unc_path']),
@@ -172,6 +187,12 @@ class CodexSessionParser {
     String? title;
     String? summary;
     String? sessionId;
+    String? threadName;
+    String? threadSource;
+    String? parentThreadId;
+    String? agentNickname;
+    String? agentRole;
+    int? subagentDepth;
     DateTime? startedAtUtc;
     DateTime? lastMessageAtUtc;
     final messages = <CodexParsedMessage>[];
@@ -189,6 +210,31 @@ class CodexSessionParser {
       final payload = _map(record['payload']);
       if (recordType == 'session_meta') {
         sessionId = _string(payload['id']) ?? sessionId;
+        threadName =
+            _cleanThreadName(
+              _string(payload['thread_name']) ??
+                  _string(payload['session_name']) ??
+                  _string(payload['name']) ??
+                  _string(payload['title']),
+            ) ??
+            threadName;
+        threadSource = _string(payload['thread_source']) ?? threadSource;
+        parentThreadId = _string(payload['parent_thread_id']) ?? parentThreadId;
+        agentNickname = _string(payload['agent_nickname']) ?? agentNickname;
+        agentRole = _string(payload['agent_role']) ?? agentRole;
+        subagentDepth = _int(payload['subagent_depth']) ?? subagentDepth;
+        final source = _map(payload['source']);
+        final subagent = _map(source['subagent']);
+        final threadSpawn = _map(subagent['thread_spawn']);
+        if (subagent.isNotEmpty || threadSpawn.isNotEmpty) {
+          threadSource = 'subagent';
+          parentThreadId =
+              _string(threadSpawn['parent_thread_id']) ?? parentThreadId;
+          agentNickname =
+              _string(threadSpawn['agent_nickname']) ?? agentNickname;
+          agentRole = _string(threadSpawn['agent_role']) ?? agentRole;
+          subagentDepth = _int(threadSpawn['depth']) ?? subagentDepth;
+        }
         workingDirectory = _string(payload['cwd']) ?? workingDirectory;
         title = _cleanTitle(_string(payload['title'])) ?? title;
         sourceFileUncPath = _string(payload['source_file_unc_path']);
@@ -200,6 +246,14 @@ class CodexSessionParser {
         workingDirectory = _string(payload['cwd']) ?? workingDirectory;
         workingDirectoryUnc =
             _string(payload['working_directory_unc']) ?? workingDirectoryUnc;
+        threadName =
+            _cleanThreadName(
+              _string(payload['thread_name']) ??
+                  _string(payload['session_name']) ??
+                  _string(payload['name']) ??
+                  _string(payload['title']),
+            ) ??
+            threadName;
         title = _cleanTitle(_string(payload['title'])) ?? title;
         summary = _cleanSummary(_string(payload['summary'])) ?? summary;
         final model = _string(payload['model']);
@@ -253,7 +307,8 @@ class CodexSessionParser {
           modelIds.add(model);
         }
         final storedContent = _truncate(content, maxMessageContentChars);
-        messages.add(
+        _addMessage(
+          messages,
           CodexParsedMessage(
             index: messages.length,
             authorType: authorType,
@@ -283,7 +338,8 @@ class CodexSessionParser {
           continue;
         }
         final storedContent = _truncate(content, maxMessageContentChars);
-        messages.add(
+        _addMessage(
+          messages,
           CodexParsedMessage(
             index: messages.length,
             authorType: authorType,
@@ -347,6 +403,30 @@ class CodexSessionParser {
         continue;
       }
 
+      if (recordType == 'response_item' && payloadType == 'reasoning') {
+        final content = _reasoningContent(payload);
+        final storedContent = _truncate(content, maxMessageContentChars);
+        _addMessage(
+          messages,
+          CodexParsedMessage(
+            index: messages.length,
+            authorType: CodexMessageAuthorType.reasoning,
+            rawType: payloadType,
+            createdAtUtc: timestamp,
+            firstLine: _firstLine(content),
+            contentPlain: storedContent.value,
+            contentPreview: _truncate(content, 200).value,
+            contentTruncated: storedContent.truncated,
+            usage: const CodexUsage.empty(),
+            model: null,
+            hasToolCalls: false,
+            hasError: false,
+          ),
+        );
+        lastMessageAtUtc = _maxDateTime(lastMessageAtUtc, timestamp);
+        continue;
+      }
+
       if (recordType == 'response_item' &&
           !_knownPassiveResponsePayloadTypes.contains(payloadType)) {
         warnings.add(
@@ -357,6 +437,8 @@ class CodexSessionParser {
             message: 'Unknown response item payload type.',
           ),
         );
+      } else if (recordType == 'response_item') {
+        continue;
       } else if (recordType == 'event_msg' &&
           !_knownEventPayloadTypes.contains(payloadType)) {
         warnings.add(
@@ -371,7 +453,8 @@ class CodexSessionParser {
 
       final content = jsonEncode(payload);
       final storedContent = _truncate(content, maxMessageContentChars);
-      messages.add(
+      _addMessage(
+        messages,
         CodexParsedMessage(
           index: messages.length,
           authorType: CodexMessageAuthorType.unknown,
@@ -397,6 +480,12 @@ class CodexSessionParser {
           .convert(utf8.encode('$sourcePath\n$rawText'))
           .toString(),
       sessionId: sessionId,
+      threadName: threadName,
+      threadSource: threadSource,
+      parentThreadId: parentThreadId,
+      agentNickname: agentNickname,
+      agentRole: agentRole,
+      subagentDepth: subagentDepth,
       sourceType: _sourceType(null, sourcePath),
       sourcePath: sourcePath,
       sourceFileUncPath: sourceFileUncPath,
@@ -508,6 +597,63 @@ class CodexSessionParser {
   }
 }
 
+void _addMessage(
+  List<CodexParsedMessage> messages,
+  CodexParsedMessage message,
+) {
+  if (messages.isNotEmpty && _isDuplicateMessage(messages.last, message)) {
+    if (_isEchoRecord(messages.last) && !_isEchoRecord(message)) {
+      messages[messages.length - 1] = message.withIndex(messages.last.index);
+    }
+    return;
+  }
+  messages.add(message);
+}
+
+bool _isDuplicateMessage(CodexParsedMessage left, CodexParsedMessage right) {
+  return left.authorType == right.authorType &&
+      _normalizedMessageContent(left.contentPlain) ==
+          _normalizedMessageContent(right.contentPlain);
+}
+
+bool _isEchoRecord(CodexParsedMessage message) {
+  return message.rawType == 'user_message' ||
+      message.rawType == 'agent_message';
+}
+
+String _normalizedMessageContent(String value) {
+  return value.trim().replaceAll(RegExp(r'\s+'), ' ');
+}
+
+String _reasoningContent(Map<String, Object?> payload) {
+  final encrypted = _string(payload['encrypted_content']);
+  if (encrypted != null && encrypted.trim().isNotEmpty) {
+    return 'Reasoning content is encrypted and cannot be displayed.';
+  }
+  final summary = _reasoningSummary(payload['summary']).trim();
+  return summary.isEmpty ? 'Reasoning content is unavailable.' : summary;
+}
+
+String _reasoningSummary(Object? value) {
+  if (value is String) {
+    return value;
+  }
+  if (value is Iterable) {
+    return value
+        .map(_reasoningSummary)
+        .where((part) => part.trim().isNotEmpty)
+        .join('\n');
+  }
+  if (value is Map) {
+    final map = value.cast<String, Object?>();
+    return _string(map['text']) ??
+        _string(map['summary']) ??
+        _string(map['content']) ??
+        '';
+  }
+  return '';
+}
+
 class CodexParseResult {
   const CodexParseResult._({this.session, this.error});
 
@@ -581,10 +727,22 @@ class CodexParsedSession {
     required this.warnings,
     required this.usage,
     required this.lastTurnUsage,
+    this.threadSource,
+    this.threadName,
+    this.parentThreadId,
+    this.agentNickname,
+    this.agentRole,
+    this.subagentDepth,
   });
 
   final String internalId;
   final String? sessionId;
+  final String? threadName;
+  final String? threadSource;
+  final String? parentThreadId;
+  final String? agentNickname;
+  final String? agentRole;
+  final int? subagentDepth;
   final CodexSessionSourceType sourceType;
   final String sourcePath;
   final String? sourceFileUncPath;
@@ -647,6 +805,23 @@ class CodexParsedMessage {
   final String? model;
   final bool hasToolCalls;
   final bool hasError;
+
+  CodexParsedMessage withIndex(int index) {
+    return CodexParsedMessage(
+      index: index,
+      authorType: authorType,
+      rawType: rawType,
+      createdAtUtc: createdAtUtc,
+      firstLine: firstLine,
+      contentPlain: contentPlain,
+      contentPreview: contentPreview,
+      contentTruncated: contentTruncated,
+      usage: usage,
+      model: model,
+      hasToolCalls: hasToolCalls,
+      hasError: hasError,
+    );
+  }
 }
 
 class CodexParsedToolCall {
@@ -902,6 +1077,11 @@ String? _cleanSummary(String? value) {
     return null;
   }
   return trimmed;
+}
+
+String? _cleanThreadName(String? value) {
+  final trimmed = value?.trim();
+  return trimmed == null || trimmed.isEmpty ? null : trimmed;
 }
 
 int? _int(Object? value) => value is int ? value : null;

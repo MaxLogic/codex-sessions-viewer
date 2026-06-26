@@ -123,7 +123,7 @@ void main() {
     expect(find.bySemanticsLabel('#2 Tool, 20 tokens'), findsOneWidget);
     expect(
       find.bySemanticsLabel(
-        'Tool output collapsed, 3 lines. Press Enter to expand.',
+        'Tool output collapsed, 3 lines. Use the Expand tool output button to show it.',
       ),
       findsOneWidget,
     );
@@ -192,7 +192,7 @@ void main() {
     );
     expect(
       tester.getSemantics(find.byKey(const Key('focus-reader-message'))).label,
-      contains('Tool output collapsed, 2 lines. Press Enter to expand.'),
+      contains('Tool output collapsed, 2 lines. Press X to expand.'),
     );
   });
 

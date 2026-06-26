@@ -1054,6 +1054,7 @@ void _upsertParsedSession(
       platformPath: scannedSession.mappedPath.platformPath,
       title: _cleanDisplayTitle(parsed.title),
       summary: _cleanDisplaySummary(parsed.summary),
+      threadName: parsed.threadName?.trim() ?? '',
       userMessages: _messagesForAuthor(parsed, CodexMessageAuthorType.user),
       assistantMessages: _messagesForAuthor(
         parsed,
@@ -1083,6 +1084,12 @@ void _upsertParsedSession(
     update sessions
     set
       session_id = ?,
+      thread_name = ?,
+      thread_source = ?,
+      parent_thread_id = ?,
+      agent_nickname = ?,
+      agent_role = ?,
+      subagent_depth = ?,
       source_file_unc_path = ?,
       working_directory_display = ?,
       working_directory_platform = ?,
@@ -1112,6 +1119,12 @@ void _upsertParsedSession(
     ''',
     [
       parsed.sessionId,
+      parsed.threadName,
+      parsed.threadSource,
+      parsed.parentThreadId,
+      parsed.agentNickname,
+      parsed.agentRole,
+      parsed.subagentDepth,
       scannedSession.mappedPath.sourceFileUncPath,
       parsed.workingDirectoryDisplay,
       parsed.workingDirectoryPlatform,
@@ -1168,6 +1181,7 @@ void _upsertParsedSession(
       case CodexMessageAuthorType.tool:
         tool += totalTokens;
       case CodexMessageAuthorType.system:
+      case CodexMessageAuthorType.reasoning:
       case CodexMessageAuthorType.unknown:
         break;
     }
@@ -1408,6 +1422,12 @@ List<SessionRowViewModel> _loadRows(
     select
       s.id,
       s.session_id,
+      s.thread_name,
+      s.thread_source,
+      s.parent_thread_id,
+      s.agent_nickname,
+      s.agent_role,
+      s.subagent_depth,
       s.source_type,
       s.source_file_path,
       s.source_file_unc_path,
@@ -1509,6 +1529,12 @@ SessionRowViewModel _loadRow(
   return SessionRowViewModel(
     id: row['id'] as String,
     sessionId: row['session_id'] as String? ?? '',
+    threadName: row['thread_name'] as String? ?? '',
+    threadSource: row['thread_source'] as String? ?? '',
+    parentThreadId: row['parent_thread_id'] as String? ?? '',
+    agentNickname: row['agent_nickname'] as String? ?? '',
+    agentRole: row['agent_role'] as String? ?? '',
+    subagentDepth: row['subagent_depth'] as int?,
     sourceFilePath: row['source_file_path'] as String? ?? '',
     displayPath: row['display_path'] as String? ?? '',
     workingDirectory: workingDirectoryDisplay ?? '',
@@ -1621,7 +1647,7 @@ List<ConversationMessageViewModel> _loadMessages(
               row['content_plain'] as String? ??
               row['content_preview'] as String? ??
               '',
-          tokenCount: row['token_total'] as int? ?? 0,
+          tokenCount: row['token_total'] as int?,
           hasError: (row['has_error'] as int? ?? 0) == 1,
           hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
         ),
@@ -2159,6 +2185,8 @@ ConversationAuthor _messageAuthor(String? value) {
   return switch (value) {
     'user' => ConversationAuthor.user,
     'assistant' => ConversationAuthor.assistant,
+    'reasoning' => ConversationAuthor.reasoning,
+    'system' => ConversationAuthor.system,
     _ => ConversationAuthor.tool,
   };
 }

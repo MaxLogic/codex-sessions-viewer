@@ -14,6 +14,9 @@ void main() {
     db.execute(
       File('../sql/migration/002_search_filter_schema.sql').readAsStringSync(),
     );
+    db.execute(
+      File('../sql/migration/007_session_thread_name.sql').readAsStringSync(),
+    );
     index = SessionSearchIndex(db);
   });
 
@@ -48,6 +51,28 @@ void main() {
       ['alpha'],
     );
     expect(index.search(const SessionSearchQuery(text: 'parser')), ['alpha']);
+  });
+
+  test('searches and filters thread names without FTS schema changes', () {
+    index.upsert(
+      _document(id: 'named', title: 'Visible title', threadName: 'dmk2'),
+    );
+    index.upsert(_document(id: 'unnamed', title: 'Visible title'));
+
+    expect(index.search(const SessionSearchQuery(text: 'dmk2')), ['named']);
+    expect(index.search(const SessionSearchQuery(threadName: 'mk2')), [
+      'named',
+    ]);
+    expect(index.search(const SessionSearchQuery(namedOnly: true)), ['named']);
+    expect(
+      index.search(
+        const SessionSearchQuery(
+          text: 'dmk2',
+          textScopes: {SearchTextScope.threadName},
+        ),
+      ),
+      ['named'],
+    );
   });
 
   test('excludes tool output by default and includes it when configured', () {
@@ -299,6 +324,7 @@ SessionSearchDocument _document({
   required String id,
   String title = '',
   String summary = '',
+  String threadName = '',
   String userMessages = '',
   String assistantMessages = '',
   String toolNames = '',
@@ -326,6 +352,7 @@ SessionSearchDocument _document({
   platformPath: displayPath.isEmpty ? '$id.jsonl' : displayPath,
   title: title,
   summary: summary,
+  threadName: threadName,
   userMessages: userMessages,
   assistantMessages: assistantMessages,
   toolNames: toolNames,

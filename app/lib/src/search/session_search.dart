@@ -12,6 +12,7 @@ enum SearchTextScope {
   toolNames,
   path,
   project,
+  threadName,
   tags,
   toolOutput,
 }
@@ -22,6 +23,7 @@ class SessionSearchIndex {
   final Database db;
 
   void upsert(SessionSearchDocument document) {
+    _ensureThreadNameSchema();
     final now = DateTime.now().toUtc().toIso8601String();
     final existingState = _existingUserState(document.id);
     db.execute(
@@ -38,6 +40,7 @@ class SessionSearchIndex {
         last_message_at_utc,
         title,
         summary,
+        thread_name,
         has_code_blocks,
         has_tool_calls,
         has_errors,
@@ -49,7 +52,7 @@ class SessionSearchIndex {
         is_archived,
         created_at_utc,
         updated_at_utc
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       on conflict(id) do update set
         source_type = excluded.source_type,
         source_file_path = excluded.source_file_path,
@@ -61,6 +64,7 @@ class SessionSearchIndex {
         last_message_at_utc = excluded.last_message_at_utc,
         title = excluded.title,
         summary = excluded.summary,
+        thread_name = excluded.thread_name,
         has_code_blocks = excluded.has_code_blocks,
         has_tool_calls = excluded.has_tool_calls,
         has_errors = excluded.has_errors,
@@ -81,6 +85,7 @@ class SessionSearchIndex {
         document.lastMessageAtUtc?.toIso8601String(),
         document.title,
         document.summary,
+        document.threadName.isEmpty ? null : document.threadName,
         document.hasCodeBlocks ? 1 : 0,
         document.hasToolCalls ? 1 : 0,
         document.hasErrors ? 1 : 0,
@@ -172,6 +177,7 @@ class SessionSearchIndex {
   }
 
   List<String> search(SessionSearchQuery query) {
+    _ensureThreadNameSchema();
     final where = <String>[];
     final args = <Object?>[];
     if (query.text.trim().isNotEmpty) {
@@ -221,6 +227,13 @@ class SessionSearchIndex {
         where.add('s.models_used like ? escape \'~\'');
         args.add('%|${_escapeLike(model)}|%');
       }
+    }
+    if (query.threadName.trim().isNotEmpty) {
+      where.add('s.thread_name like ? escape \'~\'');
+      args.add('%${_escapeLike(query.threadName.trim())}%');
+    }
+    if (query.namedOnly) {
+      where.add("coalesce(trim(s.thread_name), '') <> ''");
     }
     if (query.statuses.isNotEmpty) {
       where.add(
@@ -280,7 +293,7 @@ class SessionSearchIndex {
     final scopes = query.effectiveTextScopes;
     final columns = [for (final scope in scopes) ...scope.ftsColumns];
     final likeColumns = [for (final scope in scopes) ...scope.likeColumns];
-    if (columns.isEmpty || likeColumns.isEmpty) {
+    if (columns.isEmpty && likeColumns.isEmpty) {
       return const _SqlClause('0 = 1', []);
     }
     final tokens = _searchTokens(query.text);
@@ -297,12 +310,16 @@ class SessionSearchIndex {
         List<Object?>.filled(likeColumns.length, '%${_escapeLike(token)}%'),
       );
     }
+    final likeSql = tokenClauses.join(' and ');
+    if (columns.isEmpty) {
+      return _SqlClause(likeSql, args);
+    }
     final matchQuery = _ftsColumnQuery(columns, tokens);
-    return _SqlClause(
-      '(s.rowid in (select rowid from session_search where session_search match ?) '
-      'or (${tokenClauses.join(' and ')}))',
-      [matchQuery, ...args],
-    );
+    final sql = likeSql.isEmpty
+        ? 's.rowid in (select rowid from session_search where session_search match ?)'
+        : '(s.rowid in (select rowid from session_search where session_search match ?) '
+              'or ($likeSql))';
+    return _SqlClause(sql, [matchQuery, ...args]);
   }
 
   _ExistingUserState? _existingUserState(String sessionId) {
@@ -328,6 +345,18 @@ class SessionSearchIndex {
       tags: [for (final row in tagRows) row['name'] as String],
     );
   }
+
+  void _ensureThreadNameSchema() {
+    final rows = db.select('pragma table_info(sessions)');
+    final hasThreadName = rows.any((row) => row['name'] == 'thread_name');
+    if (hasThreadName) {
+      return;
+    }
+    db.execute('alter table sessions add column thread_name text');
+    db.execute(
+      'create index if not exists idx_sessions_thread_name on sessions(thread_name)',
+    );
+  }
 }
 
 class _ExistingUserState {
@@ -346,6 +375,7 @@ class SessionSearchDocument {
     required this.platformPath,
     this.title = '',
     this.summary = '',
+    this.threadName = '',
     this.userMessages = '',
     this.assistantMessages = '',
     this.toolNames = '',
@@ -373,6 +403,7 @@ class SessionSearchDocument {
   final String platformPath;
   final String title;
   final String summary;
+  final String threadName;
   final String userMessages;
   final String assistantMessages;
   final String toolNames;
@@ -405,6 +436,8 @@ class SessionSearchQuery {
     this.projectNames = const {},
     this.tags = const {},
     this.models = const {},
+    this.threadName = '',
+    this.namedOnly = false,
     this.statuses = const {},
     this.pinned,
     this.archived = ArchivedFilter.activeOnly,
@@ -425,6 +458,8 @@ class SessionSearchQuery {
   final Set<String> projectNames;
   final Set<String> tags;
   final Set<String> models;
+  final String threadName;
+  final bool namedOnly;
   final Set<String> statuses;
   final bool? pinned;
   final ArchivedFilter archived;
@@ -445,6 +480,7 @@ class SessionSearchQuery {
           SearchTextScope.toolNames,
           SearchTextScope.path,
           SearchTextScope.project,
+          SearchTextScope.threadName,
           SearchTextScope.tags,
         };
     if (includeToolOutput) {
@@ -477,13 +513,15 @@ extension on SearchTextScope {
     SearchTextScope.toolNames => const ['tool_names'],
     SearchTextScope.path => const ['display_path', 'normalized_path_keys'],
     SearchTextScope.project => const ['project_name'],
+    SearchTextScope.threadName => const [],
     SearchTextScope.tags => const ['tags'],
     SearchTextScope.toolOutput => const ['tool_output'],
   };
 
-  List<String> get likeColumns => [
-    for (final column in ftsColumns) 'f.$column',
-  ];
+  List<String> get likeColumns => switch (this) {
+    SearchTextScope.threadName => const ['s.thread_name'],
+    _ => [for (final column in ftsColumns) 'f.$column'],
+  };
 }
 
 String _sqlParameters(int count) => List.filled(count, '?').join(', ');

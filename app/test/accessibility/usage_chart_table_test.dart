@@ -18,8 +18,11 @@ void main() {
     expect(find.text('Input vs output vs cached tokens'), findsOneWidget);
     expect(find.text('2026-06-12, 1 session, 900 tokens'), findsOneWidget);
     expect(find.text('2026-06-13, 2 sessions, 1,800 tokens'), findsOneWidget);
-    expect(find.bySemanticsLabel('Usage chart'), findsWidgets);
-    expect(find.bySemanticsLabel('Usage table equivalent'), findsWidgets);
+    expect(find.bySemanticsLabel('Tokens over time chart'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('Tokens over time table equivalent'),
+      findsOneWidget,
+    );
 
     for (final column in const [
       'Label',
@@ -52,6 +55,13 @@ void main() {
 
     expect(find.text('Usage by platform'), findsOneWidget);
     expect(find.text('Usage by archived state'), findsOneWidget);
+    expect(find.text('Usage by origin'), findsOneWidget);
+    expect(find.text('User, 2 sessions, 1,800 tokens'), findsOneWidget);
+    expect(find.bySemanticsLabel('Usage by origin chart'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('Usage by origin table equivalent'),
+      findsOneWidget,
+    );
   });
 }
 
@@ -124,6 +134,19 @@ UsageSummary _summary() {
     ],
     byProject: const [],
     byPlatform: const [],
+    byOrigin: const [
+      UsageBreakdownRow(
+        key: 'User',
+        sessionCount: 2,
+        messageCount: 14,
+        inputTokens: 1100,
+        outputTokens: 500,
+        cachedInputTokens: 200,
+        totalTokens: 1800,
+        estimatedCostText: r'$0.09',
+        costUnknown: false,
+      ),
+    ],
     byArchiveState: const [],
     topSessionsByTokens: const [],
     topSessionsByMessageCount: const [],

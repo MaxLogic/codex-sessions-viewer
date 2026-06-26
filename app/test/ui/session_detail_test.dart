@@ -1,4 +1,5 @@
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
 import 'package:flutter/material.dart';
@@ -11,6 +12,9 @@ void main() {
         home: Scaffold(body: SessionDetailPane(row: _detailRow())),
       ),
     );
+
+    await tester.tap(find.text('Details'));
+    await tester.pumpAndSettle();
 
     for (final text in const [
       'Flutter accessibility spike',
@@ -42,19 +46,15 @@ void main() {
     }
 
     for (final action in const [
-      'Copy session path',
-      'Copy working directory',
       'Open containing folder',
       'Export Markdown',
-      'Copy conversation Markdown',
       'Re-parse this session',
       'Unpin session',
       'Unarchive session',
-      'Add/remove tags',
-      'Assign/change project',
     ]) {
       expect(find.widgetWithText(OutlinedButton, action), findsOneWidget);
     }
+    expect(find.text('More'), findsOneWidget);
 
     await tester.ensureVisible(find.text('Commands'));
     await tester.tap(find.text('Commands'));
@@ -94,16 +94,13 @@ void main() {
       ),
     );
 
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Copy session path'));
+    await tester.tap(find.text('More'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Commands'));
+    await tester.tap(find.text('Copy session path'));
     await tester.pumpAndSettle();
-    final copyResume = find.widgetWithText(
-      OutlinedButton,
-      'Copy plain resume command',
-    );
-    await tester.ensureVisible(copyResume);
-    await tester.tap(copyResume);
+    await tester.tap(find.text('More'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Copy plain resume command'));
     await tester.pumpAndSettle();
     final reparse = find.widgetWithText(
       OutlinedButton,
@@ -137,9 +134,87 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byType(AnimatedSize), findsWidgets);
+      expect(find.text('Plain resume command:'), findsNothing);
+      await tester.tap(find.text('Show command preview'));
+      await tester.pumpAndSettle();
       expect(find.text('Plain resume command:'), findsOneWidget);
     },
   );
+
+  testWidgets('conversation and focus reader are alternate tabs', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionDetailPane(
+            row: _detailRow().copyWithConversationMessages([
+              ConversationMessageViewModel(
+                id: 'm1',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Conversation preview',
+                body: 'Conversation body',
+                tokenCount: 10,
+              ),
+            ]),
+          ),
+        ),
+      ),
+    );
+
+    await tester.ensureVisible(find.text('Conversation'));
+    expect(find.text('Message 1 of 1'), findsNothing);
+    expect(find.text('Conversation body'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(Tab, 'Focus reader'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Message 1 of 1'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('Selected message 1 of 1. User.'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('shows main and subagent usage split', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionDetailPane(
+            row: _detailRow().copyWithUsageRollup(
+              const SessionUsageRollup(
+                mainTokens: 400,
+                subagentTokens: 250,
+                totalTokens: 650,
+                mainEstimatedCostText: '0.1234',
+                subagentEstimatedCostText: '0.0706',
+                totalEstimatedCostText: '0.194',
+                mainCostUnknown: false,
+                subagentCostUnknown: false,
+                totalCostUnknown: false,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('650 tokens'), findsOneWidget);
+    await tester.tap(find.text('Details'));
+    await tester.pumpAndSettle();
+
+    for (final text in const [
+      'Usage total: 650 tokens | \$0.194',
+      'Usage main: 400 tokens | \$0.1234',
+      'Usage subagents: 250 tokens | \$0.0706',
+    ]) {
+      expect(find.text(text), findsOneWidget);
+    }
+  });
 
   testWidgets('hides the title area when the session has no title', (
     tester,
@@ -153,6 +228,8 @@ void main() {
     );
 
     expect(find.text('Selected: '), findsNothing);
+    await tester.tap(find.text('Details'));
+    await tester.pumpAndSettle();
     expect(find.text('Platform: WSL'), findsOneWidget);
   });
 
@@ -188,7 +265,7 @@ void main() {
 
     await tester.tap(find.text('First project').first);
     await tester.pumpAndSettle();
-    expect(find.text('Selected: First detail'), findsOneWidget);
+    expect(find.text('First detail'), findsWidgets);
 
     await tester.tap(find.text('Second project').first);
     await tester.pump();
@@ -196,12 +273,15 @@ void main() {
     expect(find.byType(AnimatedSwitcher), findsWidgets);
     expect(find.byType(FadeTransition), findsWidgets);
     expect(find.byType(SlideTransition), findsWidgets);
-    expect(find.bySemanticsLabel('Selected: First detail'), findsNothing);
-    expect(find.text('Selected: First detail'), findsWidgets);
-    expect(find.text('Selected: Second detail'), findsWidgets);
+    expect(
+      find.bySemanticsLabel('Selected session First detail'),
+      findsNothing,
+    );
+    expect(find.text('First detail'), findsWidgets);
+    expect(find.text('Second detail'), findsWidgets);
 
     await tester.pumpAndSettle();
-    expect(find.text('Selected: Second detail'), findsOneWidget);
+    expect(find.text('Second detail'), findsWidgets);
   });
 
   testWidgets('session detail reduced motion avoids pane movement', (

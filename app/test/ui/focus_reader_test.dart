@@ -20,17 +20,20 @@ void main() {
     expect(find.text('First user body'), findsOneWidget);
     expect(find.text('Assistant body'), findsNothing);
     expect(
-      find.widgetWithText(OutlinedButton, 'Copy Markdown'),
+      find.widgetWithText(OutlinedButton, 'Copy Markdown (M)'),
       findsOneWidget,
     );
-    expect(find.widgetWithText(OutlinedButton, 'Copy text'), findsOneWidget);
+    expect(
+      find.widgetWithText(OutlinedButton, 'Copy text (C)'),
+      findsOneWidget,
+    );
 
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Next'));
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Next (N)'));
     await tester.pumpAndSettle();
     expect(find.text('Message 2 of 5'), findsOneWidget);
     expect(find.text('Assistant body'), findsOneWidget);
 
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Next tool'));
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Next tool (T)'));
     await tester.pumpAndSettle();
     expect(find.text('Message 3 of 5'), findsOneWidget);
     expect(find.text('Tool output collapsed, 2 lines.'), findsOneWidget);
@@ -45,7 +48,7 @@ void main() {
       ),
     );
 
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Next assistant'));
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Next assistant (A)'));
     await tester.pumpAndSettle();
     expect(find.text('Message 2 of 5'), findsOneWidget);
 

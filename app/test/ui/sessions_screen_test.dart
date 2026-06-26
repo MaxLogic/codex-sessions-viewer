@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -33,40 +34,22 @@ void main() {
       expect(find.bySemanticsLabel('Session search'), findsOneWidget);
       expect(find.bySemanticsLabel('Platform filter'), findsOneWidget);
       expect(find.bySemanticsLabel('Time range filter'), findsOneWidget);
+      expect(find.bySemanticsLabel('Archived filter'), findsOneWidget);
+      expect(find.text('Advanced filters'), findsOneWidget);
+      expect(find.bySemanticsLabel('Path filter'), findsNothing);
+      await tester.tap(find.text('Advanced filters'));
+      await tester.pumpAndSettle();
       expect(find.bySemanticsLabel('Project filter'), findsOneWidget);
       expect(find.bySemanticsLabel('Path filter'), findsOneWidget);
       expect(find.bySemanticsLabel('Tags filter'), findsOneWidget);
       expect(find.bySemanticsLabel('Model filter'), findsOneWidget);
-      expect(find.bySemanticsLabel('Status filter'), findsOneWidget);
-      expect(find.bySemanticsLabel('Archived filter'), findsOneWidget);
-      expect(
-        find.text('Additional time ranges are not available yet.'),
-        findsOneWidget,
-      );
-      for (final text in const [
-        'Project values are not available yet.',
-        'Tags values are not available yet.',
-        'Model values are not available yet.',
-        'Status values are not available yet.',
-      ]) {
-        expect(find.text(text), findsOneWidget);
-      }
-      expect(
-        find
-            .byType(Tooltip)
-            .evaluate()
-            .map((element) => element.widget)
-            .whereType<Tooltip>()
-            .map((tooltip) => tooltip.message),
-        contains('Advanced filters are not available yet.'),
-      );
       expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
       expect(find.text('(2)'), findsOneWidget);
       expect(find.text('2 sessions visible'), findsNothing);
       expect(find.text('Archived session'), findsNothing);
 
       for (final column in const [
-        'Last Message Date',
+        'Last Message',
         'Project',
         'Path',
         'Summary',
@@ -74,11 +57,11 @@ void main() {
         'Tokens',
         'Model',
         'Tags',
-        'Status',
         'Actions',
       ]) {
         expect(find.text(column), findsWidgets);
       }
+      expect(find.text('Status'), findsNothing);
       expect(find.text('Title'), findsNothing);
 
       expect(
@@ -103,8 +86,18 @@ void main() {
         find.bySemanticsLabel('Copy path for Broken JSONL'),
         findsOneWidget,
       );
-      expect(find.text('Pinned | Available'), findsOneWidget);
-      expect(find.text('Parse error'), findsWidgets);
+      expect(find.text('Parse error'), findsNothing);
+      expect(
+        find.bySemanticsLabel(
+          'Session Parser cache. Status Pinned, Available.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel('Session Broken JSONL. Status Parse error.'),
+        findsOneWidget,
+      );
+      expect(find.bySemanticsLabel('Add tag to Parser cache'), findsOneWidget);
       expect(find.bySemanticsLabel('Actions for Parser cache'), findsOneWidget);
       expect(find.bySemanticsLabel('Actions for Broken JSONL'), findsOneWidget);
     },
@@ -189,6 +182,81 @@ void main() {
       );
     },
   );
+
+  testWidgets('default origin filter exposes subagent-only rows', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'subagent',
+              title: 'Subagent-only session',
+              threadSource: 'subagent',
+              parentThreadId: 'parent-session',
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(
+      find.bySemanticsLabel(
+        'Session Subagent, Subagent-only session. Status Available.',
+      ),
+      findsNothing,
+    );
+    expect(
+      find.text('Only subagent sessions match the current filters.'),
+      findsOneWidget,
+    );
+    expect(
+      find.widgetWithText(OutlinedButton, 'Show all origins'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Show all origins'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.bySemanticsLabel(
+        'Session Subagent, Subagent-only session. Status Available.',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets(
+    'stale status sort settings are ignored after status column removal',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionsScreen(
+            initialTableState: const SessionTableSettings(
+              columnWidths: {},
+              sorts: [
+                SessionTableSortSettings(column: 'status', ascending: true),
+              ],
+              newestPerProjectOnly: false,
+            ),
+            initialRows: [_row(id: 'active', title: 'Parser cache')],
+          ),
+        ),
+      );
+
+      await tester.tap(
+        find.bySemanticsLabel('Last Message column descending priority 1'),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.bySemanticsLabel('Last Message column ascending priority 1'),
+        findsOneWidget,
+      );
+      expect(find.text('Status'), findsNothing);
+    },
+  );
 }
 
 SessionRowViewModel _row({
@@ -201,6 +269,8 @@ SessionRowViewModel _row({
   String status = 'Available',
   DateTime? lastMessageAtUtc,
   String summary = 'Session summary',
+  String threadSource = '',
+  String parentThreadId = '',
 }) {
   return SessionRowViewModel(
     id: id,
@@ -212,6 +282,8 @@ SessionRowViewModel _row({
         ? r'F:\projects\MaxLogic\codex-sessions-viewer'
         : '/home/pawel/.codex/sessions/2026/06/12/session.jsonl',
     title: title,
+    threadSource: threadSource,
+    parentThreadId: parentThreadId,
     summary: summary,
     messageCount: 7,
     totalTokens: 1200,

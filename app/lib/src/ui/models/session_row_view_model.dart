@@ -18,6 +18,12 @@ class SessionRowViewModel {
     required this.tags,
     required this.status,
     this.sessionId = '',
+    this.threadName = '',
+    this.threadSource = '',
+    this.parentThreadId = '',
+    this.agentNickname = '',
+    this.agentRole = '',
+    this.subagentDepth,
     this.sourceFilePath = '',
     this.displayPath = '',
     this.workingDirectory = '',
@@ -36,6 +42,7 @@ class SessionRowViewModel {
     this.costUnknown = true,
     this.modelsUsed = const [],
     this.conversationMessages = const [],
+    this.usageRollup,
     this.isPinned = false,
     this.isArchived = false,
     this.hasError = false,
@@ -55,6 +62,12 @@ class SessionRowViewModel {
   final List<String> tags;
   final String status;
   final String sessionId;
+  final String threadName;
+  final String threadSource;
+  final String parentThreadId;
+  final String agentNickname;
+  final String agentRole;
+  final int? subagentDepth;
   final String sourceFilePath;
   final String displayPath;
   final String workingDirectory;
@@ -73,6 +86,7 @@ class SessionRowViewModel {
   final bool costUnknown;
   final List<String> modelsUsed;
   final List<ConversationMessageViewModel> conversationMessages;
+  final SessionUsageRollup? usageRollup;
   final bool isPinned;
   final bool isArchived;
   final bool hasError;
@@ -81,6 +95,18 @@ class SessionRowViewModel {
     SessionRowPlatform.windows => 'Windows',
     SessionRowPlatform.wsl => 'WSL',
   };
+
+  bool get isSubagentSession => threadSource.toLowerCase() == 'subagent';
+
+  bool get hasThreadName => threadName.trim().isNotEmpty;
+
+  String get originLabel {
+    if (isSubagentSession) {
+      final nickname = agentNickname.trim();
+      return nickname.isEmpty ? 'Subagent' : 'Subagent: $nickname';
+    }
+    return 'User';
+  }
 
   String get sourcePathForDisplay =>
       sourceFilePath.isEmpty ? path : sourceFilePath;
@@ -113,6 +139,16 @@ class SessionRowViewModel {
   String get estimatedCostDisplay =>
       costUnknown ? 'Cost unknown' : '\$${estimatedCostText ?? '0'}';
 
+  int get displayTotalTokens => usageRollup?.totalTokens ?? totalTokens;
+
+  String get displayEstimatedCost {
+    final rollup = usageRollup;
+    if (rollup == null) {
+      return estimatedCostDisplay;
+    }
+    return rollup.totalEstimatedCostDisplay;
+  }
+
   int get tokenBreakdownTotal {
     if (totalTokens > 0) {
       return totalTokens;
@@ -138,6 +174,12 @@ class SessionRowViewModel {
     return SessionRowViewModel(
       id: id,
       sessionId: sessionId,
+      threadName: threadName,
+      threadSource: threadSource,
+      parentThreadId: parentThreadId,
+      agentNickname: agentNickname,
+      agentRole: agentRole,
+      subagentDepth: subagentDepth,
       sourceFilePath: sourceFilePath,
       displayPath: displayPath,
       workingDirectory: workingDirectory,
@@ -168,11 +210,93 @@ class SessionRowViewModel {
       tags: tags,
       status: status,
       conversationMessages: messages,
+      usageRollup: usageRollup,
       isPinned: isPinned,
       isArchived: isArchived,
       hasError: hasError,
     );
   }
+
+  SessionRowViewModel copyWithUsageRollup(SessionUsageRollup? rollup) {
+    return SessionRowViewModel(
+      id: id,
+      sessionId: sessionId,
+      threadName: threadName,
+      threadSource: threadSource,
+      parentThreadId: parentThreadId,
+      agentNickname: agentNickname,
+      agentRole: agentRole,
+      subagentDepth: subagentDepth,
+      sourceFilePath: sourceFilePath,
+      displayPath: displayPath,
+      workingDirectory: workingDirectory,
+      openablePath: openablePath,
+      startedAtUtc: startedAtUtc,
+      lastMessageAtUtc: lastMessageAtUtc,
+      duration: duration,
+      platform: platform,
+      project: project,
+      path: path,
+      title: title,
+      summary: summary,
+      messageCount: messageCount,
+      userMessageCount: userMessageCount,
+      assistantMessageCount: assistantMessageCount,
+      toolCallCount: toolCallCount,
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+      cachedInputTokens: cachedInputTokens,
+      userMessageTokens: userMessageTokens,
+      assistantResponseTokens: assistantResponseTokens,
+      toolCallTokens: toolCallTokens,
+      estimatedCostText: estimatedCostText,
+      costUnknown: costUnknown,
+      totalTokens: totalTokens,
+      model: model,
+      modelsUsed: modelsUsed,
+      tags: tags,
+      status: status,
+      conversationMessages: conversationMessages,
+      usageRollup: rollup,
+      isPinned: isPinned,
+      isArchived: isArchived,
+      hasError: hasError,
+    );
+  }
+}
+
+class SessionUsageRollup {
+  const SessionUsageRollup({
+    required this.mainTokens,
+    required this.subagentTokens,
+    required this.totalTokens,
+    required this.mainEstimatedCostText,
+    required this.subagentEstimatedCostText,
+    required this.totalEstimatedCostText,
+    required this.mainCostUnknown,
+    required this.subagentCostUnknown,
+    required this.totalCostUnknown,
+  });
+
+  final int mainTokens;
+  final int subagentTokens;
+  final int totalTokens;
+  final String? mainEstimatedCostText;
+  final String? subagentEstimatedCostText;
+  final String? totalEstimatedCostText;
+  final bool mainCostUnknown;
+  final bool subagentCostUnknown;
+  final bool totalCostUnknown;
+
+  String get mainEstimatedCostDisplay =>
+      mainCostUnknown ? 'Cost unknown' : '\$${mainEstimatedCostText ?? '0'}';
+
+  String get subagentEstimatedCostDisplay => subagentCostUnknown
+      ? 'Cost unknown'
+      : '\$${subagentEstimatedCostText ?? '0'}';
+
+  String get totalEstimatedCostDisplay =>
+      totalCostUnknown ? 'Cost unknown' : '\$${totalEstimatedCostText ?? '0'}';
 }
 
 bool _isWindowsOpenablePath(String path) {

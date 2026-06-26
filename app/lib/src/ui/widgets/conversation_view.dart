@@ -11,18 +11,22 @@ import 'svg_icon.dart';
 
 typedef CopyTextCallback = Future<void> Function(String text);
 
+enum ToolCallVisibility { show, collapse, hide }
+
 class ConversationView extends StatefulWidget {
   const ConversationView({
     super.key,
     required this.messages,
     this.onCopyMessageMarkdown,
     this.motionMode = AppMotionMode.system,
+    this.initialToolCallVisibility = ToolCallVisibility.collapse,
     this.announcer,
   });
 
   final List<ConversationMessageViewModel> messages;
   final CopyTextCallback? onCopyMessageMarkdown;
   final AppMotionMode motionMode;
+  final ToolCallVisibility initialToolCallVisibility;
   final ScreenReaderAnnouncer? announcer;
 
   @override
@@ -32,7 +36,14 @@ class ConversationView extends StatefulWidget {
 class _ConversationViewState extends State<ConversationView> {
   final _messageListController = ScrollController();
   var _selectedNumber = 1;
+  late ToolCallVisibility _toolCallVisibility;
   final _expanded = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    _toolCallVisibility = widget.initialToolCallVisibility;
+  }
 
   @override
   void dispose() {
@@ -42,7 +53,7 @@ class _ConversationViewState extends State<ConversationView> {
 
   @override
   Widget build(BuildContext context) {
-    final messages = widget.messages;
+    final messages = _visibleMessages;
     final motionPolicy = CodexMotionPolicy.fromContext(
       context,
       mode: widget.motionMode,
@@ -50,7 +61,7 @@ class _ConversationViewState extends State<ConversationView> {
     if (messages.isEmpty) {
       return const Center(child: Text('No conversation messages'));
     }
-    final selected = _selectedMessage;
+    final selected = _selectedMessage(messages);
     return Semantics(
       key: const Key('conversation-view-semantics'),
       container: true,
@@ -60,7 +71,7 @@ class _ConversationViewState extends State<ConversationView> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           SizedBox(
-            width: 260,
+            width: 230,
             child: _MessageIndex(
               messages: messages,
               selectedNumber: _selectedNumber,
@@ -78,7 +89,50 @@ class _ConversationViewState extends State<ConversationView> {
               children: [
                 Padding(
                   padding: const EdgeInsets.all(12),
-                  child: Text('Selected message ${selected.number}'),
+                  child: Wrap(
+                    spacing: 12,
+                    runSpacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text('Selected message ${selected.number}'),
+                      Semantics(
+                        label: 'Tool call visibility filter',
+                        child: SegmentedButton<ToolCallVisibility>(
+                          segments: const [
+                            ButtonSegment(
+                              value: ToolCallVisibility.show,
+                              label: Text('Show tools'),
+                            ),
+                            ButtonSegment(
+                              value: ToolCallVisibility.collapse,
+                              label: Text('Collapse tools'),
+                            ),
+                            ButtonSegment(
+                              value: ToolCallVisibility.hide,
+                              label: Text('Hide tools'),
+                            ),
+                          ],
+                          selected: {_toolCallVisibility},
+                          onSelectionChanged: (selection) {
+                            setState(() {
+                              _toolCallVisibility = selection.single;
+                              final visibleAfterChange = _messagesForVisibility(
+                                _toolCallVisibility,
+                              );
+                              if (!visibleAfterChange.any(
+                                (message) => message.number == _selectedNumber,
+                              )) {
+                                if (visibleAfterChange.isNotEmpty) {
+                                  _selectedNumber =
+                                      visibleAfterChange.first.number;
+                                }
+                              }
+                            });
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
                 Expanded(
                   child: ListView.builder(
@@ -91,6 +145,7 @@ class _ConversationViewState extends State<ConversationView> {
                         message: message,
                         expanded: _expanded.contains(message.id),
                         selected: message.number == _selectedNumber,
+                        toolCallVisibility: _toolCallVisibility,
                         motionPolicy: motionPolicy,
                         onCopyMarkdown: widget.onCopyMessageMarkdown,
                         onToggleExpanded: () {
@@ -120,17 +175,39 @@ class _ConversationViewState extends State<ConversationView> {
     );
   }
 
-  ConversationMessageViewModel get _selectedMessage {
-    return widget.messages.firstWhere(
+  List<ConversationMessageViewModel> get _visibleMessages {
+    return _messagesForVisibility(_toolCallVisibility);
+  }
+
+  List<ConversationMessageViewModel> _messagesForVisibility(
+    ToolCallVisibility visibility,
+  ) {
+    return widget.messages
+        .where((message) {
+          if (visibility != ToolCallVisibility.hide) {
+            return true;
+          }
+          if (!message.hasToolOutput &&
+              message.author != ConversationAuthor.tool) {
+            return true;
+          }
+          return message.hasError;
+        })
+        .toList(growable: false);
+  }
+
+  ConversationMessageViewModel _selectedMessage(
+    List<ConversationMessageViewModel> messages,
+  ) {
+    return messages.firstWhere(
       (message) => message.number == _selectedNumber,
-      orElse: () => widget.messages.first,
+      orElse: () => messages.first,
     );
   }
 
   void _selectMessage(int number) {
-    final index = widget.messages.indexWhere(
-      (message) => message.number == number,
-    );
+    final messages = _visibleMessages;
+    final index = messages.indexWhere((message) => message.number == number);
     if (index < 0) {
       return;
     }
@@ -171,7 +248,7 @@ class _MessageIndex extends StatelessWidget {
         ].join(', ');
         return Semantics(
           label:
-              '#${message.number} ${message.authorLabel}, ${message.tokenCount} tokens',
+              '#${message.number} ${message.authorLabel}, ${message.tokenLabel}',
           button: true,
           selected: selected,
           child: ListTile(
@@ -187,7 +264,7 @@ class _MessageIndex extends StatelessWidget {
               [
                 message.createdAtUtc.shortTime,
                 message.preview,
-                '${message.tokenCount} tokens',
+                message.tokenLabel,
                 if (markers.isNotEmpty) markers,
               ].join(' | '),
               maxLines: 2,
@@ -207,6 +284,7 @@ class _ConversationMessageCard extends StatelessWidget {
     required this.message,
     required this.expanded,
     required this.selected,
+    required this.toolCallVisibility,
     required this.motionPolicy,
     required this.onCopyMarkdown,
     required this.onToggleExpanded,
@@ -215,6 +293,7 @@ class _ConversationMessageCard extends StatelessWidget {
   final ConversationMessageViewModel message;
   final bool expanded;
   final bool selected;
+  final ToolCallVisibility toolCallVisibility;
   final CodexMotionPolicy motionPolicy;
   final CopyTextCallback? onCopyMarkdown;
   final VoidCallback onToggleExpanded;
@@ -222,7 +301,10 @@ class _ConversationMessageCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final collapsedToolOutput = message.hasToolOutput && !expanded;
+    final collapsedToolOutput =
+        message.hasToolOutput &&
+        toolCallVisibility == ToolCallVisibility.collapse &&
+        !expanded;
     final collapsedLongMessage = message.isLong && !expanded;
     final body = collapsedToolOutput || collapsedLongMessage
         ? message.preview
@@ -268,8 +350,7 @@ class _ConversationMessageCard extends StatelessWidget {
                     policy: motionPolicy,
                     child: Semantics(
                       label:
-                          'Tool output collapsed, ${message.lineCount} lines. Press Enter to expand.',
-                      button: true,
+                          'Tool output collapsed, ${message.lineCount} lines. Use the Expand tool output button to show it.',
                       container: true,
                       child: ExcludeSemantics(
                         child: Text(
@@ -376,6 +457,8 @@ class _MessageKindIcon extends StatelessWidget {
       ConversationAuthor.user => scheme.primary,
       ConversationAuthor.assistant => scheme.tertiary,
       ConversationAuthor.tool => scheme.secondary,
+      ConversationAuthor.reasoning => scheme.outline,
+      ConversationAuthor.system => scheme.inverseSurface,
     };
     final background = selected
         ? color.withValues(alpha: 0.22)
@@ -399,6 +482,8 @@ String _messageIcon(ConversationAuthor author) {
     ConversationAuthor.user => AppIcons.messageUser,
     ConversationAuthor.assistant => AppIcons.messageAssistant,
     ConversationAuthor.tool => AppIcons.messageTool,
+    ConversationAuthor.reasoning => AppIcons.messageAssistant,
+    ConversationAuthor.system => AppIcons.messageAssistant,
   };
 }
 

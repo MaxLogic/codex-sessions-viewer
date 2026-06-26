@@ -50,7 +50,7 @@ void main() {
 
     await tester.tap(find.text('Keep selected'));
     await tester.pumpAndSettle();
-    expect(find.text('Selected: Keep selected'), findsOneWidget);
+    expect(find.text('Keep selected'), findsWidgets);
 
     await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
     await tester.pump();
@@ -66,7 +66,6 @@ void main() {
     expect(find.text('Keep'), findsOneWidget);
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
     expect(find.text('Keep selected updated'), findsWidgets);
-    expect(find.text('Selected: Keep selected updated'), findsOneWidget);
     expect(find.text('Scan finished. 2 sessions found.'), findsOneWidget);
   });
 
@@ -114,6 +113,510 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.widgetWithText(ElevatedButton, 'Refresh'), findsOneWidget);
+  });
+
+  testWidgets('shows and filters named Codex threads', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'named',
+              title: 'Named title',
+              project: 'codex-sessions-viewer',
+              threadName: 'dmk2',
+            ),
+            _row(id: 'plain', title: 'Plain title', project: 'Other'),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.text('[dmk2]'), findsOneWidget);
+
+    await tester.enterText(find.bySemanticsLabel('Session search'), 'dmk2');
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.text('[dmk2]'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Advanced filters'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.bySemanticsLabel('Thread name filter'), 'mk2');
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.bySemanticsLabel('Named sessions only filter'));
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+
+    await tester.tap(find.text('[dmk2]'));
+    await tester.pumpAndSettle();
+    expect(find.text('dmk2'), findsWidgets);
+    expect(find.text('Thread dmk2'), findsOneWidget);
+    expect(find.text('Thread name'), findsOneWidget);
+  });
+
+  testWidgets(
+    'unreachable scan with cached rows keeps recovery actions visible',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionsScreen(
+            initialRows: [
+              _row(id: 'cached', title: 'Cached session', project: 'Viewer'),
+            ],
+            onRefreshResult: () async {
+              return SessionsRefreshResult(
+                rows: [
+                  _row(
+                    id: 'cached',
+                    title: 'Cached session',
+                    project: 'Viewer',
+                  ),
+                ],
+                statusMessage:
+                    r'Scan finished. 1 session visible. Session root is unreachable. Unreachable paths: \\wsl.localhost\Ubuntu\home\pawel\.codex',
+              );
+            },
+          ),
+        ),
+      );
+
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Cached session'), findsWidgets);
+      expect(
+        find.textContaining('Session root is unreachable'),
+        findsOneWidget,
+      );
+      expect(find.text('Test WSL path'), findsOneWidget);
+      expect(find.text('Open Settings'), findsOneWidget);
+      expect(
+        find.textContaining(
+          r'Configured path: \\wsl.localhost\Ubuntu\home\pawel\.codex',
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('groups subagent sessions under user sessions', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'parent',
+              sessionId: 'thread-parent',
+              title: 'Main user session',
+              project: 'Viewer',
+            ),
+            _row(
+              id: 'child',
+              sessionId: 'thread-child',
+              title: 'Child subagent',
+              project: 'Viewer',
+              threadSource: 'subagent',
+              parentThreadId: 'thread-parent',
+              agentNickname: 'Singer',
+              estimatedCostText: '0.12',
+              costUnknown: false,
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.text('Main user session'), findsWidgets);
+    expect(find.textContaining('Child subagent'), findsNothing);
+    expect(
+      find.bySemanticsLabel('Show 1 subagent for Main user session'),
+      findsOneWidget,
+    );
+
+    await tester.tap(
+      find.bySemanticsLabel('Show 1 subagent for Main user session'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+    expect(
+      find.text('Subagent: Singer - Child subagent - \$0.12'),
+      findsWidgets,
+    );
+    expect(
+      find.bySemanticsLabel(
+        'Session Subagent: Singer, Child subagent under Main user session. Status Available.',
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(
+      find.text('Subagent: Singer - Child subagent - \$0.12').first,
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Child subagent'), findsWidgets);
+  });
+
+  testWidgets('parent rows show aggregate subagent usage', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'parent',
+              sessionId: 'thread-parent',
+              title: 'Main user session',
+              project: 'Viewer',
+              totalTokens: 400,
+              estimatedCostText: '0.10',
+              costUnknown: false,
+            ),
+            _row(
+              id: 'child',
+              sessionId: 'thread-child',
+              title: 'Child subagent',
+              project: 'Viewer',
+              threadSource: 'subagent',
+              parentThreadId: 'thread-parent',
+              agentNickname: 'Singer',
+              totalTokens: 250,
+              estimatedCostText: '0.025',
+              costUnknown: false,
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.bySemanticsLabel('Tokens 650'), findsOneWidget);
+    expect(find.text('650'), findsOneWidget);
+
+    await tester.tap(
+      find.bySemanticsLabel('Show 1 subagent for Main user session'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Tokens 650'), findsOneWidget);
+    expect(find.bySemanticsLabel('Tokens 250'), findsOneWidget);
+    expect(find.text('250'), findsOneWidget);
+  });
+
+  testWidgets('parent aggregate tokens drive token sorting', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialTableState: const SessionTableSettings(
+            columnWidths: {},
+            newestPerProjectOnly: false,
+            sorts: [
+              SessionTableSortSettings(
+                column: 'total_tokens',
+                ascending: false,
+              ),
+            ],
+          ),
+          initialRows: [
+            _row(
+              id: 'standalone',
+              sessionId: 'thread-standalone',
+              title: 'Standalone medium',
+              project: 'Viewer',
+              totalTokens: 500,
+            ),
+            _row(
+              id: 'parent',
+              sessionId: 'thread-parent',
+              title: 'Small main big child',
+              project: 'Viewer',
+              totalTokens: 100,
+            ),
+            _row(
+              id: 'child',
+              sessionId: 'thread-child',
+              title: 'Big child',
+              project: 'Viewer',
+              threadSource: 'subagent',
+              parentThreadId: 'thread-parent',
+              agentNickname: 'Singer',
+              totalTokens: 1000,
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final parentTop = tester.getTopLeft(
+      find.text('Small main big child').first,
+    );
+    final standaloneTop = tester.getTopLeft(
+      find.text('Standalone medium').first,
+    );
+    expect(parentTop.dy, lessThan(standaloneTop.dy));
+  });
+
+  testWidgets(
+    'newest per project keeps matching subagent parent discoverable',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionsScreen(
+            initialTableState: const SessionTableSettings(
+              columnWidths: {},
+              newestPerProjectOnly: true,
+              sorts: [
+                SessionTableSortSettings(
+                  column: 'last_message_at',
+                  ascending: false,
+                ),
+              ],
+            ),
+            initialRows: [
+              _row(
+                id: 'new-parent',
+                sessionId: 'thread-new',
+                title: 'Newest same-project parent',
+                project: 'Viewer',
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 12),
+              ),
+              _row(
+                id: 'old-parent',
+                sessionId: 'thread-old',
+                title: 'Older parent',
+                project: 'Viewer',
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9),
+              ),
+              _row(
+                id: 'needle-child',
+                sessionId: 'thread-child',
+                title: 'Needle subagent',
+                project: 'Viewer',
+                threadSource: 'subagent',
+                parentThreadId: 'thread-old',
+                agentNickname: 'Singer',
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 10),
+              ),
+            ],
+          ),
+        ),
+      );
+
+      await tester.enterText(find.bySemanticsLabel('Session search'), 'Needle');
+      await tester.pumpAndSettle();
+
+      expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+      expect(find.text('Older parent'), findsWidgets);
+      expect(
+        find.text('Subagent: Singer - Needle subagent - Cost unknown'),
+        findsWidgets,
+      );
+      expect(find.text('Newest same-project parent'), findsNothing);
+    },
+  );
+
+  testWidgets('all origin applies newest per project across orphan subagents', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialTableState: const SessionTableSettings(
+            columnWidths: {},
+            newestPerProjectOnly: true,
+            sorts: [
+              SessionTableSortSettings(
+                column: 'last_message_at',
+                ascending: false,
+              ),
+            ],
+          ),
+          initialRows: [
+            _row(
+              id: 'parent',
+              sessionId: 'thread-parent',
+              title: 'Older user session',
+              project: 'Viewer',
+              lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9),
+            ),
+            _row(
+              id: 'orphan',
+              sessionId: 'thread-orphan',
+              title: 'Newer orphan subagent',
+              project: 'Viewer',
+              threadSource: 'subagent',
+              parentThreadId: 'missing-parent',
+              agentNickname: 'Singer',
+              lastMessageAtUtc: DateTime.utc(2026, 6, 12, 12),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await _setOriginFilter(tester, 'All');
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(
+      find.text('Subagent: Singer - Newer orphan subagent - Cost unknown'),
+      findsWidgets,
+    );
+    expect(find.text('Older user session'), findsNothing);
+  });
+
+  testWidgets('newest per project applies after archived filters', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialTableState: const SessionTableSettings(
+            columnWidths: {},
+            newestPerProjectOnly: true,
+            sorts: [
+              SessionTableSortSettings(
+                column: 'last_message_at',
+                ascending: false,
+              ),
+            ],
+          ),
+          initialRows: [
+            _row(
+              id: 'active-new',
+              sessionId: 'thread-active-new',
+              title: 'Active newer session',
+              project: 'Viewer',
+              lastMessageAtUtc: DateTime.utc(2026, 6, 12, 12),
+            ),
+            _row(
+              id: 'archived-old',
+              sessionId: 'thread-archived-old',
+              title: 'Archived older session',
+              project: 'Viewer',
+              isArchived: true,
+              lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Active only').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Archived only').last);
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.text('Archived older session'), findsWidgets);
+    expect(find.text('Active newer session'), findsNothing);
+  });
+
+  testWidgets('origin filters keep subagent hierarchy discoverable', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'parent',
+              sessionId: 'thread-parent',
+              title: 'Main user session',
+              project: 'Viewer',
+            ),
+            _row(
+              id: 'child',
+              sessionId: 'thread-child',
+              title: 'Child subagent',
+              project: 'Viewer',
+              threadSource: 'subagent',
+              parentThreadId: 'thread-parent',
+              agentNickname: 'Singer',
+              estimatedCostText: '0.12',
+              costUnknown: false,
+            ),
+            _row(
+              id: 'orphan',
+              sessionId: 'thread-orphan',
+              title: 'Orphan subagent',
+              project: 'Viewer',
+              threadSource: 'subagent',
+              parentThreadId: 'missing-parent',
+              agentNickname: 'Heisenberg',
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.textContaining('Child subagent'), findsNothing);
+    expect(find.textContaining('Orphan subagent'), findsNothing);
+
+    await _setOriginFilter(tester, 'All');
+
+    expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+    expect(find.text('Main user session'), findsWidgets);
+    expect(
+      find.text('Subagent: Heisenberg - Orphan subagent - Cost unknown'),
+      findsWidgets,
+    );
+    expect(find.textContaining('Child subagent'), findsNothing);
+
+    await tester.tap(
+      find.bySemanticsLabel('Show 1 subagent for Main user session'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Sessions, 3 visible'), findsOneWidget);
+    expect(
+      find.text('Subagent: Singer - Child subagent - \$0.12'),
+      findsWidgets,
+    );
+
+    await _setOriginFilter(tester, 'Subagent');
+
+    expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+    expect(
+      find.text(
+        'Subagent: Singer - Child subagent - \$0.12 (Parent: Main user session)',
+      ),
+      findsWidgets,
+    );
+    expect(
+      find.text('Subagent: Heisenberg - Orphan subagent - Cost unknown'),
+      findsWidgets,
+    );
+    expect(find.text('Main user session'), findsNothing);
   });
 
   testWidgets('newly visible rows use bounded motion feedback', (tester) async {
@@ -322,7 +825,7 @@ void main() {
     );
 
     final header = find.bySemanticsLabel(
-      'Last Message Date column descending priority 1',
+      'Last Message column descending priority 1',
     );
     await tester.tap(header, buttons: kSecondaryButton);
     await tester.pump();
@@ -827,12 +1330,25 @@ SessionRowViewModel _row({
   required String id,
   required String title,
   required String project,
+  String sessionId = '',
+  String threadName = '',
+  String threadSource = '',
+  String parentThreadId = '',
+  String agentNickname = '',
   bool isArchived = false,
   DateTime? lastMessageAtUtc,
+  int totalTokens = 900,
   List<ConversationMessageViewModel> messages = const [],
+  String? estimatedCostText,
+  bool costUnknown = true,
 }) {
   return SessionRowViewModel(
     id: id,
+    sessionId: sessionId,
+    threadName: threadName,
+    threadSource: threadSource,
+    parentThreadId: parentThreadId,
+    agentNickname: agentNickname,
     startedAtUtc: DateTime.utc(2026, 6, 12, 9),
     lastMessageAtUtc: lastMessageAtUtc ?? DateTime.utc(2026, 6, 12, 10),
     platform: SessionRowPlatform.windows,
@@ -841,13 +1357,33 @@ SessionRowViewModel _row({
     title: title,
     summary: title,
     messageCount: 3,
-    totalTokens: 900,
+    totalTokens: totalTokens,
     model: 'gpt-5.4',
+    estimatedCostText: estimatedCostText,
+    costUnknown: costUnknown,
     tags: const ['ui'],
     status: 'Available',
     isArchived: isArchived,
     conversationMessages: messages,
   );
+}
+
+Future<void> _setOriginFilter(WidgetTester tester, String label) async {
+  Finder originDropdown() {
+    return find.byWidgetPredicate((widget) {
+      final key = widget.key;
+      return key is ValueKey<String> && key.value.startsWith('origin-filter-');
+    });
+  }
+
+  if (originDropdown().evaluate().isEmpty) {
+    await tester.tap(find.byType(ExpansionTile));
+    await tester.pumpAndSettle();
+  }
+  await tester.tap(originDropdown());
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
 }
 
 Finder _rowMotionKeyFor(String id) {

@@ -59,7 +59,10 @@ void main() {
     expect(find.textContaining('Tokens over time:'), findsOneWidget);
     expect(find.text('2026-06-12'), findsWidgets);
     expect(find.text('3,200 tokens'), findsWidgets);
-    expect(find.bySemanticsLabel('Usage table equivalent'), findsWidgets);
+    expect(
+      find.bySemanticsLabel('Tokens over time table equivalent'),
+      findsOneWidget,
+    );
 
     await tester.tap(find.text('Today'));
     await tester.pump();
@@ -68,12 +71,25 @@ void main() {
     expect(announcer.messages, contains('Usage period changed to Today.'));
 
     await tester.ensureVisible(find.text('Top'));
+    await tester.ensureVisible(find.text('Platforms'));
+    await tester.tap(find.text('Platforms'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Usage by origin'), findsOneWidget);
+    expect(find.text('User, 3 sessions, 6,000 tokens'), findsOneWidget);
+    expect(find.text('Subagent, 1 session, 1,300 tokens'), findsOneWidget);
+
+    await tester.ensureVisible(find.text('Top'));
     await tester.tap(find.text('Top'));
     await tester.pumpAndSettle();
 
     expect(find.text('Top sessions by tokens'), findsOneWidget);
     expect(find.text('Top sessions by message count'), findsOneWidget);
     expect(find.text('Top sessions by estimated cost'), findsOneWidget);
+    expect(
+      find.text('Parser cache work, Origin: User, 4,100 tokens'),
+      findsOneWidget,
+    );
   });
 }
 
@@ -159,6 +175,30 @@ UsageSummary _summary() {
         costUnknown: false,
       ),
     ],
+    byOrigin: const [
+      UsageBreakdownRow(
+        key: 'User',
+        sessionCount: 3,
+        messageCount: 34,
+        inputTokens: 3600,
+        outputTokens: 1700,
+        cachedInputTokens: 700,
+        totalTokens: 6000,
+        estimatedCostText: r'$0.28',
+        costUnknown: false,
+      ),
+      UsageBreakdownRow(
+        key: 'Subagent',
+        sessionCount: 1,
+        messageCount: 7,
+        inputTokens: 700,
+        outputTokens: 400,
+        cachedInputTokens: 200,
+        totalTokens: 1300,
+        estimatedCostText: r'$0.06',
+        costUnknown: false,
+      ),
+    ],
     byArchiveState: const [
       UsageBreakdownRow(
         key: 'active',
@@ -180,6 +220,7 @@ UsageSummary _summary() {
         totalTokens: 4100,
         estimatedCostText: r'$0.19',
         costUnknown: false,
+        originLabel: 'User',
       ),
     ],
     topSessionsByMessageCount: const [],
