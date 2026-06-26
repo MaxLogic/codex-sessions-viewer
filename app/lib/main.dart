@@ -12,6 +12,7 @@ Future<void> main() async {
   final windowStateController = AppWindowStateController(
     store: WindowStateStore(SettingsRepository(defaultSettingsFile())),
   );
+  await restoreWindowStateBestEffort(windowStateController.restoreAndTrack);
   final databaseFile = defaultDatabaseFile();
   final sqlRoot = defaultSqlRoot();
   runApp(
@@ -24,7 +25,16 @@ Future<void> main() async {
       ),
     ),
   );
-  unawaited(_afterFirstFrame(windowStateController.restoreAndTrack));
+}
+
+Future<void> restoreWindowStateBestEffort(
+  Future<void> Function() restore,
+) async {
+  try {
+    await restore();
+  } on Object {
+    // Settings startup still owns user-visible configuration failures.
+  }
 }
 
 Future<T> _afterFirstFrame<T>(Future<T> Function() work) {

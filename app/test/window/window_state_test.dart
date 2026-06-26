@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/window/window_state.dart';
+import 'package:codex_sessions_viewer/main.dart' as app;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
@@ -46,5 +47,16 @@ void main() {
     );
 
     expect(await store.load(), isNull);
+  });
+
+  test('window restore failure is best effort during startup', () async {
+    var called = false;
+
+    await app.restoreWindowStateBestEffort(() async {
+      called = true;
+      throw const FormatException('bad settings');
+    });
+
+    expect(called, isTrue);
   });
 }
