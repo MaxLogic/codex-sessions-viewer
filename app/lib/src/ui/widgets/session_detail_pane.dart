@@ -15,6 +15,10 @@ import 'svg_icon.dart';
 typedef DetailCopyCallback = Future<void> Function(String text);
 typedef DetailMarkdownExportCallback =
     Future<void> Function(SessionRowViewModel row, String markdown);
+typedef FullConversationMessagesLoader =
+    Future<List<ConversationMessageViewModel>> Function(
+      SessionRowViewModel row,
+    );
 typedef SessionDetailActionCallback =
     Future<void> Function(SessionDetailAction action);
 
@@ -38,6 +42,7 @@ class SessionDetailPane extends StatelessWidget {
     this.settings,
     this.onCopyText,
     this.onExportMarkdown,
+    this.onLoadFullConversationMessages,
     this.onSessionAction,
     this.onRunTerminalCommand,
     this.onEditTerminalCommand,
@@ -50,6 +55,7 @@ class SessionDetailPane extends StatelessWidget {
   final AppSettings? settings;
   final DetailCopyCallback? onCopyText;
   final DetailMarkdownExportCallback? onExportMarkdown;
+  final FullConversationMessagesLoader? onLoadFullConversationMessages;
   final SessionDetailActionCallback? onSessionAction;
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
@@ -90,6 +96,7 @@ class SessionDetailPane extends StatelessWidget {
             commandSet: commandSet,
             onCopyText: onCopyText,
             onExportMarkdown: onExportMarkdown,
+            onLoadFullConversationMessages: onLoadFullConversationMessages,
             onSessionAction: onSessionAction,
           ),
           const SizedBox(height: 8),
@@ -451,6 +458,7 @@ class _ActionArea extends StatelessWidget {
     required this.commandSet,
     required this.onCopyText,
     required this.onExportMarkdown,
+    required this.onLoadFullConversationMessages,
     required this.onSessionAction,
   });
 
@@ -458,6 +466,7 @@ class _ActionArea extends StatelessWidget {
   final ResumeCommandSet commandSet;
   final DetailCopyCallback? onCopyText;
   final DetailMarkdownExportCallback? onExportMarkdown;
+  final FullConversationMessagesLoader? onLoadFullConversationMessages;
   final SessionDetailActionCallback? onSessionAction;
 
   @override
@@ -597,11 +606,11 @@ class _ActionArea extends StatelessWidget {
         );
         return;
       case 'copy-conversation-markdown':
-        await _copyText(
-          context,
-          'Copied conversation Markdown.',
-          _conversationMarkdown(row),
-        );
+        final markdown = await _conversationMarkdown(row);
+        if (!context.mounted) {
+          return;
+        }
+        await _copyText(context, 'Copied conversation Markdown.', markdown);
         return;
       case 'copy-plain-resume':
         final command = commandSet.plainResumeCommand;
@@ -637,7 +646,10 @@ class _ActionArea extends StatelessWidget {
     String? disabledReason,
     String? iconAsset,
   }) {
-    final onPressed = enabled && onSessionAction != null
+    final hasCallback = action == SessionDetailAction.exportMarkdown
+        ? onExportMarkdown != null
+        : onSessionAction != null;
+    final onPressed = enabled && hasCallback
         ? () => _invokeAction(action)
         : null;
     final button = iconAsset == null
@@ -685,14 +697,15 @@ class _ActionArea extends StatelessWidget {
   Future<void> _exportMarkdown() async {
     final callback = onExportMarkdown;
     if (callback != null) {
-      await callback(row, _conversationMarkdown(row));
+      await callback(row, await _conversationMarkdown(row));
     }
   }
 
-  String _conversationMarkdown(SessionRowViewModel row) {
+  Future<String> _conversationMarkdown(SessionRowViewModel row) async {
+    final messages = await _conversationMessagesForFullAction(row);
     return [
       if (row.title.trim().isNotEmpty) ...['# ${row.title}', ''],
-      for (final message in row.conversationMessages)
+      for (final message in messages)
         if (!_isInjectedContextMessage(message)) ...[
           '## Message ${message.number} - ${message.authorLabel}',
           '',
@@ -700,6 +713,19 @@ class _ActionArea extends StatelessWidget {
           '',
         ],
     ].join('\n');
+  }
+
+  Future<List<ConversationMessageViewModel>> _conversationMessagesForFullAction(
+    SessionRowViewModel row,
+  ) async {
+    if (!row.conversationMessages.any((message) => !message.isBodyLoaded)) {
+      return row.conversationMessages;
+    }
+    final loader = onLoadFullConversationMessages;
+    if (loader == null) {
+      return row.conversationMessages;
+    }
+    return loader(row);
   }
 }
 

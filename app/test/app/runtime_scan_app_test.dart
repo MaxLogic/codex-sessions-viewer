@@ -1799,6 +1799,56 @@ void main() {
     expect(first.body, isEmpty);
   });
 
+  test('paged detail load avoids full body materialization', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_paged_materialization_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writePagedJsonFixture(windowsRoot, messageCount: 60);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final result = await controller.refresh();
+    final detail = await controller.loadSessionDetail(result.rows.single.id);
+
+    final messages = detail!.conversationMessages;
+    expect(messages, hasLength(60));
+    expect(messages.where((message) => message.isBodyLoaded), hasLength(50));
+    expect(messages.take(10).every((message) => message.body.isEmpty), isTrue);
+    expect(
+      messages.skip(10).every((message) => message.body.isNotEmpty),
+      isTrue,
+    );
+  });
+
   testWidgets(
     'production empty-state actions open settings and retry path test',
     (tester) async {

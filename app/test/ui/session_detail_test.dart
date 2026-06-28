@@ -116,6 +116,84 @@ void main() {
     expect(find.text('Copied session path.'), findsOneWidget);
   });
 
+  testWidgets('exports full conversation from paged messages', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1000, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    var fullLoadCalls = 0;
+    final exports = <String>[];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionDetailPane(
+            row: _detailRow(
+              messages: [
+                ConversationMessageViewModel(
+                  id: 'old',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                  preview: 'Older prompt preview',
+                  body: '',
+                  tokenCount: 4,
+                  isBodyLoaded: false,
+                ),
+                ConversationMessageViewModel(
+                  id: 'new',
+                  number: 2,
+                  author: ConversationAuthor.assistant,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                  preview: 'Newest answer preview',
+                  body: 'Newest answer body',
+                  tokenCount: 8,
+                ),
+              ],
+            ),
+            onLoadFullConversationMessages: (_) async {
+              fullLoadCalls++;
+              return [
+                ConversationMessageViewModel(
+                  id: 'old',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                  preview: 'Older prompt preview',
+                  body: 'Older prompt body',
+                  tokenCount: 4,
+                ),
+                ConversationMessageViewModel(
+                  id: 'new',
+                  number: 2,
+                  author: ConversationAuthor.assistant,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                  preview: 'Newest answer preview',
+                  body: 'Newest answer body',
+                  tokenCount: 8,
+                ),
+              ];
+            },
+            onExportMarkdown: (_, markdown) async {
+              exports.add(markdown);
+            },
+          ),
+        ),
+      ),
+    );
+
+    expect(fullLoadCalls, 0);
+    expect(find.text('Message body not loaded yet.'), findsOneWidget);
+
+    final export = find.widgetWithText(OutlinedButton, 'Export Markdown');
+    await tester.ensureVisible(export);
+    await tester.tap(export);
+    await tester.pumpAndSettle();
+
+    expect(fullLoadCalls, 1);
+    expect(exports.single, contains('Older prompt body'));
+    expect(exports.single, contains('Newest answer body'));
+    expect(exports.single, isNot(contains('Message body not loaded yet')));
+  });
+
   testWidgets(
     'keeps command preview collapsed in the selected-session header',
     (tester) async {
@@ -354,6 +432,7 @@ SessionRowViewModel _detailRow({
   String title = 'Flutter accessibility spike',
   String project = 'Codex Viewer',
   bool isArchived = true,
+  List<ConversationMessageViewModel> messages = const [],
 }) {
   return SessionRowViewModel(
     id: id,
@@ -388,5 +467,6 @@ SessionRowViewModel _detailRow({
     status: 'Available',
     isPinned: true,
     isArchived: isArchived,
+    conversationMessages: messages,
   );
 }
