@@ -275,6 +275,42 @@ void main() {
     },
   );
 
+  testWidgets('announces new messages without stealing focus', (tester) async {
+    final announcer = RecordingScreenReaderAnnouncer();
+    var messages = _messages(40);
+    late StateSetter update;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              update = setState;
+              return ConversationView(messages: messages, announcer: announcer);
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.bySemanticsLabel('#5 Assistant, 5 tokens'));
+    await tester.pumpAndSettle();
+    announcer.messages.clear();
+
+    update(() {
+      messages = _messages(41);
+    });
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(announcer.messages, [
+      'Newer messages are available. Use Jump to newest to read them.',
+    ]);
+    expect(find.text('Selected message 5'), findsOneWidget);
+    expect(find.bySemanticsLabel('Jump to newest message'), findsOneWidget);
+  });
+
   testWidgets('auto-scrolls when already near bottom', (tester) async {
     var messages = _messages(40);
     late StateSetter update;

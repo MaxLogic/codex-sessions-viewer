@@ -92,6 +92,13 @@ class _ConversationViewState extends State<ConversationView> {
         _scrollMessagesToBottom();
         _notifyPositionChanged();
       } else {
+        if (!_showJumpToNewest) {
+          unawaited(
+            widget.announcer?.announce(
+              'Newer messages are available. Use Jump to newest to read them.',
+            ),
+          );
+        }
         _showJumpToNewest = true;
       }
     }
