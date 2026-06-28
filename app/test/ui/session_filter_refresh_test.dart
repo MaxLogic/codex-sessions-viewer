@@ -1231,6 +1231,48 @@ void main() {
     expect(find.text('Prompt body loaded lazily'), findsWidgets);
   });
 
+  testWidgets('restores selected session conversation position', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'first',
+              title: 'First session',
+              project: 'Viewer',
+              messages: _messages('first', count: 6),
+            ),
+            _row(
+              id: 'second',
+              title: 'Second session',
+              project: 'Viewer',
+              messages: _messages('second', count: 6),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('First session').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.bySemanticsLabel('#4 Assistant, 4 tokens'));
+    await tester.pumpAndSettle();
+    expect(find.text('Selected message 4'), findsOneWidget);
+
+    await tester.tap(find.text('Second session').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Selected message 4'), findsNothing);
+
+    await tester.tap(find.text('First session').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Selected message 4'), findsOneWidget);
+  });
+
   testWidgets('ignores stale selected conversation loads', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1800, 1000));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -1554,6 +1596,26 @@ SessionRowViewModel _row({
     sourceFilePath: sourceFilePath,
     conversationMessages: messages,
   );
+}
+
+List<ConversationMessageViewModel> _messages(
+  String prefix, {
+  required int count,
+}) {
+  return [
+    for (var i = 1; i <= count; i++)
+      ConversationMessageViewModel(
+        id: '$prefix-$i',
+        number: i,
+        author: i.isOdd
+            ? ConversationAuthor.user
+            : ConversationAuthor.assistant,
+        createdAtUtc: DateTime.utc(2026, 6, 12, 9, i),
+        preview: '$prefix message $i preview',
+        body: '$prefix message $i body',
+        tokenCount: i,
+      ),
+  ];
 }
 
 Future<void> _setOriginFilter(WidgetTester tester, String label) async {

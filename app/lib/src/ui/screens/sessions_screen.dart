@@ -10,6 +10,7 @@ import '../../usage/usage_summary.dart';
 import '../motion.dart';
 import '../models/session_row_view_model.dart';
 import '../widgets/command_preview.dart';
+import '../widgets/conversation_view.dart';
 import '../widgets/session_detail_pane.dart';
 import '../widgets/svg_icon.dart';
 
@@ -134,6 +135,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _rowMotionIds = <String>{};
   var _rowMotionGeneration = 0;
   final _expandedParentIds = <String>{};
+  final _conversationPositions = <String, ConversationPositionState>{};
   StreamSubscription<Object>? _selectedFileSubscription;
   Timer? _selectedFileReloadTimer;
   String? _watchedDetailPath;
@@ -385,6 +387,14 @@ class _SessionsScreenState extends State<SessionsScreen> {
                     isLoadingMessages:
                         selectedRow != null &&
                         _loadingDetailId == selectedRow.id,
+                    initialConversationMessageNumber: selectedRow == null
+                        ? null
+                        : _conversationPositions[selectedRow.id]?.messageNumber,
+                    onConversationPositionChanged: selectedRow == null
+                        ? null
+                        : (position) {
+                            _conversationPositions[selectedRow.id] = position;
+                          },
                   ),
                 ),
               ],
@@ -3192,6 +3202,8 @@ class _SessionDetailPlaceholder extends StatelessWidget {
     required this.onRunTerminalCommand,
     required this.onEditTerminalCommand,
     required this.isLoadingMessages,
+    required this.initialConversationMessageNumber,
+    required this.onConversationPositionChanged,
   });
 
   final SessionRowViewModel? row;
@@ -3202,6 +3214,8 @@ class _SessionDetailPlaceholder extends StatelessWidget {
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
   final bool isLoadingMessages;
+  final int? initialConversationMessageNumber;
+  final ConversationPositionChanged? onConversationPositionChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -3250,6 +3264,8 @@ class _SessionDetailPlaceholder extends StatelessWidget {
         onRunTerminalCommand: onRunTerminalCommand,
         onEditTerminalCommand: onEditTerminalCommand,
         isLoadingMessages: isLoadingMessages,
+        initialConversationMessageNumber: initialConversationMessageNumber,
+        onConversationPositionChanged: onConversationPositionChanged,
       );
     }
     return SingleChildScrollView(

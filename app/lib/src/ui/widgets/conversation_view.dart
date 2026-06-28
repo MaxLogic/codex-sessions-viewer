@@ -10,8 +10,22 @@ import '../motion.dart';
 import 'svg_icon.dart';
 
 typedef CopyTextCallback = Future<void> Function(String text);
+typedef ConversationPositionChanged =
+    void Function(ConversationPositionState position);
 
 enum ToolCallVisibility { show, collapse, hide }
+
+class ConversationPositionState {
+  const ConversationPositionState({
+    required this.messageNumber,
+    required this.wasNearBottom,
+    required this.messageCount,
+  });
+
+  final int messageNumber;
+  final bool wasNearBottom;
+  final int messageCount;
+}
 
 class ConversationView extends StatefulWidget {
   const ConversationView({
@@ -20,6 +34,8 @@ class ConversationView extends StatefulWidget {
     this.onCopyMessageMarkdown,
     this.motionMode = AppMotionMode.system,
     this.initialToolCallVisibility = ToolCallVisibility.collapse,
+    this.initialMessageNumber,
+    this.onPositionChanged,
     this.announcer,
   });
 
@@ -27,6 +43,8 @@ class ConversationView extends StatefulWidget {
   final CopyTextCallback? onCopyMessageMarkdown;
   final AppMotionMode motionMode;
   final ToolCallVisibility initialToolCallVisibility;
+  final int? initialMessageNumber;
+  final ConversationPositionChanged? onPositionChanged;
   final ScreenReaderAnnouncer? announcer;
 
   @override
@@ -45,16 +63,39 @@ class _ConversationViewState extends State<ConversationView> {
     super.initState();
     _toolCallVisibility = widget.initialToolCallVisibility;
     _lastVisibleMessageCount = _visibleMessages.length;
+    _selectedNumber = _initialSelectedNumber(_visibleMessages);
+    _scrollToSelectedMessage();
   }
 
   @override
   void didUpdateWidget(covariant ConversationView oldWidget) {
     super.didUpdateWidget(oldWidget);
     final visibleCount = _visibleMessages.length;
+    if (widget.initialMessageNumber != oldWidget.initialMessageNumber) {
+      _selectedNumber = _initialSelectedNumber(_visibleMessages);
+      _scrollToSelectedMessage();
+    } else if (!_visibleMessages.any(
+      (message) => message.number == _selectedNumber,
+    )) {
+      _selectedNumber = _initialSelectedNumber(_visibleMessages);
+      _scrollToSelectedMessage();
+    }
     if (visibleCount > _lastVisibleMessageCount) {
       _scrollMessagesToBottom();
     }
     _lastVisibleMessageCount = visibleCount;
+  }
+
+  int _initialSelectedNumber(List<ConversationMessageViewModel> messages) {
+    final initialNumber = widget.initialMessageNumber;
+    if (initialNumber != null &&
+        messages.any((message) => message.number == initialNumber)) {
+      return initialNumber;
+    }
+    if (messages.isEmpty) {
+      return 1;
+    }
+    return messages.last.number;
   }
 
   @override
@@ -228,6 +269,7 @@ class _ConversationViewState extends State<ConversationView> {
     setState(() {
       _selectedNumber = number;
     });
+    _notifyPositionChanged();
     if (_messageListController.hasClients) {
       _messageListController.animateTo(
         index * 210,
@@ -235,6 +277,45 @@ class _ConversationViewState extends State<ConversationView> {
         curve: Curves.linear,
       );
     }
+  }
+
+  void _scrollToSelectedMessage() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_messageListController.hasClients) {
+        return;
+      }
+      final messages = _visibleMessages;
+      final index = messages.indexWhere(
+        (message) => message.number == _selectedNumber,
+      );
+      if (index < 0) {
+        return;
+      }
+      _messageListController.jumpTo(
+        (index * 210)
+            .clamp(0, _messageListController.position.maxScrollExtent)
+            .toDouble(),
+      );
+    });
+  }
+
+  void _notifyPositionChanged() {
+    final messages = _visibleMessages;
+    widget.onPositionChanged?.call(
+      ConversationPositionState(
+        messageNumber: _selectedNumber,
+        wasNearBottom: _isNearBottom(),
+        messageCount: messages.length,
+      ),
+    );
+  }
+
+  bool _isNearBottom() {
+    if (!_messageListController.hasClients) {
+      return true;
+    }
+    final position = _messageListController.position;
+    return position.maxScrollExtent - position.pixels <= 80;
   }
 
   void _scrollMessagesToBottom() {

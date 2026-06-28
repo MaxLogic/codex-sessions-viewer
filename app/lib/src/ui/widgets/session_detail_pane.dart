@@ -42,6 +42,8 @@ class SessionDetailPane extends StatelessWidget {
     this.onRunTerminalCommand,
     this.onEditTerminalCommand,
     this.isLoadingMessages = false,
+    this.initialConversationMessageNumber,
+    this.onConversationPositionChanged,
   });
 
   final SessionRowViewModel row;
@@ -52,6 +54,8 @@ class SessionDetailPane extends StatelessWidget {
   final TerminalCommandCallback? onRunTerminalCommand;
   final TerminalCommandCallback? onEditTerminalCommand;
   final bool isLoadingMessages;
+  final int? initialConversationMessageNumber;
+  final ConversationPositionChanged? onConversationPositionChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -171,6 +175,8 @@ class SessionDetailPane extends StatelessWidget {
               messages: visibleMessages,
               onCopyText: onCopyText,
               motionMode: effectiveSettings.ui.motion,
+              initialMessageNumber: initialConversationMessageNumber,
+              onPositionChanged: onConversationPositionChanged,
             ),
         ],
       ),
@@ -258,11 +264,15 @@ class _ConversationTabs extends StatelessWidget {
     required this.messages,
     required this.onCopyText,
     required this.motionMode,
+    required this.initialMessageNumber,
+    required this.onPositionChanged,
   });
 
   final List<ConversationMessageViewModel> messages;
   final DetailCopyCallback? onCopyText;
   final AppMotionMode motionMode;
+  final int? initialMessageNumber;
+  final ConversationPositionChanged? onPositionChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -289,6 +299,8 @@ class _ConversationTabs extends StatelessWidget {
                   messages: messages,
                   onCopyMessageMarkdown: onCopyText,
                   motionMode: motionMode,
+                  initialMessageNumber: initialMessageNumber,
+                  onPositionChanged: onPositionChanged,
                 ),
                 FocusReaderView(messages: messages, onCopyText: onCopyText),
               ],

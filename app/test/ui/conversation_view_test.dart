@@ -282,6 +282,86 @@ void main() {
     expect(find.text('Message 41 body'), findsOneWidget);
   });
 
+  testWidgets('restores conversation position from message anchor', (
+    tester,
+  ) async {
+    final reportedPositions = <ConversationPositionState>[];
+    final messages = [
+      for (var i = 1; i <= 30; i++)
+        ConversationMessageViewModel(
+          id: 'm$i',
+          number: i,
+          author: ConversationAuthor.assistant,
+          createdAtUtc: DateTime.utc(2026, 6, 12, 9, i % 60),
+          preview: 'Message $i preview',
+          body: 'Message $i body',
+          tokenCount: i,
+        ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: messages,
+            initialMessageNumber: 24,
+            onPositionChanged: reportedPositions.add,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Selected message 24'), findsOneWidget);
+
+    await tester.tap(find.bySemanticsLabel('#2 Assistant, 2 tokens'));
+    await tester.pumpAndSettle();
+
+    expect(reportedPositions.last.messageNumber, 2);
+  });
+
+  testWidgets('applies updated conversation position anchor', (tester) async {
+    var initialMessageNumber = 5;
+    late StateSetter update;
+    final messages = [
+      for (var i = 1; i <= 8; i++)
+        ConversationMessageViewModel(
+          id: 'm$i',
+          number: i,
+          author: ConversationAuthor.assistant,
+          createdAtUtc: DateTime.utc(2026, 6, 12, 9, i),
+          preview: 'Message $i preview',
+          body: 'Message $i body',
+          tokenCount: i,
+        ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              update = setState;
+              return ConversationView(
+                messages: messages,
+                initialMessageNumber: initialMessageNumber,
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Selected message 5'), findsOneWidget);
+
+    update(() {
+      initialMessageNumber = 3;
+    });
+    await tester.pumpAndSettle();
+
+    expect(find.text('Selected message 3'), findsOneWidget);
+  });
+
   testWidgets('message cards keep a neutral surface background', (
     tester,
   ) async {
