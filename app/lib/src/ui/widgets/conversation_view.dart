@@ -12,6 +12,12 @@ import 'svg_icon.dart';
 typedef CopyTextCallback = Future<void> Function(String text);
 typedef ConversationPositionChanged =
     void Function(ConversationPositionState position);
+typedef ConversationOlderMessagesLoader =
+    Future<List<ConversationMessageViewModel>> Function();
+typedef ConversationMessagePageLoader =
+    Future<List<ConversationMessageViewModel>> Function(
+      int anchorMessageNumber,
+    );
 
 enum ToolCallVisibility { show, collapse, hide }
 
@@ -36,6 +42,8 @@ class ConversationView extends StatefulWidget {
     this.initialToolCallVisibility = ToolCallVisibility.collapse,
     this.initialMessageNumber,
     this.onPositionChanged,
+    this.onLoadOlderMessages,
+    this.onLoadMessagePage,
     this.announcer,
   });
 
@@ -45,6 +53,8 @@ class ConversationView extends StatefulWidget {
   final ToolCallVisibility initialToolCallVisibility;
   final int? initialMessageNumber;
   final ConversationPositionChanged? onPositionChanged;
+  final ConversationOlderMessagesLoader? onLoadOlderMessages;
+  final ConversationMessagePageLoader? onLoadMessagePage;
   final ScreenReaderAnnouncer? announcer;
 
   @override
@@ -56,8 +66,11 @@ class _ConversationViewState extends State<ConversationView> {
   var _selectedNumber = 1;
   late ToolCallVisibility _toolCallVisibility;
   final _expanded = <String>{};
+  final _messageOverridesById = <String, ConversationMessageViewModel>{};
+  final _messageOverridesByNumber = <int, ConversationMessageViewModel>{};
   var _lastVisibleMessageCount = 0;
   var _showJumpToNewest = false;
+  var _loadingOlderMessages = false;
 
   @override
   void initState() {
@@ -215,6 +228,22 @@ class _ConversationViewState extends State<ConversationView> {
                             label: const Text('Jump to newest'),
                           ),
                         ),
+                      if (_canLoadOlderMessages)
+                        Semantics(
+                          label: 'Load older conversation messages',
+                          button: true,
+                          child: OutlinedButton.icon(
+                            onPressed: _loadingOlderMessages
+                                ? null
+                                : _loadOlderMessages,
+                            icon: const Icon(Icons.keyboard_arrow_up),
+                            label: Text(
+                              _loadingOlderMessages
+                                  ? 'Loading older'
+                                  : 'Load older',
+                            ),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -266,7 +295,7 @@ class _ConversationViewState extends State<ConversationView> {
   List<ConversationMessageViewModel> _messagesForVisibility(
     ToolCallVisibility visibility,
   ) {
-    return widget.messages
+    return _mergedMessages()
         .where((message) {
           if (visibility != ToolCallVisibility.hide) {
             return true;
@@ -280,6 +309,28 @@ class _ConversationViewState extends State<ConversationView> {
         .toList(growable: false);
   }
 
+  List<ConversationMessageViewModel> _mergedMessages() {
+    final mergedByNumber = <int, ConversationMessageViewModel>{};
+    for (final message in widget.messages) {
+      mergedByNumber[message.number] =
+          _messageOverridesById[message.id] ??
+          _messageOverridesByNumber[message.number] ??
+          message;
+    }
+    for (final message in _messageOverridesByNumber.values) {
+      mergedByNumber[message.number] =
+          _messageOverridesById[message.id] ?? message;
+    }
+    final messages = mergedByNumber.values.toList(growable: false)
+      ..sort((left, right) => left.number.compareTo(right.number));
+    return messages;
+  }
+
+  bool get _canLoadOlderMessages {
+    return widget.onLoadOlderMessages != null &&
+        _visibleMessages.any((message) => !message.isBodyLoaded);
+  }
+
   ConversationMessageViewModel _selectedMessage(
     List<ConversationMessageViewModel> messages,
   ) {
@@ -289,11 +340,21 @@ class _ConversationViewState extends State<ConversationView> {
     );
   }
 
-  void _selectMessage(int number) {
+  Future<void> _selectMessage(int number) async {
     final messages = _visibleMessages;
     final index = messages.indexWhere((message) => message.number == number);
     if (index < 0) {
       return;
+    }
+    final selected = messages[index];
+    if (!selected.isBodyLoaded && widget.onLoadMessagePage != null) {
+      final page = await widget.onLoadMessagePage!(number);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _mergeLoadedMessages(page);
+      });
     }
     setState(() {
       _selectedNumber = number;
@@ -305,6 +366,38 @@ class _ConversationViewState extends State<ConversationView> {
         duration: const Duration(milliseconds: 1),
         curve: Curves.linear,
       );
+    }
+  }
+
+  Future<void> _loadOlderMessages() async {
+    final loader = widget.onLoadOlderMessages;
+    if (loader == null || _loadingOlderMessages) {
+      return;
+    }
+    setState(() {
+      _loadingOlderMessages = true;
+    });
+    try {
+      final page = await loader();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _mergeLoadedMessages(page);
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingOlderMessages = false;
+        });
+      }
+    }
+  }
+
+  void _mergeLoadedMessages(List<ConversationMessageViewModel> messages) {
+    for (final message in messages) {
+      _messageOverridesById[message.id] = message;
+      _messageOverridesByNumber[message.number] = message;
     }
   }
 

@@ -484,6 +484,124 @@ void main() {
     );
   });
 
+  testWidgets('loads older messages when requested', (tester) async {
+    var loadCalls = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'old',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Older prompt preview',
+                body: '',
+                tokenCount: 4,
+                isBodyLoaded: false,
+              ),
+              ConversationMessageViewModel(
+                id: 'new',
+                number: 2,
+                author: ConversationAuthor.assistant,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                preview: 'Newest answer preview',
+                body: 'Newest answer body',
+                tokenCount: 8,
+              ),
+            ],
+            onLoadOlderMessages: () async {
+              loadCalls++;
+              return [
+                ConversationMessageViewModel(
+                  id: 'old',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                  preview: 'Older prompt preview',
+                  body: 'Older prompt body',
+                  tokenCount: 4,
+                ),
+              ];
+            },
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Message body not loaded yet.'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('Load older conversation messages'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.bySemanticsLabel('Load older conversation messages'));
+    await tester.pumpAndSettle();
+
+    expect(loadCalls, 1);
+    expect(find.text('Older prompt body'), findsOneWidget);
+    expect(find.text('Message body not loaded yet.'), findsNothing);
+  });
+
+  testWidgets('loads target page when index selects unloaded message', (
+    tester,
+  ) async {
+    final requestedAnchors = <int>[];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'old',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Older prompt preview',
+                body: '',
+                tokenCount: 4,
+                isBodyLoaded: false,
+              ),
+              ConversationMessageViewModel(
+                id: 'new',
+                number: 2,
+                author: ConversationAuthor.assistant,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                preview: 'Newest answer preview',
+                body: 'Newest answer body',
+                tokenCount: 8,
+              ),
+            ],
+            onLoadMessagePage: (anchor) async {
+              requestedAnchors.add(anchor);
+              return [
+                ConversationMessageViewModel(
+                  id: 'old',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                  preview: 'Older prompt preview',
+                  body: 'Older prompt body',
+                  tokenCount: 4,
+                ),
+              ];
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.bySemanticsLabel('#1 User, 4 tokens'));
+    await tester.pumpAndSettle();
+
+    expect(requestedAnchors, [1]);
+    expect(find.text('Selected message 1'), findsOneWidget);
+    expect(find.text('Older prompt body'), findsOneWidget);
+  });
+
   testWidgets('message cards keep a neutral surface background', (
     tester,
   ) async {
