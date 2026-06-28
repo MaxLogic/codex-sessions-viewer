@@ -22,6 +22,8 @@ import '../ui/screens/sessions_screen.dart';
 import '../utils/injected_context_filter.dart';
 import '../utils/profiling.dart';
 
+const _conversationTailBodyPageSize = 50;
+
 class RuntimeSessionController {
   RuntimeSessionController({
     required this.settingsFile,
@@ -1882,10 +1884,88 @@ Map<String, List<String>> _loadTagsBySessionId(
 
 List<ConversationMessageViewModel> _loadMessages(
   Database db,
+  String sessionId, {
+  int? tailBodyPageSize = _conversationTailBodyPageSize,
+}) {
+  if (tailBodyPageSize == null) {
+    return _loadFullMessages(db, sessionId);
+  }
+  final rows = Profiling.spanSync(
+    'scan.runtime.load_session_detail.message_index_query',
+    () => db.select(
+      '''
+      select
+        message_index,
+        author_type,
+        created_at_utc,
+        content_preview,
+        null as content_plain,
+        token_total,
+        model,
+        has_error,
+        has_tool_calls
+      from messages
+      where session_id = ?
+      order by message_index
+      ''',
+      [sessionId],
+    ),
+    arguments: {'session_id': sessionId},
+  );
+  final bodyRows = Profiling.spanSync(
+    'scan.runtime.load_session_detail.message_tail_body_query',
+    () => db.select(
+      '''
+      select message_index, content_plain
+      from (
+        select message_index, content_plain
+        from messages
+        where session_id = ?
+        order by message_index desc
+        limit ?
+      )
+      order by message_index
+      ''',
+      [sessionId, tailBodyPageSize],
+    ),
+    arguments: {'session_id': sessionId, 'limit': tailBodyPageSize},
+  );
+  final bodiesByIndex = {
+    for (final row in bodyRows)
+      row['message_index'] as int: row['content_plain'] as String?,
+  };
+  return Profiling.spanSync(
+    'scan.runtime.load_session_detail.message_view_models',
+    () => [
+      for (final row in rows)
+        if (!_isInjectedContextRow(row))
+          ConversationMessageViewModel(
+            id: '$sessionId:${row['message_index']}',
+            number: row['message_index'] as int,
+            author: _messageAuthor(row['author_type'] as String?),
+            createdAtUtc:
+                _dateTime(row['created_at_utc'] as String?) ??
+                DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+            preview: row['content_preview'] as String? ?? '',
+            body: bodiesByIndex[row['message_index'] as int] ?? '',
+            tokenCount: row['token_total'] as int?,
+            hasError: (row['has_error'] as int? ?? 0) == 1,
+            hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
+            isBodyLoaded: bodiesByIndex.containsKey(
+              row['message_index'] as int,
+            ),
+          ),
+    ],
+    arguments: {'session_id': sessionId, 'row_count': rows.length},
+  );
+}
+
+List<ConversationMessageViewModel> _loadFullMessages(
+  Database db,
   String sessionId,
 ) {
   final rows = Profiling.spanSync(
-    'scan.runtime.load_session_detail.message_query',
+    'scan.runtime.load_session_detail.full_message_query',
     () => db.select(
       '''
       select
@@ -1907,7 +1987,7 @@ List<ConversationMessageViewModel> _loadMessages(
     arguments: {'session_id': sessionId},
   );
   return Profiling.spanSync(
-    'scan.runtime.load_session_detail.message_view_models',
+    'scan.runtime.load_session_detail.full_message_view_models',
     () => [
       for (final row in rows)
         if (!_isInjectedContextRow(row))

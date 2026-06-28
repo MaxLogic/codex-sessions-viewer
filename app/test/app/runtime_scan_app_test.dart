@@ -1698,6 +1698,107 @@ void main() {
     },
   );
 
+  test('loads newest conversation page before older message bodies', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_tail_page_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writePagedJsonFixture(windowsRoot, messageCount: 60);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final result = await controller.refresh();
+    final detail = await controller.loadSessionDetail(result.rows.single.id);
+
+    final messages = detail!.conversationMessages;
+    expect(messages, hasLength(60));
+    expect(messages.first.number, 0);
+    expect(messages.first.isBodyLoaded, isFalse);
+    expect(messages.first.body, isEmpty);
+    expect(messages[10].number, 10);
+    expect(messages[10].isBodyLoaded, isTrue);
+    expect(messages[10].body, 'Message 11 body');
+    expect(messages.last.number, 59);
+    expect(messages.last.isBodyLoaded, isTrue);
+    expect(messages.last.body, 'Message 60 body');
+  });
+
+  test('loads message index metadata without content_plain', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_message_index_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writePagedJsonFixture(windowsRoot, messageCount: 60);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final result = await controller.refresh();
+    final detail = await controller.loadSessionDetail(result.rows.single.id);
+
+    final first = detail!.conversationMessages.first;
+    expect(first.number, 0);
+    expect(first.preview, 'Message 1 body');
+    expect(first.tokenCount, 1);
+    expect(first.isBodyLoaded, isFalse);
+    expect(first.body, isEmpty);
+  });
+
   testWidgets(
     'production empty-state actions open settings and retry path test',
     (tester) async {
@@ -1778,6 +1879,45 @@ Future<File> _writeAggregateJsonlFixture(Directory destination) async {
       '{"timestamp":"2026-06-10T10:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42,"output_tokens":21,"cached_input_tokens":7}}}}',
     ].join('\n'),
   );
+  return file;
+}
+
+Future<File> _writePagedJsonFixture(
+  Directory destination, {
+  required int messageCount,
+}) async {
+  final file = File(p.join(destination.path, 'paged-detail.json'));
+  final messages = [
+    for (var i = 1; i <= messageCount; i++)
+      '''
+    {
+      "type": "assistant",
+      "id": "m$i",
+      "created_at": "2026-06-10T10:${(i % 60).toString().padLeft(2, '0')}:00Z",
+      "content": "Message $i body",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": $i,
+        "cached_input_tokens": 0
+      }
+    }''',
+  ].join(',\n');
+  await file.writeAsString('''
+{
+  "session_id": "paged-detail-001",
+  "source_type": "windows",
+  "source_file_path": "C:\\\\Users\\\\pawel\\\\.codex\\\\sessions\\\\paged-detail.json",
+  "display_path": "C:\\\\Users\\\\pawel\\\\.codex\\\\sessions\\\\paged-detail.json",
+  "platform_path": "C:\\\\Users\\\\pawel\\\\.codex\\\\sessions\\\\paged-detail.json",
+  "working_directory": "F:\\\\projects\\\\MaxLogic\\\\codex-sessions-viewer",
+  "title": "Paged detail fixture",
+  "model": "gpt-5.5-thinking",
+  "created_at": "2026-06-10T10:00:00Z",
+  "messages": [
+$messages
+  ]
+}
+''');
   return file;
 }
 
