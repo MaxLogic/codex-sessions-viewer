@@ -1231,6 +1231,68 @@ void main() {
     expect(find.text('Prompt body loaded lazily'), findsWidgets);
   });
 
+  testWidgets('loads newest selected conversation page first', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final load = Completer<SessionRowViewModel?>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'paged', title: 'Paged detail', project: 'Viewer'),
+          ],
+          onLoadSessionDetail: (_) => load.future,
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Paged detail').first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(find.text('Paged detail'), findsWidgets);
+    expect(find.text('Loading conversation messages'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel(RegExp('Loading session conversation messages')),
+      findsOneWidget,
+    );
+
+    load.complete(
+      _row(
+        id: 'paged',
+        title: 'Paged detail',
+        project: 'Viewer',
+        messages: [
+          ConversationMessageViewModel(
+            id: 'old-metadata',
+            number: 1,
+            author: ConversationAuthor.user,
+            createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+            preview: 'Older prompt preview',
+            body: '',
+            tokenCount: 4,
+            isBodyLoaded: false,
+          ),
+          ConversationMessageViewModel(
+            id: 'new-loaded',
+            number: 2,
+            author: ConversationAuthor.assistant,
+            createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+            preview: 'Newest answer preview',
+            body: 'Newest answer body',
+            tokenCount: 8,
+          ),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Newest answer body'), findsOneWidget);
+    expect(find.text('Message body not loaded yet.'), findsOneWidget);
+    expect(find.text('Loading conversation messages'), findsNothing);
+  });
+
   testWidgets('restores selected session conversation position', (
     tester,
   ) async {
@@ -1349,6 +1411,80 @@ void main() {
     expect(find.text('Current body'), findsOneWidget);
     expect(find.text('Stale body'), findsNothing);
     expect(find.text('Loading conversation messages'), findsNothing);
+  });
+
+  testWidgets('ignores stale conversation page loads', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final firstLoad = Completer<SessionRowViewModel?>();
+    final secondLoad = Completer<SessionRowViewModel?>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'first-page', title: 'First paged', project: 'Viewer'),
+            _row(id: 'second-page', title: 'Second paged', project: 'Viewer'),
+          ],
+          onLoadSessionDetail: (id) {
+            return switch (id) {
+              'first-page' => firstLoad.future,
+              'second-page' => secondLoad.future,
+              _ => Future<SessionRowViewModel?>.value(null),
+            };
+          },
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('First paged').first);
+    await tester.pump();
+    await tester.tap(find.text('Second paged').first);
+    await tester.pump();
+
+    firstLoad.complete(
+      _row(
+        id: 'first-page',
+        title: 'First loaded',
+        project: 'Viewer',
+        messages: [
+          ConversationMessageViewModel(
+            id: 'stale-page',
+            number: 1,
+            author: ConversationAuthor.assistant,
+            createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+            preview: 'Stale page preview',
+            body: 'Stale page body',
+            tokenCount: 1,
+          ),
+        ],
+      ),
+    );
+    await tester.pump();
+    expect(find.text('Stale page body'), findsNothing);
+
+    secondLoad.complete(
+      _row(
+        id: 'second-page',
+        title: 'Second loaded',
+        project: 'Viewer',
+        messages: [
+          ConversationMessageViewModel(
+            id: 'current-page',
+            number: 1,
+            author: ConversationAuthor.assistant,
+            createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+            preview: 'Current page preview',
+            body: 'Current page body',
+            tokenCount: 1,
+          ),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Current page body'), findsOneWidget);
+    expect(find.text('Stale page body'), findsNothing);
   });
 
   testWidgets('reloads selected conversation when its session file changes', (
