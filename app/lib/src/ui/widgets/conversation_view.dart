@@ -57,6 +57,7 @@ class _ConversationViewState extends State<ConversationView> {
   late ToolCallVisibility _toolCallVisibility;
   final _expanded = <String>{};
   var _lastVisibleMessageCount = 0;
+  var _showJumpToNewest = false;
 
   @override
   void initState() {
@@ -70,6 +71,7 @@ class _ConversationViewState extends State<ConversationView> {
   @override
   void didUpdateWidget(covariant ConversationView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final wasNearBottom = _isNearBottom();
     final visibleCount = _visibleMessages.length;
     if (widget.initialMessageNumber != oldWidget.initialMessageNumber) {
       _selectedNumber = _initialSelectedNumber(_visibleMessages);
@@ -81,7 +83,17 @@ class _ConversationViewState extends State<ConversationView> {
       _scrollToSelectedMessage();
     }
     if (visibleCount > _lastVisibleMessageCount) {
-      _scrollMessagesToBottom();
+      if (wasNearBottom) {
+        _showJumpToNewest = false;
+        final messages = _visibleMessages;
+        if (messages.isNotEmpty) {
+          _selectedNumber = messages.last.number;
+        }
+        _scrollMessagesToBottom();
+        _notifyPositionChanged();
+      } else {
+        _showJumpToNewest = true;
+      }
     }
     _lastVisibleMessageCount = visibleCount;
   }
@@ -186,6 +198,16 @@ class _ConversationViewState extends State<ConversationView> {
                           },
                         ),
                       ),
+                      if (_showJumpToNewest)
+                        Semantics(
+                          label: 'Jump to newest message',
+                          button: true,
+                          child: FilledButton.icon(
+                            onPressed: _jumpToNewest,
+                            icon: const Icon(Icons.keyboard_arrow_down),
+                            label: const Text('Jump to newest'),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -277,6 +299,19 @@ class _ConversationViewState extends State<ConversationView> {
         curve: Curves.linear,
       );
     }
+  }
+
+  void _jumpToNewest() {
+    final messages = _visibleMessages;
+    if (messages.isEmpty) {
+      return;
+    }
+    setState(() {
+      _selectedNumber = messages.last.number;
+      _showJumpToNewest = false;
+    });
+    _scrollMessagesToBottom();
+    _notifyPositionChanged();
   }
 
   void _scrollToSelectedMessage() {

@@ -232,19 +232,51 @@ void main() {
     );
   });
 
-  testWidgets('scrolls to the bottom when new messages arrive', (tester) async {
-    var messages = [
-      for (var i = 1; i <= 40; i++)
-        ConversationMessageViewModel(
-          id: 'm$i',
-          number: i,
-          author: ConversationAuthor.assistant,
-          createdAtUtc: DateTime.utc(2026, 6, 12, 9, i % 60),
-          preview: 'Message $i preview',
-          body: 'Message $i body',
-          tokenCount: i,
+  testWidgets(
+    'preserves reading position and offers jump when new messages arrive',
+    (tester) async {
+      var messages = _messages(40);
+      late StateSetter update;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: StatefulBuilder(
+              builder: (context, setState) {
+                update = setState;
+                return ConversationView(messages: messages);
+              },
+            ),
+          ),
         ),
-    ];
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.bySemanticsLabel('#5 Assistant, 5 tokens'));
+      await tester.pumpAndSettle();
+      expect(find.text('Selected message 5'), findsOneWidget);
+      expect(find.text('Message 41 body'), findsNothing);
+
+      update(() {
+        messages = _messages(41);
+      });
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      expect(find.text('Selected message 5'), findsOneWidget);
+      expect(find.text('Message 41 body'), findsNothing);
+      expect(find.bySemanticsLabel('Jump to newest message'), findsOneWidget);
+
+      await tester.tap(find.bySemanticsLabel('Jump to newest message'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Message 41 body'), findsOneWidget);
+      expect(find.bySemanticsLabel('Jump to newest message'), findsNothing);
+    },
+  );
+
+  testWidgets('auto-scrolls when already near bottom', (tester) async {
+    var messages = _messages(40);
     late StateSetter update;
 
     await tester.pumpWidget(
@@ -259,27 +291,17 @@ void main() {
         ),
       ),
     );
-
+    await tester.pumpAndSettle();
     expect(find.text('Message 41 body'), findsNothing);
 
     update(() {
-      messages = [
-        ...messages,
-        ConversationMessageViewModel(
-          id: 'm41',
-          number: 41,
-          author: ConversationAuthor.assistant,
-          createdAtUtc: DateTime.utc(2026, 6, 12, 9, 41),
-          preview: 'Message 41 preview',
-          body: 'Message 41 body',
-          tokenCount: 41,
-        ),
-      ];
+      messages = _messages(41);
     });
     await tester.pump();
     await tester.pumpAndSettle();
 
     expect(find.text('Message 41 body'), findsOneWidget);
+    expect(find.bySemanticsLabel('Jump to newest message'), findsNothing);
   });
 
   testWidgets('restores conversation position from message anchor', (
@@ -407,4 +429,19 @@ void main() {
     expect((firstCard.decoration as BoxDecoration).color, scheme.surface);
     expect((secondCard.decoration as BoxDecoration).color, scheme.surface);
   });
+}
+
+List<ConversationMessageViewModel> _messages(int count) {
+  return [
+    for (var i = 1; i <= count; i++)
+      ConversationMessageViewModel(
+        id: 'm$i',
+        number: i,
+        author: ConversationAuthor.assistant,
+        createdAtUtc: DateTime.utc(2026, 6, 12, 9, i % 60),
+        preview: 'Message $i preview',
+        body: 'Message $i body',
+        tokenCount: i,
+      ),
+  ];
 }
