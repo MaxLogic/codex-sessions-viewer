@@ -451,21 +451,24 @@ class _ConversationMessageCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final bodyLoaded = message.isBodyLoaded;
     final collapsedToolOutput =
+        bodyLoaded &&
         message.hasToolOutput &&
         toolCallVisibility == ToolCallVisibility.collapse &&
         !expanded;
-    final collapsedLongMessage = message.isLong && !expanded;
+    final collapsedLongMessage = bodyLoaded && message.isLong && !expanded;
     final body = collapsedToolOutput || collapsedLongMessage
         ? message.preview
         : message.body;
+    final semanticsBody = bodyLoaded ? body : 'Message body not loaded yet.';
     return Semantics(
       container: true,
       label: _messageSemanticsLabel(
         message,
         collapsedToolOutput
             ? 'Tool output collapsed, ${message.lineCount} lines.'
-            : body,
+            : semanticsBody,
       ),
       explicitChildNodes: true,
       child: Padding(
@@ -497,7 +500,14 @@ class _ConversationMessageCard extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 6),
-                if (collapsedToolOutput)
+                if (!bodyLoaded)
+                  Semantics(
+                    label: 'Message body not loaded yet.',
+                    container: true,
+                    readOnly: true,
+                    child: const Text('Message body not loaded yet.'),
+                  )
+                else if (collapsedToolOutput)
                   CodexMotion.expandCollapse(
                     policy: motionPolicy,
                     child: Semantics(
@@ -532,7 +542,7 @@ class _ConversationMessageCard extends StatelessWidget {
                 Wrap(
                   spacing: 8,
                   children: [
-                    if (message.isLong || message.hasToolOutput)
+                    if (bodyLoaded && (message.isLong || message.hasToolOutput))
                       OutlinedButton.icon(
                         onPressed: onToggleExpanded,
                         icon: AppSvgIcon(
@@ -546,11 +556,12 @@ class _ConversationMessageCard extends StatelessWidget {
                               : 'Show full message',
                         ),
                       ),
-                    OutlinedButton.icon(
-                      onPressed: () => _copyMarkdown(context),
-                      icon: const AppSvgIcon(AppIcons.copy),
-                      label: const Text('Copy message Markdown'),
-                    ),
+                    if (bodyLoaded)
+                      OutlinedButton.icon(
+                        onPressed: () => _copyMarkdown(context),
+                        icon: const AppSvgIcon(AppIcons.copy),
+                        label: const Text('Copy message Markdown'),
+                      ),
                   ],
                 ),
               ],

@@ -12,6 +12,7 @@ class ConversationMessageViewModel {
     this.hasError = false,
     this.hasToolOutput = false,
     this.isLong = false,
+    this.isBodyLoaded = true,
   });
 
   final String id;
@@ -24,6 +25,7 @@ class ConversationMessageViewModel {
   final bool hasError;
   final bool hasToolOutput;
   final bool isLong;
+  final bool isBodyLoaded;
 
   String get authorLabel => switch (author) {
     ConversationAuthor.user => 'User',

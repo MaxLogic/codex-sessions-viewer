@@ -420,6 +420,70 @@ void main() {
     expect(find.text('Selected message 3'), findsOneWidget);
   });
 
+  testWidgets('renders message index without loading all message bodies', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              for (var i = 1; i <= 12; i++)
+                ConversationMessageViewModel(
+                  id: 'metadata-$i',
+                  number: i,
+                  author: ConversationAuthor.assistant,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9, i),
+                  preview: 'Metadata preview $i',
+                  body: '',
+                  tokenCount: i,
+                  isBodyLoaded: false,
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('#1 Assistant, 1 tokens'), findsOneWidget);
+    expect(find.textContaining('Metadata preview 1'), findsOneWidget);
+    expect(find.text('Message 1 body'), findsNothing);
+  });
+
+  testWidgets('shows accessible placeholder for unloaded message body', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'metadata-only',
+                number: 1,
+                author: ConversationAuthor.assistant,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Metadata preview',
+                body: '',
+                tokenCount: 12,
+                isBodyLoaded: false,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Message body not loaded yet.'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel(
+        'Message 1 Assistant. Message body not loaded yet.',
+      ),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('message cards keep a neutral surface background', (
     tester,
   ) async {
