@@ -160,29 +160,254 @@ class RuntimeSessionController {
 
   Future<SessionRowViewModel?> loadSessionDetail(String sessionId) {
     return Profiling.spanAsync('scan.runtime.load_session_detail', () async {
-      final settings = await SettingsRepository(settingsFile).loadOrCreate();
-      final db = openFileBackedDatabase(databaseFile);
-      try {
-        _cleanSessionMetadataPlaceholders(db);
-        await _backfillAutomaticProjects(
-          db,
-          wslProjects: _WslProjectResolutionCache(wslProjectResolver),
-        );
-        final pricing = PricingRepository(db).loadCached(settings.pricing);
-        final rows = _loadRowsProfiled(
-          db,
+      return _loadSessionDetailInBackground(
+        sessionId: sessionId,
+        reloadFromSource: false,
+      );
+    }, arguments: {'session_id': sessionId});
+  }
+
+  Future<SessionRowViewModel?> _loadSessionDetailInBackground({
+    required String sessionId,
+    required bool reloadFromSource,
+  }) async {
+    final messages = ReceivePort();
+    final errors = ReceivePort();
+    final exits = ReceivePort();
+    Isolate? isolate;
+    try {
+      isolate = await Isolate.spawn<_BackgroundSessionDetailRequest>(
+        _backgroundSessionDetailEntry,
+        _BackgroundSessionDetailRequest(
+          settingsFilePath: settingsFile.path,
+          databaseFilePath: databaseFile.path,
           sessionId: sessionId,
-          includeMessages: true,
-          pricing: pricing,
-        );
-        if (rows.isEmpty) {
-          return null;
+          reloadFromSource: reloadFromSource,
+          sendPort: messages.sendPort,
+        ),
+        onError: errors.sendPort,
+        onExit: exits.sendPort,
+      );
+
+      final result = Completer<SessionRowViewModel?>();
+      late StreamSubscription<Object?> messageSubscription;
+      late StreamSubscription<Object?> errorSubscription;
+      late StreamSubscription<Object?> exitSubscription;
+
+      void finishError(Object error, [StackTrace? stackTrace]) {
+        if (!result.isCompleted) {
+          result.completeError(error, stackTrace);
         }
-        return rows.single;
-      } finally {
-        db.close();
       }
-    });
+
+      messageSubscription = messages.listen((message) {
+        if (message is _BackgroundSessionDetailDone) {
+          if (!result.isCompleted) {
+            result.complete(message.row);
+          }
+          return;
+        }
+        if (message is _BackgroundRefreshError) {
+          finishError(
+            StateError(message.error),
+            StackTrace.fromString(message.stackTrace),
+          );
+        }
+      });
+      errorSubscription = errors.listen((message) {
+        finishError(
+          StateError('Background session detail load failed. $message'),
+        );
+      });
+      exitSubscription = exits.listen((_) {
+        if (!result.isCompleted) {
+          finishError(
+            StateError(
+              'Background session detail load exited before completion.',
+            ),
+          );
+        }
+      });
+
+      return await result.future.whenComplete(() async {
+        await messageSubscription.cancel();
+        await errorSubscription.cancel();
+        await exitSubscription.cancel();
+      });
+    } finally {
+      messages.close();
+      errors.close();
+      exits.close();
+      isolate?.kill(priority: Isolate.immediate);
+    }
+  }
+
+  static Future<SessionRowViewModel?> _loadSessionDetailOnWorker({
+    required File settingsFile,
+    required File databaseFile,
+    required String sessionId,
+  }) {
+    return Profiling.spanAsync(
+      'scan.runtime.load_session_detail.worker',
+      () async {
+        final settings = await Profiling.spanAsync(
+          'scan.runtime.load_session_detail.settings',
+          () => SettingsRepository(settingsFile).loadOrCreate(),
+        );
+        final db = Profiling.spanSync(
+          'scan.runtime.load_session_detail.open_db',
+          () => openFileBackedDatabase(databaseFile),
+        );
+        try {
+          final pricing = Profiling.spanSync(
+            'scan.runtime.load_session_detail.pricing',
+            () => PricingRepository(db).loadCached(settings.pricing),
+          );
+          final rows = Profiling.spanSync(
+            'scan.runtime.load_session_detail.row_and_messages',
+            () => _loadRowsProfiled(
+              db,
+              sessionId: sessionId,
+              includeMessages: true,
+              pricing: pricing,
+            ),
+          );
+          if (rows.isEmpty) {
+            return null;
+          }
+          return rows.single;
+        } finally {
+          db.close();
+        }
+      },
+    );
+  }
+
+  Future<SessionRowViewModel?> reloadSessionDetailFromSource(String sessionId) {
+    return Profiling.spanAsync('scan.runtime.reload_session_detail', () async {
+      return _loadSessionDetailInBackground(
+        sessionId: sessionId,
+        reloadFromSource: true,
+      );
+    }, arguments: {'session_id': sessionId});
+  }
+
+  static Future<SessionRowViewModel?> _reloadSessionDetailFromSourceOnWorker({
+    required File settingsFile,
+    required File databaseFile,
+    required String sessionId,
+  }) {
+    return Profiling.spanAsync(
+      'scan.runtime.reload_session_detail.worker',
+      () async {
+        final settings = await Profiling.spanAsync(
+          'scan.runtime.reload_session_detail.settings',
+          () => SettingsRepository(settingsFile).loadOrCreate(),
+        );
+        final db = Profiling.spanSync(
+          'scan.runtime.reload_session_detail.open_db',
+          () => openFileBackedDatabase(databaseFile),
+        );
+        try {
+          final sourceRow = Profiling.spanSync(
+            'scan.runtime.reload_session_detail.source_row',
+            () => db.select(
+              '''
+            select
+              id,
+              source_type,
+              source_file_path,
+              source_file_unc_path,
+              display_path,
+              platform_path
+            from sessions
+            where id = ?
+            limit 1
+            ''',
+              [sessionId],
+            ),
+          );
+          if (sourceRow.isEmpty) {
+            return null;
+          }
+          final row = sourceRow.single;
+          final sourcePath = row['source_file_path'] as String? ?? '';
+          if (sourcePath.trim().isEmpty || !File(sourcePath).existsSync()) {
+            return null;
+          }
+          final parseResult = await Profiling.spanAsync(
+            'scan.runtime.reload_session_detail.parse_file',
+            () => CodexSessionParser().parseFile(File(sourcePath)),
+          );
+          if (!parseResult.isSuccess) {
+            return null;
+          }
+          final sourceType = row['source_type'] == 'wsl'
+              ? SessionSourceType.wsl
+              : SessionSourceType.windows;
+          final mappedPath = MappedSessionPath(
+            sourceType: sourceType,
+            displayPath: row['display_path'] as String? ?? sourcePath,
+            sourceFilePath: sourcePath,
+            sourceFileUncPath: row['source_file_unc_path'] as String?,
+            platformPath: row['platform_path'] as String? ?? sourcePath,
+            normalizedPathKeys: {
+              normalizePathKey(sourcePath),
+              normalizePathKey(row['display_path'] as String? ?? sourcePath),
+              normalizePathKey(row['platform_path'] as String? ?? sourcePath),
+              if ((row['source_file_unc_path'] as String?) case final unc?)
+                normalizePathKey(unc),
+            },
+          );
+          final scannedSession = ScannedSessionFile(
+            sourcePath: sourcePath,
+            sourceType: sourceType,
+            status: SessionFileStatus.available,
+            mappedPath: mappedPath,
+            parsedSession: parseResult.session!,
+          );
+          final projectResolver = await Profiling.spanAsync(
+            'scan.runtime.reload_session_detail.project_resolver',
+            () => _ProjectPathResolver.create(
+              _projectPathCandidatesForSessions([scannedSession]),
+              wslProjects: _WslProjectResolutionCache(
+                const ProcessWslProjectResolver(),
+              ),
+            ),
+          );
+          final now = DateTime.now().toUtc().toIso8601String();
+          Profiling.spanSync('scan.runtime.reload_session_detail.upsert', () {
+            db.execute('begin');
+            try {
+              _upsertParsedSession(db, scannedSession, now, projectResolver);
+              db.execute('commit');
+            } on Object {
+              db.execute('rollback');
+              rethrow;
+            }
+          });
+          final pricing = Profiling.spanSync(
+            'scan.runtime.reload_session_detail.pricing',
+            () => PricingRepository(db).loadCached(settings.pricing),
+          );
+          final rows = Profiling.spanSync(
+            'scan.runtime.reload_session_detail.row_and_messages',
+            () => _loadRowsProfiled(
+              db,
+              sessionId: sessionId,
+              includeMessages: true,
+              pricing: pricing,
+            ),
+          );
+          if (rows.isEmpty) {
+            return null;
+          }
+          return rows.single;
+        } finally {
+          db.close();
+        }
+      },
+    );
   }
 
   Future<SessionsRefreshResult> refreshInBackground({
@@ -709,6 +934,29 @@ Future<void> _backgroundCachedRowsEntry(
   }
 }
 
+Future<void> _backgroundSessionDetailEntry(
+  _BackgroundSessionDetailRequest request,
+) async {
+  try {
+    final row = request.reloadFromSource
+        ? await RuntimeSessionController._reloadSessionDetailFromSourceOnWorker(
+            settingsFile: File(request.settingsFilePath),
+            databaseFile: File(request.databaseFilePath),
+            sessionId: request.sessionId,
+          )
+        : await RuntimeSessionController._loadSessionDetailOnWorker(
+            settingsFile: File(request.settingsFilePath),
+            databaseFile: File(request.databaseFilePath),
+            sessionId: request.sessionId,
+          );
+    request.sendPort.send(_BackgroundSessionDetailDone(row));
+  } on Object catch (error, stackTrace) {
+    request.sendPort.send(
+      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+    );
+  }
+}
+
 List<SessionRowViewModel> _loadRowsProfiled(
   Database db, {
   bool includeMessages = false,
@@ -755,6 +1003,28 @@ class _BackgroundCachedRowsRequest {
   final String databaseFilePath;
   final SendPort sendPort;
   final int batchSize;
+}
+
+class _BackgroundSessionDetailRequest {
+  const _BackgroundSessionDetailRequest({
+    required this.settingsFilePath,
+    required this.databaseFilePath,
+    required this.sessionId,
+    required this.reloadFromSource,
+    required this.sendPort,
+  });
+
+  final String settingsFilePath;
+  final String databaseFilePath;
+  final String sessionId;
+  final bool reloadFromSource;
+  final SendPort sendPort;
+}
+
+class _BackgroundSessionDetailDone {
+  const _BackgroundSessionDetailDone(this.row);
+
+  final SessionRowViewModel? row;
 }
 
 class _BackgroundRefreshProgress {
@@ -1614,44 +1884,52 @@ List<ConversationMessageViewModel> _loadMessages(
   Database db,
   String sessionId,
 ) {
-  final rows = db.select(
-    '''
-    select
-      message_index,
-      author_type,
-      created_at_utc,
-      content_preview,
-      content_plain,
-      token_total,
-      model,
-      has_error,
-      has_tool_calls
-    from messages
-    where session_id = ?
-    order by message_index
-    ''',
-    [sessionId],
+  final rows = Profiling.spanSync(
+    'scan.runtime.load_session_detail.message_query',
+    () => db.select(
+      '''
+      select
+        message_index,
+        author_type,
+        created_at_utc,
+        content_preview,
+        content_plain,
+        token_total,
+        model,
+        has_error,
+        has_tool_calls
+      from messages
+      where session_id = ?
+      order by message_index
+      ''',
+      [sessionId],
+    ),
+    arguments: {'session_id': sessionId},
   );
-  return [
-    for (final row in rows)
-      if (!_isInjectedContextRow(row))
-        ConversationMessageViewModel(
-          id: '$sessionId:${row['message_index']}',
-          number: row['message_index'] as int,
-          author: _messageAuthor(row['author_type'] as String?),
-          createdAtUtc:
-              _dateTime(row['created_at_utc'] as String?) ??
-              DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
-          preview: row['content_preview'] as String? ?? '',
-          body:
-              row['content_plain'] as String? ??
-              row['content_preview'] as String? ??
-              '',
-          tokenCount: row['token_total'] as int?,
-          hasError: (row['has_error'] as int? ?? 0) == 1,
-          hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
-        ),
-  ];
+  return Profiling.spanSync(
+    'scan.runtime.load_session_detail.message_view_models',
+    () => [
+      for (final row in rows)
+        if (!_isInjectedContextRow(row))
+          ConversationMessageViewModel(
+            id: '$sessionId:${row['message_index']}',
+            number: row['message_index'] as int,
+            author: _messageAuthor(row['author_type'] as String?),
+            createdAtUtc:
+                _dateTime(row['created_at_utc'] as String?) ??
+                DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+            preview: row['content_preview'] as String? ?? '',
+            body:
+                row['content_plain'] as String? ??
+                row['content_preview'] as String? ??
+                '',
+            tokenCount: row['token_total'] as int?,
+            hasError: (row['has_error'] as int? ?? 0) == 1,
+            hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
+          ),
+    ],
+    arguments: {'session_id': sessionId, 'row_count': rows.length},
+  );
 }
 
 bool _isInjectedContextRow(Row row) {
@@ -1701,28 +1979,43 @@ String _cleanDisplaySummary(String? value) {
 }
 
 void _cleanSessionMetadataPlaceholders(Database db) {
+  final rows = db.select('''
+    select
+      rowid,
+      lower(trim(coalesce(title, ''))) like '# agents.md%' as bad_title,
+      lower(trim(coalesce(summary, ''))) = 'auto' as bad_summary
+    from sessions
+    where lower(trim(coalesce(title, ''))) like '# agents.md%'
+       or lower(trim(coalesce(summary, ''))) = 'auto'
+    ''');
+  if (rows.isEmpty) {
+    return;
+  }
   db.execute('begin immediate');
   try {
-    db.execute('''
-      update sessions
-      set title = null
-      where lower(trim(coalesce(title, ''))) like '# agents.md%'
-      ''');
-    db.execute('''
-      update sessions
-      set summary = null
-      where lower(trim(coalesce(summary, ''))) = 'auto'
-      ''');
-    db.execute('''
-      update session_search
-      set title = ''
-      where lower(trim(coalesce(title, ''))) like '# agents.md%'
-      ''');
-    db.execute('''
-      update session_search
-      set summary = ''
-      where lower(trim(coalesce(summary, ''))) = 'auto'
-      ''');
+    for (final row in rows) {
+      final rowid = row['rowid'] as int;
+      final badTitle = (row['bad_title'] as int? ?? 0) == 1;
+      final badSummary = (row['bad_summary'] as int? ?? 0) == 1;
+      db.execute(
+        '''
+        update sessions
+        set title = case when ? then null else title end,
+            summary = case when ? then null else summary end
+        where rowid = ?
+        ''',
+        [badTitle ? 1 : 0, badSummary ? 1 : 0, rowid],
+      );
+      db.execute(
+        '''
+        update session_search
+        set title = case when ? then '' else title end,
+            summary = case when ? then '' else summary end
+        where rowid = ?
+        ''',
+        [badTitle ? 1 : 0, badSummary ? 1 : 0, rowid],
+      );
+    }
     db.execute('commit');
   } on Object {
     db.execute('rollback');

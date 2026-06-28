@@ -226,5 +226,105 @@ void main() {
       ),
       findsOneWidget,
     );
+    expect(
+      find.bySemanticsLabel('Short answer body for the screen reader.'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('scrolls to the bottom when new messages arrive', (tester) async {
+    var messages = [
+      for (var i = 1; i <= 40; i++)
+        ConversationMessageViewModel(
+          id: 'm$i',
+          number: i,
+          author: ConversationAuthor.assistant,
+          createdAtUtc: DateTime.utc(2026, 6, 12, 9, i % 60),
+          preview: 'Message $i preview',
+          body: 'Message $i body',
+          tokenCount: i,
+        ),
+    ];
+    late StateSetter update;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              update = setState;
+              return ConversationView(messages: messages);
+            },
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Message 41 body'), findsNothing);
+
+    update(() {
+      messages = [
+        ...messages,
+        ConversationMessageViewModel(
+          id: 'm41',
+          number: 41,
+          author: ConversationAuthor.assistant,
+          createdAtUtc: DateTime.utc(2026, 6, 12, 9, 41),
+          preview: 'Message 41 preview',
+          body: 'Message 41 body',
+          tokenCount: 41,
+        ),
+      ];
+    });
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(find.text('Message 41 body'), findsOneWidget);
+  });
+
+  testWidgets('message cards keep a neutral surface background', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConversationView(
+            messages: [
+              ConversationMessageViewModel(
+                id: 'm1',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Prompt',
+                body: 'Prompt',
+                tokenCount: 8,
+              ),
+              ConversationMessageViewModel(
+                id: 'm2',
+                number: 2,
+                author: ConversationAuthor.assistant,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                preview: 'Answer',
+                body: 'Answer',
+                tokenCount: 12,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    final scheme = Theme.of(
+      tester.element(find.byType(ConversationView)),
+    ).colorScheme;
+    final firstCard = tester.widget<DecoratedBox>(
+      find.byKey(const Key('message-card-1')),
+    );
+    final secondCard = tester.widget<DecoratedBox>(
+      find.byKey(const Key('message-card-2')),
+    );
+
+    expect((firstCard.decoration as BoxDecoration).color, scheme.surface);
+    expect((secondCard.decoration as BoxDecoration).color, scheme.surface);
   });
 }

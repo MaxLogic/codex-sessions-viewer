@@ -38,11 +38,23 @@ class _ConversationViewState extends State<ConversationView> {
   var _selectedNumber = 1;
   late ToolCallVisibility _toolCallVisibility;
   final _expanded = <String>{};
+  var _lastVisibleMessageCount = 0;
 
   @override
   void initState() {
     super.initState();
     _toolCallVisibility = widget.initialToolCallVisibility;
+    _lastVisibleMessageCount = _visibleMessages.length;
+  }
+
+  @override
+  void didUpdateWidget(covariant ConversationView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final visibleCount = _visibleMessages.length;
+    if (visibleCount > _lastVisibleMessageCount) {
+      _scrollMessagesToBottom();
+    }
+    _lastVisibleMessageCount = visibleCount;
   }
 
   @override
@@ -119,6 +131,8 @@ class _ConversationViewState extends State<ConversationView> {
                               final visibleAfterChange = _messagesForVisibility(
                                 _toolCallVisibility,
                               );
+                              _lastVisibleMessageCount =
+                                  visibleAfterChange.length;
                               if (!visibleAfterChange.any(
                                 (message) => message.number == _selectedNumber,
                               )) {
@@ -222,6 +236,19 @@ class _ConversationViewState extends State<ConversationView> {
       );
     }
   }
+
+  void _scrollMessagesToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_messageListController.hasClients) {
+        return;
+      }
+      _messageListController.animateTo(
+        _messageListController.position.maxScrollExtent,
+        duration: CodexMotionDurations.fast,
+        curve: Curves.easeOut,
+      );
+    });
+  }
 }
 
 class _MessageIndex extends StatelessWidget {
@@ -321,10 +348,12 @@ class _ConversationMessageCard extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
         child: DecoratedBox(
+          key: Key('message-card-${message.number}'),
           decoration: BoxDecoration(
-            color: selected ? scheme.primaryContainer : scheme.surface,
+            color: scheme.surface,
             border: Border.all(
               color: selected ? scheme.primary : scheme.outline,
+              width: selected ? 2 : 1,
             ),
           ),
           child: Padding(
@@ -364,7 +393,16 @@ class _ConversationMessageCard extends StatelessWidget {
                     constraints: const BoxConstraints(maxHeight: 150),
                     child: CodexMotion.expandCollapse(
                       policy: motionPolicy,
-                      child: SingleChildScrollView(child: SelectableText(body)),
+                      child: Semantics(
+                        container: true,
+                        label: body,
+                        readOnly: true,
+                        child: ExcludeSemantics(
+                          child: SingleChildScrollView(
+                            child: SelectableText(body),
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                 const SizedBox(height: 8),

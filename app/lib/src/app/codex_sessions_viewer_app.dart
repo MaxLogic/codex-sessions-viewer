@@ -576,6 +576,8 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onOpenSettings: widget.onOpenSettings,
       onSessionAction: _handleSessionAction,
       onLoadSessionDetail: _controller.loadSessionDetail,
+      onReloadSessionDetailFromSource:
+          _controller.reloadSessionDetailFromSource,
       initialTableState: widget.settings.ui.sessionTable,
       onTableStateChanged: widget.onTableStateChanged,
     );

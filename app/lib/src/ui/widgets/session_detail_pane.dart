@@ -141,15 +141,37 @@ class SessionDetailPane extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           if (isLoadingMessages)
-            const Padding(
-              padding: EdgeInsets.only(bottom: 8),
-              child: LinearProgressIndicator(),
+            Semantics(
+              liveRegion: true,
+              container: true,
+              excludeSemantics: true,
+              label: 'Loading session conversation messages.',
+              child: const Padding(
+                padding: EdgeInsets.only(bottom: 8),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    SizedBox(width: 8),
+                    Text('Loading conversation messages'),
+                  ],
+                ),
+              ),
             ),
-          _ConversationTabs(
-            messages: visibleMessages,
-            onCopyText: onCopyText,
-            motionMode: effectiveSettings.ui.motion,
-          ),
+          if (isLoadingMessages && visibleMessages.isEmpty)
+            const SizedBox(
+              height: 420,
+              child: Center(child: Text('Conversation messages loading')),
+            )
+          else
+            _ConversationTabs(
+              messages: visibleMessages,
+              onCopyText: onCopyText,
+              motionMode: effectiveSettings.ui.motion,
+            ),
         ],
       ),
     );

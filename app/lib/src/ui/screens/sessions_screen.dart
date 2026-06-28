@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -47,6 +48,7 @@ typedef SessionsRefreshOperationFactory =
     SessionsRefreshOperation Function(SessionsRefreshProgressCallback);
 typedef SessionDetailLoader =
     Future<SessionRowViewModel?> Function(String sessionId);
+typedef SessionFileWatcher = Stream<Object> Function(String path);
 typedef SessionTableStateChanged = void Function(SessionTableSettings);
 typedef SessionMarkdownExportCallback =
     Future<void> Function(SessionRowViewModel row, String markdown);
@@ -78,6 +80,8 @@ class SessionsScreen extends StatefulWidget {
     this.onCopyText,
     this.onExportMarkdown,
     this.onLoadSessionDetail,
+    this.onReloadSessionDetailFromSource,
+    this.watchSessionFile = _watchSessionFile,
     this.settings,
     this.initialTableState,
     this.onTableStateChanged,
@@ -96,6 +100,8 @@ class SessionsScreen extends StatefulWidget {
   final DetailCopyCallback? onCopyText;
   final SessionMarkdownExportCallback? onExportMarkdown;
   final SessionDetailLoader? onLoadSessionDetail;
+  final SessionDetailLoader? onReloadSessionDetailFromSource;
+  final SessionFileWatcher watchSessionFile;
   final AppSettings? settings;
   final SessionTableSettings? initialTableState;
   final SessionTableStateChanged? onTableStateChanged;
@@ -107,6 +113,10 @@ class SessionsScreen extends StatefulWidget {
 }
 
 class _SessionsScreenState extends State<SessionsScreen> {
+  static const _detailPaneMinWidth = 360.0;
+  static const _minimumTablePaneWidth = 520.0;
+  static const _splitDividerWidth = 1.0;
+
   final _searchController = TextEditingController();
   final _pathController = TextEditingController();
   final _threadNameController = TextEditingController();
@@ -124,6 +134,11 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _rowMotionIds = <String>{};
   var _rowMotionGeneration = 0;
   final _expandedParentIds = <String>{};
+  StreamSubscription<Object>? _selectedFileSubscription;
+  Timer? _selectedFileReloadTimer;
+  String? _watchedDetailPath;
+  var _selectedDetailWatchGeneration = 0;
+  var _selectedDetailLoadGeneration = 0;
   late List<SessionRowViewModel> _rows;
   late Map<String, double> _columnWidths;
   late List<SessionTableSortSettings> _sorts;
@@ -195,6 +210,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       ..removeListener(_filtersChanged)
       ..dispose();
     _relativeDateTimer?.cancel();
+    _stopSelectedSessionFileWatch();
     super.dispose();
   }
 
@@ -231,155 +247,171 @@ class _SessionsScreenState extends State<SessionsScreen> {
         visibleDisplayRows.isEmpty && _hasRowsHiddenOnlyByOrigin;
     return Material(
       child: FocusTraversalGroup(
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Expanded(
-              flex: 3,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        _FilterBar(
-                          searchController: _searchController,
-                          pathController: _pathController,
-                          threadNameController: _threadNameController,
-                          platformFilter: _platformFilter,
-                          archivedFilter: _archivedFilter,
-                          originFilter: _originFilter,
-                          newestPerProjectOnly: _newestPerProjectOnly,
-                          namedOnly: _namedOnly,
-                          isScanning: _isScanning,
-                          isCancellingRefresh: _isCancellingRefresh,
-                          onPlatformChanged: (value) {
-                            setState(() {
-                              _platformFilter = value;
-                              _retainSelection();
-                              _markVisibleRowsForMotion();
-                            });
-                          },
-                          onArchivedChanged: (value) {
-                            setState(() {
-                              _archivedFilter = value;
-                              _retainSelection();
-                              _markVisibleRowsForMotion();
-                            });
-                          },
-                          onOriginChanged: (value) {
-                            setState(() {
-                              _originFilter = value;
-                              _retainSelection();
-                              _markVisibleRowsForMotion();
-                            });
-                          },
-                          onNewestPerProjectOnlyChanged: (value) {
-                            setState(() {
-                              _newestPerProjectOnly = value;
-                              _retainSelection();
-                              _markVisibleRowsForMotion();
-                            });
-                            _emitTableState();
-                          },
-                          onNamedOnlyChanged: (value) {
-                            setState(() {
-                              _namedOnly = value;
-                              _retainSelection();
-                              _markVisibleRowsForMotion();
-                            });
-                          },
-                          onClearFilters: _clearFilters,
-                          onRefresh: _refresh,
-                        ),
-                        Expanded(
-                          child: visibleDisplayRows.isEmpty
-                              ? _SessionsEmptyState(
-                                  hasRows: _rows.isNotEmpty,
-                                  hasActiveFilters: _hasActiveFilters,
-                                  statusMessage: _scanAnnouncement,
-                                  isScanning: _isScanning,
-                                  visibleCount: visibleDisplayRows.length,
-                                  unreachablePaths: _unreachablePaths,
-                                  hasRowsHiddenByDefaultOrigin:
-                                      hasRowsHiddenByDefaultOrigin,
-                                  onClearFilters: _clearFilters,
-                                  onShowAllOrigins: _showAllOrigins,
-                                  onOpenSettings: widget.onOpenSettings,
-                                  onTestWslPath:
-                                      widget.onTestWslPath ?? _refresh,
-                                )
-                              : _SessionsTable(
-                                  rows: visibleDisplayRows,
-                                  selectedId: _selectedId,
-                                  onSelect: _select,
-                                  onToggleSubagents: _toggleSubagents,
-                                  onAction: _handleSessionAction,
-                                  settings:
-                                      widget.settings ?? AppSettings.defaults(),
-                                  columnWidths: _columnWidths,
-                                  sorts: _sorts,
-                                  onColumnWidthChanged: _setColumnWidth,
-                                  onSortGesture: _handleSortGesture,
-                                  onShowSortOptions: _showSortOptions,
-                                  statusMessage: _scanAnnouncement,
-                                  isScanning: _isScanning,
-                                  animatedRowIds: _rowMotionIds,
-                                  rowMotionGeneration: _rowMotionGeneration,
-                                  unreachablePaths: _unreachablePaths,
-                                  onOpenSettings: widget.onOpenSettings,
-                                  onTestWslPath:
-                                      widget.onTestWslPath ?? _refresh,
-                                ),
-                        ),
-                      ],
-                    ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final tablePaneWidth = _tablePaneWidth(constraints.maxWidth);
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SizedBox(
+                  key: const Key('sessions-left-panel'),
+                  width: tablePaneWidth,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _FilterBar(
+                        searchController: _searchController,
+                        pathController: _pathController,
+                        threadNameController: _threadNameController,
+                        platformFilter: _platformFilter,
+                        archivedFilter: _archivedFilter,
+                        originFilter: _originFilter,
+                        newestPerProjectOnly: _newestPerProjectOnly,
+                        namedOnly: _namedOnly,
+                        isScanning: _isScanning,
+                        isCancellingRefresh: _isCancellingRefresh,
+                        onPlatformChanged: (value) {
+                          setState(() {
+                            _platformFilter = value;
+                            _retainSelection();
+                            _markVisibleRowsForMotion();
+                          });
+                        },
+                        onArchivedChanged: (value) {
+                          setState(() {
+                            _archivedFilter = value;
+                            _retainSelection();
+                            _markVisibleRowsForMotion();
+                          });
+                        },
+                        onOriginChanged: (value) {
+                          setState(() {
+                            _originFilter = value;
+                            _retainSelection();
+                            _markVisibleRowsForMotion();
+                          });
+                        },
+                        onNewestPerProjectOnlyChanged: (value) {
+                          setState(() {
+                            _newestPerProjectOnly = value;
+                            _retainSelection();
+                            _markVisibleRowsForMotion();
+                          });
+                          _emitTableState();
+                        },
+                        onNamedOnlyChanged: (value) {
+                          setState(() {
+                            _namedOnly = value;
+                            _retainSelection();
+                            _markVisibleRowsForMotion();
+                          });
+                        },
+                        onClearFilters: _clearFilters,
+                        onRefresh: _refresh,
+                      ),
+                      Expanded(
+                        child: visibleDisplayRows.isEmpty
+                            ? _SessionsEmptyState(
+                                hasRows: _rows.isNotEmpty,
+                                hasActiveFilters: _hasActiveFilters,
+                                statusMessage: _scanAnnouncement,
+                                isScanning: _isScanning,
+                                visibleCount: visibleDisplayRows.length,
+                                unreachablePaths: _unreachablePaths,
+                                hasRowsHiddenByDefaultOrigin:
+                                    hasRowsHiddenByDefaultOrigin,
+                                onClearFilters: _clearFilters,
+                                onShowAllOrigins: _showAllOrigins,
+                                onOpenSettings: widget.onOpenSettings,
+                                onTestWslPath: widget.onTestWslPath ?? _refresh,
+                              )
+                            : _SessionsTable(
+                                rows: visibleDisplayRows,
+                                selectedId: _selectedId,
+                                onSelect: _select,
+                                onToggleSubagents: _toggleSubagents,
+                                onAction: _handleSessionAction,
+                                settings:
+                                    widget.settings ?? AppSettings.defaults(),
+                                columnWidths: _columnWidths,
+                                sorts: _sorts,
+                                onColumnWidthChanged: _setColumnWidth,
+                                onSortGesture: _handleSortGesture,
+                                onShowSortOptions: _showSortOptions,
+                                statusMessage: _scanAnnouncement,
+                                isScanning: _isScanning,
+                                animatedRowIds: _rowMotionIds,
+                                rowMotionGeneration: _rowMotionGeneration,
+                                unreachablePaths: _unreachablePaths,
+                                onOpenSettings: widget.onOpenSettings,
+                                onTestWslPath: widget.onTestWslPath ?? _refresh,
+                              ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
-            ),
-            VerticalDivider(
-              width: 1,
-              thickness: 1,
-              color: Theme.of(context).colorScheme.outlineVariant,
-            ),
-            Expanded(
-              flex: 2,
-              child: _SessionDetailPlaceholder(
-                row: selectedRow,
-                settings: widget.settings ?? AppSettings.defaults(),
-                onSessionAction: selectedRow == null
-                    ? null
-                    : (action) => _handleDetailAction(selectedRow, action),
-                onCopyText: widget.onCopyText,
-                onExportMarkdown: widget.onExportMarkdown,
-                onRunTerminalCommand: selectedRow == null
-                    ? null
-                    : (command) => _handleSessionAction(
-                        SessionActionRequest(
-                          row: selectedRow,
-                          action: SessionRowAction.openTerminalResume,
-                          payload: command,
-                        ),
-                      ),
-                onEditTerminalCommand: selectedRow == null
-                    ? null
-                    : (command) => _handleSessionAction(
-                        SessionActionRequest(
-                          row: selectedRow,
-                          action: SessionRowAction.openTerminalResume,
-                          payload: command,
-                        ),
-                      ),
-                isLoadingMessages:
-                    selectedRow != null && _loadingDetailId == selectedRow.id,
-              ),
-            ),
-          ],
+                ),
+                VerticalDivider(
+                  width: 1,
+                  thickness: 1,
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                ),
+                Expanded(
+                  child: _SessionDetailPlaceholder(
+                    row: selectedRow,
+                    settings: widget.settings ?? AppSettings.defaults(),
+                    onSessionAction: selectedRow == null
+                        ? null
+                        : (action) => _handleDetailAction(selectedRow, action),
+                    onCopyText: widget.onCopyText,
+                    onExportMarkdown: widget.onExportMarkdown,
+                    onRunTerminalCommand: selectedRow == null
+                        ? null
+                        : (command) => _handleSessionAction(
+                            SessionActionRequest(
+                              row: selectedRow,
+                              action: SessionRowAction.openTerminalResume,
+                              payload: command,
+                            ),
+                          ),
+                    onEditTerminalCommand: selectedRow == null
+                        ? null
+                        : (command) => _handleSessionAction(
+                            SessionActionRequest(
+                              row: selectedRow,
+                              action: SessionRowAction.openTerminalResume,
+                              payload: command,
+                            ),
+                          ),
+                    isLoadingMessages:
+                        selectedRow != null &&
+                        _loadingDetailId == selectedRow.id,
+                  ),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
+  }
+
+  double _tablePaneWidth(double availableWidth) {
+    final tableWidth = _SessionsTable.tableWidthFor(_columnWidths);
+    if (!availableWidth.isFinite) {
+      return tableWidth;
+    }
+    final contentWidth = (availableWidth - _splitDividerWidth).clamp(
+      0.0,
+      availableWidth,
+    );
+    if (contentWidth <= _minimumTablePaneWidth) {
+      return contentWidth;
+    }
+    final maxLeftWidth = (contentWidth - _detailPaneMinWidth).clamp(
+      _minimumTablePaneWidth,
+      contentWidth,
+    );
+    return tableWidth.clamp(_minimumTablePaneWidth, maxLeftWidth).toDouble();
   }
 
   List<SessionRowViewModel> get _visibleRows => [
@@ -885,9 +917,11 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   void _select(String id) {
+    _selectedDetailLoadGeneration++;
     setState(() {
       _selectedId = id;
     });
+    _watchSelectedSessionFile(_rowById(id));
     unawaited(_loadSelectedDetail(id));
   }
 
@@ -913,9 +947,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
     setState(() {
       _loadingDetailId = id;
     });
+    final generation = ++_selectedDetailLoadGeneration;
     try {
       final loaded = await loader(id);
-      if (!mounted || loaded == null) {
+      if (!mounted ||
+          loaded == null ||
+          generation != _selectedDetailLoadGeneration ||
+          _selectedId != id) {
         return;
       }
       setState(() {
@@ -923,12 +961,101 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _retainSelection();
       });
     } finally {
-      if (mounted && _loadingDetailId == id) {
+      if (mounted &&
+          _loadingDetailId == id &&
+          generation == _selectedDetailLoadGeneration) {
         setState(() {
           _loadingDetailId = null;
         });
       }
     }
+  }
+
+  Future<void> _reloadSelectedDetailFromSource(
+    String id,
+    int generation,
+  ) async {
+    final loader =
+        widget.onReloadSessionDetailFromSource ?? widget.onLoadSessionDetail;
+    if (loader == null || _loadingDetailId == id) {
+      return;
+    }
+    setState(() {
+      _loadingDetailId = id;
+    });
+    final loadGeneration = ++_selectedDetailLoadGeneration;
+    try {
+      final loaded = await loader(id);
+      if (!mounted ||
+          loaded == null ||
+          generation != _selectedDetailWatchGeneration ||
+          loadGeneration != _selectedDetailLoadGeneration ||
+          _selectedId != id) {
+        return;
+      }
+      setState(() {
+        _replaceRow(loaded);
+        _retainSelection();
+      });
+    } finally {
+      if (mounted &&
+          _loadingDetailId == id &&
+          loadGeneration == _selectedDetailLoadGeneration) {
+        setState(() {
+          _loadingDetailId = null;
+        });
+      }
+    }
+  }
+
+  void _watchSelectedSessionFile(SessionRowViewModel? row) {
+    _selectedDetailWatchGeneration++;
+    final path = row?.sourceFilePath.trim() ?? '';
+    if (path.isEmpty ||
+        widget.onReloadSessionDetailFromSource == null &&
+            widget.onLoadSessionDetail == null) {
+      _stopSelectedSessionFileWatch(incrementGeneration: false);
+      return;
+    }
+    if (_watchedDetailPath == path) {
+      return;
+    }
+    _stopSelectedSessionFileWatch(incrementGeneration: false);
+    _watchedDetailPath = path;
+    final generation = _selectedDetailWatchGeneration;
+    try {
+      _selectedFileSubscription = widget
+          .watchSessionFile(path)
+          .listen(
+            (_) => _scheduleSelectedDetailReload(row!.id, generation),
+            onError: (_) {},
+          );
+    } on Object {
+      _watchedDetailPath = null;
+    }
+  }
+
+  void _scheduleSelectedDetailReload(String id, int generation) {
+    _selectedFileReloadTimer?.cancel();
+    _selectedFileReloadTimer = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted ||
+          generation != _selectedDetailWatchGeneration ||
+          _selectedId != id) {
+        return;
+      }
+      unawaited(_reloadSelectedDetailFromSource(id, generation));
+    });
+  }
+
+  void _stopSelectedSessionFileWatch({bool incrementGeneration = true}) {
+    if (incrementGeneration) {
+      _selectedDetailWatchGeneration++;
+    }
+    _selectedFileReloadTimer?.cancel();
+    _selectedFileReloadTimer = null;
+    unawaited(_selectedFileSubscription?.cancel());
+    _selectedFileSubscription = null;
+    _watchedDetailPath = null;
   }
 
   void _filtersChanged() {
@@ -945,6 +1072,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     }
     if (!_visibleRows.any((row) => row.id == selectedId)) {
       _selectedId = null;
+      _stopSelectedSessionFileWatch();
     }
   }
 
@@ -2377,6 +2505,14 @@ class _SessionsTable extends StatelessWidget {
     _SessionColumn(key: 'tags', label: 'Tags', defaultWidth: 130),
   ];
 
+  static double tableWidthFor(Map<String, double> columnWidths) {
+    return _columns.fold<double>(
+      0,
+      (total, column) =>
+          total + (columnWidths[column.key] ?? column.defaultWidth),
+    );
+  }
+
   double get _tableWidth => _columns.fold<double>(
     0,
     (total, column) => total + _widthFor(column.key),
@@ -3301,4 +3437,10 @@ String _columnLabel(String key) {
     'status' => 'Status',
     _ => key,
   };
+}
+
+Stream<FileSystemEvent> _watchSessionFile(String path) {
+  return File(
+    path,
+  ).watch(events: FileSystemEvent.modify | FileSystemEvent.create);
 }

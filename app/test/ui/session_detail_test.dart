@@ -233,6 +233,26 @@ void main() {
     expect(find.text('Platform: WSL'), findsOneWidget);
   });
 
+  testWidgets('loading state is visible and exposed to screen readers', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionDetailPane(row: _detailRow(), isLoadingMessages: true),
+        ),
+      ),
+    );
+
+    expect(find.text('Loading conversation messages'), findsOneWidget);
+    expect(find.text('Conversation messages loading'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('Loading session conversation messages.'),
+      findsOneWidget,
+    );
+    expect(find.text('No conversation messages'), findsNothing);
+  });
+
   testWidgets('session detail transitions between selected sessions', (
     tester,
   ) async {

@@ -1169,6 +1169,26 @@ void main() {
     expect(find.text('Session 4999'), findsNothing);
   });
 
+  testWidgets('left panel matches the session table width', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'sized', title: 'Sized panel', project: 'Viewer'),
+          ],
+        ),
+      ),
+    );
+
+    expect(
+      tester.getSize(find.byKey(const Key('sessions-left-panel'))).width,
+      1196,
+    );
+  });
+
   testWidgets('loads selected conversation on demand', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1800, 1000));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -1209,6 +1229,172 @@ void main() {
 
     expect(loadCalls, 1);
     expect(find.text('Prompt body loaded lazily'), findsWidgets);
+  });
+
+  testWidgets('ignores stale selected conversation loads', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final firstLoad = Completer<SessionRowViewModel?>();
+    final secondLoad = Completer<SessionRowViewModel?>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'first', title: 'First session', project: 'Viewer'),
+            _row(id: 'second', title: 'Second session', project: 'Viewer'),
+          ],
+          onLoadSessionDetail: (id) {
+            return switch (id) {
+              'first' => firstLoad.future,
+              'second' => secondLoad.future,
+              _ => Future<SessionRowViewModel?>.value(null),
+            };
+          },
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('First session').first);
+    await tester.pump();
+    expect(find.text('Loading conversation messages'), findsOneWidget);
+
+    await tester.tap(find.text('Second session').first);
+    await tester.pump();
+
+    firstLoad.complete(
+      _row(
+        id: 'first',
+        title: 'First loaded',
+        project: 'Viewer',
+        messages: [
+          ConversationMessageViewModel(
+            id: 'first-message',
+            number: 1,
+            author: ConversationAuthor.user,
+            createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+            preview: 'Stale body',
+            body: 'Stale body',
+            tokenCount: 1,
+          ),
+        ],
+      ),
+    );
+    await tester.pump();
+    expect(find.text('Stale body'), findsNothing);
+    expect(find.text('Loading conversation messages'), findsOneWidget);
+
+    secondLoad.complete(
+      _row(
+        id: 'second',
+        title: 'Second loaded',
+        project: 'Viewer',
+        messages: [
+          ConversationMessageViewModel(
+            id: 'second-message',
+            number: 1,
+            author: ConversationAuthor.assistant,
+            createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+            preview: 'Current body',
+            body: 'Current body',
+            tokenCount: 1,
+          ),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Current body'), findsOneWidget);
+    expect(find.text('Stale body'), findsNothing);
+    expect(find.text('Loading conversation messages'), findsNothing);
+  });
+
+  testWidgets('reloads selected conversation when its session file changes', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final changes = StreamController<Object>();
+    addTearDown(changes.close);
+    var reloadCalls = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'live',
+              title: 'Live detail',
+              project: 'Viewer',
+              sourceFilePath: r'F:\codex\sessions\live.jsonl',
+            ),
+          ],
+          watchSessionFile: (path) {
+            expect(path, r'F:\codex\sessions\live.jsonl');
+            return changes.stream;
+          },
+          onLoadSessionDetail: (id) async {
+            return _row(
+              id: id,
+              title: 'Live detail',
+              project: 'Viewer',
+              sourceFilePath: r'F:\codex\sessions\live.jsonl',
+              messages: [
+                ConversationMessageViewModel(
+                  id: 'msg-1',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                  preview: 'Initial body',
+                  body: 'Initial body',
+                  tokenCount: 12,
+                ),
+              ],
+            );
+          },
+          onReloadSessionDetailFromSource: (id) async {
+            reloadCalls++;
+            return _row(
+              id: id,
+              title: 'Live detail',
+              project: 'Viewer',
+              sourceFilePath: r'F:\codex\sessions\live.jsonl',
+              messages: [
+                ConversationMessageViewModel(
+                  id: 'msg-1',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                  preview: 'Initial body',
+                  body: 'Initial body',
+                  tokenCount: 12,
+                ),
+                ConversationMessageViewModel(
+                  id: 'msg-2',
+                  number: 2,
+                  author: ConversationAuthor.assistant,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                  preview: 'New streamed answer',
+                  body: 'New streamed answer',
+                  tokenCount: 24,
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Live detail').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Initial body'), findsWidgets);
+
+    changes.add(Object());
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+
+    expect(reloadCalls, 1);
+    expect(find.text('New streamed answer'), findsWidgets);
   });
 
   testWidgets('conversation view hides injected environment context messages', (
@@ -1336,6 +1522,7 @@ SessionRowViewModel _row({
   String parentThreadId = '',
   String agentNickname = '',
   bool isArchived = false,
+  String sourceFilePath = '',
   DateTime? lastMessageAtUtc,
   int totalTokens = 900,
   List<ConversationMessageViewModel> messages = const [],
@@ -1364,6 +1551,7 @@ SessionRowViewModel _row({
     tags: const ['ui'],
     status: 'Available',
     isArchived: isArchived,
+    sourceFilePath: sourceFilePath,
     conversationMessages: messages,
   );
 }
