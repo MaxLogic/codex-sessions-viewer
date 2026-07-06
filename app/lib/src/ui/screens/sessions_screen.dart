@@ -9,6 +9,7 @@ import '../../config/app_settings.dart';
 import '../../usage/usage_summary.dart';
 import '../motion.dart';
 import '../models/session_row_view_model.dart';
+import '../number_formatting.dart';
 import '../widgets/command_preview.dart';
 import '../widgets/conversation_view.dart';
 import '../widgets/session_detail_pane.dart';
@@ -22,7 +23,32 @@ enum SessionsArchivedFilter { activeOnly, archivedOnly, all }
 
 enum SessionsOriginFilter { all, user, subagent }
 
+enum SessionsTimeFilter {
+  today,
+  yesterday,
+  thisWeek,
+  lastWeek,
+  thisMonth,
+  lastMonth,
+  last30Days,
+  allTime,
+}
+
 const _defaultOriginFilter = SessionsOriginFilter.user;
+const _defaultTimeFilter = SessionsTimeFilter.last30Days;
+
+extension _SessionsTimeFilterLabel on SessionsTimeFilter {
+  String get label => switch (this) {
+    SessionsTimeFilter.today => 'Today',
+    SessionsTimeFilter.yesterday => 'Yesterday',
+    SessionsTimeFilter.thisWeek => 'This week',
+    SessionsTimeFilter.lastWeek => 'Last week',
+    SessionsTimeFilter.thisMonth => 'This month',
+    SessionsTimeFilter.lastMonth => 'Last month',
+    SessionsTimeFilter.last30Days => 'Last 30 days',
+    SessionsTimeFilter.allTime => 'All time',
+  };
+}
 
 enum SessionRowAction {
   openPath,
@@ -124,6 +150,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _platformFilter = SessionsPlatformFilter.both;
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
   var _originFilter = _defaultOriginFilter;
+  var _timeFilter = _defaultTimeFilter;
   var _newestPerProjectOnly = false;
   var _namedOnly = false;
   var _isScanning = false;
@@ -266,6 +293,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
                         pathController: _pathController,
                         threadNameController: _threadNameController,
                         platformFilter: _platformFilter,
+                        timeFilter: _timeFilter,
                         archivedFilter: _archivedFilter,
                         originFilter: _originFilter,
                         newestPerProjectOnly: _newestPerProjectOnly,
@@ -275,6 +303,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
                         onPlatformChanged: (value) {
                           setState(() {
                             _platformFilter = value;
+                            _retainSelection();
+                            _markVisibleRowsForMotion();
+                          });
+                        },
+                        onTimeChanged: (value) {
+                          setState(() {
+                            _timeFilter = value;
                             _retainSelection();
                             _markVisibleRowsForMotion();
                           });
@@ -360,6 +395,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
                 Expanded(
                   child: _SessionDetailPlaceholder(
                     row: selectedRow,
+                    visibleCount: visibleDisplayRows.length,
+                    hasRows: _rows.isNotEmpty,
+                    hasActiveFilters: _hasActiveFilters,
+                    isScanning: _isScanning,
                     settings: widget.settings ?? AppSettings.defaults(),
                     onSessionAction: selectedRow == null
                         ? null
@@ -731,6 +770,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   ) {
     return _matchesArchived(row) &&
         _matchesPlatform(row) &&
+        _matchesTime(row) &&
         _matchesPath(row, path) &&
         _matchesThreadName(row, threadName) &&
         (!_namedOnly || row.hasThreadName);
@@ -833,6 +873,59 @@ class _SessionsScreenState extends State<SessionsScreen> {
     };
   }
 
+  bool _matchesTime(SessionRowViewModel row) {
+    if (_timeFilter == SessionsTimeFilter.allTime) {
+      return true;
+    }
+    final value = row.lastMessageAtUtc.toLocal();
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    return switch (_timeFilter) {
+      SessionsTimeFilter.today => _isWithinTimeRange(
+        value,
+        today,
+        today.add(const Duration(days: 1)),
+      ),
+      SessionsTimeFilter.yesterday => _isWithinTimeRange(
+        value,
+        today.subtract(const Duration(days: 1)),
+        today,
+      ),
+      SessionsTimeFilter.thisWeek => _isWithinTimeRange(
+        value,
+        _startOfWeek(today),
+        _startOfWeek(today).add(const Duration(days: 7)),
+      ),
+      SessionsTimeFilter.lastWeek => _isWithinTimeRange(
+        value,
+        _startOfWeek(today).subtract(const Duration(days: 7)),
+        _startOfWeek(today),
+      ),
+      SessionsTimeFilter.thisMonth => _isWithinTimeRange(
+        value,
+        DateTime(today.year, today.month),
+        DateTime(today.year, today.month + 1),
+      ),
+      SessionsTimeFilter.lastMonth => _isWithinTimeRange(
+        value,
+        DateTime(today.year, today.month - 1),
+        DateTime(today.year, today.month),
+      ),
+      SessionsTimeFilter.last30Days => !value.isBefore(
+        now.subtract(const Duration(days: 30)),
+      ),
+      SessionsTimeFilter.allTime => true,
+    };
+  }
+
+  DateTime _startOfWeek(DateTime value) {
+    return value.subtract(Duration(days: value.weekday - DateTime.monday));
+  }
+
+  bool _isWithinTimeRange(DateTime value, DateTime start, DateTime end) {
+    return !value.isBefore(start) && value.isBefore(end);
+  }
+
   bool _matchesPath(SessionRowViewModel row, String path) {
     if (path.isEmpty) {
       return true;
@@ -870,6 +963,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _pathController.text.trim().isNotEmpty ||
         _threadNameController.text.trim().isNotEmpty ||
         _platformFilter != SessionsPlatformFilter.both ||
+        _timeFilter != _defaultTimeFilter ||
         _archivedFilter != SessionsArchivedFilter.activeOnly ||
         _originFilter != _defaultOriginFilter ||
         _newestPerProjectOnly ||
@@ -891,6 +985,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
           row.isSubagentSession &&
           _matchesArchived(row) &&
           _matchesPlatform(row) &&
+          _matchesTime(row) &&
           _matchesPath(row, path) &&
           _matchesThreadName(row, threadName) &&
           (!_namedOnly || row.hasThreadName) &&
@@ -1096,6 +1191,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _pathController.clear();
         _threadNameController.clear();
         _platformFilter = SessionsPlatformFilter.both;
+        _timeFilter = _defaultTimeFilter;
         _archivedFilter = SessionsArchivedFilter.activeOnly;
         _originFilter = _defaultOriginFilter;
         _newestPerProjectOnly = false;
@@ -1598,6 +1694,10 @@ class _SessionDisplayRow {
 
   String get summaryText {
     if (!row.isSubagentSession) {
+      final summary = row.summary.trim();
+      if (summary.isEmpty || summary == row.primaryIdentity) {
+        return '';
+      }
       return row.summary;
     }
     final parentName = parentLabel;
@@ -1830,6 +1930,7 @@ class _FilterBar extends StatelessWidget {
     required this.pathController,
     required this.threadNameController,
     required this.platformFilter,
+    required this.timeFilter,
     required this.archivedFilter,
     required this.originFilter,
     required this.newestPerProjectOnly,
@@ -1837,6 +1938,7 @@ class _FilterBar extends StatelessWidget {
     required this.isScanning,
     required this.isCancellingRefresh,
     required this.onPlatformChanged,
+    required this.onTimeChanged,
     required this.onArchivedChanged,
     required this.onOriginChanged,
     required this.onNewestPerProjectOnlyChanged,
@@ -1849,6 +1951,7 @@ class _FilterBar extends StatelessWidget {
   final TextEditingController pathController;
   final TextEditingController threadNameController;
   final SessionsPlatformFilter platformFilter;
+  final SessionsTimeFilter timeFilter;
   final SessionsArchivedFilter archivedFilter;
   final SessionsOriginFilter originFilter;
   final bool newestPerProjectOnly;
@@ -1856,6 +1959,7 @@ class _FilterBar extends StatelessWidget {
   final bool isScanning;
   final bool isCancellingRefresh;
   final ValueChanged<SessionsPlatformFilter> onPlatformChanged;
+  final ValueChanged<SessionsTimeFilter> onTimeChanged;
   final ValueChanged<SessionsArchivedFilter> onArchivedChanged;
   final ValueChanged<SessionsOriginFilter> onOriginChanged;
   final ValueChanged<bool> onNewestPerProjectOnlyChanged;
@@ -1934,20 +2038,26 @@ class _FilterBar extends StatelessWidget {
                   width: 140,
                   child: _FilterSemantics(
                     label: 'Time range filter',
-                    child: DropdownButtonFormField<String>(
-                      initialValue: 'Last 30 days',
+                    child: DropdownButtonFormField<SessionsTimeFilter>(
+                      key: ValueKey('time-filter-${timeFilter.name}'),
+                      initialValue: timeFilter,
                       isExpanded: true,
                       decoration: const InputDecoration(
                         labelText: 'Time',
                         isDense: true,
                       ),
-                      items: const [
-                        DropdownMenuItem(
-                          value: 'Last 30 days',
-                          child: Text('Last 30 days'),
-                        ),
+                      items: [
+                        for (final value in SessionsTimeFilter.values)
+                          DropdownMenuItem(
+                            value: value,
+                            child: Text(value.label),
+                          ),
                       ],
-                      onChanged: null,
+                      onChanged: (value) {
+                        if (value != null) {
+                          onTimeChanged(value);
+                        }
+                      },
                     ),
                   ),
                 ),
@@ -2246,7 +2356,8 @@ class _StatusLine extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final lowerMessage = message.toLowerCase();
+    final displayMessage = _scanStatusDisplayMessage(message);
+    final lowerMessage = displayMessage.toLowerCase();
     final isLoadingPrevious =
         lowerMessage.startsWith('loading previous sessions') ||
         (lowerMessage.startsWith('loaded ') &&
@@ -2258,7 +2369,7 @@ class _StatusLine extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return Semantics(
       liveRegion: true,
-      label: message,
+      label: displayMessage,
       child: Row(
         children: [
           SizedBox.square(
@@ -2280,11 +2391,25 @@ class _StatusLine extends StatelessWidget {
                   ),
           ),
           const SizedBox(width: 8),
-          Expanded(child: Text(message, overflow: TextOverflow.ellipsis)),
+          Expanded(
+            child: Text(displayMessage, overflow: TextOverflow.ellipsis),
+          ),
         ],
       ),
     );
   }
+}
+
+String _scanStatusDisplayMessage(String message) {
+  final lowerMessage = message.toLowerCase();
+  if (!lowerMessage.startsWith('scan finished') &&
+      !lowerMessage.startsWith('scan cancelled')) {
+    return message;
+  }
+  return message.replaceAllMapped(
+    RegExp(r'\b(\d+) (session|sessions) visible\b'),
+    (match) => '${match[1]} ${match[2]} available',
+  );
 }
 
 class _SessionColumn {
@@ -2505,7 +2630,7 @@ class _SessionsTable extends StatelessWidget {
       label: 'Last Message',
       defaultWidth: 132,
     ),
-    _SessionColumn(key: 'actions', label: 'Actions', defaultWidth: 52),
+    _SessionColumn(key: 'actions', label: 'Actions', defaultWidth: 96),
     _SessionColumn(key: 'project', label: 'Project', defaultWidth: 112),
     _SessionColumn(key: 'path', label: 'Path', defaultWidth: 280),
     _SessionColumn(key: 'summary', label: 'Summary', defaultWidth: 220),
@@ -2642,19 +2767,15 @@ class _SessionsTable extends StatelessWidget {
                   ),
                 ),
               ),
-              _cell(
-                'Summary',
-                displayRow.summaryText,
-                width: _widthFor('summary'),
-              ),
-              _cell(
+              _summaryCell(displayRow.summaryText, width: _widthFor('summary')),
+              _countCell(
                 'Messages',
-                row.messageCount.toString(),
+                row.messageCount,
                 width: _widthFor('message_count'),
               ),
-              _cell(
+              _countCell(
                 'Tokens',
-                row.displayTotalTokens.toString(),
+                row.displayTotalTokens,
                 width: _widthFor('total_tokens'),
               ),
               _cell('Model', row.model, width: _widthFor('model')),
@@ -2696,16 +2817,22 @@ class _SessionsTable extends StatelessWidget {
     );
   }
 
-  Widget _cell(String label, String text, {required double width}) => SizedBox(
+  Widget _cell(
+    String label,
+    String text, {
+    required double width,
+    String? semanticsText,
+    String? tooltip,
+  }) => SizedBox(
     width: width,
     child: Semantics(
-      label: '$label ${text.isEmpty ? 'empty' : text}',
+      label: '$label ${semanticsText ?? (text.isEmpty ? 'empty' : text)}',
       container: true,
       child: ExcludeSemantics(
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 6),
           child: Tooltip(
-            message: text,
+            message: tooltip ?? text,
             waitDuration: const Duration(milliseconds: 600),
             child: Text(text, maxLines: 1, overflow: TextOverflow.ellipsis),
           ),
@@ -2714,12 +2841,34 @@ class _SessionsTable extends StatelessWidget {
     ),
   );
 
+  Widget _countCell(String label, int value, {required double width}) {
+    final display = formatCompactInt(value);
+    final exact = formatGroupedInt(value);
+    return _cell(
+      label,
+      display,
+      width: width,
+      semanticsText: exact,
+      tooltip: exact,
+    );
+  }
+
+  Widget _summaryCell(String text, {required double width}) {
+    if (text.trim().isEmpty) {
+      return SizedBox(width: width);
+    }
+    return _cell('Summary', text, width: width);
+  }
+
   Widget _projectCell(
     BuildContext context,
     _SessionDisplayRow displayRow, {
     required double width,
   }) {
     final row = displayRow.row;
+    final identity = row.primaryIdentity;
+    final project = row.project.trim();
+    final showProject = project.isNotEmpty && project != identity;
     final subagentLabel = displayRow.childCount == 1
         ? '1 subagent'
         : '${displayRow.childCount} subagents';
@@ -2752,41 +2901,38 @@ class _SessionsTable extends StatelessWidget {
             Expanded(
               child: Semantics(
                 label:
-                    'Project ${row.project.isEmpty ? 'empty' : row.project}'
-                    '${row.hasThreadName ? ', thread ${row.threadName}' : ''}',
+                    'Session identity $identity'
+                    '${showProject ? ', project $project' : ''}',
                 container: true,
                 child: ExcludeSemantics(
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Tooltip(
-                          message: row.project,
-                          waitDuration: const Duration(milliseconds: 600),
-                          child: Text(
-                            row.project,
+                  child: Tooltip(
+                    message: showProject
+                        ? '$identity\nProject: $project'
+                        : identity,
+                    waitDuration: const Duration(milliseconds: 600),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          identity,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        if (showProject)
+                          Text(
+                            project,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.labelSmall
+                                ?.copyWith(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant,
+                                ),
                           ),
-                        ),
-                      ),
-                      if (row.hasThreadName) ...[
-                        const SizedBox(width: 4),
-                        Flexible(
-                          child: Tooltip(
-                            message: row.threadName,
-                            waitDuration: const Duration(milliseconds: 600),
-                            child: Text(
-                              '[${row.threadName}]',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: Theme.of(context).colorScheme.secondary,
-                              ),
-                            ),
-                          ),
-                        ),
                       ],
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -3017,90 +3163,119 @@ class _ActionsMenu extends StatelessWidget {
   Widget build(BuildContext context) {
     final commandSet = _commandSet(row);
     final rowLabel = _rowAccessibleLabel(row);
-    return Semantics(
-      label: 'Actions for $rowLabel',
-      button: true,
-      child: PopupMenuButton<SessionRowAction>(
-        tooltip: 'More actions',
-        onSelected: (action) => onAction(
-          SessionActionRequest(
-            row: row,
-            action: action,
-            payload: _payloadFor(row, commandSet, action),
+    final resumeReason =
+        commandSet.terminalDisabledReason ??
+        commandSet.disabledReason ??
+        'Resume command unavailable.';
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Semantics(
+          label: commandSet.terminalLaunchCommand == null
+              ? 'Open terminal and resume unavailable for $rowLabel: $resumeReason'
+              : 'Open terminal and resume for $rowLabel',
+          button: true,
+          child: IconButton(
+            tooltip: commandSet.terminalLaunchCommand == null
+                ? 'Resume unavailable: $resumeReason'
+                : 'Open terminal and resume',
+            icon: const AppSvgIcon(AppIcons.terminal),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+            onPressed: commandSet.terminalLaunchCommand == null
+                ? null
+                : () => onAction(
+                    SessionActionRequest(
+                      row: row,
+                      action: SessionRowAction.openTerminalResume,
+                      payload: commandSet.terminalLaunchCommand,
+                    ),
+                  ),
           ),
         ),
-        itemBuilder: (context) => [
-          if (_canOpenContainingFolder(row))
-            _item(
-              SessionRowAction.openPath,
-              'Open containing folder',
-              iconAsset: AppIcons.folderOpen,
+        Semantics(
+          label: 'More actions for $rowLabel',
+          button: true,
+          child: PopupMenuButton<SessionRowAction>(
+            tooltip: 'More actions',
+            onSelected: (action) => onAction(
+              SessionActionRequest(
+                row: row,
+                action: action,
+                payload: _payloadFor(row, commandSet, action),
+              ),
             ),
-          _item(
-            SessionRowAction.copyPath,
-            'Copy path',
-            iconAsset: AppIcons.copy,
+            itemBuilder: (context) => [
+              if (_canOpenContainingFolder(row))
+                _item(
+                  SessionRowAction.openPath,
+                  'Open containing folder',
+                  iconAsset: AppIcons.folderOpen,
+                ),
+              if (commandSet.terminalLaunchCommand == null)
+                _item(
+                  SessionRowAction.openTerminalResume,
+                  'Resume unavailable',
+                  iconAsset: AppIcons.terminal,
+                  enabled: false,
+                  disabledReason: resumeReason,
+                ),
+              _item(
+                SessionRowAction.copyPlainResumeCommand,
+                'Copy plain resume command',
+                iconAsset: AppIcons.copy,
+                enabled: commandSet.plainResumeCommand != null,
+                disabledReason: commandSet.disabledReason,
+              ),
+              _item(
+                SessionRowAction.copyPlatformResumeCommand,
+                'Copy platform resume command',
+                iconAsset: AppIcons.copy,
+                enabled: commandSet.platformResumeCommand != null,
+                disabledReason: commandSet.disabledReason,
+              ),
+              _item(
+                SessionRowAction.openTerminalFork,
+                'Open terminal and fork',
+                iconAsset: AppIcons.fork,
+                enabled: commandSet.terminalForkCommand != null,
+                disabledReason:
+                    commandSet.terminalDisabledReason ??
+                    commandSet.disabledReason,
+              ),
+              _item(
+                SessionRowAction.copyTerminalCommand,
+                'Copy terminal command',
+                iconAsset: AppIcons.copy,
+                enabled: commandSet.terminalLaunchCommand != null,
+                disabledReason:
+                    commandSet.terminalDisabledReason ??
+                    commandSet.disabledReason,
+              ),
+              _item(
+                SessionRowAction.editTags,
+                'Add/remove tags',
+                iconAsset: AppIcons.tag,
+              ),
+              _item(
+                SessionRowAction.togglePin,
+                row.isPinned ? 'Unpin session' : 'Pin session',
+                iconAsset: AppIcons.pin,
+              ),
+              _item(
+                SessionRowAction.toggleArchive,
+                row.isArchived ? 'Unarchive session' : 'Archive session',
+                iconAsset: AppIcons.archive,
+              ),
+              _item(
+                SessionRowAction.reparse,
+                'Re-parse session',
+                iconAsset: AppIcons.reparse,
+              ),
+            ],
           ),
-          _item(
-            SessionRowAction.copyPlainResumeCommand,
-            'Copy plain resume command',
-            iconAsset: AppIcons.copy,
-            enabled: commandSet.plainResumeCommand != null,
-            disabledReason: commandSet.disabledReason,
-          ),
-          _item(
-            SessionRowAction.copyPlatformResumeCommand,
-            'Copy platform resume command',
-            iconAsset: AppIcons.copy,
-            enabled: commandSet.platformResumeCommand != null,
-            disabledReason: commandSet.disabledReason,
-          ),
-          _item(
-            SessionRowAction.openTerminalResume,
-            'Open terminal and resume',
-            iconAsset: AppIcons.terminal,
-            enabled: commandSet.terminalLaunchCommand != null,
-            disabledReason:
-                commandSet.terminalDisabledReason ?? commandSet.disabledReason,
-          ),
-          _item(
-            SessionRowAction.openTerminalFork,
-            'Open terminal and fork',
-            iconAsset: AppIcons.fork,
-            enabled: commandSet.terminalForkCommand != null,
-            disabledReason:
-                commandSet.terminalDisabledReason ?? commandSet.disabledReason,
-          ),
-          _item(
-            SessionRowAction.copyTerminalCommand,
-            'Copy terminal command',
-            iconAsset: AppIcons.copy,
-            enabled: commandSet.terminalLaunchCommand != null,
-            disabledReason:
-                commandSet.terminalDisabledReason ?? commandSet.disabledReason,
-          ),
-          _item(
-            SessionRowAction.editTags,
-            'Add/remove tags',
-            iconAsset: AppIcons.tag,
-          ),
-          _item(
-            SessionRowAction.togglePin,
-            row.isPinned ? 'Unpin session' : 'Pin session',
-            iconAsset: AppIcons.pin,
-          ),
-          _item(
-            SessionRowAction.toggleArchive,
-            row.isArchived ? 'Unarchive session' : 'Archive session',
-            iconAsset: AppIcons.archive,
-          ),
-          _item(
-            SessionRowAction.reparse,
-            'Re-parse session',
-            iconAsset: AppIcons.reparse,
-          ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
@@ -3195,6 +3370,10 @@ extension on SessionRowAction {
 class _SessionDetailPlaceholder extends StatelessWidget {
   const _SessionDetailPlaceholder({
     required this.row,
+    required this.visibleCount,
+    required this.hasRows,
+    required this.hasActiveFilters,
+    required this.isScanning,
     required this.settings,
     required this.onSessionAction,
     required this.onCopyText,
@@ -3207,6 +3386,10 @@ class _SessionDetailPlaceholder extends StatelessWidget {
   });
 
   final SessionRowViewModel? row;
+  final int visibleCount;
+  final bool hasRows;
+  final bool hasActiveFilters;
+  final bool isScanning;
   final AppSettings settings;
   final SessionDetailActionCallback? onSessionAction;
   final DetailCopyCallback? onCopyText;
@@ -3268,17 +3451,47 @@ class _SessionDetailPlaceholder extends StatelessWidget {
         onConversationPositionChanged: onConversationPositionChanged,
       );
     }
+    final guidance = _emptyGuidance();
+    final visibleText = visibleCount == 1
+        ? '1 session visible.'
+        : '$visibleCount sessions visible.';
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Session detail', style: Theme.of(context).textTheme.titleLarge),
+          Semantics(
+            header: true,
+            child: Text(
+              'Session detail',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+          ),
           const SizedBox(height: 12),
-          const Text('No session selected'),
+          Text(guidance),
+          if (visibleCount > 0) ...[
+            const SizedBox(height: 8),
+            Text(visibleText),
+          ],
         ],
       ),
     );
+  }
+
+  String _emptyGuidance() {
+    if (visibleCount > 0) {
+      return 'Select a session from the table to view details.';
+    }
+    if (isScanning) {
+      return 'Refresh is running. Select a session when results appear.';
+    }
+    if (hasActiveFilters) {
+      return 'No sessions match the current filters. Clear filters or adjust search.';
+    }
+    if (hasRows) {
+      return 'No sessions are visible in the current view. Clear filters or refresh sessions.';
+    }
+    return 'Refresh sessions to load local Codex session data.';
   }
 }
 
@@ -3390,19 +3603,7 @@ extension on DateTime {
 }
 
 String _rowAccessibleLabel(SessionRowViewModel row) {
-  final threadName = row.threadName.trim();
-  if (threadName.isNotEmpty) {
-    return threadName;
-  }
-  final title = row.title.trim();
-  if (title.isNotEmpty) {
-    return title;
-  }
-  final sessionId = row.sessionId.trim();
-  if (sessionId.isNotEmpty) {
-    return sessionId;
-  }
-  return row.id;
+  return row.primaryIdentity;
 }
 
 String _rowState(SessionRowViewModel row) {

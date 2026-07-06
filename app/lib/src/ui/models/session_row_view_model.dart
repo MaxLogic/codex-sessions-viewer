@@ -100,6 +100,22 @@ class SessionRowViewModel {
 
   bool get hasThreadName => threadName.trim().isNotEmpty;
 
+  String get primaryIdentity {
+    final candidates = [
+      threadName.trim(),
+      title.trim(),
+      project.trim(),
+      _shortSessionIdentifier(sessionId),
+      _shortSessionIdentifier(id),
+    ];
+    for (final candidate in candidates) {
+      if (candidate.isNotEmpty) {
+        return candidate;
+      }
+    }
+    return id;
+  }
+
   String get originLabel {
     if (isSubagentSession) {
       final nickname = agentNickname.trim();
@@ -305,4 +321,12 @@ bool _isWindowsOpenablePath(String path) {
     return true;
   }
   return RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(trimmed);
+}
+
+String _shortSessionIdentifier(String value) {
+  final trimmed = value.trim();
+  if (trimmed.length <= 12) {
+    return trimmed;
+  }
+  return '${trimmed.substring(0, 8)}...';
 }

@@ -2396,10 +2396,10 @@ String _statusMessage(
   SessionScanResult result, {
   required int visibleSessionCount,
 }) {
-  final visible = _plural(visibleSessionCount, 'session');
+  final available = _plural(visibleSessionCount, 'session');
   final parsed = _plural(result.progress.filesParsed, 'new or changed session');
   if (result.cancelled) {
-    return 'Scan cancelled. $visible visible. $parsed parsed before cancellation.';
+    return 'Scan cancelled. $available available. $parsed parsed before cancellation.';
   }
   if (result.errors.any(
     (error) => error.status == SessionFileStatus.pathUnreachable,
@@ -2408,13 +2408,13 @@ String _statusMessage(
         .where((error) => error.status == SessionFileStatus.pathUnreachable)
         .map((error) => error.sourcePath)
         .join('; ');
-    return 'Scan finished. $visible visible. $parsed parsed. '
+    return 'Scan finished. $available available. $parsed parsed. '
         'Session root is unreachable. Unreachable paths: $paths';
   }
   if (result.progress.filesFound == 0 && visibleSessionCount == 0) {
     return 'Scan finished. No supported files found.';
   }
-  return 'Scan finished. $visible visible. $parsed parsed.';
+  return 'Scan finished. $available available. $parsed parsed.';
 }
 
 String _progressStatusMessage(ScanProgress progress) {

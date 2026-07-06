@@ -7,6 +7,7 @@ import '../../utils/injected_context_filter.dart';
 import '../models/conversation_message_view_model.dart';
 import '../models/session_row_view_model.dart';
 import '../motion.dart';
+import '../number_formatting.dart';
 import 'command_preview.dart';
 import 'conversation_view.dart';
 import 'focus_reader_view.dart';
@@ -195,8 +196,10 @@ class SessionDetailPane extends StatelessWidget {
         row.duration ?? row.lastMessageAtUtc.difference(row.startedAtUtc);
     return [
       row.status,
-      row.displayTotalTokens > 0 ? '${row.displayTotalTokens} tokens' : null,
-      '${row.messageCount} messages',
+      row.displayTotalTokens > 0
+          ? '${formatGroupedInt(row.displayTotalTokens)} tokens'
+          : null,
+      '${formatGroupedInt(row.messageCount)} messages',
       duration.humanDuration,
     ].whereType<String>().join(' | ');
   }
@@ -234,8 +237,8 @@ class _SelectedSessionHeader extends StatelessWidget {
               _HeaderFact(row.originLabel),
               if (row.hasThreadName) _HeaderFact('Thread ${row.threadName}'),
               _HeaderFact(row.model.isEmpty ? 'Model unknown' : row.model),
-              _HeaderFact('${row.messageCount} messages'),
-              _HeaderFact('${row.displayTotalTokens} tokens'),
+              _HeaderFact('${formatGroupedInt(row.messageCount)} messages'),
+              _HeaderFact('${formatGroupedInt(row.displayTotalTokens)} tokens'),
               if (row.usageRollup != null)
                 _HeaderFact(row.displayEstimatedCost),
               _HeaderFact(row.lastMessageAtUtc.shortDateTime),
@@ -367,7 +370,7 @@ class _MetadataGrid extends StatelessWidget {
           _DetailText('Parent thread', row.parentThreadId),
         if (row.agentRole.isNotEmpty) _DetailText('Agent role', row.agentRole),
         if (row.subagentDepth != null)
-          _DetailText('Subagent depth', row.subagentDepth.toString()),
+          _DetailText('Subagent depth', formatGroupedInt(row.subagentDepth!)),
         _DetailText('Project', row.project),
         _DetailText('Source file', row.sourcePathForDisplay),
         _DetailText('Display path', row.displayPathForDetail),
@@ -375,30 +378,33 @@ class _MetadataGrid extends StatelessWidget {
         _DetailText('Started', row.startedAtUtc.shortDateTime),
         _DetailText('Last message', row.lastMessageAtUtc.shortDateTime),
         _DetailText('Duration', duration.humanDuration),
-        _DetailText('Total messages', row.messageCount.toString()),
-        _DetailText('User message count', row.userMessageCount.toString()),
+        _DetailText('Total messages', formatGroupedInt(row.messageCount)),
+        _DetailText(
+          'User message count',
+          formatGroupedInt(row.userMessageCount),
+        ),
         _DetailText(
           'Assistant message count',
-          row.assistantMessageCount.toString(),
+          formatGroupedInt(row.assistantMessageCount),
         ),
-        _DetailText('Tool call count', row.toolCallCount.toString()),
+        _DetailText('Tool call count', formatGroupedInt(row.toolCallCount)),
         if (row.usageRollup case final rollup?) ...[
           _DetailText(
             'Usage total',
-            '${rollup.totalTokens} tokens | ${rollup.totalEstimatedCostDisplay}',
+            '${formatGroupedInt(rollup.totalTokens)} tokens | ${rollup.totalEstimatedCostDisplay}',
           ),
           _DetailText(
             'Usage main',
-            '${rollup.mainTokens} tokens | ${rollup.mainEstimatedCostDisplay}',
+            '${formatGroupedInt(rollup.mainTokens)} tokens | ${rollup.mainEstimatedCostDisplay}',
           ),
           _DetailText(
             'Usage subagents',
-            '${rollup.subagentTokens} tokens | ${rollup.subagentEstimatedCostDisplay}',
+            '${formatGroupedInt(rollup.subagentTokens)} tokens | ${rollup.subagentEstimatedCostDisplay}',
           ),
         ],
-        _DetailText('Total tokens', row.displayTotalTokens.toString()),
-        _DetailText('Input tokens', row.inputTokens.toString()),
-        _DetailText('Output tokens', row.outputTokens.toString()),
+        _DetailText('Total tokens', formatGroupedInt(row.displayTotalTokens)),
+        _DetailText('Input tokens', formatGroupedInt(row.inputTokens)),
+        _DetailText('Output tokens', formatGroupedInt(row.outputTokens)),
         _DetailText(
           'Cached input tokens',
           _tokensWithShare(row, row.cachedInputTokens),
@@ -432,7 +438,7 @@ class _MetadataGrid extends StatelessWidget {
   }
 
   String _tokensWithShare(SessionRowViewModel row, int tokens) {
-    return '$tokens (${row.tokenShareText(tokens)})';
+    return '${formatGroupedInt(tokens)} (${row.tokenShareText(tokens)})';
   }
 }
 

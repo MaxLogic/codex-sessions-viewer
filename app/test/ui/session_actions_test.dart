@@ -24,22 +24,20 @@ void main() {
       ),
     );
 
-    await tester.tap(find.byType(PopupMenuButton<SessionRowAction>));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Copy path'));
+    await tester.tap(find.bySemanticsLabel('Copy path for Parser cache'));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byType(PopupMenuButton<SessionRowAction>));
+    await tester.tap(find.bySemanticsLabel('More actions for Parser cache'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Copy plain resume command'));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byType(PopupMenuButton<SessionRowAction>));
+    await tester.tap(find.bySemanticsLabel('More actions for Parser cache'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Open terminal and fork'));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byType(PopupMenuButton<SessionRowAction>));
+    await tester.tap(find.bySemanticsLabel('More actions for Parser cache'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Re-parse session'));
     await tester.pumpAndSettle();
@@ -55,6 +53,55 @@ void main() {
     expect(actions[2].payload, contains('codex fork abc123'));
   });
 
+  testWidgets(
+    'shows primary row actions and excludes duplicates from more menu',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(5000, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final actions = <SessionActionRequest>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SessionsScreen(
+              initialRows: [_row(sessionId: 'abc123')],
+              onSessionAction: (request) async {
+                actions.add(request);
+              },
+            ),
+          ),
+        ),
+      );
+
+      expect(
+        find.bySemanticsLabel('Copy path for Parser cache'),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel('Open terminal and resume for Parser cache'),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel('More actions for Parser cache'),
+        findsOneWidget,
+      );
+
+      await tester.tap(
+        find.bySemanticsLabel('Open terminal and resume for Parser cache'),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.bySemanticsLabel('More actions for Parser cache'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Copy path'), findsNothing);
+      expect(find.text('Open terminal and resume'), findsNothing);
+      expect(find.text('Copy plain resume command'), findsOneWidget);
+      expect(find.text('Open terminal and fork'), findsOneWidget);
+      expect(actions.single.action, SessionRowAction.openTerminalResume);
+      expect(actions.single.payload, contains('codex resume abc123'));
+    },
+  );
+
   testWidgets('session table labels containing-folder action accurately', (
     tester,
   ) async {
@@ -68,7 +115,7 @@ void main() {
       ),
     );
 
-    await tester.tap(find.byType(PopupMenuButton<SessionRowAction>));
+    await tester.tap(find.bySemanticsLabel('More actions for Parser cache'));
     await tester.pumpAndSettle();
 
     expect(find.text('Open containing folder'), findsOneWidget);
@@ -100,7 +147,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Open containing folder'), findsNothing);
-    expect(find.text('Copy path'), findsOneWidget);
+    expect(find.text('Copy path'), findsNothing);
+    expect(find.bySemanticsLabel('Copy path for Parser cache'), findsOneWidget);
   });
 
   testWidgets('resolved WSL paths expose containing-folder actions', (
@@ -165,9 +213,7 @@ void main() {
       ),
     );
 
-    await tester.tap(find.byType(PopupMenuButton<SessionRowAction>));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Copy path'));
+    await tester.tap(find.bySemanticsLabel('Copy path for Parser cache'));
     await tester.pumpAndSettle();
 
     expect(actions.single.action, SessionRowAction.copyPath);

@@ -98,8 +98,14 @@ void main() {
         findsOneWidget,
       );
       expect(find.bySemanticsLabel('Add tag to Parser cache'), findsOneWidget);
-      expect(find.bySemanticsLabel('Actions for Parser cache'), findsOneWidget);
-      expect(find.bySemanticsLabel('Actions for Broken JSONL'), findsOneWidget);
+      expect(
+        find.bySemanticsLabel('More actions for Parser cache'),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel('More actions for Broken JSONL'),
+        findsOneWidget,
+      );
     },
   );
 

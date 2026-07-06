@@ -83,7 +83,141 @@ void main() {
       find.bySemanticsLabel(RegExp(r'^Last Message Date \d')),
       findsOneWidget,
     );
-    expect(find.bySemanticsLabel('Actions for Parser review'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('More actions for Parser review'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets(
+    'sessions table does not announce empty summaries for every blank row',
+    (tester) async {
+      final now = DateTime.now().toUtc();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SessionsScreen(
+            initialRows: [
+              SessionRowViewModel(
+                id: 'session-1',
+                startedAtUtc: now.subtract(const Duration(hours: 2)),
+                lastMessageAtUtc: now.subtract(const Duration(hours: 1)),
+                title: 'Parser review',
+                summary: '',
+                project: 'Codex Viewer',
+                path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+                platform: SessionRowPlatform.windows,
+                messageCount: 4,
+                totalTokens: 1200,
+                model: 'gpt-5',
+                tags: const ['parser'],
+                status: 'Parsed',
+              ),
+              SessionRowViewModel(
+                id: 'session-2',
+                startedAtUtc: now.subtract(const Duration(hours: 3)),
+                lastMessageAtUtc: now.subtract(const Duration(hours: 2)),
+                title: 'UI review',
+                summary: '',
+                project: 'Codex Viewer',
+                path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+                platform: SessionRowPlatform.windows,
+                messageCount: 3,
+                totalTokens: 900,
+                model: 'gpt-5',
+                tags: const ['ui'],
+                status: 'Parsed',
+              ),
+            ],
+          ),
+        ),
+      );
+
+      expect(find.bySemanticsLabel('Summary empty'), findsNothing);
+      expect(
+        find.bySemanticsLabel('Session Parser review. Status Parsed.'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('session row actions have distinct accessible names', (
+    tester,
+  ) async {
+    final now = DateTime.now().toUtc();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            SessionRowViewModel(
+              id: 'session-1',
+              sessionId: 'abc123',
+              startedAtUtc: now.subtract(const Duration(hours: 2)),
+              lastMessageAtUtc: now.subtract(const Duration(hours: 1)),
+              title: 'Parser review',
+              summary: 'Reviewed JSONL formats',
+              project: 'Codex Viewer',
+              path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+              platform: SessionRowPlatform.windows,
+              messageCount: 4,
+              totalTokens: 1200,
+              model: 'gpt-5',
+              tags: const ['parser'],
+              status: 'Parsed',
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(
+      find.bySemanticsLabel('Copy path for Parser review'),
+      findsOneWidget,
+    );
+    expect(
+      find.bySemanticsLabel('Open terminal and resume for Parser review'),
+      findsOneWidget,
+    );
+    expect(
+      find.bySemanticsLabel('More actions for Parser review'),
+      findsOneWidget,
+    );
+    expect(find.bySemanticsLabel('Actions for Parser review'), findsNothing);
+  });
+
+  testWidgets('empty session detail has accessible heading and guidance', (
+    tester,
+  ) async {
+    final now = DateTime.now().toUtc();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            SessionRowViewModel(
+              id: 'session-1',
+              startedAtUtc: now.subtract(const Duration(hours: 2)),
+              lastMessageAtUtc: now.subtract(const Duration(hours: 1)),
+              title: 'Parser review',
+              summary: 'Reviewed JSONL formats',
+              project: 'Codex Viewer',
+              path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+              platform: SessionRowPlatform.windows,
+              messageCount: 4,
+              totalTokens: 1200,
+              model: 'gpt-5',
+              tags: const ['parser'],
+              status: 'Parsed',
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final heading = tester.getSemantics(find.text('Session detail'));
+    expect(heading.flagsCollection.isHeader, isTrue);
+    expect(
+      find.bySemanticsLabel('Select a session from the table to view details.'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('conversation index and collapsed tool output stay accessible', (

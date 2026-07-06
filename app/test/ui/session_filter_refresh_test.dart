@@ -69,6 +69,269 @@ void main() {
     expect(find.text('Scan finished. 2 sessions found.'), findsOneWidget);
   });
 
+  testWidgets('filters sessions by selected time range', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final now = DateTime.now().toUtc();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'recent-matching',
+              title: 'Matching recent session',
+              project: 'Viewer',
+              lastMessageAtUtc: now.subtract(const Duration(days: 2)),
+            ),
+            _row(
+              id: 'old-matching',
+              title: 'Matching older session',
+              project: 'Viewer',
+              lastMessageAtUtc: now.subtract(const Duration(days: 45)),
+            ),
+            _row(
+              id: 'recent-other',
+              title: 'Unrelated recent session',
+              project: 'Other',
+              lastMessageAtUtc: now.subtract(const Duration(days: 1)),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.enterText(find.bySemanticsLabel('Session search'), 'Matching');
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.text('Matching recent session'), findsWidgets);
+    expect(find.text('Matching older session'), findsNothing);
+
+    await _setTimeFilter(tester, 'Last 30 days', 'All time');
+
+    expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+    expect(find.text('Matching recent session'), findsWidgets);
+    expect(find.text('Matching older session'), findsWidgets);
+    expect(find.text('Unrelated recent session'), findsNothing);
+  });
+
+  testWidgets('clear filters resets sessions time range', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final now = DateTime.now().toUtc();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'recent',
+              title: 'Recent session',
+              project: 'Viewer',
+              lastMessageAtUtc: now.subtract(const Duration(days: 2)),
+            ),
+            _row(
+              id: 'old',
+              title: 'Older session',
+              project: 'Viewer',
+              lastMessageAtUtc: now.subtract(const Duration(days: 45)),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await _setTimeFilter(tester, 'Last 30 days', 'All time');
+    expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Last 30 days'), findsOneWidget);
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.text('Recent session'), findsWidgets);
+    expect(find.text('Older session'), findsNothing);
+  });
+
+  testWidgets('shows filtered visible count separately from scan totals', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final now = DateTime.now().toUtc();
+    final refresh = Completer<SessionsRefreshResult>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'initial',
+              title: 'Keep initial session',
+              project: 'Viewer',
+              lastMessageAtUtc: now.subtract(const Duration(days: 1)),
+            ),
+          ],
+          onRefreshResult: () => refresh.future,
+        ),
+      ),
+    );
+
+    await tester.enterText(find.bySemanticsLabel('Session search'), 'Keep');
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
+    await tester.pump();
+
+    refresh.complete(
+      SessionsRefreshResult(
+        rows: [
+          _row(
+            id: 'keep',
+            title: 'Keep refreshed session',
+            project: 'Viewer',
+            lastMessageAtUtc: now.subtract(const Duration(days: 1)),
+          ),
+          _row(
+            id: 'hidden',
+            title: 'Other refreshed session',
+            project: 'Viewer',
+            lastMessageAtUtc: now.subtract(const Duration(days: 1)),
+          ),
+        ],
+        statusMessage:
+            'Scan finished. 2 sessions visible. 0 new or changed sessions parsed.',
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(
+      find.text(
+        'Scan finished. 2 sessions available. 0 new or changed sessions parsed.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.textContaining('2 sessions visible'), findsNothing);
+  });
+
+  testWidgets('renders session identity before path and summary', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final now = DateTime.now().toUtc();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'named-identity',
+              title: 'Parsed fallback title',
+              project: 'Codex Viewer',
+              threadName: 'Design thread',
+              summary: 'Identity summary text',
+              lastMessageAtUtc: now.subtract(const Duration(days: 1)),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.text('Design thread'), findsOneWidget);
+    expect(find.text('[Design thread]'), findsNothing);
+
+    final identityLeft = tester.getTopLeft(find.text('Design thread')).dx;
+    final pathLeft = tester
+        .getTopLeft(
+          find.bySemanticsLabel(
+            r'Windows path F:\projects\MaxLogic\codex-sessions-viewer',
+          ),
+        )
+        .dx;
+    final summaryLeft = tester
+        .getTopLeft(find.text('Identity summary text'))
+        .dx;
+
+    expect(identityLeft, lessThan(pathLeft));
+    expect(identityLeft, lessThan(summaryLeft));
+  });
+
+  testWidgets('formats large session counts with exact accessible values', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final now = DateTime.now().toUtc();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'large-counts',
+              title: 'Large count session',
+              project: 'Viewer',
+              messageCount: 12345,
+              totalTokens: 72151861,
+              lastMessageAtUtc: now.subtract(const Duration(days: 1)),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.text('12.3K'), findsOneWidget);
+    expect(find.text('72.2M'), findsOneWidget);
+    expect(find.bySemanticsLabel('Messages 12,345'), findsOneWidget);
+    expect(find.bySemanticsLabel('Tokens 72,151,861'), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is Tooltip && widget.message == '12,345',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is Tooltip && widget.message == '72,151,861',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('empty detail pane gives actionable selection guidance', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final now = DateTime.now().toUtc();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'available',
+              title: 'Available session',
+              project: 'Viewer',
+              lastMessageAtUtc: now.subtract(const Duration(days: 1)),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.text('Session detail'), findsOneWidget);
+    expect(
+      find.text('Select a session from the table to view details.'),
+      findsOneWidget,
+    );
+    expect(find.text('1 session visible.'), findsOneWidget);
+    expect(find.text('No session selected'), findsNothing);
+  });
+
   testWidgets('shows refresh progress and adds parsed rows before completion', (
     tester,
   ) async {
@@ -135,12 +398,13 @@ void main() {
       ),
     );
 
-    expect(find.text('[dmk2]'), findsOneWidget);
+    expect(find.text('dmk2'), findsOneWidget);
+    expect(find.text('[dmk2]'), findsNothing);
 
     await tester.enterText(find.bySemanticsLabel('Session search'), 'dmk2');
     await tester.pumpAndSettle();
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
-    expect(find.text('[dmk2]'), findsOneWidget);
+    expect(find.text('dmk2'), findsWidgets);
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
     await tester.pumpAndSettle();
@@ -156,7 +420,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
 
-    await tester.tap(find.text('[dmk2]'));
+    await tester.tap(find.text('dmk2').first);
     await tester.pumpAndSettle();
     expect(find.text('dmk2'), findsWidgets);
     expect(find.text('Thread dmk2'), findsOneWidget);
@@ -901,7 +1165,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.widgetWithText(ElevatedButton, 'Refresh'), findsOneWidget);
-      expect(find.text('Scan cancelled. 1 session visible.'), findsOneWidget);
+      expect(find.text('Scan cancelled. 1 session available.'), findsOneWidget);
       expect(find.text('Cached row'), findsWidgets);
     },
   );
@@ -1185,7 +1449,7 @@ void main() {
 
     expect(
       tester.getSize(find.byKey(const Key('sessions-left-panel'))).width,
-      1196,
+      1240,
     );
   });
 
@@ -1702,8 +1966,10 @@ SessionRowViewModel _row({
   bool isArchived = false,
   String sourceFilePath = '',
   DateTime? lastMessageAtUtc,
+  int messageCount = 3,
   int totalTokens = 900,
   List<ConversationMessageViewModel> messages = const [],
+  String? summary,
   String? estimatedCostText,
   bool costUnknown = true,
 }) {
@@ -1720,8 +1986,8 @@ SessionRowViewModel _row({
     project: project,
     path: r'F:\projects\MaxLogic\codex-sessions-viewer',
     title: title,
-    summary: title,
-    messageCount: 3,
+    summary: summary ?? title,
+    messageCount: messageCount,
     totalTokens: totalTokens,
     model: 'gpt-5.4',
     estimatedCostText: estimatedCostText,
@@ -1768,6 +2034,29 @@ Future<void> _setOriginFilter(WidgetTester tester, String label) async {
   }
   await tester.tap(originDropdown());
   await tester.pumpAndSettle();
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
+}
+
+Future<void> _setTimeFilter(
+  WidgetTester tester,
+  String currentLabel,
+  String label,
+) async {
+  await tester.tap(find.text(currentLabel).first);
+  await tester.pumpAndSettle();
+  for (final option in [
+    'Today',
+    'Yesterday',
+    'This week',
+    'Last week',
+    'This month',
+    'Last month',
+    'Last 30 days',
+    'All time',
+  ]) {
+    expect(find.text(option), findsWidgets);
+  }
   await tester.tap(find.text(label).last);
   await tester.pumpAndSettle();
 }

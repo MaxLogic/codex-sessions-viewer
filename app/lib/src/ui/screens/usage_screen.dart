@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../accessibility/announcement_service.dart';
 import '../../usage/usage_summary.dart';
+import '../number_formatting.dart';
 
 class UsageScreen extends StatefulWidget {
   // ignore: prefer_const_constructors_in_immutables
@@ -694,17 +695,7 @@ String _topSessionRowSummary(
 String _sessionText(int count) => count == 1 ? '1 session' : '$count sessions';
 
 String _formatInt(int value) {
-  final text = value.abs().toString();
-  final buffer = StringBuffer();
-  for (var i = 0; i < text.length; i += 1) {
-    final remaining = text.length - i;
-    buffer.write(text[i]);
-    if (remaining > 1 && remaining % 3 == 1) {
-      buffer.write(',');
-    }
-  }
-  final formatted = buffer.toString();
-  return value < 0 ? '-$formatted' : formatted;
+  return formatGroupedInt(value);
 }
 
 final _emptySummary = UsageSummary(

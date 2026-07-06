@@ -294,6 +294,52 @@ void main() {
     }
   });
 
+  testWidgets('formats token breakdown numbers consistently', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SessionDetailPane(
+            row: _detailRow(
+              messageCount: 12345,
+              userMessageCount: 3456,
+              assistantMessageCount: 7890,
+              toolCallCount: 999,
+              inputTokens: 1234567,
+              outputTokens: 2345678,
+              cachedInputTokens: 3456789,
+              totalTokens: 6000000,
+              userMessageTokens: 1000000,
+              assistantResponseTokens: 2000000,
+              toolCallTokens: 3000000,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('12,345 messages'), findsOneWidget);
+    expect(find.text('6,000,000 tokens'), findsOneWidget);
+
+    await tester.tap(find.text('Details'));
+    await tester.pumpAndSettle();
+
+    for (final text in const [
+      'Total messages: 12,345',
+      'User message count: 3,456',
+      'Assistant message count: 7,890',
+      'Tool call count: 999',
+      'Total tokens: 6,000,000',
+      'Input tokens: 1,234,567',
+      'Output tokens: 2,345,678',
+      'Cached input tokens: 3,456,789 (57.6%)',
+      'User message tokens: 1,000,000 (16.7%)',
+      'AI response tokens: 2,000,000 (33.3%)',
+      'Tool call tokens: 3,000,000 (50%)',
+    ]) {
+      expect(find.text(text), findsOneWidget);
+    }
+  });
+
   testWidgets('hides the title area when the session has no title', (
     tester,
   ) async {
@@ -433,6 +479,17 @@ SessionRowViewModel _detailRow({
   String project = 'Codex Viewer',
   bool isArchived = true,
   List<ConversationMessageViewModel> messages = const [],
+  int messageCount = 9,
+  int userMessageCount = 3,
+  int assistantMessageCount = 4,
+  int toolCallCount = 2,
+  int inputTokens = 100,
+  int outputTokens = 200,
+  int cachedInputTokens = 50,
+  int totalTokens = 400,
+  int userMessageTokens = 100,
+  int assistantResponseTokens = 200,
+  int toolCallTokens = 50,
 }) {
   return SessionRowViewModel(
     id: id,
@@ -448,17 +505,17 @@ SessionRowViewModel _detailRow({
     workingDirectory: '/home/pawel/projects/codex-viewer',
     title: title,
     summary: 'Session summary',
-    messageCount: 9,
-    userMessageCount: 3,
-    assistantMessageCount: 4,
-    toolCallCount: 2,
-    inputTokens: 100,
-    outputTokens: 200,
-    cachedInputTokens: 50,
-    totalTokens: 400,
-    userMessageTokens: 100,
-    assistantResponseTokens: 200,
-    toolCallTokens: 50,
+    messageCount: messageCount,
+    userMessageCount: userMessageCount,
+    assistantMessageCount: assistantMessageCount,
+    toolCallCount: toolCallCount,
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+    cachedInputTokens: cachedInputTokens,
+    totalTokens: totalTokens,
+    userMessageTokens: userMessageTokens,
+    assistantResponseTokens: assistantResponseTokens,
+    toolCallTokens: toolCallTokens,
     estimatedCostText: '0.1234',
     costUnknown: false,
     model: 'gpt-5.4',

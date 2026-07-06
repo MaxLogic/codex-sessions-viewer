@@ -237,7 +237,7 @@ void main() {
   );
 
   test(
-    'runtime refresh status reports cached visible sessions separately',
+    'runtime refresh status reports cached available sessions separately',
     () async {
       final temp = await Directory.systemTemp.createTemp(
         'csv_runtime_cached_status_',
@@ -279,7 +279,7 @@ void main() {
 
       expect(firstResult.rows, hasLength(1));
       expect(secondResult.rows, hasLength(1));
-      expect(secondResult.statusMessage, contains('1 session visible'));
+      expect(secondResult.statusMessage, contains('1 session available'));
       expect(
         secondResult.statusMessage,
         contains('0 new or changed sessions parsed'),
@@ -875,7 +875,9 @@ void main() {
 
       await tester.tap(find.bySemanticsLabel('Settings navigation'));
       await _pumpFrames(tester);
-      await tester.tap(find.byType(Switch).first);
+      await tester.tap(
+        find.bySemanticsLabel('Background scan enabled setting'),
+      );
       await tester.pump();
       await tester.tap(find.text('Save settings'));
       await _pumpFrames(tester);
