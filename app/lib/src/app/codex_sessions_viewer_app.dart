@@ -26,6 +26,7 @@ typedef SessionCachedRowsLoader =
 typedef FrameDeferredCallback = void Function(VoidCallback callback);
 typedef UsageSummaryLoader =
     Future<UsageSummary?> Function(AppSettings settings);
+typedef StartupPreferenceApplier = Future<void> Function(bool enabled);
 
 class CodexSessionsViewerApp extends StatefulWidget {
   CodexSessionsViewerApp({
@@ -41,6 +42,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
     this.settingsSave,
     this.settingsReload,
     this.usageSummaryLoader,
+    this.startupPreferenceApplier = _ignoreStartupPreference,
   }) : databaseStartup =
            databaseStartup ??
            Future.value(
@@ -68,6 +70,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
   final SettingsSaveCallback? settingsSave;
   final SettingsReloadCallback? settingsReload;
   final UsageSummaryLoader? usageSummaryLoader;
+  final StartupPreferenceApplier startupPreferenceApplier;
 
   @override
   State<CodexSessionsViewerApp> createState() => _CodexSessionsViewerAppState();
@@ -78,6 +81,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   UsageSummary? _usageSummary;
   var _usageLoadGeneration = 0;
   var _usageLoadScheduled = false;
+  bool? _lastSyncedStartupPreference;
 
   @override
   Widget build(BuildContext context) {
@@ -129,6 +133,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
               if (_settings == null &&
                   settingsSnapshot.connectionState == ConnectionState.done) {
                 _settings = settings;
+                _syncStartupPreferenceLater(settings);
               }
               _startUsageSummaryLoad(settings);
               return CodexAppShell(
@@ -202,6 +207,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     } else {
       await save(settings);
     }
+    await _syncStartupPreference(settings);
     if (!mounted) {
       return;
     }
@@ -216,6 +222,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     final settings = reload == null
         ? await SettingsRepository(widget.settingsFile).loadOrCreate()
         : await reload();
+    await _syncStartupPreference(settings);
     if (mounted) {
       setState(() {
         _settings = settings;
@@ -223,6 +230,35 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       unawaited(_loadUsageSummary(settings));
     }
     return settings;
+  }
+
+  void _syncStartupPreferenceLater(AppSettings settings) {
+    unawaited(
+      _syncStartupPreference(settings).catchError((
+        Object error,
+        StackTrace stack,
+      ) {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            stack: stack,
+            library: 'codex_sessions_viewer',
+            context: ErrorDescription(
+              'while applying the Windows startup preference',
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  Future<void> _syncStartupPreference(AppSettings settings) async {
+    final enabled = settings.app.startWithWindows;
+    if (_lastSyncedStartupPreference == enabled) {
+      return;
+    }
+    await widget.startupPreferenceApplier(enabled);
+    _lastSyncedStartupPreference = enabled;
   }
 
   void _startUsageSummaryLoad(AppSettings settings) {
@@ -464,6 +500,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     });
   }
 }
+
+Future<void> _ignoreStartupPreference(bool enabled) async {}
 
 class _SessionsScreenLoader extends StatefulWidget {
   const _SessionsScreenLoader({

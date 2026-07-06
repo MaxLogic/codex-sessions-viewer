@@ -140,7 +140,7 @@ class AppSettings {
   final LoggingSettings logging;
 
   factory AppSettings.defaults() => const AppSettings(
-    app: GeneralAppSettings(firstRun: false),
+    app: GeneralAppSettings(firstRun: false, startWithWindows: true),
     paths: PathSettings(
       windowsCodexPath: r'C:\Users\pawel\.codex',
       wslCodexUncPath: r'\\wsl.localhost\Ubuntu\home\pawel\.codex',
@@ -358,25 +358,46 @@ class AppSettings {
 }
 
 class GeneralAppSettings {
-  const GeneralAppSettings({required this.firstRun});
+  const GeneralAppSettings({
+    required this.firstRun,
+    required this.startWithWindows,
+  });
 
   final bool firstRun;
+  final bool startWithWindows;
+
+  GeneralAppSettings copyWith({bool? firstRun, bool? startWithWindows}) =>
+      GeneralAppSettings(
+        firstRun: firstRun ?? this.firstRun,
+        startWithWindows: startWithWindows ?? this.startWithWindows,
+      );
 
   factory GeneralAppSettings.fromMap(
     Map<String, dynamic> map,
     GeneralAppSettings defaults,
   ) => GeneralAppSettings(
     firstRun: _bool(map, 'first_run', defaults.firstRun, 'app.first_run'),
+    startWithWindows: _bool(
+      map,
+      'start_with_windows',
+      defaults.startWithWindows,
+      'app.start_with_windows',
+    ),
   );
 
-  Map<String, Object?> toTomlMap() => {'first_run': firstRun};
+  Map<String, Object?> toTomlMap() => {
+    'first_run': firstRun,
+    'start_with_windows': startWithWindows,
+  };
 
   @override
   bool operator ==(Object other) =>
-      other is GeneralAppSettings && firstRun == other.firstRun;
+      other is GeneralAppSettings &&
+      firstRun == other.firstRun &&
+      startWithWindows == other.startWithWindows;
 
   @override
-  int get hashCode => firstRun.hashCode;
+  int get hashCode => Object.hash(firstRun, startWithWindows);
 }
 
 class PathSettings {

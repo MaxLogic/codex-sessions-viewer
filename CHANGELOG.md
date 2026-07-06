@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added a persisted `app.start_with_windows` setting, defaulted on, exposed in Settings under Application, and wired to the current-user Windows Run key.
 - Added subagent-aware session grouping, main/subagent usage rollups, and origin breakdowns in Usage statistics.
 - Added a persisted `ui.motion` setting with `system`, `reduced`, and `normal` choices exposed in Settings.
 - Added an ignored private-corpus benchmark mode for realistic aggregate session scan timing.

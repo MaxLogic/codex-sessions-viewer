@@ -263,6 +263,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     _Section(
+                      title: 'Application',
+                      children: [
+                        _SwitchSetting(
+                          label: 'Start with Windows',
+                          helperText:
+                              'Launch Codex Session Viewer after signing in to Windows.',
+                          value: _settings.app.startWithWindows,
+                          onChanged: (value) {
+                            setState(() {
+                              _settings = _settings.copyWith(
+                                app: _settings.app.copyWith(
+                                  startWithWindows: value,
+                                ),
+                              );
+                            });
+                          },
+                        ),
+                      ],
+                    ),
+                    _Section(
                       title: 'Paths',
                       children: [
                         _TextSetting(
@@ -632,20 +652,46 @@ class _SwitchSetting extends StatelessWidget {
     required this.label,
     required this.value,
     required this.onChanged,
+    this.helperText,
   });
 
   final String label;
   final bool value;
   final ValueChanged<bool> onChanged;
+  final String? helperText;
 
   @override
   Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(width: 220, child: Text(label)),
-          Switch(value: value, onChanged: onChanged),
+          SizedBox(
+            width: 220,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label),
+                if (helperText != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    helperText!,
+                    style: textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Semantics(
+            label: '$label setting',
+            toggled: value,
+            child: Switch(value: value, onChanged: onChanged),
+          ),
         ],
       ),
     );

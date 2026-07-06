@@ -24,6 +24,7 @@ void main() {
     );
 
     for (final section in const [
+      'Application',
       'Paths',
       'WSL',
       'Terminal',
@@ -38,6 +39,7 @@ void main() {
     }
 
     for (final label in const [
+      'Start with Windows',
       'Windows Codex path',
       'WSL Codex UNC path',
       'WSL distro name',
@@ -66,6 +68,7 @@ void main() {
     }
 
     for (final helper in const [
+      'Launch Codex Session Viewer after signing in to Windows.',
       'Folder containing native Windows Codex session files.',
       'UNC folder used to read WSL Codex sessions from Windows.',
       'Command profile used when launching resume commands.',
@@ -85,6 +88,43 @@ void main() {
     expect(saved?.paths.windowsCodexPath, r'D:\Codex');
     expect(find.text('Settings saved.'), findsOneWidget);
     expect(announcer.messages, contains('Settings saved.'));
+  });
+
+  testWidgets('settings screen edits start with Windows preference', (
+    tester,
+  ) async {
+    AppSettings? saved;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          initialSettings: AppSettings.defaults(),
+          onSave: (settings) async {
+            saved = settings;
+          },
+        ),
+      ),
+    );
+
+    expect(find.text('Start with Windows'), findsOneWidget);
+
+    final startupRow = find.ancestor(
+      of: find.text('Start with Windows'),
+      matching: find.byType(Row),
+    );
+    final startupSwitch = find.descendant(
+      of: startupRow,
+      matching: find.byType(Switch),
+    );
+
+    expect(tester.widget<Switch>(startupSwitch).value, isTrue);
+
+    await tester.tap(startupSwitch);
+    await tester.pump();
+    await tester.tap(find.text('Save settings'));
+    await tester.pump();
+
+    expect(saved?.app.startWithWindows, isFalse);
   });
 
   testWidgets('cancel and reload make explicit state changes', (tester) async {

@@ -1,5 +1,6 @@
 [app]
 first_run = false
+start_with_windows = true
 
 [paths]
 windows_codex_path = 'C:\Users\pawel\.codex'

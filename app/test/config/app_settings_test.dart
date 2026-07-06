@@ -28,6 +28,7 @@ void main() {
     expect(settingsFile.existsSync(), isTrue);
     expect(settings.paths.windowsCodexPath, r'C:\Users\pawel\.codex');
     expect(settings.wsl.distro, 'Ubuntu');
+    expect(settings.app.startWithWindows, isTrue);
     expect(settings.ui.nativeTitleBar, isTrue);
 
     final tomlText = await settingsFile.readAsString();
@@ -48,6 +49,7 @@ void main() {
     ]) {
       expect(tomlText, contains(header));
     }
+    expect(tomlText, contains('start_with_windows = true'));
     expect(tomlText, isNot(contains('[project')));
   });
 
@@ -55,6 +57,7 @@ void main() {
     final repository = SettingsRepository(settingsFile);
     final defaults = AppSettings.defaults();
     final original = defaults.copyWith(
+      app: const GeneralAppSettings(firstRun: true, startWithWindows: false),
       paths: const PathSettings(
         windowsCodexPath: r'D:\Codex Sessions',
         wslCodexUncPath: r'\\wsl.localhost\Debian\home\dev\.codex',
@@ -162,6 +165,28 @@ void main() {
     final loaded = await repository.loadOrCreate();
 
     expect(loaded, original);
+  });
+
+  test('parses and saves start with Windows preference', () async {
+    await settingsFile.writeAsString('''
+[app]
+start_with_windows = false
+''');
+
+    final repository = SettingsRepository(settingsFile);
+    final loaded = await repository.loadOrCreate();
+
+    expect(loaded.app.startWithWindows, isFalse);
+
+    await repository.save(
+      loaded.copyWith(app: loaded.app.copyWith(startWithWindows: true)),
+    );
+    final savedText = await settingsFile.readAsString();
+    expect(savedText, contains('start_with_windows = true'));
+
+    await settingsFile.writeAsString('[app]\n');
+    final defaulted = await repository.loadOrCreate();
+    expect(defaulted.app.startWithWindows, isTrue);
   });
 
   test('rejects invalid enum values with a field-specific error', () async {
