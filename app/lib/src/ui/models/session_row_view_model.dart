@@ -46,6 +46,12 @@ class SessionRowViewModel {
     this.isPinned = false,
     this.isArchived = false,
     this.hasError = false,
+    this.evalReady = false,
+    this.evalStatus = '',
+    this.evalNotes = '',
+    this.evalExpectedOutput = '',
+    this.evalReviewedAtUtc,
+    this.evalUpdatedAtUtc,
   });
 
   final String id;
@@ -90,6 +96,23 @@ class SessionRowViewModel {
   final bool isPinned;
   final bool isArchived;
   final bool hasError;
+  final bool evalReady;
+  final String evalStatus;
+  final String evalNotes;
+  final String evalExpectedOutput;
+  final DateTime? evalReviewedAtUtc;
+  final DateTime? evalUpdatedAtUtc;
+
+  String get evalStatusLabel {
+    return switch (evalStatus.trim().toLowerCase()) {
+      'correct' => 'Correct',
+      'incorrect' => 'Incorrect',
+      'needs_review' || 'needs review' => 'Needs review',
+      'blocked' => 'Blocked',
+      'not_reviewed' || 'not reviewed' || '' => 'Not reviewed',
+      _ => 'Not reviewed',
+    };
+  }
 
   String get platformLabel => switch (platform) {
     SessionRowPlatform.windows => 'Windows',
@@ -230,6 +253,12 @@ class SessionRowViewModel {
       isPinned: isPinned,
       isArchived: isArchived,
       hasError: hasError,
+      evalReady: evalReady,
+      evalStatus: evalStatus,
+      evalNotes: evalNotes,
+      evalExpectedOutput: evalExpectedOutput,
+      evalReviewedAtUtc: evalReviewedAtUtc,
+      evalUpdatedAtUtc: evalUpdatedAtUtc,
     );
   }
 
@@ -277,8 +306,83 @@ class SessionRowViewModel {
       isPinned: isPinned,
       isArchived: isArchived,
       hasError: hasError,
+      evalReady: evalReady,
+      evalStatus: evalStatus,
+      evalNotes: evalNotes,
+      evalExpectedOutput: evalExpectedOutput,
+      evalReviewedAtUtc: evalReviewedAtUtc,
+      evalUpdatedAtUtc: evalUpdatedAtUtc,
     );
   }
+
+  SessionRowViewModel copyWithEvalMetadata(SessionEvalMetadata metadata) {
+    return SessionRowViewModel(
+      id: id,
+      sessionId: sessionId,
+      threadName: threadName,
+      threadSource: threadSource,
+      parentThreadId: parentThreadId,
+      agentNickname: agentNickname,
+      agentRole: agentRole,
+      subagentDepth: subagentDepth,
+      sourceFilePath: sourceFilePath,
+      displayPath: displayPath,
+      workingDirectory: workingDirectory,
+      openablePath: openablePath,
+      startedAtUtc: startedAtUtc,
+      lastMessageAtUtc: lastMessageAtUtc,
+      duration: duration,
+      platform: platform,
+      project: project,
+      path: path,
+      title: title,
+      summary: summary,
+      messageCount: messageCount,
+      userMessageCount: userMessageCount,
+      assistantMessageCount: assistantMessageCount,
+      toolCallCount: toolCallCount,
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+      cachedInputTokens: cachedInputTokens,
+      userMessageTokens: userMessageTokens,
+      assistantResponseTokens: assistantResponseTokens,
+      toolCallTokens: toolCallTokens,
+      estimatedCostText: estimatedCostText,
+      costUnknown: costUnknown,
+      totalTokens: totalTokens,
+      model: model,
+      modelsUsed: modelsUsed,
+      tags: tags,
+      status: status,
+      conversationMessages: conversationMessages,
+      usageRollup: usageRollup,
+      isPinned: isPinned,
+      isArchived: isArchived,
+      hasError: hasError,
+      evalReady: metadata.evalReady,
+      evalStatus: metadata.status ?? '',
+      evalNotes: metadata.notes ?? '',
+      evalExpectedOutput: metadata.expectedOutput ?? '',
+      evalReviewedAtUtc: metadata.reviewedAtUtc,
+      evalUpdatedAtUtc: DateTime.now().toUtc(),
+    );
+  }
+}
+
+class SessionEvalMetadata {
+  const SessionEvalMetadata({
+    required this.evalReady,
+    this.status,
+    this.notes,
+    this.expectedOutput,
+    this.reviewedAtUtc,
+  });
+
+  final bool evalReady;
+  final String? status;
+  final String? notes;
+  final String? expectedOutput;
+  final DateTime? reviewedAtUtc;
 }
 
 class SessionUsageRollup {

@@ -1730,7 +1730,13 @@ List<SessionRowViewModel> _loadRows(
       s.parse_status,
       s.is_pinned,
       s.is_archived,
-      s.has_errors
+      s.has_errors,
+      s.eval_ready,
+      s.eval_status,
+      s.eval_notes,
+      s.eval_expected_output,
+      s.eval_reviewed_at_utc,
+      s.eval_updated_at_utc
     from sessions s
     where ${filters.join(' and ')}
     order by coalesce(s.last_message_at_utc, s.started_at_utc, s.updated_at_utc) desc,
@@ -1852,6 +1858,12 @@ SessionRowViewModel _loadRow(
     isPinned: (row['is_pinned'] as int? ?? 0) == 1,
     isArchived: (row['is_archived'] as int? ?? 0) == 1,
     hasError: (row['has_errors'] as int? ?? 0) == 1,
+    evalReady: (row['eval_ready'] as int? ?? 0) == 1,
+    evalStatus: row['eval_status'] as String? ?? '',
+    evalNotes: row['eval_notes'] as String? ?? '',
+    evalExpectedOutput: row['eval_expected_output'] as String? ?? '',
+    evalReviewedAtUtc: _dateTime(row['eval_reviewed_at_utc'] as String?),
+    evalUpdatedAtUtc: _dateTime(row['eval_updated_at_utc'] as String?),
     conversationMessages: includeMessages
         ? _loadMessages(db, row['id'] as String)
         : const [],

@@ -7,6 +7,7 @@ import 'package:codex_sessions_viewer/src/ui/widgets/command_preview.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/conversation_view.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/focus_reader_view.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -182,6 +183,70 @@ void main() {
       findsOneWidget,
     );
     expect(find.bySemanticsLabel('Actions for Parser review'), findsNothing);
+  });
+
+  testWidgets('eval controls have distinct accessible labels', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            SessionRowViewModel(
+              id: 'session-1',
+              sessionId: 'abc123',
+              startedAtUtc: DateTime.utc(2026, 6, 12, 9),
+              lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9, 5),
+              title: 'Parser review',
+              summary: 'Reviewed JSONL formats',
+              project: 'Codex Viewer',
+              path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+              platform: SessionRowPlatform.windows,
+              messageCount: 4,
+              totalTokens: 1200,
+              model: 'gpt-5',
+              tags: const ['parser'],
+              status: 'Parsed',
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Parser review').first);
+    await tester.pumpAndSettle();
+
+    expect(
+      find.bySemanticsLabel('Add selected session to evals'),
+      findsOneWidget,
+    );
+    expect(
+      find.bySemanticsLabel('Edit eval metadata for selected session'),
+      findsOneWidget,
+    );
+    expect(
+      tester
+          .getSemantics(find.bySemanticsLabel('Add selected session to evals'))
+          .getSemanticsData()
+          .hasAction(SemanticsAction.tap),
+      isTrue,
+    );
+    expect(
+      tester
+          .getSemantics(
+            find.bySemanticsLabel('Edit eval metadata for selected session'),
+          )
+          .getSemanticsData()
+          .hasAction(SemanticsAction.tap),
+      isTrue,
+    );
+
+    await tester.tap(
+      find.bySemanticsLabel('Edit eval metadata for selected session'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Eval review status'), findsOneWidget);
+    expect(find.bySemanticsLabel('Eval notes'), findsOneWidget);
+    expect(find.bySemanticsLabel('Eval expected output'), findsOneWidget);
   });
 
   testWidgets('empty session detail has accessible heading and guidance', (

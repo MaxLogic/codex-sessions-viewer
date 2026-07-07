@@ -61,6 +61,7 @@ enum SessionRowAction {
   editTags,
   togglePin,
   toggleArchive,
+  updateEvalMetadata,
   reparse,
 }
 
@@ -85,11 +86,13 @@ class SessionActionRequest {
     required this.row,
     required this.action,
     this.payload,
+    this.evalMetadata,
   });
 
   final SessionRowViewModel row;
   final SessionRowAction action;
   final String? payload;
+  final SessionEvalMetadata? evalMetadata;
 }
 
 class SessionsScreen extends StatefulWidget {
@@ -1325,6 +1328,19 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final callback = widget.onSessionAction;
     if (callback != null) {
       await callback(request);
+      if (request.action == SessionRowAction.updateEvalMetadata &&
+          request.evalMetadata != null &&
+          mounted) {
+        _replaceEvalMetadata(request.row, request.evalMetadata!);
+      }
+      return;
+    }
+    if (request.action == SessionRowAction.updateEvalMetadata &&
+        request.evalMetadata != null) {
+      _replaceEvalMetadata(request.row, request.evalMetadata!);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Eval metadata updated.')));
       return;
     }
     final payload = request.payload;
@@ -1348,6 +1364,27 @@ class _SessionsScreenState extends State<SessionsScreen> {
     SessionRowViewModel row,
     SessionDetailAction action,
   ) async {
+    if (action == SessionDetailAction.addToEvals) {
+      await _saveEvalMetadata(
+        row,
+        SessionEvalMetadata(
+          evalReady: true,
+          status: _blankToNull(row.evalStatus),
+          notes: _blankToNull(row.evalNotes),
+          expectedOutput: _blankToNull(row.evalExpectedOutput),
+          reviewedAtUtc: row.evalReviewedAtUtc,
+        ),
+      );
+      return;
+    }
+    if (action == SessionDetailAction.removeFromEvals) {
+      await _saveEvalMetadata(row, const SessionEvalMetadata(evalReady: false));
+      return;
+    }
+    if (action == SessionDetailAction.editEvalMetadata) {
+      await _editEvalMetadata(row);
+      return;
+    }
     final commandSet =
         ResumeCommandGenerator(
           settings: widget.settings ?? AppSettings.defaults(),
@@ -1394,11 +1431,100 @@ class _SessionsScreenState extends State<SessionsScreen> {
       ),
       SessionDetailAction.openTerminalHere ||
       SessionDetailAction.exportMarkdown ||
-      SessionDetailAction.assignProject => null,
+      SessionDetailAction.assignProject ||
+      SessionDetailAction.addToEvals ||
+      SessionDetailAction.removeFromEvals ||
+      SessionDetailAction.editEvalMetadata => null,
     };
     if (request != null) {
       await _handleSessionAction(request);
     }
+  }
+
+  Future<void> _editEvalMetadata(SessionRowViewModel row) async {
+    var status = row.evalStatus;
+    var notes = row.evalNotes;
+    var expectedOutput = row.evalExpectedOutput;
+    final metadata = await showDialog<SessionEvalMetadata>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit eval details'),
+        content: SizedBox(
+          width: 520,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                initialValue: status,
+                onChanged: (value) => status = value,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: 'Eval review status',
+                ),
+              ),
+              TextFormField(
+                initialValue: notes,
+                onChanged: (value) => notes = value,
+                maxLines: 3,
+                decoration: const InputDecoration(labelText: 'Eval notes'),
+              ),
+              TextFormField(
+                initialValue: expectedOutput,
+                onChanged: (value) => expectedOutput = value,
+                maxLines: 4,
+                decoration: const InputDecoration(
+                  labelText: 'Eval expected output',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(
+              SessionEvalMetadata(
+                evalReady: true,
+                status: _blankToNull(status),
+                notes: _blankToNull(notes),
+                expectedOutput: _blankToNull(expectedOutput),
+                reviewedAtUtc: DateTime.now().toUtc(),
+              ),
+            ),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (metadata == null) {
+      return;
+    }
+    await _saveEvalMetadata(row, metadata);
+  }
+
+  Future<void> _saveEvalMetadata(
+    SessionRowViewModel row,
+    SessionEvalMetadata metadata,
+  ) async {
+    await _handleSessionAction(
+      SessionActionRequest(
+        row: row,
+        action: SessionRowAction.updateEvalMetadata,
+        evalMetadata: metadata,
+      ),
+    );
+  }
+
+  void _replaceEvalMetadata(
+    SessionRowViewModel row,
+    SessionEvalMetadata metadata,
+  ) {
+    setState(() {
+      _replaceRow(row.copyWithEvalMetadata(metadata));
+    });
   }
 
   void _setColumnWidth(String column, double width) {
@@ -3340,6 +3466,7 @@ class _ActionsMenu extends StatelessWidget {
       SessionRowAction.editTags => null,
       SessionRowAction.togglePin ||
       SessionRowAction.toggleArchive ||
+      SessionRowAction.updateEvalMetadata ||
       SessionRowAction.reparse => null,
     };
   }
@@ -3362,9 +3489,15 @@ extension on SessionRowAction {
       SessionRowAction.editTags => 'Add or remove tags',
       SessionRowAction.togglePin => 'Pin or unpin session',
       SessionRowAction.toggleArchive => 'Archive or unarchive session',
+      SessionRowAction.updateEvalMetadata => 'Update eval metadata',
       SessionRowAction.reparse => 'Re-parse session',
     };
   }
+}
+
+String? _blankToNull(String value) {
+  final trimmed = value.trim();
+  return trimmed.isEmpty ? null : trimmed;
 }
 
 class _SessionDetailPlaceholder extends StatelessWidget {

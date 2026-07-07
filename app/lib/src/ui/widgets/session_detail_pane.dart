@@ -34,6 +34,9 @@ enum SessionDetailAction {
   toggleArchive,
   editTags,
   assignProject,
+  addToEvals,
+  removeFromEvals,
+  editEvalMetadata,
 }
 
 class SessionDetailPane extends StatelessWidget {
@@ -100,6 +103,8 @@ class SessionDetailPane extends StatelessWidget {
             onLoadFullConversationMessages: onLoadFullConversationMessages,
             onSessionAction: onSessionAction,
           ),
+          const SizedBox(height: 8),
+          _EvalSummary(row: row),
           const SizedBox(height: 8),
           ExpansionTile(
             tilePadding: EdgeInsets.zero,
@@ -350,6 +355,32 @@ class _HeaderFact extends StatelessWidget {
   }
 }
 
+class _EvalSummary extends StatelessWidget {
+  const _EvalSummary({required this.row});
+
+  final SessionRowViewModel row;
+
+  @override
+  Widget build(BuildContext context) {
+    final notes = row.evalNotes.trim();
+    final expected = row.evalExpectedOutput.trim();
+    return Semantics(
+      container: true,
+      label: 'Eval metadata ${row.evalStatusLabel}',
+      child: Wrap(
+        spacing: 12,
+        runSpacing: 6,
+        children: [
+          Text(row.evalReady ? 'Eval-ready: Yes' : 'Eval-ready: No'),
+          Text('Eval status: ${row.evalStatusLabel}'),
+          if (notes.isNotEmpty) Text('Notes: $notes'),
+          if (expected.isNotEmpty) Text('Expected output: $expected'),
+        ],
+      ),
+    );
+  }
+}
+
 class _MetadataGrid extends StatelessWidget {
   const _MetadataGrid({required this.row});
 
@@ -489,6 +520,20 @@ class _ActionArea extends StatelessWidget {
           iconAsset: AppIcons.folderOpen,
           disabledReason:
               'This WSL path cannot be opened from Windows Explorer.',
+        ),
+        _callbackAction(
+          row.evalReady ? 'Remove from Evals' : 'Add to Evals',
+          row.evalReady
+              ? SessionDetailAction.removeFromEvals
+              : SessionDetailAction.addToEvals,
+          semanticLabel: row.evalReady
+              ? 'Remove selected session from evals'
+              : 'Add selected session to evals',
+        ),
+        _callbackAction(
+          'Edit eval details',
+          SessionDetailAction.editEvalMetadata,
+          semanticLabel: 'Edit eval metadata for selected session',
         ),
         _callbackAction(
           'Export Markdown',
@@ -651,6 +696,7 @@ class _ActionArea extends StatelessWidget {
     bool enabled = true,
     String? disabledReason,
     String? iconAsset,
+    String? semanticLabel,
   }) {
     final hasCallback = action == SessionDetailAction.exportMarkdown
         ? onExportMarkdown != null
@@ -665,10 +711,19 @@ class _ActionArea extends StatelessWidget {
             icon: AppSvgIcon(iconAsset),
             label: Text(label),
           );
+    final result = semanticLabel == null
+        ? button
+        : Semantics(
+            label: semanticLabel,
+            button: true,
+            enabled: onPressed != null,
+            onTap: onPressed,
+            child: ExcludeSemantics(child: button),
+          );
     if (enabled || disabledReason == null) {
-      return button;
+      return result;
     }
-    return Tooltip(message: disabledReason, child: button);
+    return Tooltip(message: disabledReason, child: result);
   }
 
   Future<void> _copyText(

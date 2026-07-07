@@ -9,6 +9,7 @@ import '../config/app_settings.dart';
 import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
 import '../database/project_tag_state.dart';
+import '../database/session_eval_state.dart';
 import '../app/runtime_session_controller.dart';
 import '../pricing/pricing_repository.dart';
 import '../ui/app_shell.dart';
@@ -358,6 +359,9 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           value: !request.row.isArchived,
         );
         return;
+      case SessionRowAction.updateEvalMetadata:
+        _updateEvalMetadata(request.row.id, request.evalMetadata);
+        return;
       case SessionRowAction.reparse:
         await RuntimeSessionController(
           settingsFile: widget.settingsFile,
@@ -479,6 +483,25 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       db.execute(
         'update sessions set $column = ?, updated_at_utc = ? where id = ?',
         [value ? 1 : 0, DateTime.now().toUtc().toIso8601String(), sessionId],
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  void _updateEvalMetadata(String sessionId, SessionEvalMetadata? metadata) {
+    if (metadata == null) {
+      return;
+    }
+    final db = openFileBackedDatabase(widget.databaseFile);
+    try {
+      SessionEvalStateStore(db).setEvalMetadata(
+        sessionId,
+        evalReady: metadata.evalReady,
+        status: metadata.status,
+        notes: metadata.notes,
+        expectedOutput: metadata.expectedOutput,
+        reviewedAtUtc: metadata.reviewedAtUtc,
       );
     } finally {
       db.close();
