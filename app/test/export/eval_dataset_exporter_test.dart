@@ -44,6 +44,32 @@ void main() {
     expect(metadata['eval_notes'], 'Regression target');
   });
 
+  test('exports normalized source metadata', () {
+    final files = const EvalDatasetExporter().export(
+      EvalDatasetExportRequest(
+        sessions: [
+          EvalDatasetSession(
+            session: _session(
+              sourceType: CodexSessionSourceType.windows,
+              modelIds: const {'anthropic/claude-sonnet-4', ''},
+            ),
+          ),
+        ],
+        format: EvalDatasetFormat.deepEvalJson,
+        turnMode: EvalTurnMode.finalAssistantAnswer,
+      ),
+    );
+
+    final decoded = jsonDecode(files.singleContent) as Map<String, Object?>;
+    final entry =
+        (decoded['test_cases'] as List<Object?>).single as Map<String, Object?>;
+    final metadata = entry['metadata'] as Map<String, Object?>;
+
+    expect(metadata['source_label'], 'Windows');
+    expect(metadata['model_labels'], ['Anthropic / Claude Sonnet 4']);
+    expect(metadata['provider_labels'], ['Anthropic']);
+  });
+
   test('exports OpenAI and Promptfoo JSONL turn cases', () {
     final exporter = const EvalDatasetExporter();
     final openAiFiles = exporter.export(
@@ -275,11 +301,13 @@ List<CodexParsedMessage> _twoTurnMessages() {
 CodexParsedSession _session({
   List<CodexParsedMessage>? messages,
   List<CodexParsedToolCall>? toolCalls,
+  CodexSessionSourceType sourceType = CodexSessionSourceType.wsl,
+  Set<String> modelIds = const {'gpt-5.5-thinking'},
 }) {
   return CodexParsedSession(
     internalId: 'internal-demo',
     sessionId: 'demo-session',
-    sourceType: CodexSessionSourceType.wsl,
+    sourceType: sourceType,
     sourcePath: '/home/pawel/.codex/sessions/demo.jsonl',
     sourceFileUncPath:
         r'\\wsl.localhost\Ubuntu\home\pawel\.codex\sessions\demo.jsonl',
@@ -293,7 +321,7 @@ CodexParsedSession _session({
     summary: 'Synthetic eval export session',
     startedAtUtc: DateTime.utc(2026, 6, 10, 9, 42),
     lastMessageAtUtc: DateTime.utc(2026, 6, 10, 9, 50),
-    modelIds: const {'gpt-5.5-thinking'},
+    modelIds: modelIds,
     messages:
         messages ??
         [

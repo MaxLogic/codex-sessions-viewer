@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import '../parser/codex_session_parser.dart';
+import '../ui/models/session_label_formatter.dart';
 import '../utils/injected_context_filter.dart';
 
 enum EvalDatasetFormat {
@@ -392,10 +393,13 @@ Map<String, Object?> _metadata(
     'session_id': session.sessionId,
     'title': _exportText(_sessionTitle(session), options, anonymizer),
     'source': session.sourceType.name,
+    'source_label': SessionLabelFormatter.sourceType(session.sourceType.name),
     'path': options.anonymizePaths
         ? anonymizer.pathFor(session.displayPath)
         : session.displayPath,
     'models': session.modelIds.toList()..sort(),
+    'model_labels': SessionLabelFormatter.modelLabels(session.modelIds),
+    'provider_labels': SessionLabelFormatter.providerLabels(session.modelIds),
   };
   if (options.includeTokenUsage && session.usage.totalTokens != null) {
     metadata['total_tokens'] = session.usage.totalTokens;

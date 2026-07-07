@@ -988,7 +988,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       row.path,
       row.platformLabel,
       row.originLabel,
-      row.model,
+      row.modelProviderLabel,
       row.status,
       ...row.tags,
     ].any((value) => value.toLowerCase().contains(search));
@@ -3006,7 +3006,7 @@ class _SessionsTable extends StatelessWidget {
                 row.displayTotalTokens,
                 width: _widthFor('total_tokens'),
               ),
-              _cell('Model', row.model, width: _widthFor('model')),
+              _cell('Model', row.modelLabel, width: _widthFor('model')),
               _TagsCell(
                 row: row,
                 width: _widthFor('tags'),

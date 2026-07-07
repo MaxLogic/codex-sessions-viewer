@@ -1,4 +1,5 @@
 import '../parser/codex_session_parser.dart';
+import '../ui/models/session_label_formatter.dart';
 import '../utils/injected_context_filter.dart';
 
 class MarkdownSessionExporter {
@@ -309,11 +310,7 @@ String _authorLabel(CodexMessageAuthorType authorType) {
 }
 
 String _sourceLabel(CodexSessionSourceType sourceType) {
-  return switch (sourceType) {
-    CodexSessionSourceType.windows => 'Windows',
-    CodexSessionSourceType.wsl => 'WSL',
-    CodexSessionSourceType.unknown => 'Unknown',
-  };
+  return SessionLabelFormatter.sourceType(sourceType.name);
 }
 
 String _projectName(CodexParsedSession session) {

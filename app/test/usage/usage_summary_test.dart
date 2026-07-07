@@ -96,10 +96,10 @@ void main() {
     expect(summary.totalTokens, 210);
     expect(summary.estimatedCostText, '1.005');
     expect(summary.costUnknown, isFalse);
-    expect(summary.mostUsedModel, 'openai/gpt-a');
+    expect(summary.mostUsedModel, 'GPT A');
     expect(summary.mostActiveProject, 'Viewer');
-    expect(summary.mostActivePlatform, 'windows');
-    expect(summary.byPlatform.map((row) => row.key), ['windows', 'wsl']);
+    expect(summary.mostActivePlatform, 'Windows');
+    expect(summary.byPlatform.map((row) => row.key), ['Windows', 'WSL']);
     expect(summary.byArchiveState.map((row) => row.key), [
       'active',
       'archived',

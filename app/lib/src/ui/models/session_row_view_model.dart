@@ -1,4 +1,5 @@
 import 'conversation_message_view_model.dart';
+import 'session_label_formatter.dart';
 
 enum SessionRowPlatform { windows, wsl }
 
@@ -114,10 +115,7 @@ class SessionRowViewModel {
     };
   }
 
-  String get platformLabel => switch (platform) {
-    SessionRowPlatform.windows => 'Windows',
-    SessionRowPlatform.wsl => 'WSL',
-  };
+  String get platformLabel => SessionLabelFormatter.platform(platform.name);
 
   bool get isSubagentSession => threadSource.toLowerCase() == 'subagent';
 
@@ -139,13 +137,17 @@ class SessionRowViewModel {
     return id;
   }
 
-  String get originLabel {
-    if (isSubagentSession) {
-      final nickname = agentNickname.trim();
-      return nickname.isEmpty ? 'Subagent' : 'Subagent: $nickname';
-    }
-    return 'User';
-  }
+  String get originLabel => SessionLabelFormatter.origin(
+    threadSource: threadSource,
+    agentNickname: agentNickname,
+  );
+
+  String get providerLabel => SessionLabelFormatter.provider(model);
+
+  String get modelLabel => SessionLabelFormatter.model(model);
+
+  String get modelProviderLabel =>
+      SessionLabelFormatter.modelWithProvider(model);
 
   String get sourcePathForDisplay =>
       sourceFilePath.isEmpty ? path : sourceFilePath;
@@ -171,8 +173,8 @@ class SessionRowViewModel {
     if (modelsUsed.isNotEmpty) {
       return modelsUsed;
     }
-    final trimmed = model.trim();
-    return trimmed.isEmpty ? const [] : [trimmed];
+    final label = modelLabel;
+    return label == SessionLabelFormatter.unknown ? const [] : [label];
   }
 
   String get estimatedCostDisplay =>

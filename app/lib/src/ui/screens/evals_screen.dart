@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../export/eval_dataset_exporter.dart';
+import '../models/session_label_formatter.dart';
 import '../models/session_row_view_model.dart';
 
 typedef EvalMetadataUpdateCallback =
@@ -139,7 +140,7 @@ class _EvalsScreenState extends State<EvalsScreen> {
             _matchesTag(row, tag) &&
             _matchesSource(row) &&
             _contains(row.project, project) &&
-            _contains(row.model, model))
+            _matchesModel(row, model))
           row,
     ];
   }
@@ -549,7 +550,7 @@ class _EvalsScreenState extends State<EvalsScreen> {
       row.summary,
       row.project,
       row.platformLabel,
-      row.model,
+      row.modelProviderLabel,
       row.evalStatusLabel,
       row.evalNotes,
       row.evalExpectedOutput,
@@ -562,6 +563,18 @@ class _EvalsScreenState extends State<EvalsScreen> {
       return true;
     }
     return row.tags.any((tag) => _contains(tag, value));
+  }
+
+  static bool _matchesModel(SessionRowViewModel row, String value) {
+    if (value.isEmpty) {
+      return true;
+    }
+    return [
+      row.modelProviderLabel,
+      row.modelLabel,
+      row.providerLabel,
+      row.model,
+    ].any((field) => _contains(field, value));
   }
 }
 
@@ -630,11 +643,10 @@ class _EvalRow extends StatelessWidget {
                               _ChipText(row.evalStatusLabel),
                               _ChipText(row.project),
                               _ChipText(row.platformLabel),
-                              _ChipText(
-                                row.model.trim().isEmpty
-                                    ? 'Unknown model'
-                                    : row.model,
-                              ),
+                              if (row.providerLabel !=
+                                  SessionLabelFormatter.unknown)
+                                _ChipText(row.providerLabel),
+                              _ChipText(row.modelLabel),
                               _ChipText(_shortDate(row.lastMessageAtUtc)),
                               if (row.evalNotes.trim().isNotEmpty)
                                 const _ChipText('Notes'),

@@ -1,5 +1,7 @@
 import 'package:sqlite3/sqlite3.dart';
 
+import '../ui/models/session_label_formatter.dart';
+
 enum UsagePeriod {
   today,
   yesterday,
@@ -358,7 +360,7 @@ UsageSummary _summarizeSessions(
   final byModel = _breakdown(
     sessions,
     pricing,
-    (session) => session.modelPrimary ?? 'Unknown',
+    (session) => SessionLabelFormatter.model(session.modelPrimary),
   );
   final byProject = _breakdown(
     sessions,
@@ -368,7 +370,7 @@ UsageSummary _summarizeSessions(
   final byPlatform = _breakdown(
     sessions,
     pricing,
-    (session) => session.sourceType,
+    (session) => SessionLabelFormatter.sourceType(session.sourceType),
   );
   final byOrigin = _breakdown(sessions, pricing, _originLabel);
   return UsageSummary(
@@ -634,12 +636,10 @@ List<UsageTopSession> _topSessionsByCost(
 }
 
 String _originLabel(_UsageSession session) {
-  final source = session.threadSource?.trim().toLowerCase();
-  return switch (source) {
-    'subagent' => 'Subagent',
-    null || '' || 'user' => 'User',
-    _ => 'Unknown',
-  };
+  return SessionLabelFormatter.origin(
+    threadSource: session.threadSource,
+    agentNickname: null,
+  );
 }
 
 String? _mostActive(List<UsageBreakdownRow> rows) =>

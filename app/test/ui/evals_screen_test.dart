@@ -174,6 +174,40 @@ void main() {
 
     expect(find.text('Exported 0 eval sessions. 1 skipped.'), findsOneWidget);
   });
+
+  testWidgets('uses normalized provider labels', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: EvalsScreen(
+          initialRows: [
+            _row(
+              id: 'provider',
+              title: 'Provider row',
+              model: 'anthropic/claude-sonnet-4',
+            ),
+            _row(id: 'unknown', title: 'Unknown row', model: ''),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.text('Anthropic'), findsOneWidget);
+    expect(find.text('Claude Sonnet 4'), findsOneWidget);
+    expect(find.text('Unknown'), findsWidgets);
+
+    await tester.enterText(
+      find.bySemanticsLabel('Eval model provider filter'),
+      'anthropic',
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Evals, 1 visible'), findsOneWidget);
+    expect(find.text('Provider row'), findsOneWidget);
+    expect(find.text('Unknown row'), findsNothing);
+  });
 }
 
 SessionRowViewModel _row({

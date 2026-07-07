@@ -244,7 +244,7 @@ class _SelectedSessionHeader extends StatelessWidget {
               _HeaderFact(row.platformLabel),
               _HeaderFact(row.originLabel),
               if (row.hasThreadName) _HeaderFact('Thread ${row.threadName}'),
-              _HeaderFact(row.model.isEmpty ? 'Model unknown' : row.model),
+              _HeaderFact(row.modelLabel),
               _HeaderFact('${formatGroupedInt(row.messageCount)} messages'),
               _HeaderFact('${formatGroupedInt(row.displayTotalTokens)} tokens'),
               if (row.usageRollup != null)

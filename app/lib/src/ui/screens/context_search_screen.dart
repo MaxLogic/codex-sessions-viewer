@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../search/message_search.dart';
+import '../models/session_label_formatter.dart';
 import '../models/session_row_view_model.dart';
 
 typedef ContextMessageSearchCallback =
@@ -273,7 +274,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
       row.summary,
       row.project,
       row.platformLabel,
-      row.model,
+      row.modelProviderLabel,
       row.path,
       ...row.tags,
     ].join(' ').toLowerCase();
@@ -447,7 +448,9 @@ class _SessionContextRow extends StatelessWidget {
                   children: [
                     _ChipText(row.project),
                     _ChipText(row.platformLabel),
-                    _ChipText(row.model.trim().isEmpty ? 'Unknown' : row.model),
+                    if (row.providerLabel != SessionLabelFormatter.unknown)
+                      _ChipText(row.providerLabel),
+                    _ChipText(row.modelLabel),
                     _ChipText(_shortDate(row.lastMessageAtUtc)),
                   ],
                 ),
@@ -654,11 +657,6 @@ extension on MessageSearchResult {
   }
 
   String get sourceLabel {
-    return switch (sourceType.trim().toLowerCase()) {
-      'windows' => 'Windows',
-      'wsl' => 'WSL',
-      final value when value.isNotEmpty => value,
-      _ => 'Unknown',
-    };
+    return SessionLabelFormatter.sourceType(sourceType);
   }
 }

@@ -259,6 +259,55 @@ void main() {
     expect(identityLeft, lessThan(summaryLeft));
   });
 
+  testWidgets('renders normalized source labels', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'windows',
+              title: 'Windows label',
+              project: 'Viewer',
+              model: '',
+            ),
+            _row(
+              id: 'wsl',
+              title: 'WSL label',
+              project: 'Viewer',
+              platform: SessionRowPlatform.wsl,
+              model: 'anthropic/claude-sonnet-4',
+            ),
+            _row(
+              id: 'subagent',
+              title: 'Subagent label',
+              project: 'Viewer',
+              threadSource: 'subagent',
+              agentNickname: 'Pascal',
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Windows label').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Windows'), findsWidgets);
+    expect(find.text('Unknown'), findsWidgets);
+
+    await tester.tap(find.text('WSL label').first);
+    await tester.pumpAndSettle();
+    expect(find.text('WSL'), findsWidgets);
+    expect(find.text('Claude Sonnet 4'), findsWidgets);
+
+    await _setOriginFilter(tester, 'All');
+    await tester.tap(find.text('Subagent label').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Subagent: Pascal'), findsWidgets);
+  });
+
   testWidgets('formats large session counts with exact accessible values', (
     tester,
   ) async {
@@ -2165,11 +2214,13 @@ SessionRowViewModel _row({
   String parentThreadId = '',
   String agentNickname = '',
   bool isArchived = false,
+  SessionRowPlatform platform = SessionRowPlatform.windows,
   String sourceFilePath = '',
   DateTime? lastMessageAtUtc,
   int messageCount = 3,
   int totalTokens = 900,
   List<ConversationMessageViewModel> messages = const [],
+  String model = 'gpt-5.4',
   String? summary,
   String? estimatedCostText,
   bool costUnknown = true,
@@ -2183,14 +2234,14 @@ SessionRowViewModel _row({
     agentNickname: agentNickname,
     startedAtUtc: DateTime.utc(2026, 6, 12, 9),
     lastMessageAtUtc: lastMessageAtUtc ?? DateTime.utc(2026, 6, 12, 10),
-    platform: SessionRowPlatform.windows,
+    platform: platform,
     project: project,
     path: r'F:\projects\MaxLogic\codex-sessions-viewer',
     title: title,
     summary: summary ?? title,
     messageCount: messageCount,
     totalTokens: totalTokens,
-    model: 'gpt-5.4',
+    model: model,
     estimatedCostText: estimatedCostText,
     costUnknown: costUnknown,
     tags: const ['ui'],
@@ -2230,7 +2281,7 @@ Future<void> _setOriginFilter(WidgetTester tester, String label) async {
   }
 
   if (originDropdown().evaluate().isEmpty) {
-    await tester.tap(find.byType(ExpansionTile));
+    await tester.tap(find.text('Advanced filters'));
     await tester.pumpAndSettle();
   }
   await tester.tap(originDropdown());
