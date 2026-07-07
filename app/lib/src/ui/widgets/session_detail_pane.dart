@@ -53,6 +53,7 @@ class SessionDetailPane extends StatelessWidget {
     this.isLoadingMessages = false,
     this.initialConversationMessageNumber,
     this.onConversationPositionChanged,
+    this.onLoadMessagePage,
   });
 
   final SessionRowViewModel row;
@@ -66,6 +67,7 @@ class SessionDetailPane extends StatelessWidget {
   final bool isLoadingMessages;
   final int? initialConversationMessageNumber;
   final ConversationPositionChanged? onConversationPositionChanged;
+  final ConversationMessagePageLoader? onLoadMessagePage;
 
   @override
   Widget build(BuildContext context) {
@@ -190,6 +192,7 @@ class SessionDetailPane extends StatelessWidget {
               motionMode: effectiveSettings.ui.motion,
               initialMessageNumber: initialConversationMessageNumber,
               onPositionChanged: onConversationPositionChanged,
+              onLoadMessagePage: onLoadMessagePage,
             ),
         ],
       ),
@@ -281,6 +284,7 @@ class _ConversationTabs extends StatelessWidget {
     required this.motionMode,
     required this.initialMessageNumber,
     required this.onPositionChanged,
+    required this.onLoadMessagePage,
   });
 
   final List<ConversationMessageViewModel> messages;
@@ -288,6 +292,7 @@ class _ConversationTabs extends StatelessWidget {
   final AppMotionMode motionMode;
   final int? initialMessageNumber;
   final ConversationPositionChanged? onPositionChanged;
+  final ConversationMessagePageLoader? onLoadMessagePage;
 
   @override
   Widget build(BuildContext context) {
@@ -316,6 +321,7 @@ class _ConversationTabs extends StatelessWidget {
                   motionMode: motionMode,
                   initialMessageNumber: initialMessageNumber,
                   onPositionChanged: onPositionChanged,
+                  onLoadMessagePage: onLoadMessagePage,
                 ),
                 FocusReaderView(messages: messages, onCopyText: onCopyText),
               ],

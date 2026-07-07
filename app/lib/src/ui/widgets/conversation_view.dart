@@ -68,6 +68,7 @@ class _ConversationViewState extends State<ConversationView> {
   final _expanded = <String>{};
   final _messageOverridesById = <String, ConversationMessageViewModel>{};
   final _messageOverridesByNumber = <int, ConversationMessageViewModel>{};
+  final _loadingMessagePages = <int>{};
   var _lastVisibleMessageCount = 0;
   var _showJumpToNewest = false;
   var _loadingOlderMessages = false;
@@ -79,6 +80,7 @@ class _ConversationViewState extends State<ConversationView> {
     _lastVisibleMessageCount = _visibleMessages.length;
     _selectedNumber = _initialSelectedNumber(_visibleMessages);
     _scrollToSelectedMessage();
+    unawaited(_loadMessagePageForNumber(_selectedNumber));
   }
 
   @override
@@ -89,11 +91,13 @@ class _ConversationViewState extends State<ConversationView> {
     if (widget.initialMessageNumber != oldWidget.initialMessageNumber) {
       _selectedNumber = _initialSelectedNumber(_visibleMessages);
       _scrollToSelectedMessage();
+      unawaited(_loadMessagePageForNumber(_selectedNumber));
     } else if (!_visibleMessages.any(
       (message) => message.number == _selectedNumber,
     )) {
       _selectedNumber = _initialSelectedNumber(_visibleMessages);
       _scrollToSelectedMessage();
+      unawaited(_loadMessagePageForNumber(_selectedNumber));
     }
     if (visibleCount > _lastVisibleMessageCount) {
       if (wasNearBottom) {
@@ -347,14 +351,8 @@ class _ConversationViewState extends State<ConversationView> {
       return;
     }
     final selected = messages[index];
-    if (!selected.isBodyLoaded && widget.onLoadMessagePage != null) {
-      final page = await widget.onLoadMessagePage!(number);
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _mergeLoadedMessages(page);
-      });
+    if (!selected.isBodyLoaded) {
+      await _loadMessagePageForNumber(number);
     }
     setState(() {
       _selectedNumber = number;
@@ -366,6 +364,35 @@ class _ConversationViewState extends State<ConversationView> {
         duration: const Duration(milliseconds: 1),
         curve: Curves.linear,
       );
+    }
+  }
+
+  Future<void> _loadMessagePageForNumber(int number) async {
+    final loader = widget.onLoadMessagePage;
+    if (loader == null || _loadingMessagePages.contains(number)) {
+      return;
+    }
+    ConversationMessageViewModel? selected;
+    for (final message in _visibleMessages) {
+      if (message.number == number) {
+        selected = message;
+        break;
+      }
+    }
+    if (selected == null || selected.isBodyLoaded) {
+      return;
+    }
+    _loadingMessagePages.add(number);
+    try {
+      final page = await loader(number);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _mergeLoadedMessages(page);
+      });
+    } finally {
+      _loadingMessagePages.remove(number);
     }
   }
 

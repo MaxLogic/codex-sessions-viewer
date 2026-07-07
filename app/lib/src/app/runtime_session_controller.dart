@@ -24,6 +24,7 @@ import '../utils/injected_context_filter.dart';
 import '../utils/profiling.dart';
 
 const _conversationTailBodyPageSize = 50;
+const _conversationMessagePageRadius = 25;
 
 class RuntimeSessionController {
   RuntimeSessionController({
@@ -168,6 +169,27 @@ class RuntimeSessionController {
         reloadFromSource: false,
       );
     }, arguments: {'session_id': sessionId});
+  }
+
+  Future<List<ConversationMessageViewModel>> loadMessagePage(
+    String sessionId,
+    int anchorMessageNumber,
+  ) {
+    return Profiling.spanAsync(
+      'scan.runtime.load_message_page',
+      () async {
+        final db = openFileBackedDatabase(databaseFile);
+        try {
+          return _loadMessagePage(db, sessionId, anchorMessageNumber);
+        } finally {
+          db.close();
+        }
+      },
+      arguments: {
+        'session_id': sessionId,
+        'anchor_message_number': anchorMessageNumber,
+      },
+    );
   }
 
   Future<SessionRowViewModel?> _loadSessionDetailInBackground({
@@ -2052,6 +2074,70 @@ List<ConversationMessageViewModel> _loadFullMessages(
   );
   return Profiling.spanSync(
     'scan.runtime.load_session_detail.full_message_view_models',
+    () => [
+      for (final row in rows)
+        if (!_isInjectedContextRow(row))
+          ConversationMessageViewModel(
+            id: '$sessionId:${row['message_index']}',
+            number: row['message_index'] as int,
+            author: _messageAuthor(row['author_type'] as String?),
+            createdAtUtc:
+                _dateTime(row['created_at_utc'] as String?) ??
+                DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+            preview: row['content_preview'] as String? ?? '',
+            body:
+                row['content_plain'] as String? ??
+                row['content_preview'] as String? ??
+                '',
+            tokenCount: row['token_total'] as int?,
+            hasError: (row['has_error'] as int? ?? 0) == 1,
+            hasToolOutput: (row['has_tool_calls'] as int? ?? 0) == 1,
+          ),
+    ],
+    arguments: {'session_id': sessionId, 'row_count': rows.length},
+  );
+}
+
+List<ConversationMessageViewModel> _loadMessagePage(
+  Database db,
+  String sessionId,
+  int anchorMessageNumber,
+) {
+  final start = math.max(
+    0,
+    anchorMessageNumber - _conversationMessagePageRadius,
+  );
+  final end = anchorMessageNumber + _conversationMessagePageRadius;
+  final rows = Profiling.spanSync(
+    'scan.runtime.load_message_page.query',
+    () => db.select(
+      '''
+      select
+        message_index,
+        author_type,
+        created_at_utc,
+        content_preview,
+        content_plain,
+        token_total,
+        model,
+        has_error,
+        has_tool_calls
+      from messages
+      where session_id = ?
+        and message_index between ? and ?
+      order by message_index
+      ''',
+      [sessionId, start, end],
+    ),
+    arguments: {
+      'session_id': sessionId,
+      'anchor_message_number': anchorMessageNumber,
+      'start_message_number': start,
+      'end_message_number': end,
+    },
+  );
+  return Profiling.spanSync(
+    'scan.runtime.load_message_page.view_models',
     () => [
       for (final row in rows)
         if (!_isInjectedContextRow(row))

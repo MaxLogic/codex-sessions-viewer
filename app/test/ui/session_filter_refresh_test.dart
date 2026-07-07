@@ -1599,6 +1599,207 @@ void main() {
     expect(find.text('Selected message 4'), findsOneWidget);
   });
 
+  testWidgets('external open target reveals a filtered session', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final rows = [
+      _row(
+        id: 'visible',
+        title: 'Visible session',
+        project: 'Viewer',
+        messages: _messages('visible', count: 3),
+      ),
+      _row(
+        id: 'target',
+        title: 'Hidden target',
+        project: 'Viewer',
+        messages: _messages('target', count: 3),
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(home: SessionsScreen(initialRows: rows)),
+    );
+
+    await tester.enterText(find.bySemanticsLabel('Session search'), 'visible');
+    await tester.pumpAndSettle();
+
+    expect(find.text('Visible session'), findsWidgets);
+    expect(find.text('Hidden target'), findsNothing);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: rows,
+          openTarget: const SessionOpenTarget(
+            sessionId: 'target',
+            messageIndex: 2,
+          ),
+          openTargetSerial: 1,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Hidden target'), findsWidgets);
+    expect(find.text('Selected message 2'), findsOneWidget);
+  });
+
+  testWidgets('external open target loads an unloaded message body', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final pageRequests = <String>[];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'target',
+              title: 'Paged target',
+              project: 'Viewer',
+              messages: [
+                ConversationMessageViewModel(
+                  id: 'target-1',
+                  number: 1,
+                  author: ConversationAuthor.user,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                  preview: 'Target prompt preview',
+                  body: '',
+                  tokenCount: 4,
+                  isBodyLoaded: false,
+                ),
+                ConversationMessageViewModel(
+                  id: 'target-2',
+                  number: 2,
+                  author: ConversationAuthor.assistant,
+                  createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+                  preview: 'Newest answer preview',
+                  body: 'Newest answer body',
+                  tokenCount: 8,
+                ),
+              ],
+            ),
+          ],
+          openTarget: const SessionOpenTarget(
+            sessionId: 'target',
+            messageIndex: 1,
+          ),
+          openTargetSerial: 1,
+          onLoadMessagePage: (sessionId, anchor) async {
+            pageRequests.add('$sessionId:$anchor');
+            return [
+              ConversationMessageViewModel(
+                id: 'target-1',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Target prompt preview',
+                body: 'Target prompt body from page',
+                tokenCount: 4,
+              ),
+            ];
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(pageRequests, ['target:1']);
+    expect(find.text('Selected message 1'), findsOneWidget);
+    expect(find.text('Target prompt body from page'), findsOneWidget);
+    expect(find.text('Message body not loaded yet.'), findsNothing);
+  });
+
+  testWidgets('pending external open target applies after rows load', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final pageRequests = <String>[];
+    final target = const SessionOpenTarget(
+      sessionId: 'target',
+      messageIndex: 1,
+    );
+
+    Widget screen(List<SessionRowViewModel> rows) {
+      return MaterialApp(
+        home: SessionsScreen(
+          initialRows: rows,
+          openTarget: target,
+          openTargetSerial: 1,
+          onLoadMessagePage: (sessionId, anchor) async {
+            pageRequests.add('$sessionId:$anchor');
+            return [
+              ConversationMessageViewModel(
+                id: 'target-1',
+                number: 1,
+                author: ConversationAuthor.user,
+                createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+                preview: 'Delayed prompt preview',
+                body: 'Delayed prompt body from page',
+                tokenCount: 4,
+              ),
+            ];
+          },
+        ),
+      );
+    }
+
+    await tester.pumpWidget(screen(const []));
+    await tester.pump();
+
+    expect(find.text('Delayed target'), findsNothing);
+
+    await tester.pumpWidget(
+      screen([
+        _row(
+          id: 'target',
+          title: 'Delayed target',
+          project: 'Viewer',
+          messages: [
+            ConversationMessageViewModel(
+              id: 'target-1',
+              number: 1,
+              author: ConversationAuthor.user,
+              createdAtUtc: DateTime.utc(2026, 6, 12, 9),
+              preview: 'Delayed prompt preview',
+              body: '',
+              tokenCount: 4,
+              isBodyLoaded: false,
+            ),
+            ConversationMessageViewModel(
+              id: 'target-2',
+              number: 2,
+              author: ConversationAuthor.assistant,
+              createdAtUtc: DateTime.utc(2026, 6, 12, 9, 1),
+              preview: 'Newest answer preview',
+              body: 'Newest answer body',
+              tokenCount: 8,
+            ),
+          ],
+        ),
+      ]),
+    );
+    for (
+      var i = 0;
+      i < 20 && find.text('Delayed prompt body from page').evaluate().isEmpty;
+      i++
+    ) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    expect(find.text('Delayed target'), findsWidgets);
+    expect(find.text('Selected message 1'), findsOneWidget);
+    expect(pageRequests, ['target:1']);
+    expect(find.text('Delayed prompt body from page'), findsOneWidget);
+  });
+
   testWidgets('ignores stale selected conversation loads', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1800, 1000));
     addTearDown(() => tester.binding.setSurfaceSize(null));

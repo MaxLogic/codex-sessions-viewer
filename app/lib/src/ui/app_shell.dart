@@ -9,6 +9,7 @@ typedef SessionsScreenBuilder =
 enum CodexAppSection {
   sessions('Sessions', Icons.history),
   evals('Evals', Icons.fact_check),
+  context('Context', Icons.manage_search),
   usage('Usage', Icons.query_stats),
   settings('Settings', Icons.settings),
   logs('Logs', Icons.list_alt);
@@ -25,18 +26,24 @@ class CodexAppShell extends StatefulWidget {
     this.title = 'Codex Session Viewer',
     required this.sessionsScreenBuilder,
     required this.evalsScreen,
+    required this.contextScreen,
     required this.usageScreen,
     required this.settingsScreen,
     required this.logsScreen,
+    this.requestedSection,
+    this.sectionRequestSerial = 0,
     this.motionMode = AppMotionMode.system,
   });
 
   final String title;
   final SessionsScreenBuilder sessionsScreenBuilder;
   final Widget evalsScreen;
+  final Widget contextScreen;
   final Widget usageScreen;
   final Widget settingsScreen;
   final Widget logsScreen;
+  final CodexAppSection? requestedSection;
+  final int sectionRequestSerial;
   final AppMotionMode motionMode;
 
   @override
@@ -46,6 +53,19 @@ class CodexAppShell extends StatefulWidget {
 class _CodexAppShellState extends State<CodexAppShell> {
   var _selectedIndex = 0;
   var _previousIndex = 0;
+  var _handledSectionRequestSerial = 0;
+
+  @override
+  void didUpdateWidget(covariant CodexAppShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final requested = widget.requestedSection;
+    if (requested != null &&
+        widget.sectionRequestSerial != _handledSectionRequestSerial) {
+      _handledSectionRequestSerial = widget.sectionRequestSerial;
+      _previousIndex = _selectedIndex;
+      _selectedIndex = requested.index;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -106,6 +126,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
                 section: section,
                 sessionsScreenBuilder: widget.sessionsScreenBuilder,
                 evalsScreen: widget.evalsScreen,
+                contextScreen: widget.contextScreen,
                 usageScreen: widget.usageScreen,
                 settingsScreen: widget.settingsScreen,
                 logsScreen: widget.logsScreen,
@@ -131,6 +152,7 @@ class _SectionContent extends StatelessWidget {
     required this.section,
     required this.sessionsScreenBuilder,
     required this.evalsScreen,
+    required this.contextScreen,
     required this.usageScreen,
     required this.settingsScreen,
     required this.logsScreen,
@@ -142,6 +164,7 @@ class _SectionContent extends StatelessWidget {
   final CodexAppSection section;
   final SessionsScreenBuilder sessionsScreenBuilder;
   final Widget evalsScreen;
+  final Widget contextScreen;
   final Widget usageScreen;
   final Widget settingsScreen;
   final Widget logsScreen;
@@ -189,6 +212,9 @@ class _SectionContent extends StatelessWidget {
     }
     if (section == CodexAppSection.evals) {
       return evalsScreen;
+    }
+    if (section == CodexAppSection.context) {
+      return contextScreen;
     }
     if (section == CodexAppSection.usage) {
       return usageScreen;

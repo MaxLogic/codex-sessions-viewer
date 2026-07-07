@@ -8,6 +8,7 @@ import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
 import '../../usage/usage_summary.dart';
 import '../motion.dart';
+import '../models/conversation_message_view_model.dart';
 import '../models/session_row_view_model.dart';
 import '../number_formatting.dart';
 import '../widgets/command_preview.dart';
@@ -80,6 +81,18 @@ typedef SessionFileWatcher = Stream<Object> Function(String path);
 typedef SessionTableStateChanged = void Function(SessionTableSettings);
 typedef SessionMarkdownExportCallback =
     Future<void> Function(SessionRowViewModel row, String markdown);
+typedef SessionMessagePageLoader =
+    Future<List<ConversationMessageViewModel>> Function(
+      String sessionId,
+      int anchorMessageNumber,
+    );
+
+class SessionOpenTarget {
+  const SessionOpenTarget({required this.sessionId, this.messageIndex});
+
+  final String sessionId;
+  final int? messageIndex;
+}
 
 class SessionActionRequest {
   const SessionActionRequest({
@@ -111,12 +124,15 @@ class SessionsScreen extends StatefulWidget {
     this.onExportMarkdown,
     this.onLoadSessionDetail,
     this.onReloadSessionDetailFromSource,
+    this.onLoadMessagePage,
     this.watchSessionFile = _watchSessionFile,
     this.settings,
     this.initialTableState,
     this.onTableStateChanged,
     this.initialStatusMessage = '',
     this.autoRefreshToken = 0,
+    this.openTarget,
+    this.openTargetSerial = 0,
   });
 
   final List<SessionRowViewModel> initialRows;
@@ -131,12 +147,15 @@ class SessionsScreen extends StatefulWidget {
   final SessionMarkdownExportCallback? onExportMarkdown;
   final SessionDetailLoader? onLoadSessionDetail;
   final SessionDetailLoader? onReloadSessionDetailFromSource;
+  final SessionMessagePageLoader? onLoadMessagePage;
   final SessionFileWatcher watchSessionFile;
   final AppSettings? settings;
   final SessionTableSettings? initialTableState;
   final SessionTableStateChanged? onTableStateChanged;
   final String initialStatusMessage;
   final int autoRefreshToken;
+  final SessionOpenTarget? openTarget;
+  final int openTargetSerial;
 
   @override
   State<SessionsScreen> createState() => _SessionsScreenState();
@@ -175,6 +194,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
   late Map<String, double> _columnWidths;
   late List<SessionTableSortSettings> _sorts;
   late int _handledAutoRefreshToken;
+  late int _handledOpenTargetSerial;
+  SessionOpenTarget? _pendingOpenTarget;
+  int? _pendingOpenTargetSerial;
   Timer? _relativeDateTimer;
   Timer? _backgroundRescanTimer;
   SessionsRefreshOperation? _activeRefreshOperation;
@@ -191,6 +213,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _newestPerProjectOnly = tableState.newestPerProjectOnly;
     _scanAnnouncement = widget.initialStatusMessage;
     _handledAutoRefreshToken = widget.autoRefreshToken;
+    _handledOpenTargetSerial = -1;
     _searchController.addListener(_filtersChanged);
     _pathController.addListener(_filtersChanged);
     _threadNameController.addListener(_filtersChanged);
@@ -200,6 +223,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       }
     });
     _configureBackgroundRescanTimer();
+    _queueOpenTargetFromWidget();
   }
 
   @override
@@ -208,6 +232,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (!_hasRefreshOwnedRows && oldWidget.initialRows != widget.initialRows) {
       _replaceRows(widget.initialRows);
       _retainSelection();
+      _tryApplyPendingOpenTarget();
     }
     if (!_isScanning &&
         oldWidget.initialStatusMessage != widget.initialStatusMessage) {
@@ -222,6 +247,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
           }
         });
       }
+    }
+    if (widget.openTargetSerial != _handledOpenTargetSerial) {
+      _queueOpenTargetFromWidget();
     }
     if (_settingsFor(oldWidget).scanner != _settingsFor(widget).scanner) {
       _configureBackgroundRescanTimer();
@@ -437,6 +465,11 @@ class _SessionsScreenState extends State<SessionsScreen> {
                         : (position) {
                             _conversationPositions[selectedRow.id] = position;
                           },
+                    onLoadMessagePage:
+                        selectedRow == null || widget.onLoadMessagePage == null
+                        ? null
+                        : (anchor) =>
+                              widget.onLoadMessagePage!(selectedRow.id, anchor),
                   ),
                 ),
               ],
@@ -1033,6 +1066,73 @@ class _SessionsScreenState extends State<SessionsScreen> {
     unawaited(_loadSelectedDetail(id));
   }
 
+  void _queueOpenTargetFromWidget() {
+    final target = widget.openTarget;
+    if (target == null) {
+      _pendingOpenTarget = null;
+      _pendingOpenTargetSerial = null;
+      _handledOpenTargetSerial = widget.openTargetSerial;
+      return;
+    }
+    _pendingOpenTarget = target;
+    _pendingOpenTargetSerial = widget.openTargetSerial;
+    _tryApplyPendingOpenTarget();
+  }
+
+  void _tryApplyPendingOpenTarget() {
+    final target = _pendingOpenTarget;
+    final serial = _pendingOpenTargetSerial;
+    if (target == null ||
+        serial == null ||
+        _rowById(target.sessionId) == null) {
+      return;
+    }
+    _applyOpenTarget(target);
+    _pendingOpenTarget = null;
+    _pendingOpenTargetSerial = null;
+    _handledOpenTargetSerial = serial;
+  }
+
+  void _applyOpenTarget(SessionOpenTarget target) {
+    _revealOpenTarget(target.sessionId);
+    final messageIndex = target.messageIndex;
+    if (messageIndex != null) {
+      _conversationPositions[target.sessionId] = ConversationPositionState(
+        messageNumber: messageIndex,
+        wasNearBottom: false,
+        messageCount: 0,
+      );
+    }
+    _select(target.sessionId);
+  }
+
+  void _revealOpenTarget(String id) {
+    if (_rowById(id) == null || _visibleRows.any((row) => row.id == id)) {
+      return;
+    }
+    _searchController.removeListener(_filtersChanged);
+    _pathController.removeListener(_filtersChanged);
+    _threadNameController.removeListener(_filtersChanged);
+    try {
+      setState(() {
+        _searchController.clear();
+        _pathController.clear();
+        _threadNameController.clear();
+        _platformFilter = SessionsPlatformFilter.both;
+        _timeFilter = SessionsTimeFilter.allTime;
+        _archivedFilter = SessionsArchivedFilter.all;
+        _originFilter = SessionsOriginFilter.all;
+        _newestPerProjectOnly = false;
+        _namedOnly = false;
+        _markVisibleRowsForMotion({id});
+      });
+    } finally {
+      _searchController.addListener(_filtersChanged);
+      _pathController.addListener(_filtersChanged);
+      _threadNameController.addListener(_filtersChanged);
+    }
+  }
+
   void _toggleSubagents(String parentId) {
     setState(() {
       if (!_expandedParentIds.add(parentId)) {
@@ -1243,6 +1343,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _scanAnnouncement = refreshResult.statusMessage;
         _retainSelection();
       });
+      _tryApplyPendingOpenTarget();
     } on Object catch (error) {
       if (!mounted) {
         return;
@@ -1293,6 +1394,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _scanAnnouncement = progress.statusMessage;
       _retainSelection();
     });
+    _tryApplyPendingOpenTarget();
   }
 
   SessionsRefreshOperation _refreshOperation(
@@ -3516,6 +3618,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
     required this.isLoadingMessages,
     required this.initialConversationMessageNumber,
     required this.onConversationPositionChanged,
+    required this.onLoadMessagePage,
   });
 
   final SessionRowViewModel? row;
@@ -3532,6 +3635,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
   final bool isLoadingMessages;
   final int? initialConversationMessageNumber;
   final ConversationPositionChanged? onConversationPositionChanged;
+  final ConversationMessagePageLoader? onLoadMessagePage;
 
   @override
   Widget build(BuildContext context) {
@@ -3582,6 +3686,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
         isLoadingMessages: isLoadingMessages,
         initialConversationMessageNumber: initialConversationMessageNumber,
         onConversationPositionChanged: onConversationPositionChanged,
+        onLoadMessagePage: onLoadMessagePage,
       );
     }
     final guidance = _emptyGuidance();

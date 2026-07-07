@@ -15,7 +15,9 @@ import '../app/runtime_session_controller.dart';
 import '../export/eval_dataset_exporter.dart';
 import '../parser/codex_session_parser.dart';
 import '../pricing/pricing_repository.dart';
+import '../search/message_search.dart';
 import '../ui/app_shell.dart';
+import '../ui/screens/context_search_screen.dart';
 import '../ui/screens/evals_screen.dart';
 import '../ui/screens/logs_screen.dart';
 import '../ui/screens/sessions_screen.dart';
@@ -87,6 +89,10 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   var _usageLoadGeneration = 0;
   var _usageLoadScheduled = false;
   bool? _lastSyncedStartupPreference;
+  CodexAppSection? _requestedSection;
+  var _sectionRequestSerial = 0;
+  SessionOpenTarget? _sessionOpenTarget;
+  var _sessionOpenTargetSerial = 0;
 
   @override
   Widget build(BuildContext context) {
@@ -143,6 +149,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
               _startUsageSummaryLoad(settings);
               return CodexAppShell(
                 motionMode: settings.ui.motion,
+                requestedSection: _requestedSection,
+                sectionRequestSerial: _sectionRequestSerial,
                 sessionsScreenBuilder: (context, onOpenSettings) =>
                     _SessionsScreenLoader(
                       settings: settings,
@@ -158,6 +166,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                       onTableStateChanged: (state) {
                         unawaited(_saveSessionTableState(state));
                       },
+                      openTarget: _sessionOpenTarget,
+                      openTargetSerial: _sessionOpenTargetSerial,
                     ),
                 evalsScreen: _EvalsScreenLoader(
                   settingsFile: widget.settingsFile,
@@ -167,6 +177,13 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                   onUpdateEvalMetadata: (row, metadata) async =>
                       _updateEvalMetadata(row.id, metadata),
                   onExport: _exportEvalDataset,
+                ),
+                contextScreen: _ContextSearchLoader(
+                  settingsFile: widget.settingsFile,
+                  databaseFile: widget.databaseFile,
+                  onLoadCachedRows: widget.sessionCachedRowsLoader,
+                  deferInitialLoad: widget.deferInitialSessionLoad,
+                  onOpenResult: _openContextResult,
                 ),
                 usageScreen: UsageScreen(summary: _usageSummary),
                 settingsScreen: SettingsScreen(
@@ -382,6 +399,18 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         ).refresh();
         return;
     }
+  }
+
+  Future<void> _openContextResult(ContextOpenRequest request) async {
+    setState(() {
+      _sessionOpenTarget = SessionOpenTarget(
+        sessionId: request.sessionId,
+        messageIndex: request.messageIndex,
+      );
+      _sessionOpenTargetSerial++;
+      _requestedSection = CodexAppSection.sessions;
+      _sectionRequestSerial++;
+    });
   }
 
   Future<void> _editSessionTags(SessionRowViewModel row) async {
@@ -603,6 +632,8 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.onSessionAction,
     required this.onExportMarkdown,
     required this.onTableStateChanged,
+    required this.openTarget,
+    required this.openTargetSerial,
   });
 
   final AppSettings settings;
@@ -615,6 +646,8 @@ class _SessionsScreenLoader extends StatefulWidget {
   final SessionActionCallback onSessionAction;
   final SessionMarkdownExportCallback onExportMarkdown;
   final SessionTableStateChanged onTableStateChanged;
+  final SessionOpenTarget? openTarget;
+  final int openTargetSerial;
 
   @override
   State<_SessionsScreenLoader> createState() => _SessionsScreenLoaderState();
@@ -704,8 +737,11 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onLoadSessionDetail: _controller.loadSessionDetail,
       onReloadSessionDetailFromSource:
           _controller.reloadSessionDetailFromSource,
+      onLoadMessagePage: _controller.loadMessagePage,
       initialTableState: widget.settings.ui.sessionTable,
       onTableStateChanged: widget.onTableStateChanged,
+      openTarget: widget.openTarget,
+      openTargetSerial: widget.openTargetSerial,
     );
   }
 
@@ -715,6 +751,116 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       return;
     }
     _startCachedLoad();
+  }
+}
+
+class _ContextSearchLoader extends StatefulWidget {
+  const _ContextSearchLoader({
+    required this.settingsFile,
+    required this.databaseFile,
+    this.onLoadCachedRows,
+    required this.deferInitialLoad,
+    required this.onOpenResult,
+  });
+
+  final File settingsFile;
+  final File databaseFile;
+  final SessionCachedRowsLoader? onLoadCachedRows;
+  final FrameDeferredCallback deferInitialLoad;
+  final ContextOpenCallback onOpenResult;
+
+  @override
+  State<_ContextSearchLoader> createState() => _ContextSearchLoaderState();
+}
+
+class _ContextSearchLoaderState extends State<_ContextSearchLoader> {
+  var _cachedRows = <SessionRowViewModel>[];
+  var _cachedStatusMessage = '';
+  var _cachedLoadGeneration = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.deferInitialLoad(_startCachedLoad);
+  }
+
+  @override
+  void didUpdateWidget(covariant _ContextSearchLoader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.settingsFile.path != widget.settingsFile.path ||
+        oldWidget.databaseFile.path != widget.databaseFile.path) {
+      _startCachedLoad();
+    }
+  }
+
+  RuntimeSessionController get _controller => RuntimeSessionController(
+    settingsFile: widget.settingsFile,
+    databaseFile: widget.databaseFile,
+  );
+
+  void _startCachedLoad() {
+    if (!mounted) {
+      return;
+    }
+    final generation = ++_cachedLoadGeneration;
+    setState(() {
+      _cachedRows = const [];
+      _cachedStatusMessage = 'Loading context sessions...';
+    });
+    unawaited(_loadCachedRows(generation));
+  }
+
+  Future<void> _loadCachedRows(int generation) async {
+    try {
+      final cachedRowsLoader =
+          widget.onLoadCachedRows ?? _controller.loadCachedRowsInBackground;
+      final result = await cachedRowsLoader(
+        onProgress: (progress) {
+          if (!mounted || generation != _cachedLoadGeneration) {
+            return;
+          }
+          setState(() {
+            _cachedRows = progress.rows ?? _cachedRows;
+            _cachedStatusMessage = progress.statusMessage;
+          });
+        },
+      );
+      if (!mounted || generation != _cachedLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _cachedRows = result.rows;
+        _cachedStatusMessage = '';
+      });
+    } on Object catch (error) {
+      if (!mounted || generation != _cachedLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _cachedStatusMessage = 'Failed to load context sessions. $error';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ContextSearchScreen(
+      initialSessionRows: _cachedRows,
+      statusMessage: _cachedStatusMessage,
+      onSearchMessages: _searchMessages,
+      onOpenResult: widget.onOpenResult,
+    );
+  }
+
+  Future<List<MessageSearchResult>> _searchMessages(
+    MessageSearchQuery query,
+  ) async {
+    final db = openFileBackedDatabase(widget.databaseFile);
+    try {
+      return MessageSearchIndex(db).search(query);
+    } finally {
+      db.close();
+    }
   }
 }
 

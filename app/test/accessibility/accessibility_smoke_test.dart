@@ -1,7 +1,9 @@
 import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/ui/app_shell.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
+import 'package:codex_sessions_viewer/src/ui/screens/context_search_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/evals_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/themes.dart';
@@ -283,6 +285,7 @@ void main() {
               ),
             ],
           ),
+          contextScreen: const Text('Context screen'),
           usageScreen: const Text('Usage screen'),
           settingsScreen: const Text('Settings screen'),
           logsScreen: const Text('Logs screen'),
@@ -389,6 +392,73 @@ void main() {
       findsOneWidget,
     );
   });
+
+  testWidgets(
+    'context search results are keyboard and screen-reader reachable',
+    (tester) async {
+      final semantics = tester.ensureSemantics();
+      try {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: ContextSearchScreen(
+                initialSessionRows: const [],
+                onSearchMessages: (_) async => [
+                  MessageSearchResult(
+                    sessionId: 'parser',
+                    messageIndex: 3,
+                    author: 'user',
+                    snippet: '<mark>Needle</mark> prompt body',
+                    sessionIdentity: 'Parser regression',
+                    sessionTitle: 'Parser regression',
+                    projectName: 'Codex Viewer',
+                    sourceType: 'windows',
+                    timestampUtc: DateTime.utc(2026, 7, 7, 10),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+
+        await tester.enterText(
+          find.bySemanticsLabel('Context query'),
+          'needle',
+        );
+        await tester.tap(find.bySemanticsLabel('Search context'));
+        await tester.pumpAndSettle();
+
+        expect(
+          find.bySemanticsLabel('Context Search, 1 result'),
+          findsOneWidget,
+        );
+        expect(
+          find.bySemanticsLabel(
+            'Select context result Parser regression message 3',
+          ),
+          findsOneWidget,
+        );
+        final openNode = tester.getSemantics(
+          find.bySemanticsLabel(
+            'Open context result Parser regression message 3',
+          ),
+        );
+        expect(
+          openNode.getSemanticsData().hasAction(SemanticsAction.tap),
+          isTrue,
+        );
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await tester.pumpAndSettle();
+
+        expect(find.text('Needle prompt body'), findsOneWidget);
+      } finally {
+        semantics.dispose();
+      }
+    },
+  );
 
   testWidgets('focus reader supports keyboard jumps by message type', (
     tester,
