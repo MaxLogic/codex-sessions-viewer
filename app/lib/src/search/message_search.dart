@@ -1,0 +1,166 @@
+import 'package:sqlite3/sqlite3.dart';
+
+class MessageSearchIndex {
+  const MessageSearchIndex(this.db);
+
+  final Database db;
+
+  void replaceSessionMessages(
+    String sessionId,
+    Iterable<MessageSearchDocument> documents,
+  ) {
+    deleteSession(sessionId);
+    final insert = db.prepare('''
+      insert into message_search (
+        session_id,
+        message_index,
+        author_type,
+        created_at_utc,
+        content
+      ) values (?, ?, ?, ?, ?)
+      ''');
+    try {
+      for (final document in documents) {
+        final content = document.content.trim();
+        if (content.isEmpty) {
+          continue;
+        }
+        insert.execute([
+          document.sessionId,
+          document.messageIndex,
+          document.author,
+          document.createdAtUtc?.toIso8601String(),
+          content,
+        ]);
+      }
+    } finally {
+      insert.close();
+    }
+  }
+
+  void deleteSession(String sessionId) {
+    db.execute('delete from message_search where session_id = ?', [sessionId]);
+  }
+
+  List<MessageSearchResult> search(MessageSearchQuery query) {
+    final tokens = _searchTokens(query.text);
+    if (tokens.isEmpty || query.limit <= 0) {
+      return const [];
+    }
+    final rows = db.select(
+      '''
+      select
+        message_search.session_id as session_id,
+        cast(message_search.message_index as integer) as message_index,
+        message_search.author_type as author_type,
+        snippet(message_search, 4, '<mark>', '</mark>', '...', 12) as snippet,
+        coalesce(
+          nullif(trim(s.thread_name), ''),
+          nullif(trim(s.title), ''),
+          s.id
+        ) as session_identity,
+        coalesce(s.title, '') as session_title,
+        coalesce(s.project_name_snapshot, '') as project_name,
+        s.source_type as source_type,
+        coalesce(
+          message_search.created_at_utc,
+          s.last_message_at_utc,
+          s.started_at_utc,
+          s.updated_at_utc
+        ) as timestamp_utc
+      from message_search
+      join sessions s on s.id = message_search.session_id
+      where message_search match ?
+        and s.scan_status = 'available'
+        and s.parse_status = 'available'
+      order by coalesce(
+                 message_search.created_at_utc,
+                 s.last_message_at_utc,
+                 s.started_at_utc,
+                 s.updated_at_utc
+               ) desc,
+               message_search.session_id asc,
+               cast(message_search.message_index as integer) asc
+      limit ?
+      ''',
+      [_ftsQuery(tokens), query.limit],
+    );
+    return [
+      for (final row in rows)
+        MessageSearchResult(
+          sessionId: row['session_id'] as String,
+          messageIndex: row['message_index'] as int,
+          author: row['author_type'] as String? ?? '',
+          snippet: row['snippet'] as String? ?? '',
+          sessionIdentity: row['session_identity'] as String? ?? '',
+          sessionTitle: row['session_title'] as String? ?? '',
+          projectName: row['project_name'] as String? ?? '',
+          sourceType: row['source_type'] as String? ?? '',
+          timestampUtc: _dateTime(row['timestamp_utc'] as String?),
+        ),
+    ];
+  }
+}
+
+class MessageSearchDocument {
+  const MessageSearchDocument({
+    required this.sessionId,
+    required this.messageIndex,
+    required this.author,
+    required this.createdAtUtc,
+    required this.content,
+  });
+
+  final String sessionId;
+  final int messageIndex;
+  final String author;
+  final DateTime? createdAtUtc;
+  final String content;
+}
+
+class MessageSearchQuery {
+  const MessageSearchQuery({required this.text, this.limit = 20});
+
+  final String text;
+  final int limit;
+}
+
+class MessageSearchResult {
+  const MessageSearchResult({
+    required this.sessionId,
+    required this.messageIndex,
+    required this.author,
+    required this.snippet,
+    required this.sessionIdentity,
+    required this.sessionTitle,
+    required this.projectName,
+    required this.sourceType,
+    required this.timestampUtc,
+  });
+
+  final String sessionId;
+  final int messageIndex;
+  final String author;
+  final String snippet;
+  final String sessionIdentity;
+  final String sessionTitle;
+  final String projectName;
+  final String sourceType;
+  final DateTime? timestampUtc;
+}
+
+List<String> _searchTokens(String text) => text
+    .toLowerCase()
+    .split(RegExp(r'[^a-z0-9_]+'))
+    .where((token) => token.isNotEmpty)
+    .toList(growable: false);
+
+String _ftsQuery(List<String> tokens) =>
+    tokens.map((token) => '"${token.replaceAll('"', '""')}"').join(' AND ');
+
+DateTime? _dateTime(String? value) {
+  if (value == null || value.trim().isEmpty) {
+    return null;
+  }
+  return DateTime.tryParse(value)?.toUtc();
+}

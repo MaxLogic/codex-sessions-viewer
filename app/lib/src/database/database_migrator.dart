@@ -26,7 +26,7 @@ Directory defaultSqlRoot() {
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 8,
+    this.supportedSchemaVersion = 9,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
@@ -407,4 +407,5 @@ const _requiredTables = [
   'model_pricing_cache',
   'logs',
   'session_search',
+  'message_search',
 ];

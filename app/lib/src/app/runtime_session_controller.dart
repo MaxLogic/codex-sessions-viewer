@@ -15,6 +15,7 @@ import '../path_mapping/path_mapper.dart';
 import '../pricing/pricing_repository.dart';
 import '../scanner/scan_batching.dart';
 import '../scanner/session_scanner.dart';
+import '../search/message_search.dart';
 import '../search/session_search.dart';
 import '../usage/usage_summary.dart';
 import '../ui/models/conversation_message_view_model.dart';
@@ -1433,8 +1434,46 @@ void _upsertParsedSession(
   if (autoProject != null) {
     _updateSearchProjectIfAutomatic(db, parsed.internalId, autoProject.name);
   }
+  _deleteReplacedSourceMessageSearchRows(
+    db,
+    sessionId: parsed.internalId,
+    sourcePath: scannedSession.sourcePath,
+    sourceFileUncPath: scannedSession.mappedPath.sourceFileUncPath,
+  );
   _replaceMessages(db, parsed, now);
   _replaceToolCalls(db, parsed);
+}
+
+void _deleteReplacedSourceMessageSearchRows(
+  Database db, {
+  required String sessionId,
+  required String sourcePath,
+  String? sourceFileUncPath,
+}) {
+  final paths = {
+    sourcePath,
+    if (sourceFileUncPath != null && sourceFileUncPath.trim().isNotEmpty)
+      sourceFileUncPath,
+  };
+  if (paths.isEmpty) {
+    return;
+  }
+  final placeholders = List.filled(paths.length, '?').join(', ');
+  db.execute(
+    '''
+    delete from message_search
+    where session_id in (
+      select id
+      from sessions
+      where id <> ?
+        and (
+          source_file_path in ($placeholders)
+          or source_file_unc_path in ($placeholders)
+        )
+    )
+    ''',
+    [sessionId, ...paths, ...paths],
+  );
 }
 
 ({int user, int assistant, int tool}) _messageTokenBuckets(
@@ -1470,6 +1509,7 @@ void _upsertParsedSession(
 
 void _replaceMessages(Database db, CodexParsedSession parsed, String now) {
   db.execute('delete from messages where session_id = ?', [parsed.internalId]);
+  final searchDocuments = <MessageSearchDocument>[];
   for (final message in parsed.messages) {
     db.execute(
       '''
@@ -1515,7 +1555,19 @@ void _replaceMessages(Database db, CodexParsedSession parsed, String now) {
         now,
       ],
     );
+    searchDocuments.add(
+      MessageSearchDocument(
+        sessionId: parsed.internalId,
+        messageIndex: message.index,
+        author: message.authorType.name,
+        createdAtUtc: message.createdAtUtc,
+        content: message.contentPlain,
+      ),
+    );
   }
+  MessageSearchIndex(
+    db,
+  ).replaceSessionMessages(parsed.internalId, searchDocuments);
 }
 
 void _replaceToolCalls(Database db, CodexParsedSession parsed) {

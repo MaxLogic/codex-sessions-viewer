@@ -1,8 +1,10 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -48,6 +50,7 @@ void main() {
       'model_pricing_cache',
       'logs',
       'session_search',
+      'message_search',
     ]) {
       expect(_tableExists(db, table), isTrue, reason: '$table should exist');
     }
@@ -56,7 +59,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 8);
+    expect(versionRows.length, 9);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -89,6 +92,10 @@ void main() {
     expect(versionRows[7]['filename'], '008_local_eval_metadata.sql');
     expect(versionRows[7]['checksum_length'], greaterThan(20));
     expect(versionRows[7]['success'], 1);
+    expect(versionRows[8]['version'], 9);
+    expect(versionRows[8]['filename'], '009_message_search.sql');
+    expect(versionRows[8]['checksum_length'], greaterThan(20));
+    expect(versionRows[8]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -125,7 +132,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 8);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 9);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -651,10 +658,10 @@ void main() {
     ).copy(evalMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 8);
+    expect(migrator.supportedSchemaVersion, 9);
     final result = await migrator.openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue);
-    expect(result.lastAppliedSchemaVersion, 8);
+    expect(result.lastAppliedSchemaVersion, 9);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -692,6 +699,104 @@ void main() {
     expect(row['eval_expected_output'], isNull);
     expect(row['eval_reviewed_at_utc'], isNull);
     expect(row['eval_updated_at_utc'], isNull);
+  });
+
+  test('migration 009 backfills message search rows', () async {
+    final sqlRoot = await _copySqlRoot(tempDir);
+    final db = openFileBackedDatabase(dbFile);
+    for (final path in [
+      ['init', '001_initial_schema.sql'],
+      ['migration', '002_search_filter_schema.sql'],
+      ['migration', '003_project_override.sql'],
+      ['migration', '004_session_token_buckets.sql'],
+      ['migration', '005_scan_run_status.sql'],
+      ['migration', '006_session_origin.sql'],
+      ['migration', '007_session_thread_name.sql'],
+      ['migration', '008_local_eval_metadata.sql'],
+    ]) {
+      await _applySqlFile(
+        db,
+        File(
+          '${sqlRoot.path}${Platform.pathSeparator}${path[0]}'
+          '${Platform.pathSeparator}${path[1]}',
+        ),
+      );
+    }
+    expect(_tableExists(db, 'message_search'), isFalse);
+    db.execute('''
+      insert into sessions (
+        id,
+        source_type,
+        source_file_path,
+        display_path,
+        platform_path,
+        title,
+        thread_name,
+        project_name_snapshot,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        'message-search-existing',
+        'windows',
+        'C:\\sessions\\message-search-existing.jsonl',
+        'C:\\sessions\\message-search-existing.jsonl',
+        'C:\\sessions\\message-search-existing.jsonl',
+        'Message search title',
+        'Message search thread',
+        'Migration Project',
+        '2026-07-07T10:00:00.000Z',
+        '2026-07-07T10:00:00.000Z'
+      )
+      ''');
+    db.execute('''
+      insert into messages (
+        session_id,
+        message_index,
+        author_type,
+        created_at_utc,
+        first_line,
+        content_plain,
+        content_preview,
+        created_at_db_utc,
+        updated_at_db_utc
+      ) values (
+        'message-search-existing',
+        4,
+        'assistant',
+        '2026-07-07T10:05:00.000Z',
+        'Migration context needle',
+        'Migration context needle with enough words for a useful snippet',
+        'Migration context needle',
+        '2026-07-07T10:05:00.000Z',
+        '2026-07-07T10:05:00.000Z'
+      )
+      ''');
+    db.close();
+
+    final result = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isTrue);
+    expect(result.lastAppliedSchemaVersion, 9);
+
+    final migrated = openFileBackedDatabase(dbFile);
+    addTearDown(migrated.close);
+    final rows = migrated.select('''
+      select
+        session_id,
+        message_index,
+        author_type,
+        created_at_utc,
+        snippet(message_search, 4, '<mark>', '</mark>', '...', 8) as snippet
+      from message_search
+      where message_search match 'migration'
+      ''');
+    expect(rows, hasLength(1));
+    expect(rows.single['session_id'], 'message-search-existing');
+    expect(rows.single['message_index'], 4);
+    expect(rows.single['author_type'], 'assistant');
+    expect(rows.single['created_at_utc'], '2026-07-07T10:05:00.000Z');
+    expect(rows.single['snippet'], contains('<mark>'));
   });
 
   test('rolls back failed migrations and records failure metadata', () async {
@@ -765,4 +870,29 @@ Future<Directory> _copySqlRoot(Directory tempDir) async {
     }
   }
   return target;
+}
+
+Future<void> _applySqlFile(Database db, File file) async {
+  final filename = file.uri.pathSegments.last;
+  final version = int.parse(filename.split('_').first);
+  final sql = await file.readAsString();
+  db.execute(sql);
+  db.execute(
+    '''
+    insert into schema_version (
+      version,
+      filename,
+      checksum,
+      applied_at_utc,
+      success,
+      error_message
+    ) values (?, ?, ?, ?, 1, null)
+    ''',
+    [
+      version,
+      filename,
+      sha256.convert(utf8.encode(sql)).toString(),
+      '2026-07-07T10:00:00.000Z',
+    ],
+  );
 }

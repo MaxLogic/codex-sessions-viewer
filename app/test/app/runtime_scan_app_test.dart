@@ -7,6 +7,7 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
+import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
@@ -570,6 +571,76 @@ void main() {
       );
     },
   );
+
+  test('updates message search when session messages change', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_message_search_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writeMessageSearchFixture(
+      windowsRoot,
+      userContent: 'first context needle',
+      assistantContent: 'first answer body',
+    );
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    await controller.refresh();
+
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    final index = MessageSearchIndex(db);
+    expect(
+      index.search(const MessageSearchQuery(text: 'first context needle')),
+      hasLength(1),
+    );
+
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    await _writeMessageSearchFixture(
+      windowsRoot,
+      userContent: 'second context needle',
+      assistantContent: 'second answer body',
+    );
+    await controller.refresh();
+
+    final second = index.search(
+      const MessageSearchQuery(text: 'second context needle'),
+    );
+    expect(second, hasLength(1));
+    expect(second.single.author, 'user');
+    expect(second.single.sessionTitle, 'Message search fixture');
+    expect(
+      index.search(const MessageSearchQuery(text: 'first context needle')),
+      isEmpty,
+    );
+  });
 
   testWidgets('production refresh distinguishes path errors from empty roots', (
     tester,
@@ -1914,6 +1985,36 @@ Future<File> _writeJsonFixture(Directory destination, String id) async {
   "source_type": "windows",
   "messages": [
     { "type": "user", "content": "hello $id" }
+  ]
+}
+''');
+  return file;
+}
+
+Future<File> _writeMessageSearchFixture(
+  Directory destination, {
+  required String userContent,
+  required String assistantContent,
+}) async {
+  final file = File(p.join(destination.path, 'message-search.json'));
+  await file.writeAsString('''
+{
+  "session_id": "message-search",
+  "source_type": "windows",
+  "working_directory": "F:\\\\projects\\\\MaxLogic\\\\codex-sessions-viewer",
+  "title": "Message search fixture",
+  "created_at": "2026-07-07T09:00:00Z",
+  "messages": [
+    {
+      "type": "user",
+      "created_at": "2026-07-07T09:01:00Z",
+      "content": "$userContent"
+    },
+    {
+      "type": "assistant",
+      "created_at": "2026-07-07T09:02:00Z",
+      "content": "$assistantContent"
+    }
   ]
 }
 ''');
