@@ -119,6 +119,34 @@ fallback_to_overrides = true
 Keep the OpenRouter API key in local private configuration. Do not commit real
 keys.
 
+## Local Evals And Context Search
+
+Use Sessions to mark a local session as eval-ready. Select a session, use the
+eval controls in the detail pane to add or remove it from Evals, and edit the
+review status, notes, or expected output when the session needs a durable eval
+target.
+
+Use Evals for review and export. The screen lists eval-ready sessions with
+status, project, source, model/provider, tags, notes, and expected-output
+markers. Filters narrow the queue by status, tag, source, project, model, or
+text. Export can include selected rows or the current filtered set.
+
+Dataset export formats are DeepEval JSON, OpenAI eval JSONL, Promptfoo JSONL,
+Markdown files, and plain text files. Turn modes are full conversation, each
+user/assistant turn, or final assistant answer only. The path anonymization
+option is on by default for exports; turn it off in export options only when
+full local paths are needed in the dataset.
+
+Use Context Search to find reusable context without leaving the app. Session
+mode searches session metadata; message mode searches the local message FTS
+index and returns snippets with author, session identity, project/source, and
+timestamp. Selected context can be copied, and a result can open the matching
+session at the target message.
+
+The eval and Context Search workflow is local-only. There is no cloud sync, no
+external embeddings, no remote export, and no background network calls for
+session content or context search.
+
 ## Accessibility
 
 The UI is designed for keyboard and screen-reader use. It avoids exposing a
