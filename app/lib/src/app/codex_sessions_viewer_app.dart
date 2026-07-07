@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 
 import '../config/app_settings.dart';
 import '../database/database_connection.dart';
@@ -11,8 +12,11 @@ import '../database/database_migrator.dart';
 import '../database/project_tag_state.dart';
 import '../database/session_eval_state.dart';
 import '../app/runtime_session_controller.dart';
+import '../export/eval_dataset_exporter.dart';
+import '../parser/codex_session_parser.dart';
 import '../pricing/pricing_repository.dart';
 import '../ui/app_shell.dart';
+import '../ui/screens/evals_screen.dart';
 import '../ui/screens/logs_screen.dart';
 import '../ui/screens/sessions_screen.dart';
 import '../ui/screens/settings_screen.dart';
@@ -155,6 +159,15 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         unawaited(_saveSessionTableState(state));
                       },
                     ),
+                evalsScreen: _EvalsScreenLoader(
+                  settingsFile: widget.settingsFile,
+                  databaseFile: widget.databaseFile,
+                  onLoadCachedRows: widget.sessionCachedRowsLoader,
+                  deferInitialLoad: widget.deferInitialSessionLoad,
+                  onUpdateEvalMetadata: (row, metadata) async =>
+                      _updateEvalMetadata(row.id, metadata),
+                  onExport: _exportEvalDataset,
+                ),
                 usageScreen: UsageScreen(summary: _usageSummary),
                 settingsScreen: SettingsScreen(
                   initialSettings: settings,
@@ -462,6 +475,58 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     return '${sanitized.isEmpty ? row.id : sanitized}.md';
   }
 
+  Future<EvalsScreenExportResult> _exportEvalDataset(
+    EvalsScreenExportRequest request,
+  ) async {
+    final destination = await getDirectoryPath(confirmButtonText: 'Export');
+    if (destination == null) {
+      return const EvalsScreenExportResult.cancelled();
+    }
+    final sessions = <EvalDatasetSession>[];
+    var skipped = 0;
+    final parser = CodexSessionParser();
+    for (final row in request.rows) {
+      final sourcePath = row.sourcePathForDisplay.trim();
+      if (sourcePath.isEmpty) {
+        skipped++;
+        continue;
+      }
+      final result = await parser.parseFile(File(sourcePath));
+      final session = result.session;
+      if (session == null) {
+        skipped++;
+        continue;
+      }
+      sessions.add(
+        EvalDatasetSession(
+          session: session,
+          expectedOutput: row.evalExpectedOutput.trim().isEmpty
+              ? null
+              : row.evalExpectedOutput,
+          status: row.evalStatus.trim().isEmpty ? null : row.evalStatus,
+          notes: row.evalNotes.trim().isEmpty ? null : row.evalNotes,
+        ),
+      );
+    }
+    final files = const EvalDatasetExporter().export(
+      EvalDatasetExportRequest(
+        sessions: sessions,
+        format: request.format,
+        turnMode: request.turnMode,
+        options: request.options,
+      ),
+    );
+    for (final entry in files.entries) {
+      final file = File(p.join(destination, entry.key));
+      await file.parent.create(recursive: true);
+      await file.writeAsString(entry.value);
+    }
+    return EvalsScreenExportResult.completed(
+      exportedCount: sessions.length,
+      skippedCount: skipped,
+    );
+  }
+
   Future<void> _runDetachedCommand(String command) async {
     if (command.trim().isEmpty) {
       return;
@@ -650,6 +715,107 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       return;
     }
     _startCachedLoad();
+  }
+}
+
+class _EvalsScreenLoader extends StatefulWidget {
+  const _EvalsScreenLoader({
+    required this.settingsFile,
+    required this.databaseFile,
+    this.onLoadCachedRows,
+    required this.deferInitialLoad,
+    required this.onUpdateEvalMetadata,
+    required this.onExport,
+  });
+
+  final File settingsFile;
+  final File databaseFile;
+  final SessionCachedRowsLoader? onLoadCachedRows;
+  final FrameDeferredCallback deferInitialLoad;
+  final EvalMetadataUpdateCallback onUpdateEvalMetadata;
+  final EvalsExportCallback onExport;
+
+  @override
+  State<_EvalsScreenLoader> createState() => _EvalsScreenLoaderState();
+}
+
+class _EvalsScreenLoaderState extends State<_EvalsScreenLoader> {
+  var _cachedRows = <SessionRowViewModel>[];
+  var _cachedStatusMessage = '';
+  var _cachedLoadGeneration = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.deferInitialLoad(_startCachedLoad);
+  }
+
+  @override
+  void didUpdateWidget(covariant _EvalsScreenLoader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.settingsFile.path != widget.settingsFile.path ||
+        oldWidget.databaseFile.path != widget.databaseFile.path) {
+      _startCachedLoad();
+    }
+  }
+
+  RuntimeSessionController get _controller => RuntimeSessionController(
+    settingsFile: widget.settingsFile,
+    databaseFile: widget.databaseFile,
+  );
+
+  void _startCachedLoad() {
+    if (!mounted) {
+      return;
+    }
+    final generation = ++_cachedLoadGeneration;
+    setState(() {
+      _cachedRows = const [];
+      _cachedStatusMessage = 'Loading eval sessions...';
+    });
+    unawaited(_loadCachedRows(generation));
+  }
+
+  Future<void> _loadCachedRows(int generation) async {
+    try {
+      final cachedRowsLoader =
+          widget.onLoadCachedRows ?? _controller.loadCachedRowsInBackground;
+      final result = await cachedRowsLoader(
+        onProgress: (progress) {
+          if (!mounted || generation != _cachedLoadGeneration) {
+            return;
+          }
+          setState(() {
+            _cachedRows = progress.rows ?? _cachedRows;
+            _cachedStatusMessage = progress.statusMessage;
+          });
+        },
+      );
+      if (!mounted || generation != _cachedLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _cachedRows = result.rows;
+        _cachedStatusMessage = '';
+      });
+    } on Object catch (error) {
+      if (!mounted || generation != _cachedLoadGeneration) {
+        return;
+      }
+      setState(() {
+        _cachedStatusMessage = 'Failed to load eval sessions. $error';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return EvalsScreen(
+      initialRows: _cachedRows,
+      statusMessage: _cachedStatusMessage,
+      onUpdateEvalMetadata: widget.onUpdateEvalMetadata,
+      onExport: widget.onExport,
+    );
   }
 }
 

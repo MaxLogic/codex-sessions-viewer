@@ -1,6 +1,8 @@
 import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/ui/app_shell.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
+import 'package:codex_sessions_viewer/src/ui/screens/evals_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/themes.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/command_preview.dart';
@@ -247,6 +249,66 @@ void main() {
     expect(find.bySemanticsLabel('Eval review status'), findsOneWidget);
     expect(find.bySemanticsLabel('Eval notes'), findsOneWidget);
     expect(find.bySemanticsLabel('Eval expected output'), findsOneWidget);
+  });
+
+  testWidgets('evals screen exposes review and export controls', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: CodexAppShell(
+          sessionsScreenBuilder: (context, onOpenSettings) =>
+              const Text('Sessions screen'),
+          evalsScreen: EvalsScreen(
+            initialRows: [
+              SessionRowViewModel(
+                id: 'session-1',
+                sessionId: 'abc123',
+                startedAtUtc: DateTime.utc(2026, 6, 12, 9),
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9, 5),
+                title: 'Parser review',
+                summary: 'Reviewed JSONL formats',
+                project: 'Codex Viewer',
+                path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+                platform: SessionRowPlatform.windows,
+                messageCount: 4,
+                totalTokens: 1200,
+                model: 'gpt-5',
+                tags: const ['parser'],
+                status: 'Parsed',
+                evalReady: true,
+                evalStatus: 'needs_review',
+                evalNotes: 'Review parser handling.',
+                evalExpectedOutput: 'Parse error.',
+              ),
+            ],
+          ),
+          usageScreen: const Text('Usage screen'),
+          settingsScreen: const Text('Settings screen'),
+          logsScreen: const Text('Logs screen'),
+        ),
+      ),
+    );
+
+    expect(find.bySemanticsLabel('Evals navigation'), findsOneWidget);
+    await tester.tap(find.bySemanticsLabel('Evals navigation'));
+    await tester.pumpAndSettle();
+
+    for (final label in [
+      'Evals, 1 visible',
+      'Evals text filter',
+      'Eval status filter',
+      'Eval tags filter',
+      'Eval source filter',
+      'Eval project filter',
+      'Eval model provider filter',
+      'Select eval Parser review',
+      'Edit review for Parser review',
+      'Export selected eval sessions',
+      'Export all filtered eval sessions',
+    ]) {
+      expect(find.bySemanticsLabel(label), findsOneWidget);
+    }
   });
 
   testWidgets('empty session detail has accessible heading and guidance', (

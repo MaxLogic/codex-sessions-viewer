@@ -44,6 +44,6 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.enter);
     await tester.pumpAndSettle();
 
-    expect(find.text('Usage summary'), findsOneWidget);
+    expect(find.bySemanticsLabel('Evals, 0 visible'), findsOneWidget);
   });
 }

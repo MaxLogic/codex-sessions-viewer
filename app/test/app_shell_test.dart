@@ -53,6 +53,7 @@ void main() {
       _shellHost(
         motionMode: AppMotionMode.normal,
         sessions: const Text('Sessions content'),
+        evals: const Text('Evals content'),
         usage: const Text('Usage content'),
         settings: const Text('Settings content'),
         logs: const Text('Logs content'),
@@ -81,6 +82,7 @@ void main() {
       _shellHost(
         motionMode: AppMotionMode.normal,
         sessions: const Text('Sessions content'),
+        evals: const Text('Evals content'),
         usage: const Text('Usage content'),
         settings: const Text('Settings content'),
         logs: const Text('Logs content'),
@@ -108,6 +110,7 @@ void main() {
       _shellHost(
         motionMode: AppMotionMode.reduced,
         sessions: const Text('Sessions content'),
+        evals: const Text('Evals content'),
         usage: const Text('Usage content'),
         settings: const Text('Settings content'),
         logs: const Text('Logs content'),
@@ -134,6 +137,7 @@ void main() {
 Widget _shellHost({
   required AppMotionMode motionMode,
   required Widget sessions,
+  required Widget evals,
   required Widget usage,
   required Widget settings,
   required Widget logs,
@@ -142,6 +146,7 @@ Widget _shellHost({
     home: CodexAppShell(
       motionMode: motionMode,
       sessionsScreenBuilder: (_, _) => sessions,
+      evalsScreen: evals,
       usageScreen: usage,
       settingsScreen: settings,
       logsScreen: logs,

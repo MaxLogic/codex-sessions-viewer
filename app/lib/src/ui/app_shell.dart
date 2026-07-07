@@ -8,6 +8,7 @@ typedef SessionsScreenBuilder =
 
 enum CodexAppSection {
   sessions('Sessions', Icons.history),
+  evals('Evals', Icons.fact_check),
   usage('Usage', Icons.query_stats),
   settings('Settings', Icons.settings),
   logs('Logs', Icons.list_alt);
@@ -23,6 +24,7 @@ class CodexAppShell extends StatefulWidget {
     super.key,
     this.title = 'Codex Session Viewer',
     required this.sessionsScreenBuilder,
+    required this.evalsScreen,
     required this.usageScreen,
     required this.settingsScreen,
     required this.logsScreen,
@@ -31,6 +33,7 @@ class CodexAppShell extends StatefulWidget {
 
   final String title;
   final SessionsScreenBuilder sessionsScreenBuilder;
+  final Widget evalsScreen;
   final Widget usageScreen;
   final Widget settingsScreen;
   final Widget logsScreen;
@@ -102,6 +105,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
               child: _SectionContent(
                 section: section,
                 sessionsScreenBuilder: widget.sessionsScreenBuilder,
+                evalsScreen: widget.evalsScreen,
                 usageScreen: widget.usageScreen,
                 settingsScreen: widget.settingsScreen,
                 logsScreen: widget.logsScreen,
@@ -126,6 +130,7 @@ class _SectionContent extends StatelessWidget {
   const _SectionContent({
     required this.section,
     required this.sessionsScreenBuilder,
+    required this.evalsScreen,
     required this.usageScreen,
     required this.settingsScreen,
     required this.logsScreen,
@@ -136,6 +141,7 @@ class _SectionContent extends StatelessWidget {
 
   final CodexAppSection section;
   final SessionsScreenBuilder sessionsScreenBuilder;
+  final Widget evalsScreen;
   final Widget usageScreen;
   final Widget settingsScreen;
   final Widget logsScreen;
@@ -180,6 +186,9 @@ class _SectionContent extends StatelessWidget {
   Widget _buildSection(BuildContext context) {
     if (section == CodexAppSection.sessions) {
       return sessionsScreenBuilder(context, onOpenSettings);
+    }
+    if (section == CodexAppSection.evals) {
+      return evalsScreen;
     }
     if (section == CodexAppSection.usage) {
       return usageScreen;

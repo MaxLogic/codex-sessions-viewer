@@ -18,6 +18,7 @@ void main() {
               ],
             );
           },
+          evalsScreen: const Text('Injected evals screen'),
           usageScreen: const Text('Injected usage screen'),
           settingsScreen: const Text('Injected settings screen'),
           logsScreen: const Text('Injected logs screen'),
@@ -30,6 +31,10 @@ void main() {
     await tester.tap(find.text('Open injected settings'));
     await tester.pumpAndSettle();
     expect(find.text('Injected settings screen'), findsOneWidget);
+
+    await tester.tap(find.bySemanticsLabel('Evals navigation'));
+    await tester.pumpAndSettle();
+    expect(find.text('Injected evals screen'), findsOneWidget);
 
     await tester.tap(find.bySemanticsLabel('Usage navigation'));
     await tester.pumpAndSettle();
