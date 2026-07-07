@@ -235,6 +235,16 @@ class SessionSearchIndex {
     if (query.namedOnly) {
       where.add("coalesce(trim(s.thread_name), '') <> ''");
     }
+    if (query.evalReady != null) {
+      where.add('s.eval_ready = ?');
+      args.add(query.evalReady! ? 1 : 0);
+    }
+    if (query.evalStatuses.isNotEmpty) {
+      where.add(
+        's.eval_status in (${_sqlParameters(query.evalStatuses.length)})',
+      );
+      args.addAll(query.evalStatuses);
+    }
     if (query.statuses.isNotEmpty) {
       where.add(
         '(s.scan_status in (${_sqlParameters(query.statuses.length)}) '
@@ -438,6 +448,8 @@ class SessionSearchQuery {
     this.models = const {},
     this.threadName = '',
     this.namedOnly = false,
+    this.evalReady,
+    this.evalStatuses = const {},
     this.statuses = const {},
     this.pinned,
     this.archived = ArchivedFilter.activeOnly,
@@ -460,6 +472,8 @@ class SessionSearchQuery {
   final Set<String> models;
   final String threadName;
   final bool namedOnly;
+  final bool? evalReady;
+  final Set<String> evalStatuses;
   final Set<String> statuses;
   final bool? pinned;
   final ArchivedFilter archived;

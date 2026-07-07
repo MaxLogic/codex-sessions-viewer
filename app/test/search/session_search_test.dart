@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:codex_sessions_viewer/src/database/session_eval_state.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
@@ -237,6 +238,69 @@ void main() {
     );
 
     expect(result, ['match']);
+  });
+
+  test('filters sessions by eval metadata', () {
+    db.execute(
+      File('../sql/migration/008_local_eval_metadata.sql').readAsStringSync(),
+    );
+    index.upsert(_document(id: 'ready', title: 'Eval target'));
+    index.upsert(_document(id: 'draft', title: 'Eval target'));
+    index.upsert(_document(id: 'not-ready', title: 'Eval target'));
+
+    final store = SessionEvalStateStore(db);
+    store.setEvalMetadata(
+      'ready',
+      evalReady: true,
+      status: 'correct',
+      notes: 'Reviewed answer',
+      expectedOutput: 'Expected answer',
+      reviewedAtUtc: DateTime.utc(2026, 7, 7, 10),
+    );
+    store.setEvalMetadata(
+      'draft',
+      evalReady: true,
+      status: 'needs_review',
+      notes: 'Needs another pass',
+      expectedOutput: 'Expected draft',
+      reviewedAtUtc: DateTime.utc(2026, 7, 7, 11),
+    );
+
+    expect(
+      index.search(const SessionSearchQuery(evalReady: true)),
+      unorderedEquals(['ready', 'draft']),
+    );
+    expect(
+      index.search(
+        const SessionSearchQuery(evalReady: true, evalStatuses: {'correct'}),
+      ),
+      ['ready'],
+    );
+
+    final row = db
+        .select(
+          '''
+      select eval_ready,
+             eval_status,
+             eval_notes,
+             eval_expected_output,
+             eval_reviewed_at_utc,
+             eval_updated_at_utc
+      from sessions
+      where id = ?
+      ''',
+          ['ready'],
+        )
+        .single;
+    expect(row['eval_ready'], 1);
+    expect(row['eval_status'], 'correct');
+    expect(row['eval_notes'], 'Reviewed answer');
+    expect(row['eval_expected_output'], 'Expected answer');
+    expect(row['eval_reviewed_at_utc'], '2026-07-07T10:00:00.000Z');
+    expect(row['eval_updated_at_utc'], isNotNull);
+
+    store.setEvalMetadata('ready', evalReady: false);
+    expect(index.search(const SessionSearchQuery(evalReady: true)), ['draft']);
   });
 
   test('uses exact tag and model membership filters', () {

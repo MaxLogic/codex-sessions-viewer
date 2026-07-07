@@ -56,7 +56,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 7);
+    expect(versionRows.length, 8);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -85,6 +85,10 @@ void main() {
     expect(versionRows[6]['filename'], '007_session_thread_name.sql');
     expect(versionRows[6]['checksum_length'], greaterThan(20));
     expect(versionRows[6]['success'], 1);
+    expect(versionRows[7]['version'], 8);
+    expect(versionRows[7]['filename'], '008_local_eval_metadata.sql');
+    expect(versionRows[7]['checksum_length'], greaterThan(20));
+    expect(versionRows[7]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -92,6 +96,12 @@ void main() {
     expect(_columnExists(db, 'sessions', 'agent_nickname'), isTrue);
     expect(_columnExists(db, 'sessions', 'agent_role'), isTrue);
     expect(_columnExists(db, 'sessions', 'subagent_depth'), isTrue);
+    expect(_columnExists(db, 'sessions', 'eval_ready'), isTrue);
+    expect(_columnExists(db, 'sessions', 'eval_status'), isTrue);
+    expect(_columnExists(db, 'sessions', 'eval_notes'), isTrue);
+    expect(_columnExists(db, 'sessions', 'eval_expected_output'), isTrue);
+    expect(_columnExists(db, 'sessions', 'eval_reviewed_at_utc'), isTrue);
+    expect(_columnExists(db, 'sessions', 'eval_updated_at_utc'), isTrue);
   });
 
   test(
@@ -115,7 +125,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 7);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 8);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -600,6 +610,90 @@ void main() {
     },
   );
 
+  test('migrates local eval metadata', () async {
+    final sqlRoot = await _copySqlRoot(tempDir);
+    final evalMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}008_local_eval_metadata.sql',
+    );
+    if (await evalMigration.exists()) {
+      await evalMigration.delete();
+    }
+    final firstRun = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(firstRun.canStartNormalUi, isTrue);
+
+    final db = openFileBackedDatabase(dbFile);
+    db.execute('''
+      insert into sessions (
+        id,
+        source_type,
+        source_file_path,
+        display_path,
+        platform_path,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        'eval-existing',
+        'windows',
+        'C:\\sessions\\eval-existing.jsonl',
+        'C:\\sessions\\eval-existing.jsonl',
+        'C:\\sessions\\eval-existing.jsonl',
+        '2026-07-07T10:00:00Z',
+        '2026-07-07T10:00:00Z'
+      )
+      ''');
+    db.close();
+
+    await File(
+      '../sql/migration/008_local_eval_metadata.sql',
+    ).copy(evalMigration.path);
+
+    final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
+    expect(migrator.supportedSchemaVersion, 8);
+    final result = await migrator.openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isTrue);
+    expect(result.lastAppliedSchemaVersion, 8);
+
+    final migrated = openFileBackedDatabase(dbFile);
+    addTearDown(migrated.close);
+    for (final column in [
+      'eval_ready',
+      'eval_status',
+      'eval_notes',
+      'eval_expected_output',
+      'eval_reviewed_at_utc',
+      'eval_updated_at_utc',
+    ]) {
+      expect(_columnExists(migrated, 'sessions', column), isTrue);
+    }
+    expect(_indexExists(migrated, 'idx_sessions_eval_ready'), isTrue);
+    expect(_indexExists(migrated, 'idx_sessions_eval_status'), isTrue);
+
+    final row = migrated
+        .select(
+          '''
+      select eval_ready,
+             eval_status,
+             eval_notes,
+             eval_expected_output,
+             eval_reviewed_at_utc,
+             eval_updated_at_utc
+      from sessions
+      where id = ?
+      ''',
+          ['eval-existing'],
+        )
+        .single;
+    expect(row['eval_ready'], 0);
+    expect(row['eval_status'], isNull);
+    expect(row['eval_notes'], isNull);
+    expect(row['eval_expected_output'], isNull);
+    expect(row['eval_reviewed_at_utc'], isNull);
+    expect(row['eval_updated_at_utc'], isNull);
+  });
+
   test('rolls back failed migrations and records failure metadata', () async {
     final sqlRoot = Directory(
       '${tempDir.path}${Platform.pathSeparator}bad_sql',
@@ -643,6 +737,14 @@ bool _tableExists(Database db, String tableName) {
 bool _columnExists(Database db, String tableName, String columnName) {
   final result = db.select('pragma table_info($tableName)');
   return result.any((row) => row['name'] == columnName);
+}
+
+bool _indexExists(Database db, String indexName) {
+  final result = db.select(
+    "select 1 from sqlite_master where name = ? and type = 'index'",
+    [indexName],
+  );
+  return result.isNotEmpty;
 }
 
 Future<Directory> _copySqlRoot(Directory tempDir) async {
