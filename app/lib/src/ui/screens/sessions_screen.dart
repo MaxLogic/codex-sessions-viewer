@@ -215,7 +215,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   @override
   void initState() {
     super.initState();
-    _rows = List.of(widget.initialRows);
+    _rows = _dedupeSessionSnapshots(widget.initialRows);
     final tableState =
         widget.initialTableState ??
         (widget.settings ?? AppSettings.defaults()).ui.sessionTable;
@@ -1822,14 +1822,14 @@ class _SessionsScreenState extends State<SessionsScreen> {
         if (row.conversationMessages.isNotEmpty)
           row.id: row.conversationMessages,
     };
-    final nextRows = [
+    final nextRows = _dedupeSessionSnapshots([
       for (final row in rows)
         if (row.conversationMessages.isEmpty &&
             loadedMessagesById.containsKey(row.id))
           row.copyWithConversationMessages(loadedMessagesById[row.id]!)
         else
           row,
-    ];
+    ]);
     final changedIds = {
       for (final row in nextRows)
         if (_rowChangedForMotion(previousById[row.id], row)) row.id,
@@ -1868,6 +1868,45 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (visibleIds.isNotEmpty) {
       _rowMotionGeneration++;
     }
+  }
+
+  List<SessionRowViewModel> _dedupeSessionSnapshots(
+    List<SessionRowViewModel> rows,
+  ) {
+    final result = <SessionRowViewModel>[];
+    final indexBySessionId = <String, int>{};
+    for (final row in rows) {
+      final sessionId = row.sessionId.trim();
+      if (sessionId.isEmpty) {
+        result.add(row);
+        continue;
+      }
+      final existingIndex = indexBySessionId[sessionId];
+      if (existingIndex == null) {
+        indexBySessionId[sessionId] = result.length;
+        result.add(row);
+      } else if (_isNewerSnapshot(row, result[existingIndex])) {
+        result[existingIndex] = row;
+      }
+    }
+    return result;
+  }
+
+  bool _isNewerSnapshot(
+    SessionRowViewModel candidate,
+    SessionRowViewModel current,
+  ) {
+    final timestampOrder = candidate.lastMessageAtUtc.compareTo(
+      current.lastMessageAtUtc,
+    );
+    if (timestampOrder != 0) {
+      return timestampOrder > 0;
+    }
+    final messageOrder = candidate.messageCount.compareTo(current.messageCount);
+    if (messageOrder != 0) {
+      return messageOrder > 0;
+    }
+    return candidate.id.compareTo(current.id) > 0;
   }
 
   bool _rowChangedForMotion(

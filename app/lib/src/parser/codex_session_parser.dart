@@ -1,8 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
-
 import '../utils/injected_context_filter.dart';
 
 enum CodexSessionSourceType { windows, wsl, unknown }
@@ -140,9 +138,10 @@ class CodexSessionParser {
     }
 
     return CodexParsedSession(
-      internalId: sha256
-          .convert(utf8.encode('$sourcePath\n$rawText'))
-          .toString(),
+      internalId: _internalId(
+        sourcePath: sourcePath,
+        sessionId: _string(json['session_id']),
+      ),
       sessionId: _string(json['session_id']),
       threadName: _cleanThreadName(
         _string(json['thread_name']) ?? _string(json['session_name']),
@@ -476,9 +475,7 @@ class CodexSessionParser {
     displayPath ??= sourcePath;
     platformPath ??= displayPath;
     return CodexParsedSession(
-      internalId: sha256
-          .convert(utf8.encode('$sourcePath\n$rawText'))
-          .toString(),
+      internalId: _internalId(sourcePath: sourcePath, sessionId: sessionId),
       sessionId: sessionId,
       threadName: threadName,
       threadSource: threadSource,
@@ -539,6 +536,14 @@ class CodexSessionParser {
     return trimmed.startsWith('{') &&
         trimmed.contains('\n{') &&
         !trimmed.startsWith('{\n  "');
+  }
+
+  String _internalId({required String sourcePath, required String? sessionId}) {
+    final stableSessionId = sessionId?.trim();
+    if (stableSessionId != null && stableSessionId.isNotEmpty) {
+      return 'session:$stableSessionId';
+    }
+    return 'source:$sourcePath';
   }
 
   _JsonlDecodeResult _decodeJsonl(File source, String text) {

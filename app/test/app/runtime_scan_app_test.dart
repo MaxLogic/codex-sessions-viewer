@@ -700,6 +700,66 @@ void main() {
     );
   });
 
+  test('updates growing jsonl sessions without duplicate rows', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_growing_jsonl_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writeGrowingJsonlFixture(windowsRoot, messageCount: 1);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final first = await controller.refresh();
+    expect(first.rows, hasLength(1));
+    expect(first.rows.single.messageCount, 1);
+
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    await _writeGrowingJsonlFixture(windowsRoot, messageCount: 3);
+    final second = await controller.refresh();
+
+    expect(second.rows, hasLength(1));
+    expect(second.rows.single.sessionId, 'growing-jsonl-session');
+    expect(second.rows.single.messageCount, 3);
+
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    expect(
+      db
+          .select(
+            "select count(*) as count from sessions where session_id = 'growing-jsonl-session'",
+          )
+          .single['count'],
+      1,
+    );
+  });
+
   testWidgets('production refresh distinguishes path errors from empty roots', (
     tester,
   ) async {
@@ -2136,6 +2196,20 @@ Future<File> _writeAggregateJsonlFixture(Directory destination) async {
       '{"timestamp":"2026-06-10T10:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42,"output_tokens":21,"cached_input_tokens":7}}}}',
     ].join('\n'),
   );
+  return file;
+}
+
+Future<File> _writeGrowingJsonlFixture(
+  Directory destination, {
+  required int messageCount,
+}) async {
+  final file = File(p.join(destination.path, 'growing.jsonl'));
+  final lines = <String>[
+    '{"timestamp":"2026-06-10T10:00:00.000Z","type":"session_meta","payload":{"id":"growing-jsonl-session","timestamp":"2026-06-10T10:00:00.000Z","cwd":"F:\\\\repo","title":"Growing JSONL"}}',
+    for (var i = 0; i < messageCount; i++)
+      '{"timestamp":"2026-06-10T10:00:0${i + 1}.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"message $i"}]}}',
+  ];
+  await file.writeAsString('${lines.join('\n')}\n');
   return file;
 }
 

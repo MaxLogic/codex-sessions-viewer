@@ -212,6 +212,45 @@ void main() {
     expect(find.textContaining('2 sessions visible'), findsNothing);
   });
 
+  testWidgets('shows one row for duplicate session snapshots', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final now = DateTime.now().toUtc();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'old-snapshot',
+              sessionId: 'dmk2-session',
+              title: 'dmk2 old',
+              project: 'TireEngineSources',
+              threadName: 'dmk2',
+              messageCount: 11,
+              lastMessageAtUtc: now.subtract(const Duration(hours: 1)),
+            ),
+            _row(
+              id: 'new-snapshot',
+              sessionId: 'dmk2-session',
+              title: 'dmk2 new',
+              project: 'TireEngineSources',
+              threadName: 'dmk2',
+              messageCount: 251,
+              lastMessageAtUtc: now,
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await _enterSessionSearch(tester, 'dmk2');
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.text('dmk2 new'), findsWidgets);
+    expect(find.text('dmk2 old'), findsNothing);
+  });
+
   testWidgets('text search is debounced before filtering rows', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));

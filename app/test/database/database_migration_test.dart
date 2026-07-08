@@ -27,7 +27,7 @@ void main() {
       sqlRoot: Directory('../sql'),
     ).openAndMigrate(dbFile);
 
-    expect(result.canStartNormalUi, isTrue);
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
     expect(result.fatalError, isNull);
 
     final db = openFileBackedDatabase(dbFile);
@@ -59,7 +59,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 10);
+    expect(versionRows.length, 11);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -100,6 +100,10 @@ void main() {
     expect(versionRows[9]['filename'], '010_session_id_lookup_index.sql');
     expect(versionRows[9]['checksum_length'], greaterThan(20));
     expect(versionRows[9]['success'], 1);
+    expect(versionRows[10]['version'], 11);
+    expect(versionRows[10]['filename'], '011_stable_session_identity.sql');
+    expect(versionRows[10]['checksum_length'], greaterThan(20));
+    expect(versionRows[10]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -137,7 +141,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 10);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 11);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -166,8 +170,13 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}003_project_override.sql',
     );
+    final copiedStableIdentityMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}011_stable_session_identity.sql',
+    );
     await copiedMigration.delete();
     await copiedProjectOverrideMigration.delete();
+    await copiedStableIdentityMigration.delete();
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
@@ -297,11 +306,14 @@ void main() {
     await File(
       '../sql/migration/003_project_override.sql',
     ).copy(copiedProjectOverrideMigration.path);
+    await File(
+      '../sql/migration/011_stable_session_identity.sql',
+    ).copy(copiedStableIdentityMigration.path);
 
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
-    expect(result.canStartNormalUi, isTrue);
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -313,12 +325,12 @@ void main() {
             "where session_search match 'user_messages: migrated'",
           )
           .single['id'],
-      'existing',
+      r'source:C:\sessions\existing.jsonl',
     );
     final row = migrated.select(
       'select has_code_blocks, has_tool_calls, has_errors '
       'from sessions where id = ?',
-      ['existing'],
+      [r'source:C:\sessions\existing.jsonl'],
     ).single;
     expect(row['has_code_blocks'], 1);
     expect(row['has_tool_calls'], 1);
@@ -333,7 +345,12 @@ void main() {
         '${sqlRoot.path}${Platform.pathSeparator}migration'
         '${Platform.pathSeparator}003_project_override.sql',
       );
+      final copiedStableIdentityMigration = File(
+        '${sqlRoot.path}${Platform.pathSeparator}migration'
+        '${Platform.pathSeparator}011_stable_session_identity.sql',
+      );
       await copiedProjectOverrideMigration.delete();
+      await copiedStableIdentityMigration.delete();
       final firstRun = await DatabaseMigrator(
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
@@ -393,17 +410,24 @@ void main() {
       await File(
         '../sql/migration/003_project_override.sql',
       ).copy(copiedProjectOverrideMigration.path);
+      await File(
+        '../sql/migration/011_stable_session_identity.sql',
+      ).copy(copiedStableIdentityMigration.path);
 
       final result = await DatabaseMigrator(
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
-      expect(result.canStartNormalUi, isTrue);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.summary,
+      );
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
       expect(
         migrated.select('select project_override from sessions where id = ?', [
-          'existing-project',
+          r'source:C:\work\session.jsonl',
         ]).single['project_override'],
         1,
       );
@@ -412,7 +436,7 @@ void main() {
 
       final row = migrated.select(
         'select project_id, project_name_snapshot from sessions where id = ?',
-        ['existing-project'],
+        [r'source:C:\work\session.jsonl'],
       ).single;
       expect(row['project_id'], 1);
       expect(row['project_name_snapshot'], 'Manual Project');
@@ -521,7 +545,7 @@ void main() {
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
-    expect(result.canStartNormalUi, isTrue);
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -594,7 +618,11 @@ void main() {
       final result = await DatabaseMigrator(
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
-      expect(result.canStartNormalUi, isTrue);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.summary,
+      );
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
@@ -628,8 +656,15 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}008_local_eval_metadata.sql',
     );
+    final stableIdentityMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}011_stable_session_identity.sql',
+    );
     if (await evalMigration.exists()) {
       await evalMigration.delete();
+    }
+    if (await stableIdentityMigration.exists()) {
+      await stableIdentityMigration.delete();
     }
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
@@ -661,12 +696,15 @@ void main() {
     await File(
       '../sql/migration/008_local_eval_metadata.sql',
     ).copy(evalMigration.path);
+    await File(
+      '../sql/migration/011_stable_session_identity.sql',
+    ).copy(stableIdentityMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 10);
+    expect(migrator.supportedSchemaVersion, 11);
     final result = await migrator.openAndMigrate(dbFile);
-    expect(result.canStartNormalUi, isTrue);
-    expect(result.lastAppliedSchemaVersion, 10);
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
+    expect(result.lastAppliedSchemaVersion, 11);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -693,9 +731,9 @@ void main() {
              eval_reviewed_at_utc,
              eval_updated_at_utc
       from sessions
-      where id = ?
+          where id = ?
       ''',
-          ['eval-existing'],
+          [r'source:C:\sessions\eval-existing.jsonl'],
         )
         .single;
     expect(row['eval_ready'], 0);
@@ -784,7 +822,7 @@ void main() {
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
       expect(result.canStartNormalUi, isTrue);
-      expect(result.lastAppliedSchemaVersion, 10);
+      expect(result.lastAppliedSchemaVersion, 11);
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
@@ -802,6 +840,232 @@ void main() {
       expect(_indexExists(migrated, 'idx_sessions_session_id'), isTrue);
     },
   );
+
+  test('collapses duplicate session snapshots', () async {
+    final sqlRoot = await _copySqlRoot(tempDir);
+    final db = openFileBackedDatabase(dbFile);
+    for (final path in [
+      ['init', '001_initial_schema.sql'],
+      ['migration', '002_search_filter_schema.sql'],
+      ['migration', '003_project_override.sql'],
+      ['migration', '004_session_token_buckets.sql'],
+      ['migration', '005_scan_run_status.sql'],
+      ['migration', '006_session_origin.sql'],
+      ['migration', '007_session_thread_name.sql'],
+      ['migration', '008_local_eval_metadata.sql'],
+      ['migration', '009_message_search.sql'],
+      ['migration', '010_session_id_lookup_index.sql'],
+    ]) {
+      await _applySqlFile(
+        db,
+        File(
+          '${sqlRoot.path}${Platform.pathSeparator}${path[0]}'
+          '${Platform.pathSeparator}${path[1]}',
+        ),
+      );
+    }
+    db.execute('''
+      insert into tags (id, name, created_at_utc, updated_at_utc)
+      values (7, 'important', '2026-07-07T10:00:00Z', '2026-07-07T10:00:00Z')
+      ''');
+    db.execute('''
+      insert into projects (id, name, created_at_utc, updated_at_utc)
+      values (3, 'Manual Project', '2026-07-07T10:00:00Z', '2026-07-07T10:00:00Z')
+      ''');
+    for (final row in [
+      ('old-snapshot', 10, 1, 1, 1, 1, 3, 'Manual Project'),
+      ('new-snapshot', 30, 0, 0, 0, 0, null, null),
+    ]) {
+      db.execute(
+        '''
+        insert into sessions (
+          id,
+          session_id,
+          source_type,
+          source_file_path,
+          display_path,
+          platform_path,
+          file_size,
+          message_count,
+          is_pinned,
+          is_archived,
+          project_override,
+          project_id,
+          project_name_snapshot,
+          archived_at_utc,
+          archive_reason,
+          eval_ready,
+          eval_status,
+          eval_notes,
+          eval_expected_output,
+          eval_reviewed_at_utc,
+          eval_updated_at_utc,
+          created_at_utc,
+          updated_at_utc
+        ) values (?, 'duplicate-session', 'windows', 'C:\\sessions\\duplicate.jsonl',
+          'C:\\sessions\\duplicate.jsonl', 'C:\\sessions\\duplicate.jsonl',
+          ?, ?, ?, ?, ?, ?, ?, '2026-07-07T10:03:00Z',
+          'archived duplicate', ?, 'correct', 'needs review',
+          'expected answer', '2026-07-07T10:04:00Z',
+          '2026-07-07T10:05:00Z', '2026-07-07T10:00:00Z',
+          '2026-07-07T10:00:00Z')
+        ''',
+        [
+          row.$1,
+          row.$2,
+          row.$2,
+          row.$3,
+          row.$4,
+          row.$6,
+          row.$7,
+          row.$8,
+          row.$5,
+        ],
+      );
+      db.execute(
+        '''
+        insert into messages (
+          session_id,
+          message_index,
+          author_type,
+          first_line,
+          content_preview,
+          created_at_db_utc,
+          updated_at_db_utc
+        ) values (?, 0, 'user', ?, ?, '2026-07-07T10:00:00Z',
+          '2026-07-07T10:00:00Z')
+        ''',
+        [row.$1, row.$1, row.$1],
+      );
+    }
+    db.execute(
+      'insert into session_tags (session_id, tag_id, created_at_utc) '
+      "values ('old-snapshot', 7, '2026-07-07T10:00:00Z')",
+    );
+    db.execute(
+      'insert into session_path_keys (session_id, path_key) '
+      "values ('old-snapshot', 'c:/sessions/duplicate.jsonl')",
+    );
+    db.close();
+
+    final result = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isTrue);
+
+    final migrated = openFileBackedDatabase(dbFile);
+    addTearDown(migrated.close);
+    final rows = migrated.select(
+      "select id, session_id, message_count, is_pinned, is_archived, "
+      "project_override, project_id, project_name_snapshot, archived_at_utc, "
+      "archive_reason, eval_ready, eval_status, eval_notes, "
+      "eval_expected_output, eval_reviewed_at_utc, eval_updated_at_utc "
+      "from sessions where session_id = "
+      "'duplicate-session'",
+    );
+    expect(rows, hasLength(1));
+    expect(rows.single['id'], 'session:duplicate-session');
+    expect(rows.single['message_count'], 30);
+    expect(rows.single['is_pinned'], 1);
+    expect(rows.single['is_archived'], 1);
+    expect(rows.single['project_override'], 1);
+    expect(rows.single['project_id'], 3);
+    expect(rows.single['project_name_snapshot'], 'Manual Project');
+    expect(rows.single['archived_at_utc'], '2026-07-07T10:03:00Z');
+    expect(rows.single['archive_reason'], 'archived duplicate');
+    expect(rows.single['eval_ready'], 1);
+    expect(rows.single['eval_status'], 'correct');
+    expect(rows.single['eval_notes'], 'needs review');
+    expect(rows.single['eval_expected_output'], 'expected answer');
+    expect(rows.single['eval_reviewed_at_utc'], '2026-07-07T10:04:00Z');
+    expect(rows.single['eval_updated_at_utc'], '2026-07-07T10:05:00Z');
+    expect(
+      migrated
+          .select(
+            "select count(*) as count from messages where session_id = "
+            "'session:duplicate-session'",
+          )
+          .single['count'],
+      1,
+    );
+    expect(
+      migrated
+          .select(
+            "select count(*) as count from session_tags where session_id = "
+            "'session:duplicate-session'",
+          )
+          .single['count'],
+      1,
+    );
+    expect(
+      migrated
+          .select(
+            "select count(*) as count from session_path_keys where session_id = "
+            "'session:duplicate-session'",
+          )
+          .single['count'],
+      1,
+    );
+  });
+
+  test('source fallback identity prefers source file path', () async {
+    final sqlRoot = await _copySqlRoot(tempDir);
+    final db = openFileBackedDatabase(dbFile);
+    for (final path in [
+      ['init', '001_initial_schema.sql'],
+      ['migration', '002_search_filter_schema.sql'],
+      ['migration', '003_project_override.sql'],
+      ['migration', '004_session_token_buckets.sql'],
+      ['migration', '005_scan_run_status.sql'],
+      ['migration', '006_session_origin.sql'],
+      ['migration', '007_session_thread_name.sql'],
+      ['migration', '008_local_eval_metadata.sql'],
+      ['migration', '009_message_search.sql'],
+      ['migration', '010_session_id_lookup_index.sql'],
+    ]) {
+      await _applySqlFile(
+        db,
+        File(
+          '${sqlRoot.path}${Platform.pathSeparator}${path[0]}'
+          '${Platform.pathSeparator}${path[1]}',
+        ),
+      );
+    }
+    db.execute('''
+      insert into sessions (
+        id,
+        source_type,
+        source_file_path,
+        source_file_unc_path,
+        display_path,
+        platform_path,
+        created_at_utc,
+        updated_at_utc
+      ) values (
+        'source-snapshot',
+        'wsl',
+        '/home/pawel/.codex/sessions/source.jsonl',
+        '\\\\wsl.localhost\\Ubuntu\\home\\pawel\\.codex\\sessions\\source.jsonl',
+        '/home/pawel/.codex/sessions/source.jsonl',
+        '/home/pawel/.codex/sessions/source.jsonl',
+        '2026-07-07T10:00:00Z',
+        '2026-07-07T10:00:00Z'
+      )
+      ''');
+    db.close();
+
+    final result = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
+
+    final migrated = openFileBackedDatabase(dbFile);
+    addTearDown(migrated.close);
+    expect(
+      migrated.select('select id from sessions').single['id'],
+      'source:/home/pawel/.codex/sessions/source.jsonl',
+    );
+  });
 
   test('rolls back failed migrations and records failure metadata', () async {
     final sqlRoot = Directory(
