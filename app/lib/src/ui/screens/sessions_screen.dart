@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -165,6 +166,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
   static const _detailPaneMinWidth = 360.0;
   static const _minimumTablePaneWidth = 520.0;
   static const _splitDividerWidth = 1.0;
+  static const _filterDebounceDuration = Duration(milliseconds: 220);
+  static const _synchronousTextFilterRowLimit = 200;
 
   final _searchController = TextEditingController();
   final _pathController = TextEditingController();
@@ -199,7 +202,15 @@ class _SessionsScreenState extends State<SessionsScreen> {
   int? _pendingOpenTargetSerial;
   Timer? _relativeDateTimer;
   Timer? _backgroundRescanTimer;
+  Timer? _filterDebounceTimer;
   SessionsRefreshOperation? _activeRefreshOperation;
+  var _textFilterGeneration = 0;
+  var _appliedSearch = '';
+  var _appliedPath = '';
+  var _appliedThreadName = '';
+  Set<String>? _matchingSearchRowIds;
+  Set<String>? _matchingPathRowIds;
+  Set<String>? _matchingThreadNameRowIds;
 
   @override
   void initState() {
@@ -260,6 +271,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   void dispose() {
     _requestRefreshCancel(updateUi: false);
     _backgroundRescanTimer?.cancel();
+    _filterDebounceTimer?.cancel();
     _searchController
       ..removeListener(_filtersChanged)
       ..dispose();
@@ -504,12 +516,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
   ];
 
   List<_SessionDisplayRow> get _visibleDisplayRows {
-    final search = _searchController.text.trim().toLowerCase();
-    final path = _pathController.text
-        .trim()
-        .replaceAll(r'\', '/')
-        .toLowerCase();
-    final threadName = _threadNameController.text.trim().toLowerCase();
+    final search = _appliedSearch;
+    final path = _appliedPath;
+    final threadName = _appliedThreadName;
     final hierarchy = _buildSessionHierarchy();
     switch (_originFilter) {
       case SessionsOriginFilter.user:
@@ -966,32 +975,21 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (path.isEmpty) {
       return true;
     }
-    return row.path.replaceAll(r'\', '/').toLowerCase().contains(path);
+    return _matchingPathRowIds?.contains(row.id) ?? false;
   }
 
   bool _matchesThreadName(SessionRowViewModel row, String threadName) {
     if (threadName.isEmpty) {
       return true;
     }
-    return row.threadName.toLowerCase().contains(threadName);
+    return _matchingThreadNameRowIds?.contains(row.id) ?? false;
   }
 
   bool _matchesSearch(SessionRowViewModel row, String search) {
     if (search.isEmpty) {
       return true;
     }
-    return [
-      row.title,
-      row.summary,
-      row.project,
-      row.threadName,
-      row.path,
-      row.platformLabel,
-      row.originLabel,
-      row.modelProviderLabel,
-      row.status,
-      ...row.tags,
-    ].any((value) => value.toLowerCase().contains(search));
+    return _matchingSearchRowIds?.contains(row.id) ?? false;
   }
 
   bool get _hasActiveFilters {
@@ -1010,12 +1008,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (_originFilter != _defaultOriginFilter || _rows.isEmpty) {
       return false;
     }
-    final search = _searchController.text.trim().toLowerCase();
-    final path = _pathController.text
-        .trim()
-        .replaceAll(r'\', '/')
-        .toLowerCase();
-    final threadName = _threadNameController.text.trim().toLowerCase();
+    final search = _appliedSearch;
+    final path = _appliedPath;
+    final threadName = _appliedThreadName;
     return _rows.any(
       (row) =>
           row.isSubagentSession &&
@@ -1118,6 +1113,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _searchController.clear();
         _pathController.clear();
         _threadNameController.clear();
+        _applyClearedTextFilters();
         _platformFilter = SessionsPlatformFilter.both;
         _timeFilter = SessionsTimeFilter.allTime;
         _archivedFilter = SessionsArchivedFilter.all;
@@ -1267,11 +1263,69 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   void _filtersChanged() {
+    _scheduleTextFilter();
+  }
+
+  void _scheduleTextFilter({Duration? delay}) {
+    _filterDebounceTimer?.cancel();
+    _filterDebounceTimer = Timer(
+      delay ?? _filterDebounceDuration,
+      _applyTextFiltersInBackground,
+    );
+  }
+
+  Future<void> _applyTextFiltersInBackground() async {
+    final search = _normalizeSearchText(_searchController.text);
+    final path = _normalizePathText(_pathController.text);
+    final threadName = _normalizeSearchText(_threadNameController.text);
+    if (search == _appliedSearch &&
+        path == _appliedPath &&
+        threadName == _appliedThreadName) {
+      return;
+    }
+
+    final generation = ++_textFilterGeneration;
+    final request = _SessionTextFilterRequest(
+      search: search,
+      path: path,
+      threadName: threadName,
+      rows: [for (final row in _rows) _SessionTextFilterRowData.from(row)],
+    );
+    final result = request.rows.length <= _synchronousTextFilterRowLimit
+        ? _matchSessionTextFilters(request)
+        : await _runSessionTextFilterOnWorker(request);
+    if (!mounted || generation != _textFilterGeneration) {
+      return;
+    }
     setState(() {
+      _appliedSearch = search;
+      _appliedPath = path;
+      _appliedThreadName = threadName;
+      _matchingSearchRowIds = search.isEmpty ? null : result.searchIds;
+      _matchingPathRowIds = path.isEmpty ? null : result.pathIds;
+      _matchingThreadNameRowIds = threadName.isEmpty
+          ? null
+          : result.threadNameIds;
       _retainSelection();
       _markVisibleRowsForMotion();
     });
   }
+
+  void _applyClearedTextFilters() {
+    _filterDebounceTimer?.cancel();
+    _textFilterGeneration++;
+    _appliedSearch = '';
+    _appliedPath = '';
+    _appliedThreadName = '';
+    _matchingSearchRowIds = null;
+    _matchingPathRowIds = null;
+    _matchingThreadNameRowIds = null;
+  }
+
+  String _normalizeSearchText(String value) => value.trim().toLowerCase();
+
+  String _normalizePathText(String value) =>
+      value.trim().replaceAll(r'\', '/').toLowerCase();
 
   void _retainSelection() {
     final selectedId = _selectedId;
@@ -1293,6 +1347,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _searchController.clear();
         _pathController.clear();
         _threadNameController.clear();
+        _applyClearedTextFilters();
         _platformFilter = SessionsPlatformFilter.both;
         _timeFilter = _defaultTimeFilter;
         _archivedFilter = SessionsArchivedFilter.activeOnly;
@@ -1780,6 +1835,21 @@ class _SessionsScreenState extends State<SessionsScreen> {
         if (_rowChangedForMotion(previousById[row.id], row)) row.id,
     };
     _rows = nextRows;
+    _textFilterGeneration++;
+    if (_appliedSearch.isNotEmpty ||
+        _appliedPath.isNotEmpty ||
+        _appliedThreadName.isNotEmpty ||
+        _searchController.text.trim().isNotEmpty ||
+        _pathController.text.trim().isNotEmpty ||
+        _threadNameController.text.trim().isNotEmpty) {
+      _appliedSearch = '';
+      _appliedPath = '';
+      _appliedThreadName = '';
+      _matchingSearchRowIds = null;
+      _matchingPathRowIds = null;
+      _matchingThreadNameRowIds = null;
+      _scheduleTextFilter(delay: Duration.zero);
+    }
     _markVisibleRowsForMotion(changedIds);
   }
 
@@ -1838,6 +1908,98 @@ class SessionsRefreshResult {
   final bool cancelled;
   final int persistenceFlushCount;
   final int fullRowSnapshotCount;
+}
+
+class _SessionTextFilterRequest {
+  const _SessionTextFilterRequest({
+    required this.search,
+    required this.path,
+    required this.threadName,
+    required this.rows,
+  });
+
+  final String search;
+  final String path;
+  final String threadName;
+  final List<_SessionTextFilterRowData> rows;
+}
+
+class _SessionTextFilterRowData {
+  const _SessionTextFilterRowData({
+    required this.id,
+    required this.path,
+    required this.threadName,
+    required this.searchFields,
+  });
+
+  factory _SessionTextFilterRowData.from(SessionRowViewModel row) {
+    return _SessionTextFilterRowData(
+      id: row.id,
+      path: row.path.replaceAll(r'\', '/').toLowerCase(),
+      threadName: row.threadName.toLowerCase(),
+      searchFields: [
+        row.title,
+        row.summary,
+        row.project,
+        row.threadName,
+        row.path,
+        row.platformLabel,
+        row.originLabel,
+        row.modelProviderLabel,
+        row.status,
+        ...row.tags,
+      ].map((value) => value.toLowerCase()).toList(growable: false),
+    );
+  }
+
+  final String id;
+  final String path;
+  final String threadName;
+  final List<String> searchFields;
+}
+
+class _SessionTextFilterResult {
+  const _SessionTextFilterResult({
+    required this.searchIds,
+    required this.pathIds,
+    required this.threadNameIds,
+  });
+
+  final Set<String> searchIds;
+  final Set<String> pathIds;
+  final Set<String> threadNameIds;
+}
+
+_SessionTextFilterResult _matchSessionTextFilters(
+  _SessionTextFilterRequest request,
+) {
+  final searchIds = <String>{};
+  final pathIds = <String>{};
+  final threadNameIds = <String>{};
+  for (final row in request.rows) {
+    if (request.search.isNotEmpty &&
+        row.searchFields.any((value) => value.contains(request.search))) {
+      searchIds.add(row.id);
+    }
+    if (request.path.isNotEmpty && row.path.contains(request.path)) {
+      pathIds.add(row.id);
+    }
+    if (request.threadName.isNotEmpty &&
+        row.threadName.contains(request.threadName)) {
+      threadNameIds.add(row.id);
+    }
+  }
+  return _SessionTextFilterResult(
+    searchIds: searchIds,
+    pathIds: pathIds,
+    threadNameIds: threadNameIds,
+  );
+}
+
+Future<_SessionTextFilterResult> _runSessionTextFilterOnWorker(
+  _SessionTextFilterRequest request,
+) {
+  return Isolate.run(() => _matchSessionTextFilters(request));
 }
 
 class _SessionHierarchy {
@@ -2338,11 +2500,6 @@ class _FilterBar extends StatelessWidget {
                   ),
                   label: Text(refreshLabel),
                 ),
-                OutlinedButton.icon(
-                  onPressed: onClearFilters,
-                  icon: const AppSvgIcon(AppIcons.filterClear),
-                  label: const Text('Clear filters'),
-                ),
               ],
             ),
             Theme(
@@ -2355,92 +2512,102 @@ class _FilterBar extends StatelessWidget {
                 childrenPadding: const EdgeInsets.only(top: 4, bottom: 2),
                 title: const Text('Advanced filters'),
                 children: [
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 940),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            flex: 2,
-                            child: Semantics(
-                              label: 'Path filter',
-                              textField: true,
-                              child: TextField(
-                                controller: pathController,
-                                decoration: const InputDecoration(
-                                  labelText: 'Path',
-                                  isDense: true,
-                                ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Wrap(
+                      spacing: 10,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        SizedBox(
+                          width: 280,
+                          child: Semantics(
+                            label: 'Path filter',
+                            textField: true,
+                            child: TextField(
+                              controller: pathController,
+                              decoration: const InputDecoration(
+                                labelText: 'Path',
+                                isDense: true,
                               ),
                             ),
                           ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Semantics(
-                              label: 'Thread name filter',
-                              textField: true,
-                              child: TextField(
-                                controller: threadNameController,
-                                decoration: const InputDecoration(
-                                  labelText: 'Thread name',
-                                  isDense: true,
-                                ),
+                        ),
+                        SizedBox(
+                          width: 170,
+                          child: Semantics(
+                            label: 'Thread name filter',
+                            textField: true,
+                            child: TextField(
+                              controller: threadNameController,
+                              decoration: const InputDecoration(
+                                labelText: 'Thread name',
+                                isDense: true,
                               ),
                             ),
                           ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: _staticFilter('Project filter', 'Project'),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(child: _staticFilter('Tags filter', 'Tags')),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: _staticFilter('Model filter', 'Model'),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: _FilterSemantics(
-                              label: 'Origin filter',
-                              child:
-                                  DropdownButtonFormField<SessionsOriginFilter>(
-                                    key: ValueKey(
-                                      'origin-filter-${originFilter.name}',
-                                    ),
-                                    initialValue: originFilter,
-                                    isExpanded: true,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Origin',
-                                      isDense: true,
-                                    ),
-                                    items: const [
-                                      DropdownMenuItem(
-                                        value: SessionsOriginFilter.all,
-                                        child: Text('All'),
-                                      ),
-                                      DropdownMenuItem(
-                                        value: SessionsOriginFilter.user,
-                                        child: Text('User'),
-                                      ),
-                                      DropdownMenuItem(
-                                        value: SessionsOriginFilter.subagent,
-                                        child: Text('Subagent'),
-                                      ),
-                                    ],
-                                    onChanged: (value) {
-                                      if (value != null) {
-                                        onOriginChanged(value);
-                                      }
-                                    },
+                        ),
+                        SizedBox(
+                          width: 150,
+                          child: _staticFilter('Project filter', 'Project'),
+                        ),
+                        SizedBox(
+                          width: 150,
+                          child: _staticFilter('Tags filter', 'Tags'),
+                        ),
+                        SizedBox(
+                          width: 150,
+                          child: _staticFilter('Model filter', 'Model'),
+                        ),
+                        SizedBox(
+                          width: 150,
+                          child: _FilterSemantics(
+                            label: 'Origin filter',
+                            child:
+                                DropdownButtonFormField<SessionsOriginFilter>(
+                                  key: ValueKey(
+                                    'origin-filter-${originFilter.name}',
                                   ),
-                            ),
+                                  initialValue: originFilter,
+                                  isExpanded: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Origin',
+                                    isDense: true,
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: SessionsOriginFilter.all,
+                                      child: Text('All'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: SessionsOriginFilter.user,
+                                      child: Text('User'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: SessionsOriginFilter.subagent,
+                                      child: Text('Subagent'),
+                                    ),
+                                  ],
+                                  onChanged: (value) {
+                                    if (value != null) {
+                                      onOriginChanged(value);
+                                    }
+                                  },
+                                ),
                           ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   ),
                 ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: OutlinedButton.icon(
+                onPressed: onClearFilters,
+                icon: const AppSvgIcon(AppIcons.filterClear),
+                label: const Text('Clear filters'),
               ),
             ),
           ],

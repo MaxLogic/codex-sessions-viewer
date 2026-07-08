@@ -8,6 +8,7 @@ import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
+import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
@@ -572,6 +573,63 @@ void main() {
     },
   );
 
+  test(
+    'refresh applies session_index thread names to unchanged cached rows',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_session_index_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      await _copyFixture('sample_windows_session.json', windowsRoot);
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      final first = await controller.refresh();
+      expect(first.rows.single.threadName, isEmpty);
+
+      await File(p.join(windowsRoot.path, 'session_index.jsonl')).writeAsString(
+        '{"id":"win-session-001","thread_name":"dmk2","updated_at":"2026-07-08T12:00:00Z"}\n',
+      );
+
+      final second = await controller.refresh();
+      expect(second.rows.single.threadName, 'dmk2');
+
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      expect(
+        SessionSearchIndex(db).search(const SessionSearchQuery(text: 'dmk2')),
+        [second.rows.single.id],
+      );
+    },
+  );
+
   test('updates message search when session messages change', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_message_search_',
@@ -812,6 +870,7 @@ void main() {
     );
 
     await tester.enterText(find.bySemanticsLabel('Session search'), 'nomatch');
+    await tester.pump(const Duration(milliseconds: 221));
     await tester.pumpAndSettle();
 
     expect(find.text('No sessions match the current filters.'), findsOneWidget);

@@ -14,6 +14,7 @@ import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
 import '../pricing/pricing_repository.dart';
 import '../scanner/scan_batching.dart';
+import '../scanner/session_index_reader.dart';
 import '../scanner/session_scanner.dart';
 import '../search/message_search.dart';
 import '../search/session_search.dart';
@@ -541,6 +542,9 @@ class RuntimeSessionController {
       var fullRowSnapshotCount = 0;
       var lastFullRowSnapshotParsedCount = 0;
       var persistenceFlushQueue = Future<void>.value();
+      final threadNamesBySessionId = await _readSessionIndexThreadNames(
+        settings.paths,
+      );
       final projectResolutionCache = _WslProjectResolutionCache(
         wslProjectResolver,
       );
@@ -558,6 +562,7 @@ class RuntimeSessionController {
               return _persistParsedSessions(
                 db,
                 batch,
+                threadNamesBySessionId: threadNamesBySessionId,
                 wslProjects: projectResolutionCache,
                 resolveWslProjects: false,
               );
@@ -721,9 +726,11 @@ class RuntimeSessionController {
             result,
             scanRunId: activeScanRunId,
             persistSessions: onProgress == null,
+            threadNamesBySessionId: threadNamesBySessionId,
             wslProjects: projectResolutionCache,
           );
         });
+        _applySessionIndexThreadNames(db, threadNamesBySessionId);
         final rows = Profiling.spanSync(
           'scan.runtime.final_load_rows',
           () => _loadRowsProfiled(db, pricing: pricing),
@@ -1145,6 +1152,7 @@ class _BackgroundRefreshCancel {
 Future<void> _persistParsedSessions(
   Database db,
   List<ScannedSessionFile> sessions, {
+  required Map<String, CodexThreadNameEntry> threadNamesBySessionId,
   required _WslProjectResolutionCache wslProjects,
   bool resolveWslProjects = true,
 }) async {
@@ -1158,7 +1166,13 @@ Future<void> _persistParsedSessions(
   try {
     final now = DateTime.now().toUtc().toIso8601String();
     for (final session in sessions) {
-      _upsertParsedSession(db, session, now, resolver);
+      _upsertParsedSession(
+        db,
+        session,
+        now,
+        resolver,
+        threadNamesBySessionId: threadNamesBySessionId,
+      );
     }
     db.execute('commit');
   } on Object {
@@ -1260,6 +1274,7 @@ Future<void> _persistScan(
   SessionScanResult result, {
   required int scanRunId,
   required bool persistSessions,
+  required Map<String, CodexThreadNameEntry> threadNamesBySessionId,
   required _WslProjectResolutionCache wslProjects,
 }) async {
   final resolver = persistSessions
@@ -1301,7 +1316,13 @@ Future<void> _persistScan(
     }
     if (persistSessions) {
       for (final session in result.sessions) {
-        _upsertParsedSession(db, session, now, resolver!);
+        _upsertParsedSession(
+          db,
+          session,
+          now,
+          resolver!,
+          threadNamesBySessionId: threadNamesBySessionId,
+        );
       }
     }
     final parsedSessionPaths = {
@@ -1325,9 +1346,15 @@ void _upsertParsedSession(
   Database db,
   ScannedSessionFile scannedSession,
   String now,
-  _ProjectPathResolver projectResolver,
-) {
+  _ProjectPathResolver projectResolver, {
+  Map<String, CodexThreadNameEntry> threadNamesBySessionId = const {},
+}) {
   final parsed = scannedSession.parsedSession;
+  final resolvedThreadName =
+      threadNamesBySessionId[parsed.sessionId]?.threadName.trim().isNotEmpty ==
+          true
+      ? threadNamesBySessionId[parsed.sessionId]!.threadName.trim()
+      : parsed.threadName?.trim() ?? '';
   final sourceType = scannedSession.sourceType == SessionSourceType.windows
       ? SessionSearchSourceType.windows
       : SessionSearchSourceType.wsl;
@@ -1349,7 +1376,7 @@ void _upsertParsedSession(
       platformPath: scannedSession.mappedPath.platformPath,
       title: _cleanDisplayTitle(parsed.title),
       summary: _cleanDisplaySummary(parsed.summary),
-      threadName: parsed.threadName?.trim() ?? '',
+      threadName: resolvedThreadName,
       userMessages: _messagesForAuthor(parsed, CodexMessageAuthorType.user),
       assistantMessages: _messagesForAuthor(
         parsed,
@@ -1414,7 +1441,7 @@ void _upsertParsedSession(
     ''',
     [
       parsed.sessionId,
-      parsed.threadName,
+      resolvedThreadName,
       parsed.threadSource,
       parsed.parentThreadId,
       parsed.agentNickname,
@@ -2206,6 +2233,85 @@ String _cleanDisplaySummary(String? value) {
     return '';
   }
   return trimmed;
+}
+
+Future<Map<String, CodexThreadNameEntry>> _readSessionIndexThreadNames(
+  PathSettings paths,
+) {
+  return Profiling.spanAsync('scan.runtime.read_session_index_names', () async {
+    final reader = CodexSessionIndexReader();
+    final results = await Future.wait([
+      reader.read(File(p.join(paths.windowsCodexPath, 'session_index.jsonl'))),
+      reader.read(File(p.join(paths.wslCodexUncPath, 'session_index.jsonl'))),
+    ]);
+    final merged = <String, CodexThreadNameEntry>{};
+    for (final result in results) {
+      for (final entry in result.entriesById.values) {
+        final previous = merged[entry.id];
+        if (previous == null ||
+            _isNewerThreadNameEntry(
+              entry.updatedAtUtc,
+              previous.updatedAtUtc,
+            )) {
+          merged[entry.id] = entry;
+        }
+      }
+    }
+    return merged;
+  });
+}
+
+bool _isNewerThreadNameEntry(DateTime? candidate, DateTime? previous) {
+  if (candidate == null) {
+    return previous == null;
+  }
+  if (previous == null) {
+    return true;
+  }
+  return candidate.isAfter(previous);
+}
+
+Set<String> _applySessionIndexThreadNames(
+  Database db,
+  Map<String, CodexThreadNameEntry> threadNamesBySessionId,
+) {
+  if (threadNamesBySessionId.isEmpty) {
+    return const {};
+  }
+  final changedIds = <String>{};
+  db.execute('begin immediate');
+  try {
+    for (final entry in threadNamesBySessionId.values) {
+      final threadName = entry.threadName.trim();
+      if (threadName.isEmpty) {
+        continue;
+      }
+      final rows = db.select(
+        '''
+        select rowid, id, thread_name
+        from sessions
+        where session_id = ?
+        ''',
+        [entry.id],
+      );
+      for (final row in rows) {
+        if ((row['thread_name'] as String? ?? '') == threadName) {
+          continue;
+        }
+        final rowid = row['rowid'] as int;
+        db.execute('update sessions set thread_name = ? where rowid = ?', [
+          threadName,
+          rowid,
+        ]);
+        changedIds.add(row['id'] as String);
+      }
+    }
+    db.execute('commit');
+  } on Object {
+    db.execute('rollback');
+    rethrow;
+  }
+  return changedIds;
 }
 
 void _cleanSessionMetadataPlaceholders(Database db) {

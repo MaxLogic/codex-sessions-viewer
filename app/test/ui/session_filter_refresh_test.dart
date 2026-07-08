@@ -36,16 +36,14 @@ void main() {
     expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
     expect(find.text('Archived selected'), findsNothing);
 
-    await tester.enterText(find.bySemanticsLabel('Session search'), 'Other');
-    await tester.pumpAndSettle();
+    await _enterSessionSearch(tester, 'Other');
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
     await tester.pumpAndSettle();
     expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
 
-    await tester.enterText(find.bySemanticsLabel('Session search'), 'Keep');
-    await tester.pumpAndSettle();
+    await _enterSessionSearch(tester, 'Keep');
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
 
     await tester.tap(find.text('Keep selected'));
@@ -101,8 +99,7 @@ void main() {
       ),
     );
 
-    await tester.enterText(find.bySemanticsLabel('Session search'), 'Matching');
-    await tester.pumpAndSettle();
+    await _enterSessionSearch(tester, 'Matching');
 
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
     expect(find.text('Matching recent session'), findsWidgets);
@@ -178,8 +175,7 @@ void main() {
       ),
     );
 
-    await tester.enterText(find.bySemanticsLabel('Session search'), 'Keep');
-    await tester.pumpAndSettle();
+    await _enterSessionSearch(tester, 'Keep');
 
     await tester.tap(find.widgetWithText(ElevatedButton, 'Refresh'));
     await tester.pump();
@@ -214,6 +210,74 @@ void main() {
       findsOneWidget,
     );
     expect(find.textContaining('2 sessions visible'), findsNothing);
+  });
+
+  testWidgets('text search is debounced before filtering rows', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(
+              id: 'named',
+              title: 'Named row',
+              project: 'Viewer',
+              threadName: 'dmk2',
+            ),
+            _row(id: 'other', title: 'Other row', project: 'Viewer'),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+
+    await tester.enterText(find.bySemanticsLabel('Session search'), 'dmk2');
+    await tester.pump();
+
+    expect(_searchText(tester), 'dmk2');
+    expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 221));
+    await tester.pumpAndSettle();
+
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(find.text('Named row'), findsWidgets);
+    expect(find.text('Other row'), findsNothing);
+  });
+
+  testWidgets('clear filters stays below advanced filters', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SessionsScreen(
+          initialRows: [
+            _row(id: 'layout', title: 'Layout row', project: 'Viewer'),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Advanced filters'));
+    await tester.pumpAndSettle();
+
+    final searchLeft = tester
+        .getTopLeft(find.bySemanticsLabel('Session search'))
+        .dx;
+    final pathLeft = tester.getTopLeft(find.bySemanticsLabel('Path filter')).dx;
+    final pathBottom = tester
+        .getBottomLeft(find.bySemanticsLabel('Path filter'))
+        .dy;
+    final clearTop = tester
+        .getTopLeft(find.widgetWithText(OutlinedButton, 'Clear filters'))
+        .dy;
+
+    expect((pathLeft - searchLeft).abs(), lessThan(4));
+    expect(clearTop, greaterThan(pathBottom));
   });
 
   testWidgets('renders session identity before path and summary', (
@@ -450,8 +514,7 @@ void main() {
     expect(find.text('dmk2'), findsOneWidget);
     expect(find.text('[dmk2]'), findsNothing);
 
-    await tester.enterText(find.bySemanticsLabel('Session search'), 'dmk2');
-    await tester.pumpAndSettle();
+    await _enterSessionSearch(tester, 'dmk2');
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
     expect(find.text('dmk2'), findsWidgets);
 
@@ -459,8 +522,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Advanced filters'));
     await tester.pumpAndSettle();
-    await tester.enterText(find.bySemanticsLabel('Thread name filter'), 'mk2');
-    await tester.pumpAndSettle();
+    await _enterThreadNameFilter(tester, 'mk2');
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
@@ -735,8 +797,7 @@ void main() {
         ),
       );
 
-      await tester.enterText(find.bySemanticsLabel('Session search'), 'Needle');
-      await tester.pumpAndSettle();
+      await _enterSessionSearch(tester, 'Needle');
 
       expect(find.bySemanticsLabel('Sessions, 2 visible'), findsOneWidget);
       expect(find.text('Older parent'), findsWidgets);
@@ -1026,8 +1087,7 @@ void main() {
       ),
     );
 
-    await tester.enterText(find.bySemanticsLabel('Session search'), 'Alpha');
-    await tester.pumpAndSettle();
+    await _enterSessionSearch(tester, 'Alpha');
     expect(find.text('Beta row'), findsNothing);
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
@@ -1673,8 +1733,7 @@ void main() {
       MaterialApp(home: SessionsScreen(initialRows: rows)),
     );
 
-    await tester.enterText(find.bySemanticsLabel('Session search'), 'visible');
-    await tester.pumpAndSettle();
+    await _enterSessionSearch(tester, 'visible');
 
     expect(find.text('Visible session'), findsWidgets);
     expect(find.text('Hidden target'), findsNothing);
@@ -2202,6 +2261,31 @@ void main() {
 
     expect(find.byKey(const Key('message-card-icon-3')), findsOneWidget);
   });
+}
+
+String _searchText(WidgetTester tester) {
+  final field = tester.widget<TextField>(
+    find.descendant(
+      of: find.bySemanticsLabel('Session search'),
+      matching: find.byType(TextField),
+    ),
+  );
+  return field.controller?.text ?? '';
+}
+
+Future<void> _enterSessionSearch(WidgetTester tester, String value) async {
+  await tester.enterText(find.bySemanticsLabel('Session search'), value);
+  await _pumpFilterDebounce(tester);
+}
+
+Future<void> _enterThreadNameFilter(WidgetTester tester, String value) async {
+  await tester.enterText(find.bySemanticsLabel('Thread name filter'), value);
+  await _pumpFilterDebounce(tester);
+}
+
+Future<void> _pumpFilterDebounce(WidgetTester tester) async {
+  await tester.pump(const Duration(milliseconds: 221));
+  await tester.pumpAndSettle();
 }
 
 SessionRowViewModel _row({
