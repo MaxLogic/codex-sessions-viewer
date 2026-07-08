@@ -326,13 +326,13 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   ) async {
     final db = openFileBackedDatabase(widget.databaseFile);
     try {
-      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      final pricingResult = await PricingRepository(db).load(settings.pricing);
       final summary = UsageSummaryRepository(db).summarize(
         UsageSummaryRequest(
           period: UsagePeriod.last30Days,
           nowUtc: DateTime.now().toUtc(),
         ),
-        pricing: pricing,
+        pricing: pricingResult.catalog,
       );
       if (!mounted || generation != _usageLoadGeneration) {
         return;
