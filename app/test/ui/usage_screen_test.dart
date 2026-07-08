@@ -1,4 +1,5 @@
 import 'package:codex_sessions_viewer/src/accessibility/announcement_service.dart';
+import 'package:codex_sessions_viewer/src/ui/number_formatting.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/usage_screen.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter/material.dart';
@@ -58,7 +59,7 @@ void main() {
     expect(find.text('Tokens over time'), findsOneWidget);
     expect(find.textContaining('Tokens over time:'), findsOneWidget);
     expect(find.text('2026-06-12'), findsWidgets);
-    expect(find.text('3,200 tokens'), findsWidgets);
+    expect(find.text('${formatCompactInt(3200)} tokens'), findsWidgets);
     expect(
       find.bySemanticsLabel('Tokens over time table equivalent'),
       findsOneWidget,
@@ -76,8 +77,14 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Usage by origin'), findsOneWidget);
-    expect(find.text('User, 3 sessions, 6,000 tokens'), findsOneWidget);
-    expect(find.text('Subagent, 1 session, 1,300 tokens'), findsOneWidget);
+    expect(
+      find.text('User, 3 sessions, ${formatCompactInt(6000)} tokens'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('Subagent, 1 session, ${formatCompactInt(1300)} tokens'),
+      findsOneWidget,
+    );
 
     await tester.ensureVisible(find.text('Top'));
     await tester.tap(find.text('Top'));
@@ -87,7 +94,9 @@ void main() {
     expect(find.text('Top sessions by message count'), findsOneWidget);
     expect(find.text('Top sessions by estimated cost'), findsOneWidget);
     expect(
-      find.text('Parser cache work, Origin: User, 4,100 tokens'),
+      find.text(
+        'Parser cache work, Origin: User, ${formatCompactInt(4100)} tokens',
+      ),
       findsOneWidget,
     );
   });

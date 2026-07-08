@@ -1,4 +1,5 @@
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/ui/number_formatting.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
@@ -317,24 +318,24 @@ void main() {
       ),
     );
 
-    expect(find.text('12,345 messages'), findsOneWidget);
-    expect(find.text('6,000,000 tokens'), findsOneWidget);
+    expect(find.text('${formatCompactInt(12345)} messages'), findsOneWidget);
+    expect(find.text('${formatCompactInt(6000000)} tokens'), findsOneWidget);
 
     await tester.tap(find.text('Details'));
     await tester.pumpAndSettle();
 
-    for (final text in const [
-      'Total messages: 12,345',
-      'User message count: 3,456',
-      'Assistant message count: 7,890',
+    for (final text in [
+      'Total messages: ${formatGroupedInt(12345)}',
+      'User message count: ${formatGroupedInt(3456)}',
+      'Assistant message count: ${formatGroupedInt(7890)}',
       'Tool call count: 999',
-      'Total tokens: 6,000,000',
-      'Input tokens: 1,234,567',
-      'Output tokens: 2,345,678',
-      'Cached input tokens: 3,456,789 (57.6%)',
-      'User message tokens: 1,000,000 (16.7%)',
-      'AI response tokens: 2,000,000 (33.3%)',
-      'Tool call tokens: 3,000,000 (50%)',
+      'Total tokens: ${formatGroupedInt(6000000)}',
+      'Input tokens: ${formatGroupedInt(1234567)}',
+      'Output tokens: ${formatGroupedInt(2345678)}',
+      'Cached input tokens: ${formatGroupedInt(3456789)} (57.6%)',
+      'User message tokens: ${formatGroupedInt(1000000)} (16.7%)',
+      'AI response tokens: ${formatGroupedInt(2000000)} (33.3%)',
+      'Tool call tokens: ${formatGroupedInt(3000000)} (50%)',
     ]) {
       expect(find.text(text), findsOneWidget);
     }

@@ -205,9 +205,9 @@ class SessionDetailPane extends StatelessWidget {
     return [
       row.status,
       row.displayTotalTokens > 0
-          ? '${formatGroupedInt(row.displayTotalTokens)} tokens'
+          ? '${formatCompactInt(row.displayTotalTokens)} tokens'
           : null,
-      '${formatGroupedInt(row.messageCount)} messages',
+      '${formatCompactInt(row.messageCount)} messages',
       duration.humanDuration,
     ].whereType<String>().join(' | ');
   }
@@ -245,8 +245,8 @@ class _SelectedSessionHeader extends StatelessWidget {
               _HeaderFact(row.originLabel),
               if (row.hasThreadName) _HeaderFact('Thread ${row.threadName}'),
               _HeaderFact(row.modelLabel),
-              _HeaderFact('${formatGroupedInt(row.messageCount)} messages'),
-              _HeaderFact('${formatGroupedInt(row.displayTotalTokens)} tokens'),
+              _HeaderFact('${formatCompactInt(row.messageCount)} messages'),
+              _HeaderFact('${formatCompactInt(row.displayTotalTokens)} tokens'),
               if (row.usageRollup != null)
                 _HeaderFact(row.displayEstimatedCost),
               _HeaderFact(row.lastMessageAtUtc.shortDateTime),

@@ -1,3 +1,5 @@
+import '../number_formatting.dart';
+
 enum ConversationAuthor { user, assistant, tool, reasoning, system }
 
 class ConversationMessageViewModel {
@@ -37,7 +39,9 @@ class ConversationMessageViewModel {
 
   String get tokenLabel {
     final count = tokenCount;
-    return count == null ? 'tokens unknown' : '$count tokens';
+    return count == null
+        ? 'tokens unknown'
+        : '${formatCompactInt(count)} tokens';
   }
 
   int get lineCount => body.isEmpty ? 0 : body.split('\n').length;

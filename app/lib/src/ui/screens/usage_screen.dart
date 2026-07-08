@@ -616,16 +616,16 @@ String _chartSummary(
 }
 
 String _tokenRowSummary(UsageBreakdownRow row) {
-  return '${row.key}, ${_sessionText(row.sessionCount)}, ${_formatInt(row.totalTokens)} tokens';
+  return '${row.key}, ${_compactSessionText(row.sessionCount)}, ${_formatInt(row.totalTokens)} tokens';
 }
 
 String _costRowSummary(UsageBreakdownRow row) {
   final cost = row.costUnknown ? 'cost unknown' : row.estimatedCostText ?? '0';
-  return '${row.key}, ${_sessionText(row.sessionCount)}, $cost';
+  return '${row.key}, ${_compactSessionText(row.sessionCount)}, $cost';
 }
 
 String _sessionsRowSummary(UsageBreakdownRow row) {
-  return '${row.key}, ${_sessionText(row.sessionCount)}';
+  return '${row.key}, ${_compactSessionText(row.sessionCount)}';
 }
 
 int _tokenBarValue(UsageBreakdownRow row) => row.totalTokens;
@@ -692,10 +692,11 @@ String _topSessionRowSummary(
   return '${row.title}, Origin: ${row.originLabel}, ${summaryValue(row)}';
 }
 
-String _sessionText(int count) => count == 1 ? '1 session' : '$count sessions';
+String _compactSessionText(int count) =>
+    count == 1 ? '1 session' : '${_formatInt(count)} sessions';
 
 String _formatInt(int value) {
-  return formatGroupedInt(value);
+  return formatCompactInt(value);
 }
 
 final _emptySummary = UsageSummary(

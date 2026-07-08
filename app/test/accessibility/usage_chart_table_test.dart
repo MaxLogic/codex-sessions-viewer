@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/ui/number_formatting.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/usage_screen.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter/material.dart';
@@ -17,7 +18,10 @@ void main() {
     expect(find.text('Usage by month'), findsOneWidget);
     expect(find.text('Input vs output vs cached tokens'), findsOneWidget);
     expect(find.text('2026-06-12, 1 session, 900 tokens'), findsOneWidget);
-    expect(find.text('2026-06-13, 2 sessions, 1,800 tokens'), findsOneWidget);
+    expect(
+      find.text('2026-06-13, 2 sessions, ${formatCompactInt(1800)} tokens'),
+      findsOneWidget,
+    );
     expect(find.bySemanticsLabel('Tokens over time chart'), findsOneWidget);
     expect(
       find.bySemanticsLabel('Tokens over time table equivalent'),
@@ -43,7 +47,10 @@ void main() {
 
     expect(find.text('Tokens by model'), findsOneWidget);
     expect(find.textContaining('Tokens by model:'), findsOneWidget);
-    expect(find.text('gpt-5.4, 2 sessions, 1,800 tokens'), findsOneWidget);
+    expect(
+      find.text('gpt-5.4, 2 sessions, ${formatCompactInt(1800)} tokens'),
+      findsOneWidget,
+    );
     expect(
       find.text('claude-sonnet-4.5, 1 session, 900 tokens'),
       findsOneWidget,
@@ -56,7 +63,10 @@ void main() {
     expect(find.text('Usage by platform'), findsOneWidget);
     expect(find.text('Usage by archived state'), findsOneWidget);
     expect(find.text('Usage by origin'), findsOneWidget);
-    expect(find.text('User, 2 sessions, 1,800 tokens'), findsOneWidget);
+    expect(
+      find.text('User, 2 sessions, ${formatCompactInt(1800)} tokens'),
+      findsOneWidget,
+    );
     expect(find.bySemanticsLabel('Usage by origin chart'), findsOneWidget);
     expect(
       find.bySemanticsLabel('Usage by origin table equivalent'),

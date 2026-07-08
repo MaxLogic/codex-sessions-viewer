@@ -1,20 +1,14 @@
+import 'dart:io';
+
+import 'package:intl/intl.dart';
+
 String formatGroupedInt(int value) {
-  final text = value.abs().toString();
-  final buffer = StringBuffer();
-  for (var i = 0; i < text.length; i += 1) {
-    final remaining = text.length - i;
-    buffer.write(text[i]);
-    if (remaining > 1 && remaining % 3 == 1) {
-      buffer.write(',');
-    }
-  }
-  final formatted = buffer.toString();
-  return value < 0 ? '-$formatted' : formatted;
+  return NumberFormat.decimalPattern(_systemLocaleName()).format(value);
 }
 
 String formatCompactInt(int value) {
   final absValue = value.abs();
-  if (absValue < 10000) {
+  if (absValue < 1000) {
     return formatGroupedInt(value);
   }
   if (absValue < 1000000) {
@@ -29,9 +23,20 @@ String formatCompactInt(int value) {
 String _formatScaled(int value, int scale, String suffix) {
   final scaled = value / scale;
   final precision = scaled.abs() < 100 ? 1 : 0;
-  var text = scaled.toStringAsFixed(precision);
-  if (text.endsWith('.0')) {
+  var text = NumberFormat(
+    precision == 0 ? '0' : '0.#',
+    _systemLocaleName(),
+  ).format(scaled);
+  if (text.endsWith('.0') || text.endsWith(',0')) {
     text = text.substring(0, text.length - 2);
   }
   return '$text$suffix';
+}
+
+String _systemLocaleName() {
+  final locale = Platform.localeName;
+  if (locale.trim().isEmpty) {
+    return Intl.systemLocale;
+  }
+  return locale.replaceAll('_', '-');
 }
