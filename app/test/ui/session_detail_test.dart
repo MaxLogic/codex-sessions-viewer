@@ -390,12 +390,14 @@ void main() {
           initialRows: [
             _detailRow(
               id: 'row-1',
+              sessionId: 'row-1',
               title: 'First detail',
               project: 'First project',
               isArchived: false,
             ),
             _detailRow(
               id: 'row-2',
+              sessionId: 'row-2',
               title: 'Second detail',
               project: 'Second project',
               isArchived: false,
@@ -408,11 +410,11 @@ void main() {
       ),
     );
 
-    await tester.tap(find.text('First project').first);
+    await tester.tap(find.bySemanticsLabel(RegExp('Session First detail')));
     await tester.pumpAndSettle();
     expect(find.text('First detail'), findsWidgets);
 
-    await tester.tap(find.text('Second project').first);
+    await tester.tap(find.bySemanticsLabel(RegExp('Session Second detail')));
     await tester.pump();
 
     expect(find.byType(AnimatedSwitcher), findsWidgets);
@@ -441,12 +443,14 @@ void main() {
           initialRows: [
             _detailRow(
               id: 'row-1',
+              sessionId: 'row-1',
               title: 'First detail',
               project: 'First project',
               isArchived: false,
             ),
             _detailRow(
               id: 'row-2',
+              sessionId: 'row-2',
               title: 'Second detail',
               project: 'Second project',
               isArchived: false,
@@ -459,9 +463,9 @@ void main() {
       ),
     );
 
-    await tester.tap(find.text('First project').first);
+    await tester.tap(find.bySemanticsLabel(RegExp('Session First detail')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Second project').first);
+    await tester.tap(find.bySemanticsLabel(RegExp('Session Second detail')));
     await tester.pump();
 
     expect(
@@ -476,6 +480,7 @@ void main() {
 
 SessionRowViewModel _detailRow({
   String id = 'row-1',
+  String sessionId = 'abc123',
   String title = 'Flutter accessibility spike',
   String project = 'Codex Viewer',
   bool isArchived = true,
@@ -494,7 +499,7 @@ SessionRowViewModel _detailRow({
 }) {
   return SessionRowViewModel(
     id: id,
-    sessionId: 'abc123',
+    sessionId: sessionId,
     startedAtUtc: DateTime.utc(2026, 6, 12, 9),
     lastMessageAtUtc: DateTime.utc(2026, 6, 12, 10, 30),
     duration: const Duration(minutes: 90),
