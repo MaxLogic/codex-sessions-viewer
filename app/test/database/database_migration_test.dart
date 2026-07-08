@@ -59,7 +59,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 9);
+    expect(versionRows.length, 10);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -96,6 +96,10 @@ void main() {
     expect(versionRows[8]['filename'], '009_message_search.sql');
     expect(versionRows[8]['checksum_length'], greaterThan(20));
     expect(versionRows[8]['success'], 1);
+    expect(versionRows[9]['version'], 10);
+    expect(versionRows[9]['filename'], '010_session_id_lookup_index.sql');
+    expect(versionRows[9]['checksum_length'], greaterThan(20));
+    expect(versionRows[9]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -109,6 +113,7 @@ void main() {
     expect(_columnExists(db, 'sessions', 'eval_expected_output'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_reviewed_at_utc'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_updated_at_utc'), isTrue);
+    expect(_indexExists(db, 'idx_sessions_session_id'), isTrue);
   });
 
   test(
@@ -132,7 +137,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 9);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 10);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -658,10 +663,10 @@ void main() {
     ).copy(evalMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 9);
+    expect(migrator.supportedSchemaVersion, 10);
     final result = await migrator.openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue);
-    expect(result.lastAppliedSchemaVersion, 9);
+    expect(result.lastAppliedSchemaVersion, 10);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -701,29 +706,31 @@ void main() {
     expect(row['eval_updated_at_utc'], isNull);
   });
 
-  test('migration 009 backfills message search rows', () async {
-    final sqlRoot = await _copySqlRoot(tempDir);
-    final db = openFileBackedDatabase(dbFile);
-    for (final path in [
-      ['init', '001_initial_schema.sql'],
-      ['migration', '002_search_filter_schema.sql'],
-      ['migration', '003_project_override.sql'],
-      ['migration', '004_session_token_buckets.sql'],
-      ['migration', '005_scan_run_status.sql'],
-      ['migration', '006_session_origin.sql'],
-      ['migration', '007_session_thread_name.sql'],
-      ['migration', '008_local_eval_metadata.sql'],
-    ]) {
-      await _applySqlFile(
-        db,
-        File(
-          '${sqlRoot.path}${Platform.pathSeparator}${path[0]}'
-          '${Platform.pathSeparator}${path[1]}',
-        ),
-      );
-    }
-    expect(_tableExists(db, 'message_search'), isFalse);
-    db.execute('''
+  test(
+    'migration 009 creates message search without startup backfill',
+    () async {
+      final sqlRoot = await _copySqlRoot(tempDir);
+      final db = openFileBackedDatabase(dbFile);
+      for (final path in [
+        ['init', '001_initial_schema.sql'],
+        ['migration', '002_search_filter_schema.sql'],
+        ['migration', '003_project_override.sql'],
+        ['migration', '004_session_token_buckets.sql'],
+        ['migration', '005_scan_run_status.sql'],
+        ['migration', '006_session_origin.sql'],
+        ['migration', '007_session_thread_name.sql'],
+        ['migration', '008_local_eval_metadata.sql'],
+      ]) {
+        await _applySqlFile(
+          db,
+          File(
+            '${sqlRoot.path}${Platform.pathSeparator}${path[0]}'
+            '${Platform.pathSeparator}${path[1]}',
+          ),
+        );
+      }
+      expect(_tableExists(db, 'message_search'), isFalse);
+      db.execute('''
       insert into sessions (
         id,
         source_type,
@@ -748,7 +755,7 @@ void main() {
         '2026-07-07T10:00:00.000Z'
       )
       ''');
-    db.execute('''
+      db.execute('''
       insert into messages (
         session_id,
         message_index,
@@ -771,17 +778,17 @@ void main() {
         '2026-07-07T10:05:00.000Z'
       )
       ''');
-    db.close();
+      db.close();
 
-    final result = await DatabaseMigrator(
-      sqlRoot: sqlRoot,
-    ).openAndMigrate(dbFile);
-    expect(result.canStartNormalUi, isTrue);
-    expect(result.lastAppliedSchemaVersion, 9);
+      final result = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+      expect(result.canStartNormalUi, isTrue);
+      expect(result.lastAppliedSchemaVersion, 10);
 
-    final migrated = openFileBackedDatabase(dbFile);
-    addTearDown(migrated.close);
-    final rows = migrated.select('''
+      final migrated = openFileBackedDatabase(dbFile);
+      addTearDown(migrated.close);
+      final rows = migrated.select('''
       select
         session_id,
         message_index,
@@ -791,13 +798,10 @@ void main() {
       from message_search
       where message_search match 'migration'
       ''');
-    expect(rows, hasLength(1));
-    expect(rows.single['session_id'], 'message-search-existing');
-    expect(rows.single['message_index'], 4);
-    expect(rows.single['author_type'], 'assistant');
-    expect(rows.single['created_at_utc'], '2026-07-07T10:05:00.000Z');
-    expect(rows.single['snippet'], contains('<mark>'));
-  });
+      expect(rows, isEmpty);
+      expect(_indexExists(migrated, 'idx_sessions_session_id'), isTrue);
+    },
+  );
 
   test('rolls back failed migrations and records failure metadata', () async {
     final sqlRoot = Directory(
