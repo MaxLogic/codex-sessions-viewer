@@ -760,6 +760,50 @@ void main() {
     );
   });
 
+  test('message search backfill does not block startup', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'csv_runtime_backfill_',
+    );
+    addTearDown(() async {
+      if (await tempDir.exists()) {
+        await _deleteTempDirWithRetry(tempDir);
+      }
+    });
+    final dbFile = File(p.join(tempDir.path, 'viewer.sqlite'));
+    final settingsFile = File(p.join(tempDir.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(AppSettings.defaults());
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+    ).openAndMigrate(dbFile);
+    expect(startup.canStartNormalUi, isTrue);
+    final db = openFileBackedDatabase(dbFile);
+    _insertBackfillSession(db);
+    for (var i = 0; i < 50; i++) {
+      _insertBackfillMessage(db, i);
+    }
+    db.close();
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: dbFile,
+    );
+    final stopwatch = Stopwatch()..start();
+    final operation = controller
+        .startMessageSearchBackfillInBackgroundOperation(
+          batchSize: 1,
+          pauseBetweenBatches: const Duration(milliseconds: 20),
+        );
+    stopwatch.stop();
+
+    expect(stopwatch.elapsedMilliseconds, lessThan(200));
+    var completedImmediately = false;
+    operation.result.then((_) => completedImmediately = true);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    expect(completedImmediately, isFalse);
+
+    await operation.cancel();
+  });
+
   testWidgets('production refresh distinguishes path errors from empty roots', (
     tester,
   ) async {
@@ -2280,6 +2324,78 @@ Future<File> _writeWslJsonFixture(
 
 String _escapedJsonString(String value) =>
     value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
+
+void _insertBackfillSession(Database db) {
+  db.execute('''
+    insert into sessions (
+      id,
+      source_type,
+      source_file_path,
+      display_path,
+      platform_path,
+      title,
+      scan_status,
+      parse_status,
+      created_at_utc,
+      updated_at_utc
+    ) values (
+      'backfill-session',
+      'windows',
+      'backfill.jsonl',
+      'backfill.jsonl',
+      'backfill.jsonl',
+      'Backfill session',
+      'available',
+      'available',
+      '2026-07-08T10:00:00.000Z',
+      '2026-07-08T10:00:00.000Z'
+    )
+    ''');
+}
+
+void _insertBackfillMessage(Database db, int index) {
+  final content = 'background backfill needle $index';
+  db.execute(
+    '''
+    insert into messages (
+      session_id,
+      message_index,
+      author_type,
+      created_at_utc,
+      first_line,
+      content_plain,
+      content_preview,
+      created_at_db_utc,
+      updated_at_db_utc
+    ) values (
+      'backfill-session',
+      ?,
+      'user',
+      '2026-07-08T10:00:00.000Z',
+      ?,
+      ?,
+      ?,
+      '2026-07-08T10:00:00.000Z',
+      '2026-07-08T10:00:00.000Z'
+    )
+    ''',
+    [index, content, content, content],
+  );
+}
+
+Future<void> _deleteTempDirWithRetry(Directory directory) async {
+  for (var attempt = 0; attempt < 5; attempt++) {
+    try {
+      await directory.delete(recursive: true);
+      return;
+    } on FileSystemException {
+      if (attempt == 4) {
+        rethrow;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+}
 
 class _RecordingWslProjectResolver implements WslProjectResolver {
   _RecordingWslProjectResolver(this.results);

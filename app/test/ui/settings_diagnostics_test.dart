@@ -19,22 +19,55 @@ void main() {
       ),
     );
 
-    for (final label in SettingsDiagnosticAction.values.map(
-      (action) => action.label,
-    )) {
+    for (final action in SettingsDiagnosticAction.values) {
+      final label = action.label;
+      final expectedMessage =
+          action == SettingsDiagnosticAction.messageSearchBackfillStatus
+          ? 'Message search backfill: 5 indexed, 3 remaining.'
+          : '$label checked.';
       expect(find.text(label), findsOneWidget);
       await tester.ensureVisible(find.text(label));
       await tester.tap(find.text(label));
       await tester.pump();
 
-      expect(find.text('Result: Success. $label checked.'), findsOneWidget);
+      expect(find.text('Result: Success. $expectedMessage'), findsOneWidget);
       expect(
-        find.bySemanticsLabel('Diagnostic result: Success. $label checked.'),
+        find.bySemanticsLabel('Diagnostic result: Success. $expectedMessage'),
         findsOneWidget,
       );
     }
 
     expect(diagnostics.actions, SettingsDiagnosticAction.values);
+  });
+
+  testWidgets('message search backfill reports progress', (tester) async {
+    final diagnostics = _RecordingDiagnostics();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          initialSettings: AppSettings.defaults(),
+          diagnostics: diagnostics,
+        ),
+      ),
+    );
+
+    await tester.ensureVisible(find.text('Message search backfill status'));
+    await tester.tap(find.text('Message search backfill status'));
+    await tester.pump();
+
+    expect(
+      find.text(
+        'Result: Success. Message search backfill: 5 indexed, 3 remaining.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.bySemanticsLabel(
+        'Diagnostic result: Success. Message search backfill: 5 indexed, 3 remaining.',
+      ),
+      findsOneWidget,
+    );
   });
 }
 
@@ -47,6 +80,11 @@ class _RecordingDiagnostics implements SettingsDiagnostics {
     AppSettings settings,
   ) async {
     actions.add(action);
+    if (action == SettingsDiagnosticAction.messageSearchBackfillStatus) {
+      return SettingsDiagnosticResult.success(
+        'Message search backfill: 5 indexed, 3 remaining.',
+      );
+    }
     return SettingsDiagnosticResult.success('${action.label} checked.');
   }
 }

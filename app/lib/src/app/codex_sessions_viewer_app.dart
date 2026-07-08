@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
 import '../config/app_settings.dart';
+import '../config/settings_diagnostics.dart';
 import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
 import '../database/project_tag_state.dart';
@@ -93,6 +94,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   var _sectionRequestSerial = 0;
   SessionOpenTarget? _sessionOpenTarget;
   var _sessionOpenTargetSerial = 0;
+  CancellableMessageSearchBackfillOperation? _messageSearchBackfill;
 
   @override
   Widget build(BuildContext context) {
@@ -147,6 +149,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                 _syncStartupPreferenceLater(settings);
               }
               _startUsageSummaryLoad(settings);
+              _startMessageSearchBackfill();
               return CodexAppShell(
                 motionMode: settings.ui.motion,
                 requestedSection: _requestedSection,
@@ -188,6 +191,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                 usageScreen: UsageScreen(summary: _usageSummary),
                 settingsScreen: SettingsScreen(
                   initialSettings: settings,
+                  diagnostics: DatabaseSettingsDiagnostics(widget.databaseFile),
                   onSave: _saveSettings,
                   onReload: _reloadSettings,
                 ),
@@ -198,6 +202,22 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         },
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    unawaited(_messageSearchBackfill?.cancel());
+    super.dispose();
+  }
+
+  void _startMessageSearchBackfill() {
+    if (_messageSearchBackfill != null) {
+      return;
+    }
+    _messageSearchBackfill = RuntimeSessionController(
+      settingsFile: widget.settingsFile,
+      databaseFile: widget.databaseFile,
+    ).startMessageSearchBackfillInBackgroundOperation();
   }
 
   SessionsRefreshOperation _sessionRefreshOperation(

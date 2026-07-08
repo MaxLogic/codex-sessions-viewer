@@ -442,6 +442,18 @@ class RuntimeSessionController {
     return startRefreshInBackgroundOperation(onProgress: onProgress).result;
   }
 
+  CancellableMessageSearchBackfillOperation
+  startMessageSearchBackfillInBackgroundOperation({
+    int batchSize = 500,
+    Duration pauseBetweenBatches = const Duration(milliseconds: 10),
+  }) {
+    return _BackgroundMessageSearchBackfillOperation.start(
+      databaseFile: databaseFile,
+      batchSize: batchSize,
+      pauseBetweenBatches: pauseBetweenBatches,
+    );
+  }
+
   Future<SessionsRefreshResult> _refreshInBackground({
     SessionsRefreshProgressCallback? onProgress,
     required _BackgroundScanCancellationHandle cancellationHandle,
@@ -966,6 +978,52 @@ Future<void> _backgroundCachedRowsEntry(
   }
 }
 
+Future<void> _backgroundMessageSearchBackfillEntry(
+  _BackgroundMessageSearchBackfillRequest request,
+) async {
+  final cancelPort = ReceivePort();
+  StreamSubscription<Object?>? cancelSubscription;
+  var cancelRequested = false;
+  try {
+    request.sendPort.send(_BackgroundRefreshControl(cancelPort.sendPort));
+    cancelSubscription = cancelPort.listen((message) {
+      if (message is _BackgroundRefreshCancel) {
+        cancelRequested = true;
+      }
+    });
+    final db = openFileBackedDatabase(File(request.databaseFilePath));
+    try {
+      var result = MessageSearchIndex(
+        db,
+      ).backfillStatus().toResult(indexedInBatch: 0, complete: false);
+      while (!cancelRequested) {
+        result = MessageSearchIndex(db).backfillBatch(limit: request.batchSize);
+        if (result.complete || result.remaining == 0) {
+          break;
+        }
+        await Future<void>.delayed(request.pauseBetweenBatches);
+      }
+      if (cancelRequested) {
+        result = MessageSearchIndex(db).backfillStatus().toResult(
+          indexedInBatch: 0,
+          complete: false,
+          cancelled: true,
+        );
+      }
+      request.sendPort.send(_BackgroundMessageSearchBackfillDone(result));
+    } finally {
+      db.close();
+    }
+  } on Object catch (error, stackTrace) {
+    request.sendPort.send(
+      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+    );
+  } finally {
+    await cancelSubscription?.cancel();
+    cancelPort.close();
+  }
+}
+
 Future<void> _backgroundSessionDetailEntry(
   _BackgroundSessionDetailRequest request,
 ) async {
@@ -1037,6 +1095,20 @@ class _BackgroundCachedRowsRequest {
   final int batchSize;
 }
 
+class _BackgroundMessageSearchBackfillRequest {
+  const _BackgroundMessageSearchBackfillRequest({
+    required this.databaseFilePath,
+    required this.sendPort,
+    required this.batchSize,
+    required this.pauseBetweenBatches,
+  });
+
+  final String databaseFilePath;
+  final SendPort sendPort;
+  final int batchSize;
+  final Duration pauseBetweenBatches;
+}
+
 class _BackgroundSessionDetailRequest {
   const _BackgroundSessionDetailRequest({
     required this.settingsFilePath,
@@ -1071,6 +1143,12 @@ class _BackgroundRefreshDone {
   final SessionsRefreshResult result;
 }
 
+class _BackgroundMessageSearchBackfillDone {
+  const _BackgroundMessageSearchBackfillDone(this.result);
+
+  final MessageSearchBackfillResult result;
+}
+
 class _BackgroundRefreshError {
   const _BackgroundRefreshError(this.error, this.stackTrace);
 
@@ -1095,6 +1173,128 @@ class CancellableSessionScanOperation {
       _requestCancel();
     }
     return _done;
+  }
+}
+
+class CancellableMessageSearchBackfillOperation {
+  CancellableMessageSearchBackfillOperation._(
+    this.result,
+    void Function() requestCancel,
+  ) : _requestCancel = requestCancel {
+    _done = result.then<void>((_) {}, onError: (_) {});
+  }
+
+  final Future<MessageSearchBackfillResult> result;
+  final void Function() _requestCancel;
+  late final Future<void> _done;
+  var _cancelRequested = false;
+
+  Future<void> cancel() {
+    if (!_cancelRequested) {
+      _cancelRequested = true;
+      _requestCancel();
+    }
+    return _done;
+  }
+}
+
+class _BackgroundMessageSearchBackfillOperation {
+  static CancellableMessageSearchBackfillOperation start({
+    required File databaseFile,
+    required int batchSize,
+    required Duration pauseBetweenBatches,
+  }) {
+    final cancellationHandle = _BackgroundScanCancellationHandle();
+    final result = _start(
+      databaseFile: databaseFile,
+      batchSize: batchSize,
+      pauseBetweenBatches: pauseBetweenBatches,
+      cancellationHandle: cancellationHandle,
+    );
+    return CancellableMessageSearchBackfillOperation._(
+      result,
+      cancellationHandle.requestCancel,
+    );
+  }
+
+  static Future<MessageSearchBackfillResult> _start({
+    required File databaseFile,
+    required int batchSize,
+    required Duration pauseBetweenBatches,
+    required _BackgroundScanCancellationHandle cancellationHandle,
+  }) async {
+    final messages = ReceivePort();
+    final errors = ReceivePort();
+    final exits = ReceivePort();
+    Isolate? isolate;
+    try {
+      isolate = await Isolate.spawn<_BackgroundMessageSearchBackfillRequest>(
+        _backgroundMessageSearchBackfillEntry,
+        _BackgroundMessageSearchBackfillRequest(
+          databaseFilePath: databaseFile.path,
+          sendPort: messages.sendPort,
+          batchSize: batchSize,
+          pauseBetweenBatches: pauseBetweenBatches,
+        ),
+        onError: errors.sendPort,
+        onExit: exits.sendPort,
+      );
+
+      final result = Completer<MessageSearchBackfillResult>();
+      late StreamSubscription<Object?> messageSubscription;
+      late StreamSubscription<Object?> errorSubscription;
+      late StreamSubscription<Object?> exitSubscription;
+
+      void finishError(Object error, [StackTrace? stackTrace]) {
+        if (!result.isCompleted) {
+          result.completeError(error, stackTrace);
+        }
+      }
+
+      messageSubscription = messages.listen((message) {
+        if (message is _BackgroundRefreshControl) {
+          cancellationHandle.attach(message.cancelPort);
+          return;
+        }
+        if (message is _BackgroundMessageSearchBackfillDone) {
+          if (!result.isCompleted) {
+            result.complete(message.result);
+          }
+          return;
+        }
+        if (message is _BackgroundRefreshError) {
+          finishError(
+            StateError(message.error),
+            StackTrace.fromString(message.stackTrace),
+          );
+        }
+      });
+      errorSubscription = errors.listen((message) {
+        finishError(
+          StateError('Background message search backfill failed. $message'),
+        );
+      });
+      exitSubscription = exits.listen((_) {
+        if (!result.isCompleted) {
+          finishError(
+            StateError(
+              'Background message search backfill exited before completion.',
+            ),
+          );
+        }
+      });
+
+      return await result.future.whenComplete(() async {
+        await messageSubscription.cancel();
+        await errorSubscription.cancel();
+        await exitSubscription.cancel();
+      });
+    } finally {
+      messages.close();
+      errors.close();
+      exits.close();
+      isolate?.kill(priority: Isolate.immediate);
+    }
   }
 }
 

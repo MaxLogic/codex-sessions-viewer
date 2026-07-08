@@ -1,3 +1,7 @@
+import 'dart:io';
+
+import '../database/database_connection.dart';
+import '../search/message_search.dart';
 import 'app_settings.dart';
 
 enum SettingsDiagnosticAction {
@@ -9,6 +13,7 @@ enum SettingsDiagnosticAction {
   testCodexCommand('Test Codex command'),
   testVoiceOverSounds('Test voice-over sounds'),
   testOpenRouterPricingFetch('Test OpenRouter pricing fetch'),
+  messageSearchBackfillStatus('Message search backfill status'),
   openDatabaseFolder('Open database folder'),
   openLogsFolder('Open logs folder');
 
@@ -51,5 +56,31 @@ class DefaultSettingsDiagnostics implements SettingsDiagnostics {
     AppSettings settings,
   ) async {
     return SettingsDiagnosticResult.success('${action.label} is available.');
+  }
+}
+
+class DatabaseSettingsDiagnostics implements SettingsDiagnostics {
+  const DatabaseSettingsDiagnostics(this.databaseFile);
+
+  final File databaseFile;
+
+  @override
+  Future<SettingsDiagnosticResult> run(
+    SettingsDiagnosticAction action,
+    AppSettings settings,
+  ) async {
+    if (action != SettingsDiagnosticAction.messageSearchBackfillStatus) {
+      return const DefaultSettingsDiagnostics().run(action, settings);
+    }
+    final db = openFileBackedDatabase(databaseFile);
+    try {
+      final status = MessageSearchIndex(db).backfillStatus();
+      return SettingsDiagnosticResult.success(
+        'Message search backfill: ${status.indexed} indexed, '
+        '${status.remaining} remaining.',
+      );
+    } finally {
+      db.close();
+    }
   }
 }

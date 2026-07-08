@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added resumable background backfill for historical message search rows plus a Settings diagnostic for indexed and remaining message-search counts.
 - Added a persisted `app.start_with_windows` setting, defaulted on, exposed in Settings under Application, and wired to the current-user Windows Run key.
 - Added subagent-aware session grouping, main/subagent usage rollups, and origin breakdowns in Usage statistics.
 - Added a persisted `ui.motion` setting with `system`, `reduced`, and `normal` choices exposed in Settings.

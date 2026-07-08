@@ -4,6 +4,10 @@ class MessageSearchIndex {
   const MessageSearchIndex(this.db);
 
   final Database db;
+  static const _lastMessageRowIdKey =
+      'message_search.backfill.last_message_rowid';
+  static const _updatedAtKey = 'message_search.backfill.updated_at_utc';
+  static const _completedAtKey = 'message_search.backfill.completed_at_utc';
 
   void replaceSessionMessages(
     String sessionId,
@@ -40,6 +44,114 @@ class MessageSearchIndex {
 
   void deleteSession(String sessionId) {
     db.execute('delete from message_search where session_id = ?', [sessionId]);
+  }
+
+  MessageSearchBackfillResult backfillBatch({int limit = 500}) {
+    if (limit <= 0) {
+      return backfillStatus().toResult(indexedInBatch: 0, complete: false);
+    }
+    final lastRowId = _metadataInt(_lastMessageRowIdKey);
+    final insert = db.prepare('''
+      insert into message_search (
+        session_id,
+        message_index,
+        author_type,
+        created_at_utc,
+        content
+      ) values (?, ?, ?, ?, ?)
+      ''');
+    var maxRowId = lastRowId;
+    var indexed = 0;
+    var complete = false;
+    try {
+      db.execute('begin immediate');
+      final rows = db.select(
+        '''
+        select
+          rowid as message_rowid,
+          session_id,
+          message_index,
+          author_type,
+          created_at_utc,
+          content_plain
+        from messages
+        where rowid > ?
+          and trim(coalesce(content_plain, '')) <> ''
+        order by rowid
+        limit ?
+        ''',
+        [lastRowId, limit],
+      );
+      if (rows.isEmpty) {
+        _setMetadata(_completedAtKey, DateTime.now().toUtc().toIso8601String());
+        complete = true;
+      }
+      for (final row in rows) {
+        final content = (row['content_plain'] as String? ?? '').trim();
+        if (content.isEmpty) {
+          continue;
+        }
+        final sessionId = row['session_id'] as String;
+        final messageIndex = row['message_index'] as int;
+        db.execute(
+          'delete from message_search where session_id = ? and message_index = ?',
+          [sessionId, messageIndex],
+        );
+        insert.execute([
+          sessionId,
+          messageIndex,
+          row['author_type'] as String? ?? '',
+          row['created_at_utc'] as String?,
+          content,
+        ]);
+        indexed++;
+        maxRowId = row['message_rowid'] as int;
+      }
+      if (rows.isNotEmpty) {
+        _setMetadata(_lastMessageRowIdKey, maxRowId.toString());
+        _setMetadata(_updatedAtKey, DateTime.now().toUtc().toIso8601String());
+      }
+      db.execute('commit');
+    } on Object {
+      db.execute('rollback');
+      rethrow;
+    } finally {
+      insert.close();
+    }
+    final status = backfillStatus();
+    return status.toResult(
+      indexedInBatch: indexed,
+      complete: complete || status.remaining == 0,
+    );
+  }
+
+  MessageSearchBackfillStatus backfillStatus() {
+    final lastRowId = _metadataInt(_lastMessageRowIdKey);
+    final indexed =
+        db
+                .select('select count(*) as count from message_search')
+                .single['count']
+            as int;
+    final remaining =
+        db
+                .select(
+                  '''
+          select count(*) as count
+          from messages
+          where rowid > ?
+            and trim(coalesce(content_plain, '')) <> ''
+          ''',
+                  [lastRowId],
+                )
+                .single['count']
+            as int;
+    return MessageSearchBackfillStatus(
+      indexed: indexed,
+      remaining: remaining,
+      lastMessageRowId: lastRowId,
+      updatedAtUtc: _dateTime(_metadataString(_updatedAtKey)),
+      completedAtUtc: _dateTime(_metadataString(_completedAtKey)),
+    );
   }
 
   List<MessageSearchResult> search(MessageSearchQuery query) {
@@ -100,6 +212,34 @@ class MessageSearchIndex {
         ),
     ];
   }
+
+  int _metadataInt(String key) {
+    final value = _metadataString(key);
+    return int.tryParse(value ?? '') ?? 0;
+  }
+
+  String? _metadataString(String key) {
+    final rows = db.select('select value from app_metadata where key = ?', [
+      key,
+    ]);
+    if (rows.isEmpty) {
+      return null;
+    }
+    return rows.single['value'] as String?;
+  }
+
+  void _setMetadata(String key, String value) {
+    db.execute(
+      '''
+      insert into app_metadata (key, value, updated_at_utc)
+      values (?, ?, ?)
+      on conflict(key) do update set
+        value = excluded.value,
+        updated_at_utc = excluded.updated_at_utc
+      ''',
+      [key, value, DateTime.now().toUtc().toIso8601String()],
+    );
+  }
 }
 
 class MessageSearchDocument {
@@ -147,6 +287,53 @@ class MessageSearchResult {
   final String projectName;
   final String sourceType;
   final DateTime? timestampUtc;
+}
+
+class MessageSearchBackfillStatus {
+  const MessageSearchBackfillStatus({
+    required this.indexed,
+    required this.remaining,
+    required this.lastMessageRowId,
+    required this.updatedAtUtc,
+    required this.completedAtUtc,
+  });
+
+  final int indexed;
+  final int remaining;
+  final int lastMessageRowId;
+  final DateTime? updatedAtUtc;
+  final DateTime? completedAtUtc;
+
+  MessageSearchBackfillResult toResult({
+    required int indexedInBatch,
+    required bool complete,
+    bool cancelled = false,
+  }) => MessageSearchBackfillResult(
+    indexed: indexed,
+    remaining: remaining,
+    lastMessageRowId: lastMessageRowId,
+    indexedInBatch: indexedInBatch,
+    complete: complete,
+    cancelled: cancelled,
+  );
+}
+
+class MessageSearchBackfillResult {
+  const MessageSearchBackfillResult({
+    required this.indexed,
+    required this.remaining,
+    required this.lastMessageRowId,
+    required this.indexedInBatch,
+    required this.complete,
+    this.cancelled = false,
+  });
+
+  final int indexed;
+  final int remaining;
+  final int lastMessageRowId;
+  final int indexedInBatch;
+  final bool complete;
+  final bool cancelled;
 }
 
 List<String> _searchTokens(String text) => text
