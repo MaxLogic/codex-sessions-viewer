@@ -17,17 +17,21 @@ class PricingRepository {
     DateTime? nowUtc,
   }) async {
     final now = (nowUtc ?? DateTime.now().toUtc()).toUtc();
-    _upsertOverrides(settings, now);
-    if (!settings.useExternalPricing) {
-      return PricingLoadResult.success(
-        _loadCatalog(settings, includeOpenRouter: false),
-      );
-    }
-    final cutoff = _openRouterCutoff(settings, now);
-    if (_hasFreshOpenRouterCache(settings, now)) {
-      return PricingLoadResult.success(_loadCatalog(settings, cutoff: cutoff));
-    }
+    final cutoff = settings.useExternalPricing
+        ? _openRouterCutoff(settings, now)
+        : null;
     try {
+      _upsertOverrides(settings, now);
+      if (!settings.useExternalPricing) {
+        return PricingLoadResult.success(
+          _loadCatalog(settings, includeOpenRouter: false),
+        );
+      }
+      if (_hasFreshOpenRouterCache(settings, now)) {
+        return PricingLoadResult.success(
+          _loadCatalog(settings, cutoff: cutoff),
+        );
+      }
       await _fetchAndCache(
         settings,
         client ?? const OpenRouterHttpClient(),
@@ -37,7 +41,11 @@ class PricingRepository {
     } on Object catch (error) {
       _recordPricingError(error);
       return PricingLoadResult.failure(
-        _loadCatalog(settings, staleOpenRouterOverrideCutoff: cutoff),
+        _loadCatalog(
+          settings,
+          includeOpenRouter: settings.useExternalPricing,
+          staleOpenRouterOverrideCutoff: cutoff,
+        ),
         errorMessage: error.toString(),
       );
     }
@@ -49,14 +57,16 @@ class PricingRepository {
     DateTime? nowUtc,
   }) async {
     final now = (nowUtc ?? DateTime.now().toUtc()).toUtc();
-    _upsertOverrides(settings, now);
-    if (!settings.useExternalPricing) {
-      return PricingLoadResult.success(
-        _loadCatalog(settings, includeOpenRouter: false),
-      );
-    }
-    final cutoff = _openRouterCutoff(settings, now);
+    final cutoff = settings.useExternalPricing
+        ? _openRouterCutoff(settings, now)
+        : null;
     try {
+      _upsertOverrides(settings, now);
+      if (!settings.useExternalPricing) {
+        return PricingLoadResult.success(
+          _loadCatalog(settings, includeOpenRouter: false),
+        );
+      }
       await _fetchAndCache(
         settings,
         client ?? const OpenRouterHttpClient(),
@@ -66,7 +76,11 @@ class PricingRepository {
     } on Object catch (error) {
       _recordPricingError(error);
       return PricingLoadResult.failure(
-        _loadCatalog(settings, staleOpenRouterOverrideCutoff: cutoff),
+        _loadCatalog(
+          settings,
+          includeOpenRouter: settings.useExternalPricing,
+          staleOpenRouterOverrideCutoff: cutoff,
+        ),
         errorMessage: error.toString(),
       );
     }
@@ -74,7 +88,6 @@ class PricingRepository {
 
   UsagePricingCatalog loadCached(PricingSettings settings, {DateTime? nowUtc}) {
     final now = (nowUtc ?? DateTime.now().toUtc()).toUtc();
-    _upsertOverrides(settings, now);
     if (!settings.useExternalPricing) {
       return _loadCatalog(settings, includeOpenRouter: false);
     }
@@ -188,9 +201,20 @@ class PricingRepository {
     if (!settings.fallbackToOverrides) {
       return;
     }
+    final pending = <MapEntry<String, PricingOverrideSettings>>[];
     for (final entry in settings.overrides.entries) {
       final existing = db.select(
-        'select source from model_pricing_cache where model_id = ?',
+        '''
+        select
+          source,
+          prompt_price_per_token,
+          completion_price_per_token,
+          input_cache_read_price_per_token,
+          input_cache_write_price_per_token,
+          internal_reasoning_price_per_token
+        from model_pricing_cache
+        where model_id = ?
+        ''',
         [entry.key],
       );
       if (settings.useExternalPricing &&
@@ -199,37 +223,81 @@ class PricingRepository {
         continue;
       }
       final override = entry.value;
-      db.execute(
-        '''
-        insert into model_pricing_cache (
-          model_id, provider, prompt_price_per_token,
-          completion_price_per_token, input_cache_read_price_per_token,
-          input_cache_write_price_per_token,
-          internal_reasoning_price_per_token, fetched_at_utc, source
-        ) values (?, 'override', ?, ?, ?, ?, ?, ?, 'override')
-        on conflict(model_id) do update set
-          provider = excluded.provider,
-          prompt_price_per_token = excluded.prompt_price_per_token,
-          completion_price_per_token = excluded.completion_price_per_token,
-          input_cache_read_price_per_token =
-            excluded.input_cache_read_price_per_token,
-          input_cache_write_price_per_token =
-            excluded.input_cache_write_price_per_token,
-          internal_reasoning_price_per_token =
-            excluded.internal_reasoning_price_per_token,
-          fetched_at_utc = excluded.fetched_at_utc,
-          source = excluded.source
-        ''',
-        [
-          entry.key,
-          override.prompt,
-          override.completion,
-          override.inputCacheRead,
-          override.inputCacheWrite,
-          override.internalReasoning,
-          now.toIso8601String(),
-        ],
-      );
+      if (existing.isNotEmpty &&
+          existing.single['source'] == 'override' &&
+          existing.single['prompt_price_per_token'] == override.prompt &&
+          existing.single['completion_price_per_token'] ==
+              override.completion &&
+          existing.single['input_cache_read_price_per_token'] ==
+              override.inputCacheRead &&
+          existing.single['input_cache_write_price_per_token'] ==
+              override.inputCacheWrite &&
+          existing.single['internal_reasoning_price_per_token'] ==
+              override.internalReasoning) {
+        continue;
+      }
+      pending.add(entry);
+    }
+    if (pending.isEmpty) {
+      return;
+    }
+
+    db.execute('begin immediate');
+    try {
+      final statement = db.prepare('''
+          insert into model_pricing_cache (
+            model_id, provider, prompt_price_per_token,
+            completion_price_per_token, input_cache_read_price_per_token,
+            input_cache_write_price_per_token,
+            internal_reasoning_price_per_token, fetched_at_utc, source
+          ) values (?, 'override', ?, ?, ?, ?, ?, ?, 'override')
+          on conflict(model_id) do update set
+            provider = excluded.provider,
+            prompt_price_per_token = excluded.prompt_price_per_token,
+            completion_price_per_token = excluded.completion_price_per_token,
+            input_cache_read_price_per_token =
+              excluded.input_cache_read_price_per_token,
+            input_cache_write_price_per_token =
+              excluded.input_cache_write_price_per_token,
+            internal_reasoning_price_per_token =
+              excluded.internal_reasoning_price_per_token,
+            fetched_at_utc = excluded.fetched_at_utc,
+            source = excluded.source
+        ''');
+      try {
+        for (final entry in pending) {
+          if (settings.useExternalPricing) {
+            final current = db.select(
+              'select source from model_pricing_cache where model_id = ?',
+              [entry.key],
+            );
+            if (current.isNotEmpty &&
+                current.single['source'] == 'openrouter') {
+              continue;
+            }
+          }
+          final override = entry.value;
+          statement.execute([
+            entry.key,
+            override.prompt,
+            override.completion,
+            override.inputCacheRead,
+            override.inputCacheWrite,
+            override.internalReasoning,
+            now.toIso8601String(),
+          ]);
+        }
+      } finally {
+        statement.close();
+      }
+      db.execute('commit');
+    } on Object {
+      try {
+        db.execute('rollback');
+      } on Object {
+        // Preserve the original failure if SQLite already rolled back.
+      }
+      rethrow;
     }
   }
 
@@ -303,13 +371,18 @@ class PricingRepository {
   }
 
   void _recordPricingError(Object error) {
-    db.execute(
-      '''
-      insert into logs (time_utc, level, category, message, details)
-      values (?, 'error', 'pricing', 'Pricing fetch failed.', ?)
-      ''',
-      [DateTime.now().toUtc().toIso8601String(), error.toString()],
-    );
+    try {
+      db.execute(
+        '''
+        insert into logs (time_utc, level, category, message, details)
+        values (?, 'error', 'pricing', 'Pricing fetch failed.', ?)
+        ''',
+        [DateTime.now().toUtc().toIso8601String(), error.toString()],
+      );
+    } on Object {
+      // Pricing failures are recoverable even when another process owns the
+      // SQLite writer slot and the diagnostic row cannot be persisted.
+    }
   }
 }
 

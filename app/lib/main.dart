@@ -1,20 +1,31 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import 'src/database/database_migrator.dart';
 import 'src/app/codex_sessions_viewer_app.dart';
 import 'src/config/app_settings.dart';
+import 'src/platform/app_instance_lock.dart';
 import 'src/window/window_state.dart';
 import 'src/platform/windows_startup_registration.dart';
 
+final _processLifetimeInstanceLocks = <AppInstanceLock>[];
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  final databaseFile = defaultDatabaseFile();
+  final instanceLock = AppInstanceLock(
+    File('${databaseFile.path}.instance.lock'),
+  );
+  if (!instanceLock.tryAcquire()) {
+    exit(0);
+  }
+  _processLifetimeInstanceLocks.add(instanceLock);
   final windowStateController = AppWindowStateController(
     store: WindowStateStore(SettingsRepository(defaultSettingsFile())),
   );
   await restoreWindowStateBestEffort(windowStateController.restoreAndTrack);
-  final databaseFile = defaultDatabaseFile();
   final sqlRoot = defaultSqlRoot();
   final startupRegistration = WindowsStartupRegistration();
   runApp(

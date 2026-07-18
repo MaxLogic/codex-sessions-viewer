@@ -30,6 +30,12 @@ from sessions
 where trim(coalesce(session_id, '')) <> ''
    or trim(coalesce(source_file_path, source_file_unc_path, display_path, platform_path, '')) <> '';
 
+create index temp_idx_session_dedupe_id
+on temp_session_dedupe(id);
+
+create index temp_idx_session_dedupe_keep_id
+on temp_session_dedupe(keep_id);
+
 create temp table temp_session_metadata as
 select
   d.keep_id,
@@ -76,6 +82,9 @@ select
 from temp_session_dedupe d
 join sessions s on s.id = d.id
 group by d.keep_id;
+
+create unique index temp_idx_session_metadata_keep_id
+on temp_session_metadata(keep_id);
 
 update sessions
 set

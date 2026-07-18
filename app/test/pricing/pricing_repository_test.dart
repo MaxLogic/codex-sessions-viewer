@@ -121,6 +121,17 @@ void main() {
     expect(catalog.models['local/model']?.promptPricePerToken, '0.10');
   });
 
+  test('loads cached pricing without requiring a database write', () {
+    db.execute('pragma query_only = on');
+
+    final catalog = repository.loadCached(
+      settings,
+      nowUtc: DateTime.utc(2026, 6, 13, 10),
+    );
+
+    expect(catalog.models['local/model']?.promptPricePerToken, '0.10');
+  });
+
   test(
     'stale cache fetch failure is recoverable and keeps local prices',
     () async {
@@ -252,11 +263,121 @@ void main() {
       'override',
     );
   });
+
+  test('unchanged overrides do not require the SQLite writer slot', () async {
+    final localSettings = _settings(useExternalPricing: false);
+    final first = await repository.load(
+      localSettings,
+      nowUtc: DateTime.utc(2026, 6, 13, 10),
+    );
+    expect(first.success, isTrue);
+    db.execute('pragma query_only = on');
+
+    final second = await repository.load(
+      localSettings,
+      nowUtc: DateTime.utc(2026, 6, 13, 11),
+    );
+
+    expect(second.success, isTrue);
+    expect(second.catalog.models['local/model']?.promptPricePerToken, '0.10');
+  });
+
+  test('persists changed overrides in one atomic write transaction', () async {
+    db.execute('''
+      create trigger reject_bad_override
+      before insert on model_pricing_cache
+      when new.model_id = 'local/bad'
+      begin
+        select raise(abort, 'rejected test override');
+      end
+      ''');
+    final localSettings = _settings(
+      useExternalPricing: false,
+      overrides: const {
+        'local/good': PricingOverrideSettings(
+          prompt: '0.10',
+          completion: '0.20',
+          inputCacheRead: '0.03',
+          inputCacheWrite: '0.04',
+          internalReasoning: '0.05',
+        ),
+        'local/bad': PricingOverrideSettings(
+          prompt: '1.10',
+          completion: '1.20',
+          inputCacheRead: '1.03',
+          inputCacheWrite: '1.04',
+          internalReasoning: '1.05',
+        ),
+      },
+    );
+
+    final result = await repository.load(
+      localSettings,
+      nowUtc: DateTime.utc(2026, 6, 13, 10),
+    );
+
+    expect(result.success, isFalse);
+    expect(result.errorMessage, contains('rejected test override'));
+    expect(
+      db.select(
+        "select model_id from model_pricing_cache where source = 'override'",
+      ),
+      isEmpty,
+    );
+  });
+
+  test(
+    'pricing failure stays recoverable when error logging cannot write',
+    () async {
+      final localSettings = _settings(useExternalPricing: false);
+      final first = await repository.load(
+        localSettings,
+        nowUtc: DateTime.utc(2026, 6, 13, 10),
+      );
+      expect(first.success, isTrue);
+      db.execute('pragma query_only = on');
+
+      final result = await repository.load(
+        settings,
+        client: _FakeOpenRouterClient(error: 'network down'),
+        nowUtc: DateTime.utc(2026, 6, 15, 10),
+      );
+
+      expect(result.success, isFalse);
+      expect(result.errorMessage, contains('network down'));
+      expect(result.catalog.models['local/model']?.promptPricePerToken, '0.10');
+    },
+  );
+
+  test(
+    'override persistence lock returns in-memory pricing fallback',
+    () async {
+      db.execute('pragma query_only = on');
+
+      final result = await repository.load(
+        _settings(useExternalPricing: false),
+        nowUtc: DateTime.utc(2026, 6, 13, 10),
+      );
+
+      expect(result.success, isFalse);
+      expect(result.errorMessage, contains('readonly database'));
+      expect(result.catalog.models['local/model']?.promptPricePerToken, '0.10');
+    },
+  );
 }
 
 PricingSettings _settings({
   bool useExternalPricing = true,
   String endpoint = 'https://openrouter.ai/api/v1/models',
+  Map<String, PricingOverrideSettings> overrides = const {
+    'local/model': PricingOverrideSettings(
+      prompt: '0.10',
+      completion: '0.20',
+      inputCacheRead: '0.03',
+      inputCacheWrite: '0.04',
+      internalReasoning: '0.05',
+    ),
+  },
 }) {
   return PricingSettings(
     provider: 'openrouter',
@@ -267,15 +388,7 @@ PricingSettings _settings({
       modelsEndpoint: endpoint,
       apiKey: 'secret-key',
     ),
-    overrides: const {
-      'local/model': PricingOverrideSettings(
-        prompt: '0.10',
-        completion: '0.20',
-        inputCacheRead: '0.03',
-        inputCacheWrite: '0.04',
-        internalReasoning: '0.05',
-      ),
-    },
+    overrides: overrides,
   );
 }
 
