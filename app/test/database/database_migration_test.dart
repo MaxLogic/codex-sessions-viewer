@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
+import 'package:codex_sessions_viewer/src/search/message_search.dart';
+import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -51,6 +53,7 @@ void main() {
       'logs',
       'session_search',
       'message_search',
+      'tool_output_search',
     ]) {
       expect(_tableExists(db, table), isTrue, reason: '$table should exist');
     }
@@ -59,7 +62,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 11);
+    expect(versionRows.length, 12);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -104,6 +107,10 @@ void main() {
     expect(versionRows[10]['filename'], '011_stable_session_identity.sql');
     expect(versionRows[10]['checksum_length'], greaterThan(20));
     expect(versionRows[10]['success'], 1);
+    expect(versionRows[11]['version'], 12);
+    expect(versionRows[11]['filename'], '012_external_content_search.sql');
+    expect(versionRows[11]['checksum_length'], greaterThan(20));
+    expect(versionRows[11]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -119,6 +126,66 @@ void main() {
     expect(_columnExists(db, 'sessions', 'eval_updated_at_utc'), isTrue);
     expect(_indexExists(db, 'idx_sessions_session_id'), isTrue);
   });
+
+  test(
+    'migration 012 removes copied conversation text from search indexes',
+    () async {
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(dbFile);
+
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.summary,
+      );
+      expect(result.lastAppliedSchemaVersion, 12);
+
+      final db = openFileBackedDatabase(dbFile);
+      addTearDown(db.close);
+      final messageSearchSql =
+          db
+                  .select(
+                    "select sql from sqlite_master where name = 'message_search'",
+                  )
+                  .single['sql']
+              as String;
+      final toolOutputSearchSql =
+          db
+                  .select(
+                    "select sql from sqlite_master where name = 'tool_output_search'",
+                  )
+                  .single['sql']
+              as String;
+      final sessionSearchColumns = db
+          .select('pragma table_info(session_search)')
+          .map((row) => row['name'])
+          .toList();
+
+      expect(messageSearchSql.toLowerCase(), contains("content='messages'"));
+      expect(_tableExists(db, 'message_search_content'), isFalse);
+      expect(
+        toolOutputSearchSql.toLowerCase(),
+        contains("content='tool_calls'"),
+      );
+      expect(_tableExists(db, 'tool_output_search_content'), isFalse);
+      expect(
+        sessionSearchColumns,
+        containsAll([
+          'title',
+          'summary',
+          'tool_names',
+          'display_path',
+          'normalized_path_keys',
+          'project_name',
+          'tags',
+        ]),
+      );
+      expect(sessionSearchColumns, isNot(contains('user_messages')));
+      expect(sessionSearchColumns, isNot(contains('assistant_messages')));
+      expect(sessionSearchColumns, isNot(contains('tool_output')));
+    },
+  );
 
   test(
     'blocks normal startup when an applied migration checksum changes',
@@ -141,7 +208,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 11);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 12);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -174,9 +241,14 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}011_stable_session_identity.sql',
     );
+    final copiedExternalContentMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}012_external_content_search.sql',
+    );
     await copiedMigration.delete();
     await copiedProjectOverrideMigration.delete();
     await copiedStableIdentityMigration.delete();
+    await copiedExternalContentMigration.delete();
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
@@ -309,6 +381,9 @@ void main() {
     await File(
       '../sql/migration/011_stable_session_identity.sql',
     ).copy(copiedStableIdentityMigration.path);
+    await File(
+      '../sql/migration/012_external_content_search.sql',
+    ).copy(copiedExternalContentMigration.path);
 
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
@@ -318,14 +393,15 @@ void main() {
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
 
+    MessageSearchIndex(migrated).backfillBatch(limit: 10);
     expect(
-      migrated
-          .select(
-            'select s.id from sessions s join session_search f on f.rowid = s.rowid '
-            "where session_search match 'user_messages: migrated'",
-          )
-          .single['id'],
-      r'source:C:\sessions\existing.jsonl',
+      SessionSearchIndex(migrated).search(
+        const SessionSearchQuery(
+          text: 'migrated',
+          textScopes: {SearchTextScope.userMessages},
+        ),
+      ),
+      [r'source:C:\sessions\existing.jsonl'],
     );
     final row = migrated.select(
       'select has_code_blocks, has_tool_calls, has_errors '
@@ -349,8 +425,13 @@ void main() {
         '${sqlRoot.path}${Platform.pathSeparator}migration'
         '${Platform.pathSeparator}011_stable_session_identity.sql',
       );
+      final copiedExternalContentMigration = File(
+        '${sqlRoot.path}${Platform.pathSeparator}migration'
+        '${Platform.pathSeparator}012_external_content_search.sql',
+      );
       await copiedProjectOverrideMigration.delete();
       await copiedStableIdentityMigration.delete();
+      await copiedExternalContentMigration.delete();
       final firstRun = await DatabaseMigrator(
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
@@ -413,6 +494,9 @@ void main() {
       await File(
         '../sql/migration/011_stable_session_identity.sql',
       ).copy(copiedStableIdentityMigration.path);
+      await File(
+        '../sql/migration/012_external_content_search.sql',
+      ).copy(copiedExternalContentMigration.path);
 
       final result = await DatabaseMigrator(
         sqlRoot: sqlRoot,
@@ -660,11 +744,18 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}011_stable_session_identity.sql',
     );
+    final externalContentMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}012_external_content_search.sql',
+    );
     if (await evalMigration.exists()) {
       await evalMigration.delete();
     }
     if (await stableIdentityMigration.exists()) {
       await stableIdentityMigration.delete();
+    }
+    if (await externalContentMigration.exists()) {
+      await externalContentMigration.delete();
     }
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
@@ -699,12 +790,15 @@ void main() {
     await File(
       '../sql/migration/011_stable_session_identity.sql',
     ).copy(stableIdentityMigration.path);
+    await File(
+      '../sql/migration/012_external_content_search.sql',
+    ).copy(externalContentMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 11);
+    expect(migrator.supportedSchemaVersion, 12);
     final result = await migrator.openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
-    expect(result.lastAppliedSchemaVersion, 11);
+    expect(result.lastAppliedSchemaVersion, 12);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -822,17 +916,13 @@ void main() {
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
       expect(result.canStartNormalUi, isTrue);
-      expect(result.lastAppliedSchemaVersion, 11);
+      expect(result.lastAppliedSchemaVersion, 12);
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
       final rows = migrated.select('''
       select
-        session_id,
-        message_index,
-        author_type,
-        created_at_utc,
-        snippet(message_search, 4, '<mark>', '</mark>', '...', 8) as snippet
+        rowid
       from message_search
       where message_search match 'migration'
       ''');

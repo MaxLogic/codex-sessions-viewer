@@ -6,60 +6,25 @@ class MessageSearchIndex {
   final Database db;
   static const _lastMessageRowIdKey =
       'message_search.backfill.last_message_rowid';
+  static const _targetMessageRowIdKey =
+      'message_search.backfill.target_message_rowid';
+  static const _targetMessageCountKey =
+      'message_search.backfill.target_message_count';
+  static const _indexedMessageCountKey =
+      'message_search.backfill.indexed_message_count';
   static const _updatedAtKey = 'message_search.backfill.updated_at_utc';
   static const _completedAtKey = 'message_search.backfill.completed_at_utc';
-
-  void replaceSessionMessages(
-    String sessionId,
-    Iterable<MessageSearchDocument> documents,
-  ) {
-    deleteSession(sessionId);
-    final insert = db.prepare('''
-      insert into message_search (
-        session_id,
-        message_index,
-        author_type,
-        created_at_utc,
-        content
-      ) values (?, ?, ?, ?, ?)
-      ''');
-    try {
-      for (final document in documents) {
-        final content = document.content.trim();
-        if (content.isEmpty) {
-          continue;
-        }
-        insert.execute([
-          document.sessionId,
-          document.messageIndex,
-          document.author,
-          document.createdAtUtc?.toIso8601String(),
-          content,
-        ]);
-      }
-    } finally {
-      insert.close();
-    }
-  }
-
-  void deleteSession(String sessionId) {
-    db.execute('delete from message_search where session_id = ?', [sessionId]);
-  }
 
   MessageSearchBackfillResult backfillBatch({int limit = 500}) {
     if (limit <= 0) {
       return backfillStatus().toResult(indexedInBatch: 0, complete: false);
     }
     final lastRowId = _metadataInt(_lastMessageRowIdKey);
-    final insert = db.prepare('''
-      insert into message_search (
-        session_id,
-        message_index,
-        author_type,
-        created_at_utc,
-        content
-      ) values (?, ?, ?, ?, ?)
-      ''');
+    final targetRowId = _metadataInt(_targetMessageRowIdKey);
+    final targetCount = _backfillTargetCount(targetRowId);
+    final insert = db.prepare(
+      'insert into message_search (rowid, content_plain) values (?, ?)',
+    );
     var maxRowId = lastRowId;
     var indexed = 0;
     var complete = false;
@@ -68,48 +33,36 @@ class MessageSearchIndex {
       final rows = db.select(
         '''
         select
-          rowid as message_rowid,
-          session_id,
-          message_index,
-          author_type,
-          created_at_utc,
+          id as message_rowid,
           content_plain
         from messages
-        where rowid > ?
-          and trim(coalesce(content_plain, '')) <> ''
-        order by rowid
+        where id > ?
+          and id <= ?
+        order by id
         limit ?
         ''',
-        [lastRowId, limit],
+        [lastRowId, targetRowId, limit],
       );
-      if (rows.isEmpty) {
-        _setMetadata(_completedAtKey, DateTime.now().toUtc().toIso8601String());
-        complete = true;
-      }
       for (final row in rows) {
-        final content = (row['content_plain'] as String? ?? '').trim();
-        if (content.isEmpty) {
-          continue;
-        }
-        final sessionId = row['session_id'] as String;
-        final messageIndex = row['message_index'] as int;
-        db.execute(
-          'delete from message_search where session_id = ? and message_index = ?',
-          [sessionId, messageIndex],
-        );
-        insert.execute([
-          sessionId,
-          messageIndex,
-          row['author_type'] as String? ?? '',
-          row['created_at_utc'] as String?,
-          content,
-        ]);
+        final content = row['content_plain'] as String? ?? '';
+        final messageRowId = row['message_rowid'] as int;
+        insert.execute([messageRowId, content]);
         indexed++;
-        maxRowId = row['message_rowid'] as int;
+        maxRowId = messageRowId;
       }
-      if (rows.isNotEmpty) {
-        _setMetadata(_lastMessageRowIdKey, maxRowId.toString());
+      complete = rows.length < limit;
+      final committedRowId = complete ? targetRowId : maxRowId;
+      _setMetadata(_lastMessageRowIdKey, committedRowId.toString());
+      final previousIndexed = _metadataInt(_indexedMessageCountKey);
+      final indexedCount = complete
+          ? targetCount
+          : (previousIndexed + indexed).clamp(0, targetCount).toInt();
+      _setMetadata(_indexedMessageCountKey, indexedCount.toString());
+      if (indexed > 0) {
         _setMetadata(_updatedAtKey, DateTime.now().toUtc().toIso8601String());
+      }
+      if (complete) {
+        _setMetadata(_completedAtKey, DateTime.now().toUtc().toIso8601String());
       }
       db.execute('commit');
     } on Object {
@@ -127,27 +80,14 @@ class MessageSearchIndex {
 
   MessageSearchBackfillStatus backfillStatus() {
     final lastRowId = _metadataInt(_lastMessageRowIdKey);
-    final indexed =
-        db
-                .select('select count(*) as count from message_search')
-                .single['count']
-            as int;
-    final remaining =
-        db
-                .select(
-                  '''
-          select count(*) as count
-          from messages
-          where rowid > ?
-            and trim(coalesce(content_plain, '')) <> ''
-          ''',
-                  [lastRowId],
-                )
-                .single['count']
-            as int;
+    final targetRowId = _metadataInt(_targetMessageRowIdKey);
+    final targetCount = _backfillTargetCount(targetRowId);
+    final indexed = _metadataInt(
+      _indexedMessageCountKey,
+    ).clamp(0, targetCount).toInt();
     return MessageSearchBackfillStatus(
       indexed: indexed,
-      remaining: remaining,
+      remaining: targetCount - indexed,
       lastMessageRowId: lastRowId,
       updatedAtUtc: _dateTime(_metadataString(_updatedAtKey)),
       completedAtUtc: _dateTime(_metadataString(_completedAtKey)),
@@ -162,10 +102,10 @@ class MessageSearchIndex {
     final rows = db.select(
       '''
       select
-        message_search.session_id as session_id,
-        cast(message_search.message_index as integer) as message_index,
-        message_search.author_type as author_type,
-        snippet(message_search, 4, '<mark>', '</mark>', '...', 12) as snippet,
+        m.session_id as session_id,
+        m.message_index as message_index,
+        m.author_type as author_type,
+        snippet(message_search, 0, '<mark>', '</mark>', '...', 12) as snippet,
         coalesce(
           nullif(trim(s.thread_name), ''),
           nullif(trim(s.title), ''),
@@ -175,24 +115,25 @@ class MessageSearchIndex {
         coalesce(s.project_name_snapshot, '') as project_name,
         s.source_type as source_type,
         coalesce(
-          message_search.created_at_utc,
+          m.created_at_utc,
           s.last_message_at_utc,
           s.started_at_utc,
           s.updated_at_utc
         ) as timestamp_utc
       from message_search
-      join sessions s on s.id = message_search.session_id
+      join messages m on m.id = message_search.rowid
+      join sessions s on s.id = m.session_id
       where message_search match ?
         and s.scan_status = 'available'
         and s.parse_status = 'available'
       order by coalesce(
-                 message_search.created_at_utc,
+                 m.created_at_utc,
                  s.last_message_at_utc,
                  s.started_at_utc,
                  s.updated_at_utc
                ) desc,
-               message_search.session_id asc,
-               cast(message_search.message_index as integer) asc
+               m.session_id asc,
+               m.message_index asc
       limit ?
       ''',
       [_ftsQuery(tokens), query.limit],
@@ -218,6 +159,27 @@ class MessageSearchIndex {
     return int.tryParse(value ?? '') ?? 0;
   }
 
+  int _backfillTargetCount(int targetRowId) {
+    final stored = int.tryParse(_metadataString(_targetMessageCountKey) ?? '');
+    if (stored != null && stored >= 0) {
+      return stored;
+    }
+    final count =
+        db
+                .select(
+                  '''
+                  select count(*) as count
+                  from messages
+                  where id <= ?
+                  ''',
+                  [targetRowId],
+                )
+                .single['count']
+            as int;
+    _setMetadata(_targetMessageCountKey, count.toString());
+    return count;
+  }
+
   String? _metadataString(String key) {
     final rows = db.select('select value from app_metadata where key = ?', [
       key,
@@ -240,22 +202,6 @@ class MessageSearchIndex {
       [key, value, DateTime.now().toUtc().toIso8601String()],
     );
   }
-}
-
-class MessageSearchDocument {
-  const MessageSearchDocument({
-    required this.sessionId,
-    required this.messageIndex,
-    required this.author,
-    required this.createdAtUtc,
-    required this.content,
-  });
-
-  final String sessionId;
-  final int messageIndex;
-  final String author;
-  final DateTime? createdAtUtc;
-  final String content;
 }
 
 class MessageSearchQuery {

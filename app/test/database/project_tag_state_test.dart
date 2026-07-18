@@ -19,6 +19,14 @@ void main() {
     db.execute(
       File('../sql/migration/003_project_override.sql').readAsStringSync(),
     );
+    db.execute(
+      File('../sql/migration/009_message_search.sql').readAsStringSync(),
+    );
+    db.execute(
+      File(
+        '../sql/migration/012_external_content_search.sql',
+      ).readAsStringSync(),
+    );
     searchIndex = SessionSearchIndex(db);
     store = ProjectTagStateStore(db);
   });

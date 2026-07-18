@@ -545,6 +545,9 @@ class RuntimeSessionController {
     return Profiling.spanAsync('scan.runtime.refresh', () async {
       final settings = await SettingsRepository(settingsFile).loadOrCreate();
       final db = openFileBackedDatabase(databaseFile);
+      ToolOutputSearchIndex(
+        db,
+      ).configure(enabled: settings.toolOutput.indexToolOutput);
       final logger = StructuredLogger(db: db, settings: settings.logging);
       final pricing = PricingRepository(db).loadCached(settings.pricing);
       int? scanRunId;
@@ -998,7 +1001,7 @@ Future<void> _backgroundMessageSearchBackfillEntry(
       ).backfillStatus().toResult(indexedInBatch: 0, complete: false);
       while (!cancelRequested) {
         result = MessageSearchIndex(db).backfillBatch(limit: request.batchSize);
-        if (result.complete || result.remaining == 0) {
+        if (result.complete) {
           break;
         }
         await Future<void>.delayed(request.pauseBetweenBatches);
@@ -1577,13 +1580,7 @@ void _upsertParsedSession(
       title: _cleanDisplayTitle(parsed.title),
       summary: _cleanDisplaySummary(parsed.summary),
       threadName: resolvedThreadName,
-      userMessages: _messagesForAuthor(parsed, CodexMessageAuthorType.user),
-      assistantMessages: _messagesForAuthor(
-        parsed,
-        CodexMessageAuthorType.assistant,
-      ),
       toolNames: parsed.toolCalls.map((tool) => tool.toolName).join(' '),
-      toolOutput: parsed.toolCalls.map((tool) => tool.outputPreview).join('\n'),
       normalizedPathKeys: scannedSession.mappedPath.normalizedPathKeys.join(
         ' ',
       ),
@@ -1683,46 +1680,8 @@ void _upsertParsedSession(
   if (autoProject != null) {
     _updateSearchProjectIfAutomatic(db, parsed.internalId, autoProject.name);
   }
-  _deleteReplacedSourceMessageSearchRows(
-    db,
-    sessionId: parsed.internalId,
-    sourcePath: scannedSession.sourcePath,
-    sourceFileUncPath: scannedSession.mappedPath.sourceFileUncPath,
-  );
   _replaceMessages(db, parsed, now);
   _replaceToolCalls(db, parsed);
-}
-
-void _deleteReplacedSourceMessageSearchRows(
-  Database db, {
-  required String sessionId,
-  required String sourcePath,
-  String? sourceFileUncPath,
-}) {
-  final paths = {
-    sourcePath,
-    if (sourceFileUncPath != null && sourceFileUncPath.trim().isNotEmpty)
-      sourceFileUncPath,
-  };
-  if (paths.isEmpty) {
-    return;
-  }
-  final placeholders = List.filled(paths.length, '?').join(', ');
-  db.execute(
-    '''
-    delete from message_search
-    where session_id in (
-      select id
-      from sessions
-      where id <> ?
-        and (
-          source_file_path in ($placeholders)
-          or source_file_unc_path in ($placeholders)
-        )
-    )
-    ''',
-    [sessionId, ...paths, ...paths],
-  );
 }
 
 ({int user, int assistant, int tool}) _messageTokenBuckets(
@@ -1758,7 +1717,6 @@ void _deleteReplacedSourceMessageSearchRows(
 
 void _replaceMessages(Database db, CodexParsedSession parsed, String now) {
   db.execute('delete from messages where session_id = ?', [parsed.internalId]);
-  final searchDocuments = <MessageSearchDocument>[];
   for (final message in parsed.messages) {
     db.execute(
       '''
@@ -1804,19 +1762,7 @@ void _replaceMessages(Database db, CodexParsedSession parsed, String now) {
         now,
       ],
     );
-    searchDocuments.add(
-      MessageSearchDocument(
-        sessionId: parsed.internalId,
-        messageIndex: message.index,
-        author: message.authorType.name,
-        createdAtUtc: message.createdAtUtc,
-        content: message.contentPlain,
-      ),
-    );
   }
-  MessageSearchIndex(
-    db,
-  ).replaceSessionMessages(parsed.internalId, searchDocuments);
 }
 
 void _replaceToolCalls(Database db, CodexParsedSession parsed) {
@@ -2839,14 +2785,6 @@ class _ProjectPathResolver {
     return _ResolvedProjectPath(segments.last);
   }
 }
-
-String _messagesForAuthor(
-  CodexParsedSession session,
-  CodexMessageAuthorType author,
-) => session.messages
-    .where((message) => message.authorType == author)
-    .map((message) => message.contentPlain)
-    .join('\n');
 
 String _statusMessage(
   SessionScanResult result, {

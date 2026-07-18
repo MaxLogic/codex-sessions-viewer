@@ -26,7 +26,7 @@ Directory defaultSqlRoot() {
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 11,
+    this.supportedSchemaVersion = 12,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
@@ -279,7 +279,12 @@ class DatabaseMigrator {
   }
 
   DatabaseFatalError? _validateSchema(Database db, String databasePath) {
-    for (final table in _requiredTables) {
+    final lastAppliedVersion = _lastAppliedVersion(db);
+    final requiredTables = [
+      ..._requiredTables,
+      if (lastAppliedVersion >= 12) 'tool_output_search',
+    ];
+    for (final table in requiredTables) {
       final rows = db.select(
         "select 1 from sqlite_master where name = ? and type in ('table', 'view')",
         [table],

@@ -4,6 +4,45 @@ enum SessionSearchSourceType { windows, wsl }
 
 enum ArchivedFilter { activeOnly, archivedOnly, all }
 
+class ToolOutputSearchIndex {
+  const ToolOutputSearchIndex(this.db);
+
+  final Database db;
+
+  void configure({required bool enabled}) {
+    final rows = db.select(
+      "select value from app_metadata where key = 'tool_output_search.enabled'",
+    );
+    final currentlyEnabled =
+        rows.isNotEmpty && (rows.single['value'] as String? ?? '') == '1';
+    if (currentlyEnabled == enabled) {
+      return;
+    }
+    db.execute('begin immediate');
+    try {
+      db.execute(
+        '''
+        insert into app_metadata (key, value, updated_at_utc)
+        values ('tool_output_search.enabled', ?, ?)
+        on conflict(key) do update set
+          value = excluded.value,
+          updated_at_utc = excluded.updated_at_utc
+        ''',
+        [enabled ? '1' : '0', DateTime.now().toUtc().toIso8601String()],
+      );
+      db.execute(
+        enabled
+            ? "insert into tool_output_search(tool_output_search) values('rebuild')"
+            : "insert into tool_output_search(tool_output_search) values('delete-all')",
+      );
+      db.execute('commit');
+    } on Object {
+      db.execute('rollback');
+      rethrow;
+    }
+  }
+}
+
 enum SearchTextScope {
   title,
   summary,
@@ -128,28 +167,22 @@ class SessionSearchIndex {
         rowid,
         title,
         summary,
-        user_messages,
-        assistant_messages,
         tool_names,
         display_path,
         normalized_path_keys,
         project_name,
-        tags,
-        tool_output
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        tags
+      ) values (?, ?, ?, ?, ?, ?, ?, ?)
       ''',
       [
         rowid,
         document.title,
         document.summary,
-        document.userMessages,
-        document.assistantMessages,
         document.toolNames,
         document.displayPath,
         document.normalizedPathKeys,
         ftsProjectName,
         ftsTags.join(' '),
-        document.toolOutput,
       ],
     );
     if (existingState == null) {
@@ -301,35 +334,65 @@ class SessionSearchIndex {
 
   _SqlClause _textWhere(SessionSearchQuery query) {
     final scopes = query.effectiveTextScopes;
-    final columns = [for (final scope in scopes) ...scope.ftsColumns];
+    final columns = [for (final scope in scopes) ...scope.sessionFtsColumns];
     final likeColumns = [for (final scope in scopes) ...scope.likeColumns];
-    if (columns.isEmpty && likeColumns.isEmpty) {
-      return const _SqlClause('0 = 1', []);
-    }
+    final messageAuthors = {
+      for (final scope in scopes) ...scope.messageAuthors,
+    };
+    final includeToolOutput = scopes.contains(SearchTextScope.toolOutput);
     final tokens = _searchTokens(query.text);
-    if (tokens.isEmpty) {
+    if (tokens.isEmpty ||
+        (columns.isEmpty &&
+            likeColumns.isEmpty &&
+            messageAuthors.isEmpty &&
+            !includeToolOutput)) {
       return const _SqlClause('0 = 1', []);
     }
     final args = <Object?>[];
     final tokenClauses = <String>[];
     for (final token in tokens) {
-      tokenClauses.add(
-        '(${likeColumns.map((column) => '$column like ? escape \'~\'').join(' or ')})',
-      );
-      args.addAll(
-        List<Object?>.filled(likeColumns.length, '%${_escapeLike(token)}%'),
-      );
+      final sources = <String>[];
+      if (columns.isNotEmpty) {
+        sources.add(
+          's.rowid in (select rowid from session_search '
+          'where session_search match ?)',
+        );
+        args.add(_ftsColumnQuery(columns, [token]));
+      }
+      for (final column in likeColumns) {
+        sources.add('$column like ? escape \'~\'');
+        args.add('%${_escapeLike(token)}%');
+      }
+      if (messageAuthors.isNotEmpty) {
+        sources.add(
+          'exists ('
+          'select 1 '
+          'from message_search '
+          'join messages m on m.id = message_search.rowid '
+          'where m.session_id = s.id '
+          'and m.author_type in (${_sqlParameters(messageAuthors.length)}) '
+          'and message_search match ?'
+          ')',
+        );
+        args
+          ..addAll(messageAuthors)
+          ..add(_ftsToken(token));
+      }
+      if (includeToolOutput) {
+        sources.add(
+          'exists ('
+          'select 1 '
+          'from tool_output_search '
+          'join tool_calls tc on tc.id = tool_output_search.rowid '
+          'where tc.session_id = s.id '
+          'and tool_output_search match ?'
+          ')',
+        );
+        args.add(_ftsToken(token));
+      }
+      tokenClauses.add('(${sources.join(' or ')})');
     }
-    final likeSql = tokenClauses.join(' and ');
-    if (columns.isEmpty) {
-      return _SqlClause(likeSql, args);
-    }
-    final matchQuery = _ftsColumnQuery(columns, tokens);
-    final sql = likeSql.isEmpty
-        ? 's.rowid in (select rowid from session_search where session_search match ?)'
-        : '(s.rowid in (select rowid from session_search where session_search match ?) '
-              'or ($likeSql))';
-    return _SqlClause(sql, [matchQuery, ...args]);
+    return _SqlClause(tokenClauses.join(' and '), args);
   }
 
   _ExistingUserState? _existingUserState(String sessionId) {
@@ -386,10 +449,7 @@ class SessionSearchDocument {
     this.title = '',
     this.summary = '',
     this.threadName = '',
-    this.userMessages = '',
-    this.assistantMessages = '',
     this.toolNames = '',
-    this.toolOutput = '',
     this.normalizedPathKeys = '',
     this.projectName = '',
     this.tags = const [],
@@ -414,10 +474,7 @@ class SessionSearchDocument {
   final String title;
   final String summary;
   final String threadName;
-  final String userMessages;
-  final String assistantMessages;
   final String toolNames;
-  final String toolOutput;
   final String normalizedPathKeys;
   final String projectName;
   final List<String> tags;
@@ -519,22 +576,28 @@ extension on SessionSearchSourceType {
 }
 
 extension on SearchTextScope {
-  List<String> get ftsColumns => switch (this) {
+  List<String> get sessionFtsColumns => switch (this) {
     SearchTextScope.title => const ['title'],
     SearchTextScope.summary => const ['summary'],
-    SearchTextScope.userMessages => const ['user_messages'],
-    SearchTextScope.assistantMessages => const ['assistant_messages'],
+    SearchTextScope.userMessages => const [],
+    SearchTextScope.assistantMessages => const [],
     SearchTextScope.toolNames => const ['tool_names'],
     SearchTextScope.path => const ['display_path', 'normalized_path_keys'],
     SearchTextScope.project => const ['project_name'],
     SearchTextScope.threadName => const [],
     SearchTextScope.tags => const ['tags'],
-    SearchTextScope.toolOutput => const ['tool_output'],
+    SearchTextScope.toolOutput => const [],
   };
 
   List<String> get likeColumns => switch (this) {
     SearchTextScope.threadName => const ['s.thread_name'],
-    _ => [for (final column in ftsColumns) 'f.$column'],
+    _ => [for (final column in sessionFtsColumns) 'f.$column'],
+  };
+
+  List<String> get messageAuthors => switch (this) {
+    SearchTextScope.userMessages => const ['user'],
+    SearchTextScope.assistantMessages => const ['assistant'],
+    _ => const [],
   };
 }
 

@@ -29,11 +29,25 @@ void main() {
     _insertMessage(db, 0, 'first historical needle');
     _insertMessage(db, 1, 'second historical needle');
     _insertMessage(db, 2, 'third historical needle');
+    db.execute(
+      File(
+        '../sql/migration/012_external_content_search.sql',
+      ).readAsStringSync(),
+    );
 
     final first = index.backfillBatch(limit: 2);
 
     expect(first.indexedInBatch, 2);
     expect(first.remaining, 1);
+    expect(
+      db
+          .select(
+            "select value from app_metadata "
+            "where key = 'message_search.backfill.target_message_count'",
+          )
+          .single['value'],
+      '3',
+    );
     expect(
       index.search(const MessageSearchQuery(text: 'historical')),
       hasLength(2),
@@ -58,6 +72,24 @@ void main() {
       hasLength(3),
     );
     expect(index.backfillStatus().remaining, 0);
+  });
+
+  test('keeps external content consistent for empty message bodies', () {
+    _insertMessage(db, 0, '');
+    db.execute(
+      File(
+        '../sql/migration/012_external_content_search.sql',
+      ).readAsStringSync(),
+    );
+
+    expect(index.backfillBatch(limit: 10).complete, isTrue);
+    expect(
+      () => db.execute(
+        "insert into message_search(message_search, rank) "
+        "values('integrity-check', 1)",
+      ),
+      returnsNormally,
+    );
   });
 }
 

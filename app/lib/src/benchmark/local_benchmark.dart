@@ -118,6 +118,20 @@ class LocalBenchmarkRunner {
             p.join(sqlRoot.path, 'migration', '002_search_filter_schema.sql'),
           ).readAsStringSync(),
         );
+        db.execute(
+          File(
+            p.join(sqlRoot.path, 'migration', '009_message_search.sql'),
+          ).readAsStringSync(),
+        );
+        db.execute(
+          File(
+            p.join(
+              sqlRoot.path,
+              'migration',
+              '012_external_content_search.sql',
+            ),
+          ).readAsStringSync(),
+        );
         final index = SessionSearchIndex(db);
         final documents = scanResult.sessions.isEmpty
             ? [_syntheticDocument()]
@@ -125,7 +139,7 @@ class LocalBenchmarkRunner {
                 for (final session in scanResult.sessions)
                   _documentFromSession(
                     session,
-                    includeMessageText: !options.copyFromSettings,
+                    includeToolNames: !options.copyFromSettings,
                   ),
               ];
         for (final document in documents) {
@@ -780,7 +794,7 @@ void _seedRowLoadData(Database db, List<ScannedSessionFile> sessions) {
 
 SessionSearchDocument _documentFromSession(
   ScannedSessionFile session, {
-  bool includeMessageText = true,
+  bool includeToolNames = true,
 }) {
   final parsed = session.parsedSession;
   return SessionSearchDocument(
@@ -793,24 +807,7 @@ SessionSearchDocument _documentFromSession(
     platformPath: '<fixture>',
     title: parsed.title ?? 'Benchmark session',
     summary: parsed.summary ?? '',
-    userMessages: includeMessageText
-        ? parsed.messages
-              .where(
-                (message) => message.authorType == CodexMessageAuthorType.user,
-              )
-              .map((message) => message.firstLine)
-              .join(' ')
-        : '',
-    assistantMessages: includeMessageText
-        ? parsed.messages
-              .where(
-                (message) =>
-                    message.authorType == CodexMessageAuthorType.assistant,
-              )
-              .map((message) => message.firstLine)
-              .join(' ')
-        : '',
-    toolNames: includeMessageText
+    toolNames: includeToolNames
         ? parsed.toolCalls.map((call) => call.toolName).join(' ')
         : '',
     normalizedPathKeys: '<fixture>',

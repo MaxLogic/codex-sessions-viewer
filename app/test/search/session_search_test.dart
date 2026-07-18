@@ -18,6 +18,11 @@ void main() {
     db.execute(
       File('../sql/migration/007_session_thread_name.sql').readAsStringSync(),
     );
+    db.execute(
+      File(
+        '../sql/migration/012_external_content_search.sql',
+      ).readAsStringSync(),
+    );
     index = SessionSearchIndex(db);
   });
 
@@ -31,14 +36,26 @@ void main() {
         id: 'alpha',
         title: 'Parser cache notes',
         summary: 'SQLite FTS integration',
-        userMessages: 'Find my scanner implementation',
-        assistantMessages: 'The cache invalidation is complete',
         toolNames: 'apply_patch shell_command',
         displayPath: r'F:\projects\MaxLogic\codex-sessions-viewer',
         normalizedPathKeys: 'f:/projects/maxlogic/codex-sessions-viewer',
         projectName: 'Codex Sessions Viewer',
         tags: ['parser', 'scanner'],
       ),
+    );
+    _insertMessage(
+      db,
+      sessionId: 'alpha',
+      messageIndex: 0,
+      author: 'user',
+      content: 'Find my scanner implementation',
+    );
+    _insertMessage(
+      db,
+      sessionId: 'alpha',
+      messageIndex: 1,
+      author: 'assistant',
+      content: 'The cache invalidation is complete',
     );
 
     expect(index.search(const SessionSearchQuery(text: 'scanner')), ['alpha']);
@@ -77,12 +94,17 @@ void main() {
   });
 
   test('excludes tool output by default and includes it when configured', () {
-    index.upsert(
-      _document(
-        id: 'tool-output',
-        title: 'Visible title',
-        toolOutput: 'secret-build-output-token',
-      ),
+    index.upsert(_document(id: 'tool-output', title: 'Visible title'));
+    db.execute('''
+      update app_metadata
+      set value = '1'
+      where key = 'tool_output_search.enabled'
+      ''');
+    _insertToolCall(
+      db,
+      sessionId: 'tool-output',
+      toolIndex: 0,
+      output: 'secret-build-output-token',
     );
 
     expect(
@@ -100,14 +122,33 @@ void main() {
     );
   });
 
+  test('tool output index follows the persisted enable setting', () {
+    index.upsert(_document(id: 'optional-output', title: 'Visible title'));
+    _insertToolCall(
+      db,
+      sessionId: 'optional-output',
+      toolIndex: 0,
+      output: 'optional-output-needle',
+    );
+    const query = SessionSearchQuery(
+      text: 'optional-output-needle',
+      includeToolOutput: true,
+    );
+    expect(index.search(query), isEmpty);
+
+    ToolOutputSearchIndex(db).configure(enabled: true);
+    expect(index.search(query), ['optional-output']);
+
+    ToolOutputSearchIndex(db).configure(enabled: false);
+    expect(index.search(query), isEmpty);
+  });
+
   test('limits full-text search to selected scopes', () {
     index.upsert(
       _document(
         id: 'scoped',
         title: 'Title needle',
         summary: 'Summary needle',
-        userMessages: 'User needle',
-        assistantMessages: 'Assistant needle',
         displayPath: r'C:\needle\session.jsonl',
         normalizedPathKeys: 'c:/needle/session.jsonl',
         projectName: 'Project needle',
@@ -174,7 +215,6 @@ void main() {
       _document(
         id: 'match',
         title: 'Filter target',
-        assistantMessages: '```dart\nprint("hello");\n```',
         toolNames: 'shell_command',
         sourceType: SessionSearchSourceType.wsl,
         startedAtUtc: DateTime.utc(2026, 6, 12, 10),
@@ -197,7 +237,6 @@ void main() {
       _document(
         id: 'miss',
         title: 'Filter target',
-        assistantMessages: 'plain text only',
         sourceType: SessionSearchSourceType.windows,
         startedAtUtc: DateTime.utc(2026, 5, 1),
         displayPath: r'C:\temp\other',
@@ -389,10 +428,7 @@ SessionSearchDocument _document({
   String title = '',
   String summary = '',
   String threadName = '',
-  String userMessages = '',
-  String assistantMessages = '',
   String toolNames = '',
-  String toolOutput = '',
   String displayPath = '',
   String normalizedPathKeys = '',
   String projectName = '',
@@ -417,10 +453,7 @@ SessionSearchDocument _document({
   title: title,
   summary: summary,
   threadName: threadName,
-  userMessages: userMessages,
-  assistantMessages: assistantMessages,
   toolNames: toolNames,
-  toolOutput: toolOutput,
   normalizedPathKeys: normalizedPathKeys,
   projectName: projectName,
   tags: tags,
@@ -435,3 +468,56 @@ SessionSearchDocument _document({
   hasErrors: hasErrors,
   totalTokens: totalTokens,
 );
+
+void _insertMessage(
+  Database db, {
+  required String sessionId,
+  required int messageIndex,
+  required String author,
+  required String content,
+}) {
+  db.execute(
+    '''
+    insert into messages (
+      session_id,
+      message_index,
+      author_type,
+      first_line,
+      content_plain,
+      content_preview,
+      created_at_db_utc,
+      updated_at_db_utc
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+    ''',
+    [
+      sessionId,
+      messageIndex,
+      author,
+      content,
+      content,
+      content,
+      '2026-07-17T10:00:00.000Z',
+      '2026-07-17T10:00:00.000Z',
+    ],
+  );
+}
+
+void _insertToolCall(
+  Database db, {
+  required String sessionId,
+  required int toolIndex,
+  required String output,
+}) {
+  db.execute(
+    '''
+    insert into tool_calls (
+      session_id,
+      tool_index,
+      tool_name,
+      status,
+      output_preview
+    ) values (?, ?, 'shell_command', 'completed', ?)
+    ''',
+    [sessionId, toolIndex, output],
+  );
+}

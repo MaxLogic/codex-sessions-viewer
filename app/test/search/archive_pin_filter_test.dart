@@ -16,6 +16,14 @@ void main() {
     db.execute(
       File('../sql/migration/002_search_filter_schema.sql').readAsStringSync(),
     );
+    db.execute(
+      File('../sql/migration/009_message_search.sql').readAsStringSync(),
+    );
+    db.execute(
+      File(
+        '../sql/migration/012_external_content_search.sql',
+      ).readAsStringSync(),
+    );
     index = SessionSearchIndex(db);
     store = ProjectTagStateStore(db);
   });

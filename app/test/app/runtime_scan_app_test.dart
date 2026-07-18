@@ -700,6 +700,72 @@ void main() {
     );
   });
 
+  test(
+    'runtime tool output setting controls the separate search index',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_tool_output_search_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final windowsRoot = Directory(p.join(temp.path, 'windows'));
+      final wslRoot = Directory(p.join(temp.path, 'wsl'));
+      await windowsRoot.create();
+      await wslRoot.create();
+      await _copyFixture('sample_windows_session.json', windowsRoot);
+      final defaults = AppSettings.defaults();
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      final disabledSettings = defaults.copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      );
+      await SettingsRepository(settingsFile).save(disabledSettings);
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      await controller.refresh();
+
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      const query = SessionSearchQuery(
+        text: '2026',
+        includeToolOutput: true,
+        textScopes: {SearchTextScope.toolOutput},
+      );
+      expect(SessionSearchIndex(db).search(query), isEmpty);
+
+      await SettingsRepository(settingsFile).save(
+        disabledSettings.copyWith(
+          toolOutput: ToolOutputSettings(
+            indexToolOutput: true,
+            maxToolOutputPreviewChars:
+                disabledSettings.toolOutput.maxToolOutputPreviewChars,
+            maxToolOutputStoreChars:
+                disabledSettings.toolOutput.maxToolOutputStoreChars,
+            collapseToolOutputByDefault:
+                disabledSettings.toolOutput.collapseToolOutputByDefault,
+          ),
+        ),
+      );
+      await controller.refresh();
+
+      expect(SessionSearchIndex(db).search(query), isNotEmpty);
+    },
+  );
+
   test('updates growing jsonl sessions without duplicate rows', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_growing_jsonl_',
@@ -781,6 +847,19 @@ void main() {
     for (var i = 0; i < 50; i++) {
       _insertBackfillMessage(db, i);
     }
+    db.execute(
+      "insert into message_search(message_search) values('delete-all')",
+    );
+    db.execute('''
+      update app_metadata
+      set value = '0'
+      where key = 'message_search.backfill.last_message_rowid'
+      ''');
+    db.execute('''
+      update app_metadata
+      set value = (select cast(max(id) as text) from messages)
+      where key = 'message_search.backfill.target_message_rowid'
+      ''');
     db.close();
 
     final controller = RuntimeSessionController(

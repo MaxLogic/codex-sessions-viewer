@@ -17,6 +17,11 @@ void main() {
     db.execute(
       File('../sql/migration/009_message_search.sql').readAsStringSync(),
     );
+    db.execute(
+      File(
+        '../sql/migration/012_external_content_search.sql',
+      ).readAsStringSync(),
+    );
     index = MessageSearchIndex(db);
   });
 
@@ -45,24 +50,22 @@ void main() {
       lastMessageAtUtc: '2026-07-06T10:00:00.000Z',
     );
 
-    index.replaceSessionMessages('older', [
-      MessageSearchDocument(
-        sessionId: 'older',
-        messageIndex: 0,
-        author: 'user',
-        createdAtUtc: DateTime.utc(2026, 7, 6, 10),
-        content: 'cache needle in an older conversation',
-      ),
-    ]);
-    index.replaceSessionMessages('recent', [
-      MessageSearchDocument(
-        sessionId: 'recent',
-        messageIndex: 2,
-        author: 'assistant',
-        createdAtUtc: DateTime.utc(2026, 7, 7, 10),
-        content: 'The cache needle appears in the newer assistant reply.',
-      ),
-    ]);
+    _insertMessage(
+      db,
+      sessionId: 'older',
+      messageIndex: 0,
+      author: 'user',
+      createdAtUtc: '2026-07-06T10:00:00.000Z',
+      content: 'cache needle in an older conversation',
+    );
+    _insertMessage(
+      db,
+      sessionId: 'recent',
+      messageIndex: 2,
+      author: 'assistant',
+      createdAtUtc: '2026-07-07T10:00:00.000Z',
+      content: 'The cache needle appears in the newer assistant reply.',
+    );
 
     final results = index.search(
       const MessageSearchQuery(text: 'cache needle', limit: 1),
@@ -85,61 +88,82 @@ void main() {
   test('replaces and deletes stale rows for a session', () {
     _insertSession(db, id: 'alpha', title: 'Alpha session');
 
-    index.replaceSessionMessages('alpha', [
-      MessageSearchDocument(
-        sessionId: 'alpha',
-        messageIndex: 0,
-        author: 'user',
-        createdAtUtc: DateTime.utc(2026, 7, 7, 9),
-        content: 'stale context token',
-      ),
-    ]);
+    _insertMessage(
+      db,
+      sessionId: 'alpha',
+      messageIndex: 0,
+      author: 'user',
+      createdAtUtc: '2026-07-07T09:00:00.000Z',
+      content: 'stale context token',
+    );
     expect(index.search(const MessageSearchQuery(text: 'stale')), hasLength(1));
 
-    index.replaceSessionMessages('alpha', [
-      MessageSearchDocument(
-        sessionId: 'alpha',
-        messageIndex: 1,
-        author: 'assistant',
-        createdAtUtc: DateTime.utc(2026, 7, 7, 10),
-        content: 'fresh context token',
-      ),
-    ]);
+    db.execute('delete from messages where session_id = ?', ['alpha']);
+    _insertMessage(
+      db,
+      sessionId: 'alpha',
+      messageIndex: 1,
+      author: 'assistant',
+      createdAtUtc: '2026-07-07T10:00:00.000Z',
+      content: 'fresh context token',
+    );
 
     expect(index.search(const MessageSearchQuery(text: 'stale')), isEmpty);
     expect(index.search(const MessageSearchQuery(text: 'fresh')), hasLength(1));
 
-    index.deleteSession('alpha');
+    db.execute('delete from sessions where id = ?', ['alpha']);
     expect(index.search(const MessageSearchQuery(text: 'fresh')), isEmpty);
   });
 
   test('removes message search rows when a session is deleted', () {
     _insertSession(db, id: 'deleted', title: 'Deleted session');
-    index.replaceSessionMessages('deleted', [
-      MessageSearchDocument(
-        sessionId: 'deleted',
-        messageIndex: 0,
-        author: 'user',
-        createdAtUtc: DateTime.utc(2026, 7, 7, 9),
-        content: 'delete trigger context token',
-      ),
-    ]);
+    _insertMessage(
+      db,
+      sessionId: 'deleted',
+      messageIndex: 0,
+      author: 'user',
+      createdAtUtc: '2026-07-07T09:00:00.000Z',
+      content: 'delete trigger context token',
+    );
 
     db.execute('delete from sessions where id = ?', ['deleted']);
 
     expect(
-      db
-          .select(
-            '''
-            select count(*) as count
-            from message_search
-            where session_id = ?
-            ''',
-            ['deleted'],
-          )
-          .single['count'],
-      0,
+      index.search(const MessageSearchQuery(text: 'delete trigger')),
+      isEmpty,
     );
+  });
+
+  test('searches external message content with message metadata', () {
+    _insertSession(
+      db,
+      id: 'external',
+      title: 'External content session',
+      threadName: 'External thread',
+      projectName: 'Search Storage',
+      sourceType: 'windows',
+      startedAtUtc: '2026-07-17T09:00:00.000Z',
+      lastMessageAtUtc: '2026-07-17T10:00:00.000Z',
+    );
+    _insertMessage(
+      db,
+      sessionId: 'external',
+      messageIndex: 3,
+      author: 'assistant',
+      createdAtUtc: '2026-07-17T10:00:00.000Z',
+      content: 'external content needle',
+    );
+
+    final result = index
+        .search(const MessageSearchQuery(text: 'external needle'))
+        .single;
+
+    expect(result.sessionId, 'external');
+    expect(result.messageIndex, 3);
+    expect(result.author, 'assistant');
+    expect(result.snippet, contains('<mark>external</mark>'));
+    expect(result.sessionIdentity, 'External thread');
+    expect(result.timestampUtc, DateTime.utc(2026, 7, 17, 10));
   });
 }
 
@@ -183,6 +207,42 @@ void _insertSession(
       projectName,
       startedAtUtc,
       startedAtUtc,
+    ],
+  );
+}
+
+void _insertMessage(
+  Database db, {
+  required String sessionId,
+  required int messageIndex,
+  required String author,
+  required String createdAtUtc,
+  required String content,
+}) {
+  db.execute(
+    '''
+    insert into messages (
+      session_id,
+      message_index,
+      author_type,
+      created_at_utc,
+      first_line,
+      content_plain,
+      content_preview,
+      created_at_db_utc,
+      updated_at_db_utc
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''',
+    [
+      sessionId,
+      messageIndex,
+      author,
+      createdAtUtc,
+      content,
+      content,
+      content,
+      createdAtUtc,
+      createdAtUtc,
     ],
   );
 }
