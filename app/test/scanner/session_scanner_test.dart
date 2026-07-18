@@ -140,6 +140,143 @@ void main() {
     expect(result.progress.filesFailed, 1);
   });
 
+  test('retries a temporarily unavailable WSL root', () async {
+    final wslRoot = Directory('${temp.path}${Platform.pathSeparator}wsl');
+    await wslRoot.create();
+    await File(
+      '${wslRoot.path}${Platform.pathSeparator}ok.json',
+    ).writeAsString(_validJsonSession('wsl-retry'));
+    var availabilityChecks = 0;
+    final requestedDelays = <Duration>[];
+    final scanner = SessionScanner(
+      parser: CodexSessionParser(),
+      pathMapper: mapper,
+      wslRootRetryDelays: const [Duration(seconds: 1), Duration(seconds: 2)],
+      shouldRetryWslRoot: (_) => true,
+      rootExists: (directory) async {
+        availabilityChecks++;
+        return availabilityChecks >= 3;
+      },
+      retryDelay: (delay) async {
+        requestedDelays.add(delay);
+      },
+    );
+
+    final result = await scanner.scan(
+      SessionScanRequest(wslRoot: wslRoot.path),
+    );
+
+    expect(availabilityChecks, 3);
+    expect(requestedDelays, const [Duration(seconds: 1), Duration(seconds: 2)]);
+    expect(result.sessions.single.parsedSession.sessionId, 'wsl-retry');
+    expect(
+      result.errors.map((error) => error.status),
+      isNot(contains(SessionFileStatus.pathUnreachable)),
+    );
+  });
+
+  test('reports an unreachable WSL root after exhausting retries', () async {
+    var availabilityChecks = 0;
+    final requestedDelays = <Duration>[];
+    final scanner = SessionScanner(
+      parser: CodexSessionParser(),
+      pathMapper: mapper,
+      wslRootRetryDelays: const [Duration(seconds: 1), Duration(seconds: 2)],
+      rootExists: (_) async {
+        availabilityChecks++;
+        return false;
+      },
+      retryDelay: (delay) async {
+        requestedDelays.add(delay);
+      },
+    );
+
+    final result = await scanner.scan(
+      const SessionScanRequest(wslRoot: r'\\wsl.localhost\Ubuntu\missing'),
+    );
+
+    expect(availabilityChecks, 3);
+    expect(requestedDelays, const [Duration(seconds: 1), Duration(seconds: 2)]);
+    expect(result.errors.single.status, SessionFileStatus.pathUnreachable);
+  });
+
+  test('does not retry an unreachable Windows root', () async {
+    var availabilityChecks = 0;
+    final scanner = SessionScanner(
+      parser: CodexSessionParser(),
+      pathMapper: mapper,
+      wslRootRetryDelays: const [Duration(seconds: 1)],
+      rootExists: (_) async {
+        availabilityChecks++;
+        return false;
+      },
+      retryDelay: (_) => fail('Windows roots must not be retried.'),
+    );
+
+    final result = await scanner.scan(
+      const SessionScanRequest(windowsRoot: r'C:\missing'),
+    );
+
+    expect(availabilityChecks, 1);
+    expect(result.errors.single.status, SessionFileStatus.pathUnreachable);
+  });
+
+  test('cancels promptly while waiting to retry a WSL root', () async {
+    final retryStarted = Completer<void>();
+    final neverFinishes = Completer<void>();
+    final cancellation = ScanCancellationController();
+    final scanner = SessionScanner(
+      parser: CodexSessionParser(),
+      pathMapper: mapper,
+      wslRootRetryDelays: const [Duration(seconds: 30)],
+      rootExists: (_) async => false,
+      retryDelay: (_) {
+        retryStarted.complete();
+        return neverFinishes.future;
+      },
+    );
+
+    final scan = scanner.scan(
+      SessionScanRequest(
+        wslRoot: r'\\wsl.localhost\Ubuntu\missing',
+        cancellationToken: cancellation.token,
+      ),
+    );
+    await retryStarted.future;
+    cancellation.cancel();
+    final result = await scan.timeout(const Duration(seconds: 1));
+
+    expect(result.cancelled, isTrue);
+    expect(result.errors, isEmpty);
+  });
+
+  test(
+    'does not report an unreachable root when cancelled during lookup',
+    () async {
+      final cancellation = ScanCancellationController();
+      final scanner = SessionScanner(
+        parser: CodexSessionParser(),
+        pathMapper: mapper,
+        wslRootRetryDelays: const [Duration(seconds: 1)],
+        rootExists: (_) async {
+          cancellation.cancel();
+          return false;
+        },
+        retryDelay: (_) => fail('A cancelled scan must not wait to retry.'),
+      );
+
+      final result = await scanner.scan(
+        SessionScanRequest(
+          wslRoot: r'\\wsl.localhost\Ubuntu\missing',
+          cancellationToken: cancellation.token,
+        ),
+      );
+
+      expect(result.cancelled, isTrue);
+      expect(result.errors, isEmpty);
+    },
+  );
+
   test(
     'reports cached sessions missing when no matching file is found',
     () async {
@@ -180,6 +317,7 @@ void main() {
       final scanner = SessionScanner(
         parser: CodexSessionParser(),
         pathMapper: mapper,
+        wslRootRetryDelays: const [],
       );
 
       final result = await scanner.scan(

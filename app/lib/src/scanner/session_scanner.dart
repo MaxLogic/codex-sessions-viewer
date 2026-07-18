@@ -11,6 +11,17 @@ import '../path_mapping/path_mapper.dart';
 import '../utils/profiling.dart';
 
 typedef SessionFileStatReader = Future<FileStat> Function(File file);
+typedef SessionRootExists = Future<bool> Function(Directory directory);
+typedef ScanRetryDelay = Future<void> Function(Duration delay);
+typedef SessionRootRetryPredicate = bool Function(String rootPath);
+
+const defaultWslRootRetryDelays = [
+  Duration(seconds: 1),
+  Duration(seconds: 2),
+  Duration(seconds: 4),
+  Duration(seconds: 8),
+  Duration(seconds: 15),
+];
 
 enum SessionFileStatus {
   available,
@@ -46,12 +57,19 @@ class SessionScanner {
     this.onSessionParsed,
     this.onParserPoolClosing,
     SessionFileStatReader? fileStatReader,
+    SessionRootExists? rootExists,
+    ScanRetryDelay? retryDelay,
+    SessionRootRetryPredicate? shouldRetryWslRoot,
+    this.wslRootRetryDelays = defaultWslRootRetryDelays,
     this.progressEveryWorkItems = 100,
     this.cacheModifiedTolerance = const Duration(seconds: 2),
   }) : assert(maxConcurrentParses > 0),
        assert(maxConcurrentDirectoryScans > 0),
        assert(maxConcurrentMetadataChecks > 0),
        fileStatReader = fileStatReader ?? _defaultFileStatReader,
+       rootExists = rootExists ?? _defaultRootExists,
+       retryDelay = retryDelay ?? Future<void>.delayed,
+       shouldRetryWslRoot = shouldRetryWslRoot ?? _isWslUncPath,
        assert(!cacheModifiedTolerance.isNegative);
 
   final CodexSessionParser parser;
@@ -68,6 +86,10 @@ class SessionScanner {
   onSessionParsed;
   final Future<void> Function()? onParserPoolClosing;
   final SessionFileStatReader fileStatReader;
+  final SessionRootExists rootExists;
+  final ScanRetryDelay retryDelay;
+  final SessionRootRetryPredicate shouldRetryWslRoot;
+  final List<Duration> wslRootRetryDelays;
   final int progressEveryWorkItems;
   final Duration cacheModifiedTolerance;
   bool _isScanning = false;
@@ -274,7 +296,25 @@ class SessionScanner {
       return;
     }
     final root = Directory(rootPath);
-    if (!await root.exists()) {
+    final retryDelays =
+        sourceType == SessionSourceType.wsl && shouldRetryWslRoot(rootPath)
+        ? wslRootRetryDelays
+        : const <Duration>[];
+    var reachable = await rootExists(root);
+    for (final delay in retryDelays) {
+      if (reachable || (cancellationToken?.isCancellationRequested ?? false)) {
+        break;
+      }
+      await _waitForRetry(delay, cancellationToken);
+      if (cancellationToken?.isCancellationRequested ?? false) {
+        return;
+      }
+      reachable = await rootExists(root);
+    }
+    if (cancellationToken?.isCancellationRequested ?? false) {
+      return;
+    }
+    if (!reachable) {
       progress.filesFailed++;
       _emitProgress(progress);
       errors.add(
@@ -303,6 +343,27 @@ class SessionScanner {
       return;
     }
     directoryQueue.add(_ScanDirectory(directory: root, sourceType: sourceType));
+  }
+
+  Future<void> _waitForRetry(
+    Duration delay,
+    ScanCancellationToken? cancellationToken,
+  ) async {
+    if (cancellationToken == null) {
+      await retryDelay(delay);
+      return;
+    }
+    final cancelled = Completer<void>();
+    final removeListener = cancellationToken._addListener(() {
+      if (!cancelled.isCompleted) {
+        cancelled.complete();
+      }
+    });
+    try {
+      await Future.any([retryDelay(delay), cancelled.future]);
+    } finally {
+      removeListener();
+    }
   }
 
   Future<void> _directoryWorker({
@@ -716,6 +777,13 @@ class SessionScanner {
 }
 
 Future<FileStat> _defaultFileStatReader(File file) => file.stat();
+Future<bool> _defaultRootExists(Directory directory) => directory.exists();
+
+bool _isWslUncPath(String rootPath) {
+  final normalized = rootPath.replaceAll('/', r'\').toLowerCase();
+  return normalized.startsWith(r'\\wsl.localhost\') ||
+      normalized.startsWith(r'\\wsl$\');
+}
 
 class SessionScanRequest {
   const SessionScanRequest({
