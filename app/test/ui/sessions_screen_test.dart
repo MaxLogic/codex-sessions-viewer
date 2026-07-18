@@ -4,13 +4,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../helpers/test_sessions_screen.dart';
+
 void main() {
   testWidgets(
     'shows required filters, table columns, row states, and actions',
     (tester) async {
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialRows: [
               _row(
                 id: 'active',
@@ -114,7 +116,7 @@ void main() {
   ) async {
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [_row(id: 'active', title: 'Parser cache')],
           initialStatusMessage:
               'Loaded 250 of 7843 sessions from the previous scan.',
@@ -137,7 +139,7 @@ void main() {
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialRows: [
               _row(
                 id: 'old',
@@ -194,7 +196,7 @@ void main() {
   ) async {
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'subagent',
@@ -238,7 +240,7 @@ void main() {
     (tester) async {
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialTableState: const SessionTableSettings(
               columnWidths: {},
               sorts: [

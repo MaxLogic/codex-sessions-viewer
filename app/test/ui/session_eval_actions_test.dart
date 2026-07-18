@@ -23,6 +23,7 @@ void main() {
             onSessionAction: (request) async {
               actions.add(request);
             },
+            now: _fixedNow,
           ),
         ),
       ),
@@ -67,7 +68,7 @@ void main() {
     expect(actions.last.evalMetadata?.status, 'correct');
     expect(actions.last.evalMetadata?.notes, 'Covers cache invalidation');
     expect(actions.last.evalMetadata?.expectedOutput, 'It invalidates cache.');
-    expect(actions.last.evalMetadata?.reviewedAtUtc, isNotNull);
+    expect(actions.last.evalMetadata?.reviewedAtUtc, _fixedNow());
     expect(find.text('Eval status: Correct'), findsOneWidget);
     expect(find.text('Notes: Covers cache invalidation'), findsOneWidget);
     expect(find.text('Expected output: It invalidates cache.'), findsOneWidget);
@@ -89,6 +90,7 @@ void main() {
         home: Scaffold(
           body: SessionsScreen(
             initialRows: [_row(evalReady: true, evalStatus: 'mystery')],
+            now: _fixedNow,
           ),
         ),
       ),
@@ -100,6 +102,8 @@ void main() {
     expect(find.text('Eval status: Not reviewed'), findsOneWidget);
   });
 }
+
+DateTime _fixedNow() => DateTime.utc(2026, 6, 13, 12);
 
 SessionRowViewModel _row({bool evalReady = false, String evalStatus = ''}) {
   return SessionRowViewModel(

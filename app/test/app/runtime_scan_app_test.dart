@@ -997,6 +997,7 @@ void main() {
           ]);
         },
         deferInitialSessionLoad: (_) {},
+        now: () => DateTime.utc(2026, 6, 15, 12),
       ),
     );
     await tester.pump();

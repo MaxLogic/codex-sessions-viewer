@@ -134,6 +134,7 @@ class SessionsScreen extends StatefulWidget {
     this.autoRefreshToken = 0,
     this.openTarget,
     this.openTargetSerial = 0,
+    this.now = DateTime.now,
   });
 
   final List<SessionRowViewModel> initialRows;
@@ -157,6 +158,7 @@ class SessionsScreen extends StatefulWidget {
   final int autoRefreshToken;
   final SessionOpenTarget? openTarget;
   final int openTargetSerial;
+  final DateTime Function() now;
 
   @override
   State<SessionsScreen> createState() => _SessionsScreenState();
@@ -425,6 +427,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                 unreachablePaths: _unreachablePaths,
                                 onOpenSettings: widget.onOpenSettings,
                                 onTestWslPath: widget.onTestWslPath ?? _refresh,
+                                now: widget.now,
                               ),
                       ),
                     ],
@@ -923,7 +926,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       return true;
     }
     final value = row.lastMessageAtUtc.toLocal();
-    final now = DateTime.now();
+    final now = widget.now().toLocal();
     final today = DateTime(now.year, now.month, now.day);
     return switch (_timeFilter) {
       SessionsTimeFilter.today => _isWithinTimeRange(
@@ -1648,7 +1651,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
                 status: _blankToNull(status),
                 notes: _blankToNull(notes),
                 expectedOutput: _blankToNull(expectedOutput),
-                reviewedAtUtc: DateTime.now().toUtc(),
+                reviewedAtUtc: widget.now().toUtc(),
               ),
             ),
             child: const Text('Save'),
@@ -3036,6 +3039,7 @@ class _SessionsTable extends StatelessWidget {
     required this.unreachablePaths,
     required this.onOpenSettings,
     required this.onTestWslPath,
+    required this.now,
   });
 
   final List<_SessionDisplayRow> rows;
@@ -3056,6 +3060,7 @@ class _SessionsTable extends StatelessWidget {
   final List<String> unreachablePaths;
   final VoidCallback? onOpenSettings;
   final VoidCallback? onTestWslPath;
+  final DateTime Function() now;
 
   static const _rowHeight = 48.0;
   static const _columns = <_SessionColumn>[
@@ -3378,7 +3383,7 @@ class _SessionsTable extends StatelessWidget {
   }
 
   Widget _dateCell(SessionRowViewModel row) {
-    final display = row.lastMessageAtUtc.relativeDisplay();
+    final display = row.lastMessageAtUtc.relativeDisplay(now().toUtc());
     return Semantics(
       label: 'Last Message Date $display',
       container: true,
@@ -3646,14 +3651,15 @@ class _ActionsMenu extends StatelessWidget {
                   'Open containing folder',
                   iconAsset: AppIcons.folderOpen,
                 ),
-              if (commandSet.terminalLaunchCommand == null)
-                _item(
-                  SessionRowAction.openTerminalResume,
-                  'Resume unavailable',
-                  iconAsset: AppIcons.terminal,
-                  enabled: false,
-                  disabledReason: resumeReason,
-                ),
+              _item(
+                SessionRowAction.openTerminalResume,
+                commandSet.terminalLaunchCommand == null
+                    ? 'Resume unavailable'
+                    : 'Open terminal and resume',
+                iconAsset: AppIcons.terminal,
+                enabled: commandSet.terminalLaunchCommand != null,
+                disabledReason: resumeReason,
+              ),
               _item(
                 SessionRowAction.copyPlainResumeCommand,
                 'Copy plain resume command',
@@ -4023,9 +4029,8 @@ extension on DateTime {
         '${two(local.hour)}:${two(local.minute)}';
   }
 
-  String relativeDisplay() {
-    final now = DateTime.now().toUtc();
-    final elapsed = now.difference(toUtc());
+  String relativeDisplay(DateTime nowUtc) {
+    final elapsed = nowUtc.difference(toUtc());
     final absolute = '($shortDateTime)';
     if (elapsed.inMinutes < 1) {
       return 'just now';

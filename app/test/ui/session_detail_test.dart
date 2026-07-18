@@ -6,6 +6,8 @@ import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../helpers/test_sessions_screen.dart';
+
 void main() {
   testWidgets('shows required metadata and detail actions', (tester) async {
     await tester.pumpWidget(
@@ -386,7 +388,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _detailRow(
               id: 'row-1',
@@ -439,7 +441,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _detailRow(
               id: 'row-1',

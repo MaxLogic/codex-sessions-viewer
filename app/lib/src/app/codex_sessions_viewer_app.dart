@@ -51,6 +51,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
     this.settingsReload,
     this.usageSummaryLoader,
     this.startupPreferenceApplier = _ignoreStartupPreference,
+    this.now = DateTime.now,
   }) : databaseStartup =
            databaseStartup ??
            Future.value(
@@ -79,6 +80,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
   final SettingsReloadCallback? settingsReload;
   final UsageSummaryLoader? usageSummaryLoader;
   final StartupPreferenceApplier startupPreferenceApplier;
+  final DateTime Function() now;
 
   @override
   State<CodexSessionsViewerApp> createState() => _CodexSessionsViewerAppState();
@@ -171,6 +173,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                       },
                       openTarget: _sessionOpenTarget,
                       openTargetSerial: _sessionOpenTargetSerial,
+                      now: widget.now,
                     ),
                 evalsScreen: _EvalsScreenLoader(
                   settingsFile: widget.settingsFile,
@@ -654,6 +657,7 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.onTableStateChanged,
     required this.openTarget,
     required this.openTargetSerial,
+    required this.now,
   });
 
   final AppSettings settings;
@@ -668,6 +672,7 @@ class _SessionsScreenLoader extends StatefulWidget {
   final SessionTableStateChanged onTableStateChanged;
   final SessionOpenTarget? openTarget;
   final int openTargetSerial;
+  final DateTime Function() now;
 
   @override
   State<_SessionsScreenLoader> createState() => _SessionsScreenLoaderState();
@@ -762,6 +767,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onTableStateChanged: widget.onTableStateChanged,
       openTarget: widget.openTarget,
       openTargetSerial: widget.openTargetSerial,
+      now: widget.now,
     );
   }
 

@@ -252,36 +252,41 @@ class _ConversationViewState extends State<ConversationView> {
                   ),
                 ),
                 Expanded(
-                  child: ListView.builder(
-                    controller: _messageListController,
-                    itemCount: messages.length,
-                    itemBuilder: (context, index) {
-                      final message = messages[index];
-                      return _ConversationMessageCard(
-                        key: ValueKey(message.id),
-                        message: message,
-                        expanded: _expanded.contains(message.id),
-                        selected: message.number == _selectedNumber,
-                        toolCallVisibility: _toolCallVisibility,
-                        motionPolicy: motionPolicy,
-                        onCopyMarkdown: widget.onCopyMessageMarkdown,
-                        onToggleExpanded: () {
-                          final willExpand = !_expanded.contains(message.id);
-                          setState(() {
-                            if (!_expanded.add(message.id)) {
-                              _expanded.remove(message.id);
-                            }
-                          });
-                          unawaited(
-                            widget.announcer?.announce(
-                              willExpand
-                                  ? 'Tool output expanded for message ${message.number}.'
-                                  : 'Tool output collapsed for message ${message.number}.',
-                            ),
-                          );
-                        },
-                      );
-                    },
+                  child: Semantics(
+                    container: true,
+                    explicitChildNodes: true,
+                    label: 'Conversation messages',
+                    child: ListView.builder(
+                      controller: _messageListController,
+                      itemCount: messages.length,
+                      itemBuilder: (context, index) {
+                        final message = messages[index];
+                        return _ConversationMessageCard(
+                          key: ValueKey(message.id),
+                          message: message,
+                          expanded: _expanded.contains(message.id),
+                          selected: message.number == _selectedNumber,
+                          toolCallVisibility: _toolCallVisibility,
+                          motionPolicy: motionPolicy,
+                          onCopyMarkdown: widget.onCopyMessageMarkdown,
+                          onToggleExpanded: () {
+                            final willExpand = !_expanded.contains(message.id);
+                            setState(() {
+                              if (!_expanded.add(message.id)) {
+                                _expanded.remove(message.id);
+                              }
+                            });
+                            unawaited(
+                              widget.announcer?.announce(
+                                willExpand
+                                    ? 'Tool output expanded for message ${message.number}.'
+                                    : 'Tool output collapsed for message ${message.number}.',
+                              ),
+                            );
+                          },
+                        );
+                      },
+                    ),
                   ),
                 ),
               ],
@@ -583,7 +588,10 @@ class _ConversationMessageCard extends StatelessWidget {
         : message.body;
     final semanticsBody = bodyLoaded ? body : 'Message body not loaded yet.';
     return Semantics(
+      key: Key('message-card-semantics-${message.number}'),
       container: true,
+      focusable: true,
+      readOnly: true,
       label: _messageSemanticsLabel(
         message,
         collapsedToolOutput

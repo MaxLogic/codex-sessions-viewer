@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../helpers/test_sessions_screen.dart';
+
 void main() {
   testWidgets('defaults to active sessions and preserves filters on refresh', (
     tester,
@@ -17,7 +19,7 @@ void main() {
     final refresh = Completer<List<SessionRowViewModel>>();
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'keep', title: 'Keep selected', project: 'Viewer'),
             _row(id: 'other', title: 'Other active', project: 'Viewer'),
@@ -70,11 +72,11 @@ void main() {
   testWidgets('filters sessions by selected time range', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final now = DateTime.now().toUtc();
+    final now = DateTime.utc(2026, 6, 15, 12);
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'recent-matching',
@@ -95,6 +97,7 @@ void main() {
               lastMessageAtUtc: now.subtract(const Duration(days: 1)),
             ),
           ],
+          now: () => now,
         ),
       ),
     );
@@ -116,11 +119,11 @@ void main() {
   testWidgets('clear filters resets sessions time range', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'recent',
@@ -156,12 +159,12 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
     final refresh = Completer<SessionsRefreshResult>();
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'initial',
@@ -215,11 +218,11 @@ void main() {
   testWidgets('shows one row for duplicate session snapshots', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'old-snapshot',
@@ -257,7 +260,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'named',
@@ -293,7 +296,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'layout', title: 'Layout row', project: 'Viewer'),
           ],
@@ -324,11 +327,11 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1800, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'named-identity',
@@ -368,7 +371,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'windows',
@@ -416,11 +419,11 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1800, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'large-counts',
@@ -458,11 +461,11 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'available',
@@ -491,7 +494,7 @@ void main() {
     SessionsRefreshProgressCallback? progressCallback;
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           onRefreshWithProgress: (onProgress) {
             progressCallback = onProgress;
             return refresh.future;
@@ -536,7 +539,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'named',
@@ -582,7 +585,7 @@ void main() {
     (tester) async {
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialRows: [
               _row(id: 'cached', title: 'Cached session', project: 'Viewer'),
             ],
@@ -628,7 +631,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'parent',
@@ -690,7 +693,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'parent',
@@ -737,7 +740,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialTableState: const SessionTableSettings(
             columnWidths: {},
             newestPerProjectOnly: false,
@@ -795,7 +798,7 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialTableState: const SessionTableSettings(
               columnWidths: {},
               newestPerProjectOnly: true,
@@ -856,7 +859,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialTableState: const SessionTableSettings(
             columnWidths: {},
             newestPerProjectOnly: true,
@@ -908,7 +911,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialTableState: const SessionTableSettings(
             columnWidths: {},
             newestPerProjectOnly: true,
@@ -958,7 +961,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'parent',
@@ -1037,7 +1040,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'existing', title: 'Existing row', project: 'Viewer'),
           ],
@@ -1078,7 +1081,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'visible', title: 'Visible old', project: 'Viewer'),
           ],
@@ -1114,7 +1117,7 @@ void main() {
   testWidgets('filter changes animate newly visible rows', (tester) async {
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'alpha', title: 'Alpha row', project: 'Viewer'),
             _row(id: 'beta', title: 'Beta row', project: 'Viewer'),
@@ -1146,7 +1149,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'repeat', title: 'Repeat v1', project: 'Viewer'),
           ],
@@ -1188,7 +1191,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'existing', title: 'Existing row', project: 'Viewer'),
           ],
@@ -1227,7 +1230,7 @@ void main() {
   ) async {
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [_row(id: 'sort', title: 'Sort row', project: 'Viewer')],
           settings: AppSettings.defaults().copyWith(
             ui: AppSettings.defaults().ui.copyWithMotion(AppMotionMode.normal),
@@ -1260,7 +1263,7 @@ void main() {
       var cancelCalls = 0;
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialRows: [
               _row(id: 'cached', title: 'Cached row', project: 'Viewer'),
             ],
@@ -1325,7 +1328,7 @@ void main() {
     var cancelCalls = 0;
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           onRefreshOperation: (_) => SessionsRefreshOperation(
             result: refresh.future,
             cancel: () {
@@ -1373,7 +1376,7 @@ void main() {
     );
 
     Widget screen(AppSettings settings) => MaterialApp(
-      home: SessionsScreen(
+      home: TestSessionsScreen(
         settings: settings,
         onRefreshOperation: (_) {
           refreshCalls++;
@@ -1422,7 +1425,7 @@ void main() {
     final refresh = Completer<SessionsRefreshResult>();
 
     Widget screen(int token) => MaterialApp(
-      home: SessionsScreen(
+      home: TestSessionsScreen(
         initialRows: [
           _row(id: 'cached', title: 'Cached row', project: 'Viewer'),
         ],
@@ -1463,7 +1466,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           onTableStateChanged: tableStates.add,
           initialRows: [
             _row(
@@ -1526,7 +1529,7 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialTableState: const SessionTableSettings(
               columnWidths: {},
               newestPerProjectOnly: true,
@@ -1567,7 +1570,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             for (var i = 0; i < 5000; i++)
               _row(id: 'row-$i', title: 'Session $i', project: 'Viewer'),
@@ -1587,7 +1590,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'sized', title: 'Sized panel', project: 'Viewer'),
           ],
@@ -1607,7 +1610,7 @@ void main() {
     var loadCalls = 0;
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'lazy', title: 'Lazy detail', project: 'Viewer'),
           ],
@@ -1650,7 +1653,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'paged', title: 'Paged detail', project: 'Viewer'),
           ],
@@ -1713,7 +1716,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'first',
@@ -1769,7 +1772,7 @@ void main() {
     ];
 
     await tester.pumpWidget(
-      MaterialApp(home: SessionsScreen(initialRows: rows)),
+      MaterialApp(home: TestSessionsScreen(initialRows: rows)),
     );
 
     await _enterSessionSearch(tester, 'visible');
@@ -1779,7 +1782,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: rows,
           openTarget: const SessionOpenTarget(
             sessionId: 'target',
@@ -1804,7 +1807,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'target',
@@ -1876,7 +1879,7 @@ void main() {
 
     Widget screen(List<SessionRowViewModel> rows) {
       return MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: rows,
           openTarget: target,
           openTargetSerial: 1,
@@ -1955,7 +1958,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'first', title: 'First session', project: 'Viewer'),
             _row(id: 'second', title: 'Second session', project: 'Viewer'),
@@ -2033,7 +2036,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(id: 'first-page', title: 'First paged', project: 'Viewer'),
             _row(id: 'second-page', title: 'Second paged', project: 'Viewer'),
@@ -2110,7 +2113,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'live',
@@ -2194,7 +2197,7 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'context',
@@ -2245,7 +2248,7 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             _row(
               id: 'icons',

@@ -1,3 +1,5 @@
+import 'dart:ui' show Tristate;
+
 import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
@@ -14,6 +16,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import '../helpers/test_sessions_screen.dart';
 
 void main() {
   testWidgets('important command actions expose specific semantics labels', (
@@ -58,7 +62,7 @@ void main() {
   ) async {
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             SessionRowViewModel(
               id: 'session-1',
@@ -97,10 +101,10 @@ void main() {
   testWidgets(
     'sessions table does not announce empty summaries for every blank row',
     (tester) async {
-      final now = DateTime.now().toUtc();
+      final now = fixedSessionsNow();
       await tester.pumpWidget(
         MaterialApp(
-          home: SessionsScreen(
+          home: TestSessionsScreen(
             initialRows: [
               SessionRowViewModel(
                 id: 'session-1',
@@ -148,10 +152,10 @@ void main() {
   testWidgets('session row actions have distinct accessible names', (
     tester,
   ) async {
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             SessionRowViewModel(
               id: 'session-1',
@@ -192,7 +196,7 @@ void main() {
   testWidgets('eval controls have distinct accessible labels', (tester) async {
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             SessionRowViewModel(
               id: 'session-1',
@@ -317,10 +321,10 @@ void main() {
   testWidgets('empty session detail has accessible heading and guidance', (
     tester,
   ) async {
-    final now = DateTime.now().toUtc();
+    final now = fixedSessionsNow();
     await tester.pumpWidget(
       MaterialApp(
-        home: SessionsScreen(
+        home: TestSessionsScreen(
           initialRows: [
             SessionRowViewModel(
               id: 'session-1',
@@ -385,6 +389,12 @@ void main() {
 
     expect(find.bySemanticsLabel('#1 User, 10 tokens'), findsOneWidget);
     expect(find.bySemanticsLabel('#2 Tool, 20 tokens'), findsOneWidget);
+    expect(find.bySemanticsLabel('Conversation messages'), findsOneWidget);
+    final message = tester.getSemantics(
+      find.byKey(const Key('message-card-semantics-1')),
+    );
+    expect(message.flagsCollection.isFocused, isNot(Tristate.none));
+    expect(message.label, contains('Prompt body'));
     expect(
       find.bySemanticsLabel(
         'Tool output collapsed, 3 lines. Use the Expand tool output button to show it.',
