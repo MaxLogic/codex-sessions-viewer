@@ -18,6 +18,13 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- Prevented duplicate viewer processes from racing database startup and migrations by holding a process-lifetime app-instance lock.
+- Indexed migration 11's temporary identity tables so large existing databases avoid unindexed correlated lookups during the stable-session rewrite.
+- Added bounded, cancellation-aware retries for temporarily unavailable WSL session roots while keeping Windows roots fail-fast.
+- Avoided writer contention during cached pricing reads and batched changed pricing overrides into atomic transactions.
+- Reworked full-text search to index canonical message and optional tool-output rows without copying conversation text into session search.
+- Made conversation messages individually focusable for screen readers and labeled the virtualized message list as a conversation region.
+- Exposed Open terminal and resume in each session row's More menu alongside Open terminal and fork.
 - Improved window placement restore so maximized state is saved separately from restored bounds and invalid saved bounds are clamped to the current display.
 - Stabilized parsed session row identity so growing JSONL files update the same row and existing duplicate snapshots collapse while retaining local metadata.
 - Improved Sessions table filtering, row identity, count formatting, row actions, scan-status wording, and empty-detail guidance for clearer desktop and screen-reader use.
