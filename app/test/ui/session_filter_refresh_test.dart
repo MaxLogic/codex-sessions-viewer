@@ -69,6 +69,35 @@ void main() {
     expect(find.text('Scan finished. 2 sessions found.'), findsOneWidget);
   });
 
+  testWidgets('distinguishes Codex source archive from viewer archive', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TestSessionsScreen(
+          initialRows: [
+            _row(
+              id: 'codex-archived',
+              title: 'Archived by Codex',
+              project: 'Viewer',
+              sourceState: SessionRowSourceState.codexArchived,
+            ),
+          ],
+        ),
+      ),
+    );
+
+    expect(find.text('Codex archived'), findsOneWidget);
+    expect(find.text('Viewer archive'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel(RegExp('Codex source archived')),
+      findsWidgets,
+    );
+  });
+
   testWidgets('filters sessions by selected time range', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1600, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -2340,6 +2369,7 @@ SessionRowViewModel _row({
   String parentThreadId = '',
   String agentNickname = '',
   bool isArchived = false,
+  SessionRowSourceState sourceState = SessionRowSourceState.active,
   SessionRowPlatform platform = SessionRowPlatform.windows,
   String sourceFilePath = '',
   DateTime? lastMessageAtUtc,
@@ -2373,6 +2403,7 @@ SessionRowViewModel _row({
     tags: const ['ui'],
     status: 'Available',
     isArchived: isArchived,
+    sourceState: sourceState,
     sourceFilePath: sourceFilePath,
     conversationMessages: messages,
   );

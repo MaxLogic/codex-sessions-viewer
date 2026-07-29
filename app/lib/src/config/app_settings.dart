@@ -3,20 +3,26 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:toml/toml.dart';
 
+import '../platform/application_working_directory.dart';
+
 File defaultSettingsFile() {
+  final executableDirectory = applicationExecutableDirectory();
   final executableSettings = File(
-    p.join(File(Platform.resolvedExecutable).parent.path, 'settings.toml'),
+    p.join(executableDirectory.path, 'settings.toml'),
   );
   if (executableSettings.existsSync()) {
     return executableSettings;
   }
-  final repoRootSettings = File(
-    p.normalize(p.join(Directory.current.path, '..', 'settings.toml')),
-  );
-  if (repoRootSettings.existsSync()) {
-    return repoRootSettings;
+  final developmentRoot = findDevelopmentRepositoryRoot();
+  if (developmentRoot != null) {
+    final repoRootSettings = File(
+      p.join(developmentRoot.path, 'settings.toml'),
+    );
+    if (repoRootSettings.existsSync()) {
+      return repoRootSettings;
+    }
   }
-  return File(p.join(Directory.current.path, 'settings.toml'));
+  return executableSettings;
 }
 
 enum AppThemeMode {

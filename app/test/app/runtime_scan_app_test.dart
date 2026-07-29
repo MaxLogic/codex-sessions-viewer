@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
@@ -6,6 +7,7 @@ import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/session_cache_repair.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
@@ -72,12 +74,21 @@ void main() {
         containsAll(['Windows', 'WSL']),
       );
       expect(result.statusMessage, contains('Scan finished'));
+      expect(result.persistenceFlushCount, 1);
 
       final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
       expect(
         db.select('select count(*) as count from sessions').single['count'],
         2,
+      );
+      expect(
+        db
+            .select(
+              'select count(*) as count from sessions where content_hash is not null',
+            )
+            .single['count'],
+        0,
       );
       expect(
         db
@@ -94,8 +105,12 @@ void main() {
         isTrue,
       );
       expect(
-        progressEvents.last.statusMessage,
-        contains('estimated progress 100%'),
+        progressEvents.map((event) => event.statusMessage),
+        contains(contains('estimated progress 100%')),
+      );
+      expect(
+        progressEvents.map((event) => event.statusMessage),
+        contains(startsWith('Maintaining session cache:')),
       );
       final spanNames = {
         for (final event in profilingEvents)
@@ -280,6 +295,7 @@ void main() {
       final secondResult = await controller.refresh();
 
       expect(firstResult.rows, hasLength(1));
+      expect(firstResult.persistenceFlushCount, 1);
       expect(secondResult.rows, hasLength(1));
       expect(secondResult.statusMessage, contains('1 session available'));
       expect(
@@ -446,13 +462,14 @@ void main() {
         settingsFile: settingsFile,
         databaseFile: databaseFile,
         scanBatchingPolicy: const ScanBatchingPolicy(
-          parsedSessionFlushBatchSize: 2,
+          parsedSessionFlushBatchSize: 99,
+          parsedSessionFlushSourceBytes: 1,
           fullRowSnapshotBatchSize: 4,
         ),
       ).refreshInBackground(onProgress: progressEvents.add);
 
       expect(result.rows, hasLength(5));
-      expect(result.persistenceFlushCount, 3);
+      expect(result.persistenceFlushCount, 5);
       expect(result.fullRowSnapshotCount, 2);
       expect(
         progressEvents
@@ -513,10 +530,12 @@ void main() {
       final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
       final row = db.select(
-        'select scan_status from sessions where source_file_path = ?',
+        'select scan_status, source_state '
+        'from sessions where source_file_path = ?',
         [fixture.path],
       ).single;
       expect(row['scan_status'], 'missing');
+      expect(row['source_state'], 'missing');
     },
   );
 
@@ -572,6 +591,878 @@ void main() {
       );
     },
   );
+
+  test('runtime persists active and archived source lifecycle separately', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_source_lifecycle_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    final archivedRoot = Directory(p.join(codexRoot.path, 'archived_sessions'));
+    final unrelatedRoot = Directory(p.join(codexRoot.path, 'plugins'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await activeRoot.create(recursive: true);
+    await archivedRoot.create();
+    await unrelatedRoot.create();
+    await wslRoot.create();
+    await _writeJsonFixture(activeRoot, 'active-lifecycle');
+    await _writeJsonFixture(archivedRoot, 'archived-lifecycle');
+    await _writeJsonFixture(unrelatedRoot, 'unrelated-lifecycle');
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: codexRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final first = await controller.refresh();
+
+    expect(first.rows, hasLength(2));
+    expect(
+      {for (final row in first.rows) row.sessionId: row.sourceState},
+      {
+        'active-lifecycle': SessionRowSourceState.active,
+        'archived-lifecycle': SessionRowSourceState.codexArchived,
+      },
+    );
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    expect(
+      {
+        for (final row in db.select(
+          'select session_id, source_state from sessions order by session_id',
+        ))
+          row['session_id']: row['source_state'],
+      },
+      {'active-lifecycle': 'active', 'archived-lifecycle': 'codex_archived'},
+    );
+    await controller.reloadSessionDetailFromSource(
+      'session:archived-lifecycle',
+    );
+    expect(
+      db
+          .select(
+            "select source_state from sessions where session_id = 'archived-lifecycle'",
+          )
+          .single['source_state'],
+      'codex_archived',
+    );
+    db.execute(
+      "update sessions set is_archived = 1 where session_id = 'active-lifecycle'",
+    );
+
+    await controller.refresh();
+
+    final active = db
+        .select(
+          "select source_state, is_archived from sessions where session_id = 'active-lifecycle'",
+        )
+        .single;
+    expect(active['source_state'], 'active');
+    expect(active['is_archived'], 1);
+    expect(
+      db
+          .select(
+            "select count(*) as count from sessions where session_id = 'unrelated-lifecycle'",
+          )
+          .single['count'],
+      0,
+    );
+  });
+
+  test(
+    'reconciles active and archived copies by complete stable identity',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_runtime_identity_winner_',
+      );
+      addTearDown(() async {
+        if (await temp.exists()) {
+          await temp.delete(recursive: true);
+        }
+      });
+
+      final codexRoot = Directory(p.join(temp.path, '.codex'));
+      final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+      final archivedRoot = Directory(
+        p.join(codexRoot.path, 'archived_sessions'),
+      );
+      await activeRoot.create(recursive: true);
+      await archivedRoot.create();
+      final activeFile = await _writeIdentityFixture(
+        activeRoot,
+        fileName: 'shared-active.json',
+        sessionId: 'shared-identity',
+        messages: const [
+          ('user', '2026-07-27T10:01:00Z', 'active older message'),
+        ],
+      );
+      final archivedFile = await _writeIdentityFixture(
+        archivedRoot,
+        fileName: 'shared-archived.json',
+        sessionId: 'shared-identity',
+        messages: const [
+          ('user', '2026-07-27T10:01:00Z', 'archived first message'),
+          ('assistant', '2026-07-27T10:02:00Z', 'archived complete reply'),
+        ],
+      );
+      await activeFile.setLastModified(DateTime.utc(2026, 7, 27, 11));
+      await archivedFile.setLastModified(DateTime.utc(2026, 7, 27, 10));
+
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: codexRoot.path,
+            wslCodexUncPath: '',
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+      ).openAndMigrate(databaseFile);
+      expect(startup.canStartNormalUi, isTrue);
+
+      final result = await RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+        scanBatchingPolicy: const ScanBatchingPolicy(
+          parsedSessionFlushBatchSize: 1,
+          fullRowSnapshotBatchSize: 1,
+        ),
+      ).refresh(onProgress: (_) {});
+
+      expect(result.rows, hasLength(1));
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      final session = db.select('''
+            select id, source_file_path, source_state, message_count
+            from sessions where session_id = 'shared-identity'
+            ''').single;
+      expect(
+        db.select('select count(*) as count from sessions').single['count'],
+        1,
+      );
+      expect(session['id'], 'session:shared-identity');
+      expect(session['source_file_path'], archivedFile.path);
+      expect(session['source_state'], 'codex_archived');
+      expect(session['message_count'], 2);
+      expect(
+        db
+            .select(
+              'select content_plain from messages where session_id = ? '
+              'order by message_index',
+              ['session:shared-identity'],
+            )
+            .map((row) => row['content_plain']),
+        ['archived first message', 'archived complete reply'],
+      );
+    },
+  );
+
+  test('merges fallback identity and protected metadata atomically', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_fallback_merge_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    await activeRoot.create(recursive: true);
+    final sourceFile = await _writeIdentityFixture(
+      activeRoot,
+      fileName: 'fallback-merge.json',
+      sessionId: 'fallback-merge',
+      messages: const [
+        ('user', '2026-07-27T14:00:00Z', 'current parsed message'),
+      ],
+    );
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: codexRoot.path,
+          wslCodexUncPath: '',
+        ),
+        logging: _testLogging(temp),
+        toolOutput: const ToolOutputSettings(
+          indexToolOutput: true,
+          maxToolOutputPreviewChars: 2000,
+          maxToolOutputStoreChars: 20000,
+          collapseToolOutputByDefault: true,
+        ),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final db = openFileBackedDatabase(databaseFile);
+    db.execute('''
+      insert into projects (id, name, created_at_utc, updated_at_utc)
+      values
+        (1, 'Canonical Project', '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z'),
+        (2, 'Fallback Project', '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+      ''');
+    db.execute('''
+      insert into sessions (
+        id, session_id, source_type, source_file_path, display_path,
+        platform_path, project_id, project_name_snapshot, project_override,
+        is_pinned, is_archived, archived_at_utc, archive_reason,
+        eval_ready, eval_status, eval_notes, eval_expected_output,
+        eval_reviewed_at_utc, eval_updated_at_utc,
+        created_at_utc, updated_at_utc
+      ) values (
+        'session:fallback-merge', 'fallback-merge', 'windows',
+        'C:\\old\\canonical.jsonl', 'C:\\old\\canonical.jsonl',
+        'C:\\old\\canonical.jsonl', 1, 'Canonical Project', 1,
+        0, 1, '2026-07-27T12:00:00Z', 'canonical archive reason',
+        1, 'canonical-eval', 'canonical notes', 'canonical expected',
+        '2026-07-27T10:30:00Z', '2026-07-27T11:00:00Z',
+        '2026-07-27T09:00:00Z', '2026-07-27T10:00:00Z'
+      )
+      ''');
+    final fallbackId = 'source:${sourceFile.path}';
+    final statusFallbackId =
+        'source-status:${p.normalize(sourceFile.path).toLowerCase()}';
+    db.execute(
+      '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        project_id, project_name_snapshot, project_override,
+        is_pinned, is_archived, archived_at_utc, archive_reason,
+        eval_ready, eval_status, eval_notes, eval_expected_output,
+        eval_reviewed_at_utc, eval_updated_at_utc,
+        created_at_utc, updated_at_utc
+      ) values (?, 'windows', ?, ?, ?, 2, 'Fallback Project', 1,
+        1, 1, '2026-07-27T11:00:00Z', 'fallback archive reason',
+        1, 'fallback-eval', 'fallback notes', 'fallback expected',
+        '2026-07-27T12:30:00Z', '2026-07-27T13:00:00Z',
+        '2026-07-27T09:00:00Z', '2026-07-27T12:00:00Z')
+      ''',
+      [fallbackId, sourceFile.path, sourceFile.path, sourceFile.path],
+    );
+    db.execute(
+      '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        scan_status, parse_status, created_at_utc, updated_at_utc
+      ) values (?, 'windows', ?, ?, ?, 'parse_error', 'parse_error',
+        '2026-07-27T08:00:00Z', '2026-07-27T08:00:00Z')
+      ''',
+      [statusFallbackId, sourceFile.path, sourceFile.path, sourceFile.path],
+    );
+    db.execute('''
+      insert into tags (id, name, created_at_utc, updated_at_utc)
+      values
+        (1, 'canonical-tag', '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z'),
+        (2, 'fallback-tag', '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+      ''');
+    db.execute(
+      '''
+      insert into session_tags (session_id, tag_id, created_at_utc)
+      values
+        ('session:fallback-merge', 1, '2026-07-27T09:00:00Z'),
+        (?, 2, '2026-07-27T09:00:00Z')
+      ''',
+      [fallbackId],
+    );
+    db.execute(
+      '''
+      insert into session_path_keys (session_id, path_key)
+      values
+        ('session:fallback-merge', 'c:/old/canonical.jsonl'),
+        (?, 'c:/old/fallback.jsonl')
+      ''',
+      [fallbackId],
+    );
+    db.execute(
+      '''
+      insert into messages (
+        session_id, message_index, author_type, content_plain,
+        content_preview, created_at_db_utc, updated_at_db_utc
+      ) values (?, 0, 'user', 'legacy fallback message',
+        'legacy fallback message', '2026-07-27T09:00:00Z',
+        '2026-07-27T09:00:00Z')
+      ''',
+      [fallbackId],
+    );
+    ToolOutputSearchIndex(db).configure(enabled: true);
+    db.execute(
+      '''
+      insert into tool_calls (
+        session_id, tool_index, tool_name, status, output_preview
+      ) values (?, 0, 'legacy_tool', 'completed', 'legacy output')
+      ''',
+      [fallbackId],
+    );
+    final fallbackRowId = db.select('select rowid from sessions where id = ?', [
+      fallbackId,
+    ]).single['rowid'];
+    db.execute(
+      '''
+      insert into session_search (
+        rowid, title, summary, tool_names, display_path,
+        normalized_path_keys, project_name, tags
+      ) values (?, 'staleidentityterm', '', '', '', '', '', '')
+      ''',
+      [fallbackRowId],
+    );
+    db.close();
+
+    final result = await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
+
+    expect(result.rows, hasLength(1));
+    final migrated = openFileBackedDatabase(databaseFile);
+    addTearDown(migrated.close);
+    final session = migrated.select('''
+          select is_pinned, project_id, project_name_snapshot,
+                 project_override, is_archived, archived_at_utc,
+                 archive_reason, eval_ready, eval_status, eval_notes,
+                 eval_expected_output, eval_reviewed_at_utc,
+                 eval_updated_at_utc
+          from sessions where id = 'session:fallback-merge'
+          ''').single;
+    expect(session['is_pinned'], 1);
+    expect(session['project_id'], 2);
+    expect(session['project_name_snapshot'], 'Fallback Project');
+    expect(session['project_override'], 1);
+    expect(session['is_archived'], 1);
+    expect(session['archived_at_utc'], '2026-07-27T12:00:00Z');
+    expect(session['archive_reason'], 'canonical archive reason');
+    expect(session['eval_ready'], 1);
+    expect(session['eval_status'], 'fallback-eval');
+    expect(session['eval_notes'], 'fallback notes');
+    expect(session['eval_expected_output'], 'fallback expected');
+    expect(session['eval_reviewed_at_utc'], '2026-07-27T12:30:00Z');
+    expect(session['eval_updated_at_utc'], '2026-07-27T13:00:00Z');
+    expect(
+      migrated
+          .select('''
+            select t.name
+            from session_tags st join tags t on t.id = st.tag_id
+            where st.session_id = 'session:fallback-merge'
+            order by t.name
+            ''')
+          .map((row) => row['name']),
+      ['canonical-tag', 'fallback-tag'],
+    );
+    expect(
+      migrated
+          .select('''
+            select path_key from session_path_keys
+            where session_id = 'session:fallback-merge'
+            order by path_key
+            ''')
+          .map((row) => row['path_key']),
+      containsAll(['c:/old/canonical.jsonl', 'c:/old/fallback.jsonl']),
+    );
+    expect(
+      migrated
+          .select(
+            "select content_plain from messages where session_id = 'session:fallback-merge'",
+          )
+          .single['content_plain'],
+      'current parsed message',
+    );
+    final canonicalRowId = migrated
+        .select(
+          "select rowid from sessions where id = 'session:fallback-merge'",
+        )
+        .single['rowid'];
+    expect(
+      migrated
+          .select(
+            "select rowid from session_search where session_search match 'fallback'",
+          )
+          .map((row) => row['rowid']),
+      contains(canonicalRowId),
+    );
+    expect(
+      migrated
+          .select(
+            "select count(*) as count from message_search where message_search match 'current'",
+          )
+          .single['count'],
+      1,
+    );
+    expect(
+      migrated
+          .select(
+            "select count(*) as count from session_search where session_search match 'staleidentityterm'",
+          )
+          .single['count'],
+      0,
+    );
+    expect(
+      migrated
+          .select(
+            "select count(*) as count from message_search where message_search match 'legacy'",
+          )
+          .single['count'],
+      0,
+    );
+    expect(
+      migrated
+          .select(
+            "select count(*) as count from tool_output_search where tool_output_search match 'legacy'",
+          )
+          .single['count'],
+      0,
+    );
+    expect(
+      migrated.select(
+        'select count(*) as count from sessions where id in (?, ?)',
+        [fallbackId, statusFallbackId],
+      ).single['count'],
+      0,
+    );
+    for (final table in [
+      'messages',
+      'tool_calls',
+      'session_tags',
+      'session_path_keys',
+    ]) {
+      expect(
+        migrated.select(
+          'select count(*) as count from $table where session_id = ?',
+          [fallbackId],
+        ).single['count'],
+        0,
+        reason: '$table must not retain fallback ownership',
+      );
+    }
+    expect(migrated.select('pragma foreign_key_check'), isEmpty);
+  });
+
+  test('rolls back identity reconciliation failure', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_fallback_rollback_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    await activeRoot.create(recursive: true);
+    final sourceFile = await _writeIdentityFixture(
+      activeRoot,
+      fileName: 'fallback-rollback.json',
+      sessionId: 'fallback-rollback',
+      messages: const [('user', '2026-07-27T14:00:00Z', 'replacement message')],
+    );
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: codexRoot.path,
+          wslCodexUncPath: '',
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final fallbackId = 'source:${sourceFile.path}';
+    final db = openFileBackedDatabase(databaseFile);
+    for (final row in [
+      (
+        id: 'session:fallback-rollback',
+        sessionId: 'fallback-rollback',
+        sourcePath: 'C:\\old\\canonical-rollback.jsonl',
+      ),
+      (id: fallbackId, sessionId: null, sourcePath: sourceFile.path),
+    ]) {
+      db.execute(
+        '''
+        insert into sessions (
+          id, session_id, source_type, source_file_path, display_path,
+          platform_path, created_at_utc, updated_at_utc
+        ) values (?, ?, 'windows', ?, ?, ?,
+          '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+        ''',
+        [row.id, row.sessionId, row.sourcePath, row.sourcePath, row.sourcePath],
+      );
+    }
+    db.execute('''
+      update sessions
+      set is_pinned = 1,
+          project_name_snapshot = 'Canonical rollback metadata'
+      where id = 'session:fallback-rollback'
+      ''');
+    db.execute('''
+      insert into messages (
+        session_id, message_index, author_type, content_plain,
+        content_preview, created_at_db_utc, updated_at_db_utc
+      ) values ('session:fallback-rollback', 0, 'user',
+        'canonical original', 'canonical original',
+        '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+      ''');
+    db.execute(
+      '''
+      insert into messages (
+        session_id, message_index, author_type, content_plain,
+        content_preview, created_at_db_utc, updated_at_db_utc
+      ) values (?, 0, 'user', 'fallback original', 'fallback original',
+        '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+      ''',
+      [fallbackId],
+    );
+    db.execute('''
+      insert into tags (id, name, created_at_utc, updated_at_utc)
+      values (1, 'rollback-tag', '2026-07-27T09:00:00Z',
+        '2026-07-27T09:00:00Z')
+      ''');
+    db.execute(
+      '''
+      insert into session_tags (session_id, tag_id, created_at_utc)
+      values (?, 1, '2026-07-27T09:00:00Z')
+      ''',
+      [fallbackId],
+    );
+    db.execute(
+      'insert into session_path_keys (session_id, path_key) values (?, ?)',
+      [fallbackId, 'c:/old/fallback-rollback.jsonl'],
+    );
+    db.execute('''
+      create trigger fail_identity_reconciliation
+      before delete on sessions
+      when old.id like 'source:%'
+      begin
+        select raise(abort, 'injected identity reconciliation failure');
+      end
+      ''');
+    db.close();
+
+    await expectLater(
+      RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      ).refresh(),
+      throwsA(anything),
+    );
+
+    final rolledBack = openFileBackedDatabase(databaseFile);
+    addTearDown(rolledBack.close);
+    expect(
+      rolledBack.select(
+        'select count(*) as count from sessions '
+        "where id in ('session:fallback-rollback', ?)",
+        [fallbackId],
+      ).single['count'],
+      2,
+    );
+    final canonical = rolledBack.select('''
+      select source_file_path, is_pinned, project_name_snapshot
+      from sessions where id = 'session:fallback-rollback'
+      ''').single;
+    expect(canonical['source_file_path'], r'C:\old\canonical-rollback.jsonl');
+    expect(canonical['is_pinned'], 1);
+    expect(canonical['project_name_snapshot'], 'Canonical rollback metadata');
+    expect(
+      rolledBack
+          .select(
+            "select content_plain from messages where session_id = 'session:fallback-rollback'",
+          )
+          .single['content_plain'],
+      'canonical original',
+    );
+    for (final table in ['messages', 'session_tags', 'session_path_keys']) {
+      expect(
+        rolledBack.select(
+          'select count(*) as count from $table where session_id = ?',
+          [fallbackId],
+        ).single['count'],
+        1,
+        reason: '$table must roll back with the identity transaction',
+      );
+    }
+    expect(rolledBack.select('pragma foreign_key_check'), isEmpty);
+  });
+
+  test('keeps case-distinct WSL fallback identities unresolved', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_wsl_identity_case_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    await activeRoot.create(recursive: true);
+    final sourceFile = await _writeIdentityFixture(
+      activeRoot,
+      fileName: 'Case-Sensitive.json',
+      sessionId: 'wsl-case-sensitive',
+      messages: const [
+        ('user', '2026-07-27T14:00:00Z', 'case-sensitive source'),
+      ],
+    );
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: '',
+          wslCodexUncPath: codexRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final caseDistinctPath =
+        '/${sourceFile.path.replaceAll(r'\', '/').toLowerCase()}';
+    final fallbackId = 'source-status:$caseDistinctPath';
+    final db = openFileBackedDatabase(databaseFile);
+    db.execute(
+      '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        is_pinned, created_at_utc, updated_at_utc
+      ) values (?, 'wsl', ?, ?, ?, 1,
+        '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+      ''',
+      [fallbackId, caseDistinctPath, caseDistinctPath, caseDistinctPath],
+    );
+    db.close();
+
+    await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
+
+    final refreshed = openFileBackedDatabase(databaseFile);
+    addTearDown(refreshed.close);
+    expect(
+      refreshed.select('select count(*) as count from sessions where id = ?', [
+        fallbackId,
+      ]).single['count'],
+      1,
+    );
+    expect(
+      refreshed
+          .select(
+            "select is_pinned from sessions where id = 'session:wsl-case-sensitive'",
+          )
+          .single['is_pinned'],
+      0,
+    );
+  });
+
+  test('release lifecycle certification preflight invariants', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_cache_repair_gate_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    final sessionsRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    final pluginsRoot = Directory(p.join(codexRoot.path, 'plugins'));
+    await sessionsRoot.create(recursive: true);
+    await pluginsRoot.create();
+    final malformed = File(p.join(sessionsRoot.path, 'repair-gate.json'));
+    await malformed.writeAsString('{ malformed');
+    final legacyArtifact = File(p.join(pluginsRoot.path, 'legacy.json'));
+    await legacyArtifact.writeAsString('{}');
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: codexRoot.path,
+          wslCodexUncPath: '',
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+    final db = openFileBackedDatabase(databaseFile);
+    db.execute(
+      '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        parser_version, created_at_utc, updated_at_utc
+      ) values ('source:legacy-artifact', 'windows', ?, ?, ?, 1,
+        '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+      ''',
+      [legacyArtifact.path, legacyArtifact.path, legacyArtifact.path],
+    );
+    db.close();
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    await controller.refresh();
+    final afterFailedScan = openFileBackedDatabase(databaseFile);
+    expect(
+      afterFailedScan
+          .select(
+            "select count(*) as count from sessions where id = 'source:legacy-artifact'",
+          )
+          .single['count'],
+      1,
+    );
+    expect(
+      afterFailedScan
+          .select(
+            "select count(*) as count from app_metadata where key = '$sessionCacheRepairCompletionKey'",
+          )
+          .single['count'],
+      0,
+    );
+    afterFailedScan.close();
+
+    await malformed.writeAsString('''
+      {
+        "session_id": "repair-gate",
+        "source_type": "windows",
+        "messages": [{"type": "user", "content": "repaired"}]
+      }
+      ''');
+    await controller.refresh();
+
+    final repaired = openFileBackedDatabase(databaseFile);
+    addTearDown(repaired.close);
+    expect(
+      repaired
+          .select(
+            "select count(*) as count from sessions where id = 'source:legacy-artifact'",
+          )
+          .single['count'],
+      0,
+    );
+    expect(
+      repaired
+          .select(
+            "select count(*) as count from app_metadata where key = '$sessionCacheRepairCompletionKey'",
+          )
+          .single['count'],
+      1,
+    );
+    expect(await legacyArtifact.exists(), isTrue);
+    final backups = Directory(p.join(temp.path, 'backups'));
+    expect(await backups.list().where((entity) => entity is File).length, 1);
+  });
+
+  test('runtime cache repair failure does not fail the scan', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_cache_repair_failure_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    final sessionsRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    await sessionsRoot.create(recursive: true);
+    await _writeJsonFixture(sessionsRoot, 'repair-failure-session');
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: codexRoot.path,
+          wslCodexUncPath: '',
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+    final db = openFileBackedDatabase(databaseFile);
+    db.execute('''
+      create trigger fail_cache_repair_audit
+      before insert on session_cache_repair_manifest
+      begin
+        select raise(abort, 'injected audit failure');
+      end
+      ''');
+    db.close();
+
+    final result = await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
+
+    expect(result.rows, hasLength(1));
+    final refreshed = openFileBackedDatabase(databaseFile);
+    addTearDown(refreshed.close);
+    expect(
+      refreshed
+          .select(
+            "select count(*) as count from app_metadata where key = '$sessionCacheRepairCompletionKey'",
+          )
+          .single['count'],
+      0,
+    );
+    expect(
+      refreshed
+          .select(
+            "select details from logs where message = 'Session cache repair postponed.' order by id desc limit 1",
+          )
+          .single['details']
+          .toString(),
+      contains('unexpected_repair_error'),
+    );
+  });
 
   test(
     'refresh applies session_index thread names to unchanged cached rows',
@@ -1023,6 +1914,63 @@ void main() {
 
     expect(result.rows, isEmpty);
     expect(result.statusMessage, contains('No supported files found'));
+  });
+
+  test('runtime refresh continues when the text log cannot open', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_scan_unavailable_log_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    final unavailableLogFile = Directory(p.join(temp.path, 'unavailable.log'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await unavailableLogFile.create();
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        pricing: _testPricing(),
+        logging: LoggingSettings(
+          level: 'info',
+          logFile: unavailableLogFile.path,
+          maxLogFiles: 2,
+          maxLogSizeMb: 1,
+        ),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final result = await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
+
+    expect(result.rows, isEmpty);
+    expect(result.statusMessage, contains('No supported files found'));
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    expect(
+      db
+          .select(
+            "select count(*) as count from logs where message like 'Text log write failed%'",
+          )
+          .single['count'],
+      1,
+    );
   });
 
   testWidgets('empty reachable scans show a no-sessions empty state', (
@@ -1824,6 +2772,70 @@ void main() {
     },
   );
 
+  test('runtime cancellation is honored during cache maintenance', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_cancel_maintenance_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writeJsonFixture(windowsRoot, 'maintenance-cancel');
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    late CancellableSessionScanOperation operation;
+    var maintenanceReported = false;
+    operation = controller.startRefreshOperation(
+      onProgress: (progress) {
+        if (progress.statusMessage ==
+            'Maintaining session cache: auditing cached rows...') {
+          maintenanceReported = true;
+          unawaited(operation.cancel());
+        }
+      },
+    );
+
+    final result = await operation.result;
+
+    expect(maintenanceReported, isTrue);
+    expect(result.cancelled, isTrue);
+    expect(result.statusMessage, contains('cancelled'));
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    expect(
+      db
+          .select(
+            "select count(*) as count from app_metadata where key = '$sessionCacheRepairCompletionKey'",
+          )
+          .single['count'],
+      0,
+    );
+  });
+
   test('background cancellable refresh acknowledges cancellation', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_background_cancel_scan_',
@@ -2276,6 +3288,28 @@ Future<File> _writeJsonFixture(Directory destination, String id) async {
   ]
 }
 ''');
+  return file;
+}
+
+Future<File> _writeIdentityFixture(
+  Directory destination, {
+  required String fileName,
+  required String sessionId,
+  required List<(String, String, String)> messages,
+}) async {
+  final file = File(p.join(destination.path, fileName));
+  final encodedMessages = messages
+      .map(
+        (message) =>
+            '{"type":${jsonEncode(message.$1)},'
+            '"created_at":${jsonEncode(message.$2)},'
+            '"content":${jsonEncode(message.$3)}}',
+      )
+      .join(',');
+  await file.writeAsString(
+    '{"session_id":${jsonEncode(sessionId)},'
+    '"source_type":"windows","messages":[$encodedMessages]}',
+  );
   return file;
 }
 

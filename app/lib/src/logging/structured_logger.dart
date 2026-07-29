@@ -37,11 +37,14 @@ typedef UtcNow = DateTime Function();
 
 class StructuredLogger {
   StructuredLogger({required this.db, required this.settings, UtcNow? nowUtc})
-    : _nowUtc = nowUtc ?? (() => DateTime.now().toUtc());
+    : _nowUtc = nowUtc ?? (() => DateTime.now().toUtc()),
+      _logFile = File(settings.logFile).absolute;
 
   final Database db;
   final LoggingSettings settings;
   final UtcNow _nowUtc;
+  final File _logFile;
+  var _fileFailureReported = false;
 
   Future<void> write(LogEntryDraft draft) async {
     if (!_isEnabled(draft.level)) {
@@ -63,16 +66,27 @@ class StructuredLogger {
       ],
     );
     final safeMessage = _sanitizeMessage(draft.message);
-    await _writeFileEntry(
-      LogEntry(
-        id: null,
-        timeUtc: time,
-        level: draft.level,
-        category: draft.category,
-        message: safeMessage,
-        details: details,
-      ),
+    final entry = LogEntry(
+      id: null,
+      timeUtc: time,
+      level: draft.level,
+      category: draft.category,
+      message: safeMessage,
+      details: details,
     );
+    try {
+      await _writeFileEntry(entry);
+    } on FileSystemException catch (error) {
+      _recordFileFailure(entry, error);
+    }
+  }
+
+  Future<void> writeBestEffort(LogEntryDraft draft) async {
+    try {
+      await write(draft);
+    } on Object {
+      // Diagnostic failures must not replace the operation being diagnosed.
+    }
   }
 
   List<LogEntry> query(LogQuery query) {
@@ -101,7 +115,7 @@ class StructuredLogger {
   }
 
   Future<void> _writeFileEntry(LogEntry entry) async {
-    final file = File(settings.logFile);
+    final file = _logFile;
     await file.parent.create(recursive: true);
     final jsonLine = jsonEncode({
       'time_utc': entry.timeUtc.toIso8601String(),
@@ -112,6 +126,40 @@ class StructuredLogger {
     });
     await _rotateIfNeeded(file, utf8.encode('$jsonLine\n').length);
     await file.writeAsString('$jsonLine\n', mode: FileMode.append);
+  }
+
+  void _recordFileFailure(LogEntry entry, FileSystemException error) {
+    if (_fileFailureReported) {
+      return;
+    }
+    _fileFailureReported = true;
+    final details = jsonEncode({
+      'error_type': error.runtimeType.toString(),
+      'operation': error.message,
+      'log_file': error.path ?? _logFile.path,
+      if (error.osError case final osError?) ...{
+        'os_error': osError.message,
+        'os_error_code': osError.errorCode,
+      },
+    });
+    try {
+      db.execute(
+        '''
+        insert into logs (time_utc, level, category, message, details)
+        values (?, ?, ?, ?, ?)
+        ''',
+        [
+          entry.timeUtc.toIso8601String(),
+          LogLevel.warning.wireName,
+          entry.category.wireName,
+          'Text log write failed; continuing with SQLite logging.',
+          details,
+        ],
+      );
+    } on Object {
+      // The original SQLite entry succeeded. Do not rethrow a secondary
+      // failure while attempting to describe the unavailable text log.
+    }
   }
 
   Future<void> _rotateIfNeeded(File file, int incomingBytes) async {

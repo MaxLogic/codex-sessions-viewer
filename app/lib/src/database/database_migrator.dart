@@ -4,29 +4,34 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
+import '../platform/application_working_directory.dart';
 import 'database_connection.dart';
 
 File defaultDatabaseFile() {
   final appData = Platform.environment['APPDATA'];
   final basePath = appData == null || appData.isEmpty
-      ? Directory.current.path
+      ? applicationExecutableDirectory().path
       : p.join(appData, 'CodexSessionViewer');
   return File(p.join(basePath, 'codex_sessions_viewer.sqlite'));
 }
 
 Directory defaultSqlRoot() {
-  final executableDir = File(Platform.resolvedExecutable).parent;
+  final executableDir = applicationExecutableDirectory();
   final releaseSqlRoot = Directory(p.join(executableDir.path, 'sql'));
   if (releaseSqlRoot.existsSync()) {
     return releaseSqlRoot;
   }
-  return Directory(p.normalize(p.join(Directory.current.path, '..', 'sql')));
+  final developmentRoot = findDevelopmentRepositoryRoot();
+  if (developmentRoot != null) {
+    return Directory(p.join(developmentRoot.path, 'sql'));
+  }
+  return releaseSqlRoot;
 }
 
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 12,
+    this.supportedSchemaVersion = 14,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
@@ -79,6 +84,8 @@ class DatabaseMigrator {
         return DatabaseStartupResult.blocked(schemaError);
       }
 
+      _recoverInterruptedScanRuns(db);
+
       return DatabaseStartupResult.ready(
         lastAppliedSchemaVersion: _lastAppliedVersion(db),
       );
@@ -96,6 +103,24 @@ class DatabaseMigrator {
     } finally {
       db?.close();
     }
+  }
+
+  void _recoverInterruptedScanRuns(Database db) {
+    final hasStatusColumn = db
+        .select("pragma table_info('scan_runs')")
+        .any((row) => row['name'] == 'status');
+    if (!hasStatusColumn) {
+      return;
+    }
+    db.execute(
+      '''
+      update scan_runs
+      set status = 'failed',
+          finished_at_utc = coalesce(finished_at_utc, ?)
+      where status = 'running'
+      ''',
+      [DateTime.now().toUtc().toIso8601String()],
+    );
   }
 
   DatabaseFatalError? _verifyFts5(Database db, String databasePath) {
@@ -283,6 +308,7 @@ class DatabaseMigrator {
     final requiredTables = [
       ..._requiredTables,
       if (lastAppliedVersion >= 12) 'tool_output_search',
+      if (lastAppliedVersion >= 14) 'session_cache_repair_manifest',
     ];
     for (final table in requiredTables) {
       final rows = db.select(

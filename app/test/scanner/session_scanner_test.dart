@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/path_mapping/path_mapper.dart';
 import 'package:codex_sessions_viewer/src/scanner/session_scanner.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 
 void main() {
   late Directory temp;
@@ -25,6 +27,34 @@ void main() {
       await temp.delete(recursive: true);
     }
   });
+
+  test(
+    'maps parser snapshot metadata into a pending scanned session',
+    () async {
+      final source = File(p.join(temp.path, 'snapshot.json'));
+      await source.writeAsString(_validJsonSession('snapshot'));
+      final parsed = await CodexSessionParser().parseFile(source);
+      final snapshotModifiedUtc = DateTime.utc(2026, 7, 27, 12);
+
+      final scanned = ScannedSessionFile.fromParseResult(
+        sourcePath: source.path,
+        sourceType: SessionSourceType.windows,
+        sourceState: SessionSourceState.active,
+        mappedPath: mapper.mapWindowsPath(source.path),
+        parseResult: CodexParseResult.success(
+          parsed.session!,
+          sourceSnapshotSize: 123,
+          sourceSnapshotModifiedUtc: snapshotModifiedUtc,
+          sourceChangedDuringParse: true,
+        ),
+      );
+
+      expect(scanned.status, SessionFileStatus.changedPendingParse);
+      expect(scanned.sourceSnapshotSize, 123);
+      expect(scanned.sourceSnapshotModifiedUtc, snapshotModifiedUtc);
+      expect(scanned.sourceChangedDuringParse, isTrue);
+    },
+  );
 
   test(
     'scans Windows and WSL roots and reports available and failed files',
@@ -62,6 +92,7 @@ void main() {
       expect(result.progress.filesSkipped, 1);
       expect(result.progress.filesParsed, 2);
       expect(result.progress.filesFailed, 1);
+      expect(result.canRunCacheRepair, isFalse);
       expect(result.sessions, hasLength(2));
       expect(
         result.sessions.map((session) => session.sourceType),
@@ -113,6 +144,553 @@ void main() {
           .toList();
       expect(wslEvents.first, SessionFileStatus.changedPendingParse);
       expect(wslEvents.last, SessionFileStatus.available);
+    },
+  );
+
+  test('scans explicit active and archived roots', () async {
+    final codexRoot = Directory(p.join(temp.path, 'windows-codex'));
+    final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    final archivedRoot = Directory(p.join(codexRoot.path, 'archived_sessions'));
+    final unrelatedRoot = Directory(p.join(codexRoot.path, 'plugins'));
+    final wslCodexRoot = Directory(p.join(temp.path, 'wsl-codex'));
+    final wslActiveRoot = Directory(p.join(wslCodexRoot.path, 'sessions'));
+    final wslArchivedRoot = Directory(
+      p.join(wslCodexRoot.path, 'archived_sessions'),
+    );
+    final wslUnrelatedRoot = Directory(p.join(wslCodexRoot.path, 'plugins'));
+    await activeRoot.create(recursive: true);
+    await archivedRoot.create();
+    await unrelatedRoot.create();
+    await wslActiveRoot.create(recursive: true);
+    await wslArchivedRoot.create();
+    await wslUnrelatedRoot.create();
+    await File(
+      p.join(activeRoot.path, 'active.json'),
+    ).writeAsString(_validJsonSession('active-session'));
+    await File(
+      p.join(archivedRoot.path, 'archived.json'),
+    ).writeAsString(_validJsonSession('archived-session'));
+    await File(
+      p.join(unrelatedRoot.path, 'not-a-session.json'),
+    ).writeAsString(_validJsonSession('unrelated-session'));
+    await File(
+      p.join(wslActiveRoot.path, 'wsl-active.json'),
+    ).writeAsString(_validJsonSession('wsl-active-session'));
+    await File(
+      p.join(wslArchivedRoot.path, 'wsl-archived.json'),
+    ).writeAsString(_validJsonSession('wsl-archived-session'));
+    await File(
+      p.join(wslUnrelatedRoot.path, 'not-a-session.json'),
+    ).writeAsString(_validJsonSession('wsl-unrelated-session'));
+
+    final result =
+        await SessionScanner(
+          parser: CodexSessionParser(),
+          pathMapper: mapper,
+        ).scan(
+          SessionScanRequest(
+            roots: [
+              SessionScanRoot(
+                path: activeRoot.path,
+                availabilityRootPath: codexRoot.path,
+                sourceType: SessionSourceType.windows,
+                sourceState: SessionSourceState.active,
+              ),
+              SessionScanRoot(
+                path: archivedRoot.path,
+                availabilityRootPath: codexRoot.path,
+                sourceType: SessionSourceType.windows,
+                sourceState: SessionSourceState.codexArchived,
+              ),
+              SessionScanRoot(
+                path: wslActiveRoot.path,
+                availabilityRootPath: wslCodexRoot.path,
+                sourceType: SessionSourceType.wsl,
+                sourceState: SessionSourceState.active,
+              ),
+              SessionScanRoot(
+                path: wslArchivedRoot.path,
+                availabilityRootPath: wslCodexRoot.path,
+                sourceType: SessionSourceType.wsl,
+                sourceState: SessionSourceState.codexArchived,
+              ),
+            ],
+          ),
+        );
+
+    expect(result.progress.filesFound, 4);
+    expect(result.allConfiguredRootsReachable, isTrue);
+    expect(result.canRunCacheRepair, isTrue);
+    expect(
+      {
+        for (final session in result.sessions)
+          session.parsedSession.sessionId: session.sourceState,
+      },
+      {
+        'active-session': SessionSourceState.active,
+        'archived-session': SessionSourceState.codexArchived,
+        'wsl-active-session': SessionSourceState.active,
+        'wsl-archived-session': SessionSourceState.codexArchived,
+      },
+    );
+    final sessionIds = result.sessions.map(
+      (session) => session.parsedSession.sessionId,
+    );
+    expect(sessionIds, isNot(contains('unrelated-session')));
+    expect(sessionIds, isNot(contains('wsl-unrelated-session')));
+    expect(
+      {
+        for (final session in result.sessions)
+          session.parsedSession.sessionId: session.sourceType,
+      },
+      {
+        'active-session': SessionSourceType.windows,
+        'archived-session': SessionSourceType.windows,
+        'wsl-active-session': SessionSourceType.wsl,
+        'wsl-archived-session': SessionSourceType.wsl,
+      },
+    );
+  });
+
+  test(
+    'treats a missing archive directory as a reachable empty source',
+    () async {
+      final codexRoot = Directory(p.join(temp.path, 'codex'));
+      final archivedRoot = p.join(codexRoot.path, 'archived_sessions');
+      await codexRoot.create(recursive: true);
+      final cachedPath = p.join(archivedRoot, 'moved-away.jsonl');
+
+      final result =
+          await SessionScanner(
+            parser: CodexSessionParser(),
+            pathMapper: mapper,
+          ).scan(
+            SessionScanRequest(
+              roots: [
+                SessionScanRoot(
+                  path: archivedRoot,
+                  availabilityRootPath: codexRoot.path,
+                  sourceType: SessionSourceType.windows,
+                  sourceState: SessionSourceState.codexArchived,
+                ),
+              ],
+              cachedSessions: [
+                CachedSessionSnapshot(
+                  sourcePath: cachedPath,
+                  status: SessionFileStatus.available,
+                  sourceState: SessionSourceState.codexArchived,
+                ),
+              ],
+            ),
+          );
+
+      expect(result.progress.sessionsMissing, 1);
+      expect(result.allConfiguredRootsReachable, isTrue);
+      final missing = result.fileStatuses.singleWhere(
+        (status) => status.sourcePath == cachedPath,
+      );
+      expect(missing.status, SessionFileStatus.missing);
+      expect(missing.sourceState, SessionSourceState.missing);
+      expect(
+        result.errors,
+        isNot(
+          contains(
+            isA<ScanFileError>().having(
+              (error) => error.status,
+              'status',
+              SessionFileStatus.pathUnreachable,
+            ),
+          ),
+        ),
+      );
+    },
+  );
+
+  test(
+    'disconnect during child source probe preserves cached source state',
+    () async {
+      final codexRoot = p.join(temp.path, 'wsl-codex');
+      final activeRoot = p.join(codexRoot, 'sessions');
+      final cached = CachedSessionSnapshot(
+        sourcePath: p.join(activeRoot, 'cached.jsonl'),
+        status: SessionFileStatus.available,
+        sourceState: SessionSourceState.active,
+      );
+      var ownerChecks = 0;
+
+      final result =
+          await SessionScanner(
+            parser: CodexSessionParser(),
+            pathMapper: mapper,
+            rootExists: (directory) async {
+              if (p.equals(directory.path, codexRoot)) {
+                ownerChecks++;
+                return ownerChecks == 1;
+              }
+              return false;
+            },
+          ).scan(
+            SessionScanRequest(
+              roots: [
+                SessionScanRoot(
+                  path: activeRoot,
+                  availabilityRootPath: codexRoot,
+                  sourceType: SessionSourceType.wsl,
+                  sourceState: SessionSourceState.active,
+                ),
+              ],
+              cachedSessions: [cached],
+            ),
+          );
+
+      expect(ownerChecks, 2);
+      expect(result.progress.sessionsMissing, 0);
+      expect(result.cachedSessions, [cached]);
+      expect(
+        result.errors.map((error) => error.status),
+        contains(SessionFileStatus.pathUnreachable),
+      );
+    },
+  );
+
+  test('child source access failure preserves cached source state', () async {
+    final codexRoot = p.join(temp.path, 'wsl-codex');
+    final activeRoot = p.join(codexRoot, 'sessions');
+    final cached = CachedSessionSnapshot(
+      sourcePath: p.join(activeRoot, 'cached.jsonl'),
+      status: SessionFileStatus.available,
+      sourceState: SessionSourceState.active,
+    );
+
+    final result =
+        await SessionScanner(
+          parser: CodexSessionParser(),
+          pathMapper: mapper,
+          rootExists: (_) async => true,
+          sourceRootTypeReader: (_) async => throw FileSystemException(
+            'Access is denied.',
+            activeRoot,
+            const OSError('Access is denied.', 5),
+          ),
+        ).scan(
+          SessionScanRequest(
+            roots: [
+              SessionScanRoot(
+                path: activeRoot,
+                availabilityRootPath: codexRoot,
+                sourceType: SessionSourceType.wsl,
+                sourceState: SessionSourceState.active,
+              ),
+            ],
+            cachedSessions: [cached],
+          ),
+        );
+
+    expect(result.progress.sessionsMissing, 0);
+    expect(result.cachedSessions, [cached]);
+    expect(result.errors.single.status, SessionFileStatus.permissionDenied);
+  });
+
+  test(
+    'cancellation during child source probe returns a cancelled scan',
+    () async {
+      final codexRoot = p.join(temp.path, 'wsl-codex');
+      final activeRoot = p.join(codexRoot, 'sessions');
+      final cancellation = ScanCancellationController();
+      final cached = CachedSessionSnapshot(
+        sourcePath: p.join(activeRoot, 'cached.jsonl'),
+        status: SessionFileStatus.available,
+        sourceState: SessionSourceState.active,
+      );
+
+      final result =
+          await SessionScanner(
+            parser: CodexSessionParser(),
+            pathMapper: mapper,
+            rootExists: (_) async => true,
+            sourceRootTypeReader: (_) async {
+              cancellation.cancel();
+              return FileSystemEntityType.directory;
+            },
+          ).scan(
+            SessionScanRequest(
+              roots: [
+                SessionScanRoot(
+                  path: activeRoot,
+                  availabilityRootPath: codexRoot,
+                  sourceType: SessionSourceType.wsl,
+                  sourceState: SessionSourceState.active,
+                ),
+              ],
+              cachedSessions: [cached],
+              cancellationToken: cancellation.token,
+            ),
+          );
+
+      expect(result.cancelled, isTrue);
+      expect(result.progress.sessionsMissing, 0);
+      expect(result.cachedSessions, [cached]);
+      expect(result.errors, isEmpty);
+    },
+  );
+
+  test('unreachable or cancelled roots preserve cached source state', () async {
+    final codexRoot = p.join(temp.path, 'missing-codex');
+    final activePath = p.join(codexRoot, 'sessions', 'active.jsonl');
+    final archivedPath = p.join(
+      codexRoot,
+      'archived_sessions',
+      'archived.jsonl',
+    );
+    var availabilityChecks = 0;
+    final cached = [
+      CachedSessionSnapshot(
+        sourcePath: activePath,
+        status: SessionFileStatus.available,
+        sourceState: SessionSourceState.active,
+      ),
+      CachedSessionSnapshot(
+        sourcePath: archivedPath,
+        status: SessionFileStatus.available,
+        sourceState: SessionSourceState.codexArchived,
+      ),
+    ];
+
+    final result =
+        await SessionScanner(
+          parser: CodexSessionParser(),
+          pathMapper: mapper,
+          rootExists: (_) async {
+            availabilityChecks++;
+            return false;
+          },
+        ).scan(
+          SessionScanRequest(
+            roots: [
+              SessionScanRoot(
+                path: p.dirname(activePath),
+                availabilityRootPath: codexRoot,
+                sourceType: SessionSourceType.windows,
+                sourceState: SessionSourceState.active,
+              ),
+              SessionScanRoot(
+                path: p.dirname(archivedPath),
+                availabilityRootPath: codexRoot,
+                sourceType: SessionSourceType.windows,
+                sourceState: SessionSourceState.codexArchived,
+              ),
+            ],
+            cachedSessions: cached,
+          ),
+        );
+
+    expect(availabilityChecks, 1);
+    expect(result.progress.sessionsMissing, 0);
+    expect(result.cachedSessions, orderedEquals(cached));
+    expect(result.errors, hasLength(1));
+    expect(result.errors.single.sourcePath, codexRoot);
+    expect(result.errors.single.status, SessionFileStatus.pathUnreachable);
+    expect(result.allConfiguredRootsReachable, isFalse);
+    expect(result.canRunCacheRepair, isFalse);
+
+    final cancellation = ScanCancellationController();
+    final cancelledResult =
+        await SessionScanner(
+          parser: CodexSessionParser(),
+          pathMapper: mapper,
+          rootExists: (_) async {
+            cancellation.cancel();
+            return true;
+          },
+        ).scan(
+          SessionScanRequest(
+            roots: [
+              SessionScanRoot(
+                path: p.dirname(activePath),
+                availabilityRootPath: codexRoot,
+                sourceType: SessionSourceType.windows,
+                sourceState: SessionSourceState.active,
+              ),
+              SessionScanRoot(
+                path: p.dirname(archivedPath),
+                availabilityRootPath: codexRoot,
+                sourceType: SessionSourceType.windows,
+                sourceState: SessionSourceState.codexArchived,
+              ),
+            ],
+            cachedSessions: cached,
+            cancellationToken: cancellation.token,
+          ),
+        );
+
+    expect(cancelledResult.cancelled, isTrue);
+    expect(cancelledResult.allConfiguredRootsReachable, isFalse);
+    expect(cancelledResult.canRunCacheRepair, isFalse);
+    expect(cancelledResult.progress.sessionsMissing, 0);
+    expect(cancelledResult.cachedSessions, orderedEquals(cached));
+    expect(
+      cancelledResult.fileStatuses.where(
+        (status) => status.status == SessionFileStatus.missing,
+      ),
+      isEmpty,
+    );
+  });
+
+  test(
+    'does not mark cached sessions missing after partial root enumeration',
+    () async {
+      final invalidRoot = File(p.join(temp.path, 'not-a-directory'));
+      await invalidRoot.writeAsString('not a directory');
+      final cachedPath = p.join(invalidRoot.path, 'cached.jsonl');
+
+      final result =
+          await SessionScanner(
+            parser: CodexSessionParser(),
+            pathMapper: mapper,
+            rootExists: (_) async => true,
+          ).scan(
+            SessionScanRequest(
+              roots: [
+                SessionScanRoot(
+                  path: invalidRoot.path,
+                  sourceType: SessionSourceType.windows,
+                  sourceState: SessionSourceState.active,
+                ),
+              ],
+              cachedSessions: [
+                CachedSessionSnapshot(
+                  sourcePath: cachedPath,
+                  status: SessionFileStatus.available,
+                ),
+              ],
+            ),
+          );
+
+      expect(result.progress.sessionsMissing, 0);
+      expect(result.allConfiguredRootsReachable, isFalse);
+      expect(
+        result.fileStatuses.where(
+          (status) => status.status == SessionFileStatus.missing,
+        ),
+        isEmpty,
+      );
+      expect(result.errors, isNotEmpty);
+    },
+  );
+
+  test(
+    'partial sibling source suppresses owner missing reconciliation',
+    () async {
+      final codexRoot = Directory(p.join(temp.path, 'codex'));
+      final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+      final invalidArchive = File(p.join(codexRoot.path, 'archived_sessions'));
+      await activeRoot.create(recursive: true);
+      await invalidArchive.writeAsString('not a directory');
+      final cachedPath = p.join(activeRoot.path, 'cached.jsonl');
+
+      final result =
+          await SessionScanner(
+            parser: CodexSessionParser(),
+            pathMapper: mapper,
+            rootExists: (_) async => true,
+          ).scan(
+            SessionScanRequest(
+              roots: [
+                SessionScanRoot(
+                  path: activeRoot.path,
+                  availabilityRootPath: codexRoot.path,
+                  sourceType: SessionSourceType.windows,
+                  sourceState: SessionSourceState.active,
+                ),
+                SessionScanRoot(
+                  path: invalidArchive.path,
+                  availabilityRootPath: codexRoot.path,
+                  sourceType: SessionSourceType.windows,
+                  sourceState: SessionSourceState.codexArchived,
+                ),
+              ],
+              cachedSessions: [
+                CachedSessionSnapshot(
+                  sourcePath: cachedPath,
+                  status: SessionFileStatus.available,
+                ),
+              ],
+            ),
+          );
+
+      expect(result.progress.sessionsMissing, 0);
+      expect(
+        result.fileStatuses.where(
+          (status) => status.status == SessionFileStatus.missing,
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test('uses cached UNC path when classifying missing WSL sources', () async {
+    final wslRoot = Directory(p.join(temp.path, 'wsl-sessions'));
+    await wslRoot.create();
+    final missingUncPath = p.join(wslRoot.path, 'missing.jsonl');
+
+    final result =
+        await SessionScanner(
+          parser: CodexSessionParser(),
+          pathMapper: mapper,
+        ).scan(
+          SessionScanRequest(
+            roots: [
+              SessionScanRoot(
+                path: wslRoot.path,
+                sourceType: SessionSourceType.wsl,
+                sourceState: SessionSourceState.active,
+              ),
+            ],
+            cachedSessions: [
+              CachedSessionSnapshot(
+                sourcePath: '/home/pawel/.codex/sessions/missing.jsonl',
+                sourceFileUncPath: missingUncPath,
+                status: SessionFileStatus.available,
+              ),
+            ],
+          ),
+        );
+
+    expect(result.progress.sessionsMissing, 1);
+    expect(result.fileStatuses.single.status, SessionFileStatus.missing);
+    expect(result.fileStatuses.single.sourceState, SessionSourceState.missing);
+  });
+
+  test(
+    'streams parsed sessions without retaining successful results',
+    () async {
+      final windowsRoot = Directory('${temp.path}${Platform.pathSeparator}win');
+      await windowsRoot.create();
+      await File(
+        '${windowsRoot.path}${Platform.pathSeparator}one.json',
+      ).writeAsString(_validJsonSession('streamed-1'));
+      await File(
+        '${windowsRoot.path}${Platform.pathSeparator}two.json',
+      ).writeAsString(_validJsonSession('streamed-2'));
+      final streamedIds = <String>[];
+      final scanner = SessionScanner(
+        parser: CodexSessionParser(),
+        pathMapper: mapper,
+        useParserIsolates: false,
+        retainParsedSessions: false,
+        onSessionParsed: (session, _) async {
+          streamedIds.add(session.parsedSession.sessionId!);
+        },
+      );
+
+      final result = await scanner.scan(
+        SessionScanRequest(windowsRoot: windowsRoot.path, wslRoot: null),
+      );
+
+      expect(streamedIds, containsAll(['streamed-1', 'streamed-2']));
+      expect(result.progress.filesParsed, 2);
+      expect(result.sessions, isEmpty);
+      expect(result.errors, isEmpty);
     },
   );
 
@@ -579,6 +1157,36 @@ void main() {
     },
   );
 
+  test(
+    'fails promptly when a parser worker exits during startup',
+    () async {
+      final root = Directory('${temp.path}${Platform.pathSeparator}win');
+      await root.create();
+      await File(
+        '${root.path}${Platform.pathSeparator}session.json',
+      ).writeAsString(_validJsonSession('worker-exit'));
+      final scanner = SessionScanner(
+        parser: CodexSessionParser(),
+        pathMapper: mapper,
+        maxConcurrentParses: 1,
+        parserIsolateEntrypoint: _exitParserWorkerImmediately,
+        parserWorkerStartupTimeout: const Duration(milliseconds: 100),
+      );
+
+      await expectLater(
+        scanner.scan(SessionScanRequest(windowsRoot: root.path)),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('exited before becoming ready'),
+          ),
+        ),
+      );
+    },
+    timeout: const Timeout(Duration(seconds: 2)),
+  );
+
   test('parses changed files with bounded concurrency', () async {
     final root = Directory('${temp.path}${Platform.pathSeparator}win');
     await root.create();
@@ -748,7 +1356,83 @@ void main() {
     expect(spanNames, contains('scan.scanner.parse_decision'));
     expect(spanNames, contains('scan.scanner.parse_file'));
   });
+
+  test('append during parse never caches an unread suffix', () async {
+    final root = Directory(p.join(temp.path, 'append-race'));
+    await root.create();
+    final source = File(p.join(root.path, 'growing.jsonl'));
+    await source.writeAsString(
+      [
+        '{"timestamp":"2026-07-27T10:00:00Z","type":"session_meta","payload":{"id":"growing-snapshot","cwd":"F:\\\\repo"}}',
+        '{"timestamp":"2026-07-27T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":"before append"}}',
+      ].join('\n'),
+    );
+    final initialStat = await source.stat();
+    var appended = false;
+    final parser = CodexSessionParser(
+      jsonlByteStreamReader: (file, endExclusive) async* {
+        final bytes = await file
+            .openRead(0, endExclusive)
+            .fold<List<int>>(<int>[], (all, chunk) => all..addAll(chunk));
+        final split = bytes.length ~/ 2;
+        yield bytes.sublist(0, split);
+        await file.writeAsString(
+          '\n{"timestamp":"2026-07-27T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"unread append"}}',
+          mode: FileMode.append,
+          flush: true,
+        );
+        appended = true;
+        yield bytes.sublist(split);
+      },
+    );
+
+    final first = await SessionScanner(
+      parser: parser,
+      pathMapper: mapper,
+      useParserIsolates: false,
+    ).scan(SessionScanRequest(windowsRoot: root.path));
+
+    expect(appended, isTrue);
+    expect(first.sessions, hasLength(1));
+    final parsed = first.sessions.single;
+    expect(parsed.parsedSession.messages, hasLength(1));
+    expect(parsed.sourceSnapshotSize, initialStat.size);
+    expect(parsed.sourceSnapshotModifiedUtc, initialStat.modified.toUtc());
+    expect(parsed.sourceChangedDuringParse, isTrue);
+    expect(parsed.status, SessionFileStatus.changedPendingParse);
+    expect(
+      first.fileStatuses.single.status,
+      SessionFileStatus.changedPendingParse,
+    );
+    expect(first.canRunCacheRepair, isTrue);
+    expect(await source.length(), greaterThan(initialStat.size));
+
+    final second =
+        await SessionScanner(
+          parser: CodexSessionParser(),
+          pathMapper: mapper,
+          useParserIsolates: false,
+        ).scan(
+          SessionScanRequest(
+            windowsRoot: root.path,
+            cachedSessions: [
+              CachedSessionSnapshot(
+                sourcePath: source.path,
+                status: SessionFileStatus.available,
+                sourceFileSize: parsed.sourceSnapshotSize,
+                sourceModifiedUtc: parsed.sourceSnapshotModifiedUtc,
+                parserVersion: CodexSessionParser.currentVersion,
+              ),
+            ],
+          ),
+        );
+
+    expect(second.progress.filesParsed, 1);
+    expect(second.sessions.single.parsedSession.messages, hasLength(2));
+  });
 }
+
+void _exitParserWorkerImmediately(Object? _) => Isolate.exit();
 
 String _validJsonSession(String id) =>
     '''

@@ -36,7 +36,7 @@ void main() {
       expect(find.bySemanticsLabel('Session search'), findsOneWidget);
       expect(find.bySemanticsLabel('Platform filter'), findsOneWidget);
       expect(find.bySemanticsLabel('Time range filter'), findsOneWidget);
-      expect(find.bySemanticsLabel('Archived filter'), findsOneWidget);
+      expect(find.bySemanticsLabel('Viewer archive filter'), findsOneWidget);
       expect(find.text('Advanced filters'), findsOneWidget);
       expect(find.bySemanticsLabel('Path filter'), findsNothing);
       await tester.tap(find.text('Advanced filters'));

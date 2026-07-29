@@ -3,6 +3,8 @@ import 'session_label_formatter.dart';
 
 enum SessionRowPlatform { windows, wsl }
 
+enum SessionRowSourceState { active, codexArchived, missing }
+
 class SessionRowViewModel {
   const SessionRowViewModel({
     required this.id,
@@ -46,6 +48,7 @@ class SessionRowViewModel {
     this.usageRollup,
     this.isPinned = false,
     this.isArchived = false,
+    this.sourceState = SessionRowSourceState.active,
     this.hasError = false,
     this.evalReady = false,
     this.evalStatus = '',
@@ -96,6 +99,7 @@ class SessionRowViewModel {
   final SessionUsageRollup? usageRollup;
   final bool isPinned;
   final bool isArchived;
+  final SessionRowSourceState sourceState;
   final bool hasError;
   final bool evalReady;
   final String evalStatus;
@@ -254,6 +258,7 @@ class SessionRowViewModel {
       usageRollup: usageRollup,
       isPinned: isPinned,
       isArchived: isArchived,
+      sourceState: sourceState,
       hasError: hasError,
       evalReady: evalReady,
       evalStatus: evalStatus,
@@ -307,6 +312,7 @@ class SessionRowViewModel {
       usageRollup: rollup,
       isPinned: isPinned,
       isArchived: isArchived,
+      sourceState: sourceState,
       hasError: hasError,
       evalReady: evalReady,
       evalStatus: evalStatus,
@@ -360,6 +366,7 @@ class SessionRowViewModel {
       usageRollup: usageRollup,
       isPinned: isPinned,
       isArchived: isArchived,
+      sourceState: sourceState,
       hasError: hasError,
       evalReady: metadata.evalReady,
       evalStatus: metadata.status ?? '',

@@ -24,6 +24,21 @@ void main() {
     }
   });
 
+  test('cache invalidation performs zero full-content hash reads', () async {
+    final root = await _createRootWithSession('no-content-hash', temp);
+    final file = File(
+      '${root.path}${Platform.pathSeparator}no-content-hash.json',
+    );
+
+    final snapshot = await CachedSessionSnapshot.fromFile(
+      file,
+      status: SessionFileStatus.available,
+      parserVersion: CodexSessionParser.currentVersion,
+    );
+
+    expect(snapshot.sourceContentHash, isNull);
+  });
+
   test('skips unchanged cached files without reparsing', () async {
     final root = await _createRootWithSession('unchanged', temp);
     final file = File('${root.path}${Platform.pathSeparator}unchanged.json');

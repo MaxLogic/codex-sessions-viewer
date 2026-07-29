@@ -4,16 +4,17 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 
-import 'package:crypto/crypto.dart';
-
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
 import '../utils/profiling.dart';
 
 typedef SessionFileStatReader = Future<FileStat> Function(File file);
 typedef SessionRootExists = Future<bool> Function(Directory directory);
+typedef SessionSourceRootTypeReader =
+    Future<FileSystemEntityType> Function(String path);
 typedef ScanRetryDelay = Future<void> Function(Duration delay);
 typedef SessionRootRetryPredicate = bool Function(String rootPath);
+typedef SessionParserIsolateEntrypoint = void Function(Object? start);
 
 const defaultWslRootRetryDelays = [
   Duration(seconds: 1),
@@ -31,6 +32,30 @@ enum SessionFileStatus {
   permissionDenied,
   unsupportedFormat,
   changedPendingParse,
+}
+
+enum SessionSourceState { active, codexArchived, missing }
+
+extension SessionSourceStateName on SessionSourceState {
+  String get wireName => switch (this) {
+    SessionSourceState.active => 'active',
+    SessionSourceState.codexArchived => 'codex_archived',
+    SessionSourceState.missing => 'missing',
+  };
+}
+
+class SessionScanRoot {
+  const SessionScanRoot({
+    required this.path,
+    required this.sourceType,
+    required this.sourceState,
+    this.availabilityRootPath,
+  });
+
+  final String path;
+  final SessionSourceType sourceType;
+  final SessionSourceState sourceState;
+  final String? availabilityRootPath;
 }
 
 extension SessionFileStatusName on SessionFileStatus {
@@ -53,11 +78,15 @@ class SessionScanner {
     this.maxConcurrentDirectoryScans = 4,
     this.maxConcurrentMetadataChecks = 32,
     this.useParserIsolates = true,
+    this.parserIsolateEntrypoint = _parserWorkerEntry,
+    this.parserWorkerStartupTimeout = const Duration(seconds: 30),
+    this.retainParsedSessions = true,
     this.onProgress,
     this.onSessionParsed,
     this.onParserPoolClosing,
     SessionFileStatReader? fileStatReader,
     SessionRootExists? rootExists,
+    SessionSourceRootTypeReader? sourceRootTypeReader,
     ScanRetryDelay? retryDelay,
     SessionRootRetryPredicate? shouldRetryWslRoot,
     this.wslRootRetryDelays = defaultWslRootRetryDelays,
@@ -66,8 +95,12 @@ class SessionScanner {
   }) : assert(maxConcurrentParses > 0),
        assert(maxConcurrentDirectoryScans > 0),
        assert(maxConcurrentMetadataChecks > 0),
+       assert(parserWorkerStartupTimeout > Duration.zero),
+       assert(retainParsedSessions || onSessionParsed != null),
        fileStatReader = fileStatReader ?? _defaultFileStatReader,
        rootExists = rootExists ?? _defaultRootExists,
+       sourceRootTypeReader =
+           sourceRootTypeReader ?? _defaultSourceRootTypeReader,
        retryDelay = retryDelay ?? Future<void>.delayed,
        shouldRetryWslRoot = shouldRetryWslRoot ?? _isWslUncPath,
        assert(!cacheModifiedTolerance.isNegative);
@@ -78,6 +111,9 @@ class SessionScanner {
   final int maxConcurrentDirectoryScans;
   final int maxConcurrentMetadataChecks;
   final bool useParserIsolates;
+  final SessionParserIsolateEntrypoint parserIsolateEntrypoint;
+  final Duration parserWorkerStartupTimeout;
+  final bool retainParsedSessions;
   final void Function(ScanProgress progress)? onProgress;
   final Future<void> Function(
     ScannedSessionFile session,
@@ -87,6 +123,7 @@ class SessionScanner {
   final Future<void> Function()? onParserPoolClosing;
   final SessionFileStatReader fileStatReader;
   final SessionRootExists rootExists;
+  final SessionSourceRootTypeReader sourceRootTypeReader;
   final ScanRetryDelay retryDelay;
   final SessionRootRetryPredicate shouldRetryWslRoot;
   final List<Duration> wslRootRetryDelays;
@@ -113,6 +150,7 @@ class SessionScanner {
         final candidates = <_ScanCandidate>[];
         final parsed = <_ParsedCandidate>[];
         final reachableRoots = <String>[];
+        final failedRoots = <String>{};
         final forcedReparse = request.forceReparsePlan.apply(
           request.cachedSessions,
         );
@@ -154,31 +192,26 @@ class SessionScanner {
             if (cancellationToken?.isCancellationRequested ?? false) {
               return;
             }
-            await _enqueueRoot(
-              rootPath: request.windowsRoot,
-              sourceType: SessionSourceType.windows,
-              progress: progress,
-              errors: errors,
-              fileStatuses: fileStatuses,
-              statusEvents: statusEvents,
-              reachableRoots: reachableRoots,
-              directoryQueue: directoryQueue,
-              cancellationToken: cancellationToken,
-            );
-            if (cancellationToken?.isCancellationRequested ?? false) {
-              return;
+            final availabilityByOwner = <String, bool>{};
+            final reportedUnavailableOwners = <String>{};
+            for (final root in request.effectiveRoots) {
+              await _enqueueRoot(
+                root: root,
+                progress: progress,
+                errors: errors,
+                fileStatuses: fileStatuses,
+                statusEvents: statusEvents,
+                reachableRoots: reachableRoots,
+                availabilityByOwner: availabilityByOwner,
+                reportedUnavailableOwners: reportedUnavailableOwners,
+                failedRoots: failedRoots,
+                directoryQueue: directoryQueue,
+                cancellationToken: cancellationToken,
+              );
+              if (cancellationToken?.isCancellationRequested ?? false) {
+                return;
+              }
             }
-            await _enqueueRoot(
-              rootPath: request.wslRoot,
-              sourceType: SessionSourceType.wsl,
-              progress: progress,
-              errors: errors,
-              fileStatuses: fileStatuses,
-              statusEvents: statusEvents,
-              reachableRoots: reachableRoots,
-              directoryQueue: directoryQueue,
-              cancellationToken: cancellationToken,
-            );
           });
           directoryQueue.closeWhenIdle();
 
@@ -192,6 +225,7 @@ class SessionScanner {
                 fileStatuses: fileStatuses,
                 statusEvents: statusEvents,
                 candidates: candidates,
+                failedRoots: failedRoots,
                 cancellationToken: cancellationToken,
               ),
           ];
@@ -239,12 +273,38 @@ class SessionScanner {
           }
         }
         final cancelled = cancellationToken?.isCancellationRequested ?? false;
-        if (!cancelled && reachableRoots.isNotEmpty) {
+        final ownerByRoot = {
+          for (final root in request.effectiveRoots)
+            _canonicalScanPath(root.path): _canonicalScanPath(
+              root.availabilityRootPath ?? root.path,
+            ),
+        };
+        final completeRoots = reachableRoots
+            .where(
+              (root) => !failedRoots.contains(
+                ownerByRoot[_canonicalScanPath(root)] ??
+                    _canonicalScanPath(root),
+              ),
+            )
+            .toList(growable: false);
+        final requestedOwners = {
+          for (final root in request.effectiveRoots)
+            _canonicalScanPath(root.availabilityRootPath ?? root.path),
+        };
+        final completeOwners = {
+          for (final root in completeRoots)
+            ownerByRoot[_canonicalScanPath(root)] ?? _canonicalScanPath(root),
+        };
+        final allConfiguredRootsReachable =
+            !cancelled &&
+            requestedOwners.isNotEmpty &&
+            requestedOwners.every(completeOwners.contains);
+        if (!cancelled && completeRoots.isNotEmpty) {
           Profiling.spanSync('scan.scanner.missing_cached', () {
             _recordMissingCachedSessions(
               request.cachedSessions,
               candidates,
-              reachableRoots,
+              completeRoots,
               progress,
               errors,
               fileStatuses,
@@ -261,6 +321,7 @@ class SessionScanner {
         final result = SessionScanResult(
           progress: finishedProgress,
           cancelled: finishedProgress.cancelled,
+          allConfiguredRootsReachable: allConfiguredRootsReachable,
           sessions: List.unmodifiable(sessions),
           errors: List.unmodifiable(errors),
           fileStatuses: List.unmodifiable(fileStatuses),
@@ -279,70 +340,156 @@ class SessionScanner {
   }
 
   Future<void> _enqueueRoot({
-    required String? rootPath,
-    required SessionSourceType sourceType,
+    required SessionScanRoot root,
     required ScanProgress progress,
     required List<ScanFileError> errors,
     required List<ScannedFileStatus> fileStatuses,
     required List<ScannedFileStatus> statusEvents,
     required List<String> reachableRoots,
+    required Map<String, bool> availabilityByOwner,
+    required Set<String> reportedUnavailableOwners,
+    required Set<String> failedRoots,
     required _WorkQueue<_ScanDirectory> directoryQueue,
     required ScanCancellationToken? cancellationToken,
   }) async {
     if (cancellationToken?.isCancellationRequested ?? false) {
       return;
     }
-    if (rootPath == null || rootPath.isEmpty) {
+    final rootPath = root.path;
+    if (rootPath.isEmpty) {
       return;
     }
-    final root = Directory(rootPath);
-    final retryDelays =
-        sourceType == SessionSourceType.wsl && shouldRetryWslRoot(rootPath)
-        ? wslRootRetryDelays
-        : const <Duration>[];
-    var reachable = await rootExists(root);
-    for (final delay in retryDelays) {
-      if (reachable || (cancellationToken?.isCancellationRequested ?? false)) {
-        break;
-      }
-      await _waitForRetry(delay, cancellationToken);
-      if (cancellationToken?.isCancellationRequested ?? false) {
+    final directory = Directory(rootPath);
+    final availabilityRootPath = root.availabilityRootPath ?? rootPath;
+    final availabilityRoot = Directory(availabilityRootPath);
+    final availabilityKey = _canonicalScanPath(availabilityRootPath);
+
+    void reportUnavailable({
+      required String sourcePath,
+      required SessionFileStatus status,
+      required String message,
+    }) {
+      failedRoots.add(availabilityKey);
+      if (!reportedUnavailableOwners.add(availabilityKey)) {
         return;
       }
-      reachable = await rootExists(root);
+      progress.filesFailed++;
+      _emitProgress(progress);
+      errors.add(
+        ScanFileError(sourcePath: sourcePath, status: status, message: message),
+      );
+      final fileStatus = ScannedFileStatus(
+        sourcePath: sourcePath,
+        status: status,
+        sourceState: root.sourceState,
+      );
+      fileStatuses.add(fileStatus);
+      statusEvents.add(fileStatus);
+    }
+
+    Future<bool> ownerExists() async {
+      try {
+        return await rootExists(availabilityRoot);
+      } on FileSystemException {
+        return false;
+      }
+    }
+
+    late bool reachable;
+    if (availabilityByOwner.containsKey(availabilityKey)) {
+      reachable = availabilityByOwner[availabilityKey]!;
+    } else {
+      final retryDelays =
+          root.sourceType == SessionSourceType.wsl &&
+              shouldRetryWslRoot(availabilityRootPath)
+          ? wslRootRetryDelays
+          : const <Duration>[];
+      reachable = await ownerExists();
+      for (final delay in retryDelays) {
+        if (reachable ||
+            (cancellationToken?.isCancellationRequested ?? false)) {
+          break;
+        }
+        await _waitForRetry(delay, cancellationToken);
+        if (cancellationToken?.isCancellationRequested ?? false) {
+          return;
+        }
+        reachable = await ownerExists();
+      }
+      availabilityByOwner[availabilityKey] = reachable;
     }
     if (cancellationToken?.isCancellationRequested ?? false) {
       return;
     }
     if (!reachable) {
-      progress.filesFailed++;
-      _emitProgress(progress);
-      errors.add(
-        ScanFileError(
+      reportUnavailable(
+        sourcePath: availabilityRootPath,
+        status: SessionFileStatus.pathUnreachable,
+        message: 'Session root is unreachable.',
+      );
+      return;
+    }
+    if (availabilityRootPath != rootPath) {
+      late FileSystemEntityType sourceRootType;
+      try {
+        sourceRootType = await sourceRootTypeReader(rootPath);
+      } on FileSystemException catch (error) {
+        if (cancellationToken?.isCancellationRequested ?? false) {
+          return;
+        }
+        reportUnavailable(
+          sourcePath: rootPath,
+          status: _statusFromFileSystemError(error),
+          message: error.message,
+        );
+        return;
+      }
+      if (cancellationToken?.isCancellationRequested ?? false) {
+        return;
+      }
+      if (sourceRootType == FileSystemEntityType.notFound) {
+        if (!await ownerExists()) {
+          if (cancellationToken?.isCancellationRequested ?? false) {
+            return;
+          }
+          reportUnavailable(
+            sourcePath: availabilityRootPath,
+            status: SessionFileStatus.pathUnreachable,
+            message: 'Session root became unreachable during discovery.',
+          );
+          return;
+        }
+        if (cancellationToken?.isCancellationRequested ?? false) {
+          return;
+        }
+        reachableRoots.add(rootPath);
+        return;
+      }
+      if (sourceRootType != FileSystemEntityType.directory) {
+        reportUnavailable(
           sourcePath: rootPath,
           status: SessionFileStatus.pathUnreachable,
-          message: 'Session root is unreachable.',
-        ),
-      );
-      fileStatuses.add(
-        ScannedFileStatus(
-          sourcePath: rootPath,
-          status: SessionFileStatus.pathUnreachable,
-        ),
-      );
-      statusEvents.add(
-        ScannedFileStatus(
-          sourcePath: rootPath,
-          status: SessionFileStatus.pathUnreachable,
-        ),
-      );
+          message: 'Session source root is not a directory.',
+        );
+        return;
+      }
+    }
+    if (cancellationToken?.isCancellationRequested ?? false) {
       return;
     }
     reachableRoots.add(rootPath);
     if (cancellationToken?.isCancellationRequested ?? false) {
       return;
     }
-    directoryQueue.add(_ScanDirectory(directory: root, sourceType: sourceType));
+    directoryQueue.add(
+      _ScanDirectory(
+        directory: directory,
+        sourceRootPath: rootPath,
+        availabilityRootPath: availabilityRootPath,
+        sourceType: root.sourceType,
+        sourceState: root.sourceState,
+      ),
+    );
   }
 
   Future<void> _waitForRetry(
@@ -374,6 +521,7 @@ class SessionScanner {
     required List<ScannedFileStatus> fileStatuses,
     required List<ScannedFileStatus> statusEvents,
     required List<_ScanCandidate> candidates,
+    required Set<String> failedRoots,
     required ScanCancellationToken? cancellationToken,
   }) async {
     while (true) {
@@ -394,6 +542,7 @@ class SessionScanner {
           fileStatuses: fileStatuses,
           statusEvents: statusEvents,
           candidates: candidates,
+          failedRoots: failedRoots,
           cancellationToken: cancellationToken,
         );
       } finally {
@@ -411,6 +560,7 @@ class SessionScanner {
     required List<ScannedFileStatus> fileStatuses,
     required List<ScannedFileStatus> statusEvents,
     required List<_ScanCandidate> candidates,
+    required Set<String> failedRoots,
     required ScanCancellationToken? cancellationToken,
   }) {
     return Profiling.spanAsync('scan.scanner.directory', () async {
@@ -427,7 +577,10 @@ class SessionScanner {
               directoryQueue.add(
                 _ScanDirectory(
                   directory: entity,
+                  sourceRootPath: scanDirectory.sourceRootPath,
+                  availabilityRootPath: scanDirectory.availabilityRootPath,
                   sourceType: scanDirectory.sourceType,
+                  sourceState: scanDirectory.sourceState,
                 ),
               );
             } on StateError {
@@ -455,12 +608,14 @@ class SessionScanner {
               ScannedFileStatus(
                 sourcePath: entity.path,
                 status: SessionFileStatus.unsupportedFormat,
+                sourceState: scanDirectory.sourceState,
               ),
             );
             statusEvents.add(
               ScannedFileStatus(
                 sourcePath: entity.path,
                 status: SessionFileStatus.unsupportedFormat,
+                sourceState: scanDirectory.sourceState,
               ),
             );
             continue;
@@ -470,6 +625,7 @@ class SessionScanner {
           final candidate = _ScanCandidate(
             file: entity,
             sourceType: scanDirectory.sourceType,
+            sourceState: scanDirectory.sourceState,
           );
           candidates.add(candidate);
           try {
@@ -482,6 +638,7 @@ class SessionScanner {
           }
         }
       } on FileSystemException catch (error) {
+        failedRoots.add(_canonicalScanPath(scanDirectory.availabilityRootPath));
         progress.filesFailed++;
         _emitProgress(progress);
         errors.add(
@@ -495,12 +652,14 @@ class SessionScanner {
           ScannedFileStatus(
             sourcePath: root.path,
             status: _statusFromFileSystemError(error),
+            sourceState: scanDirectory.sourceState,
           ),
         );
         statusEvents.add(
           ScannedFileStatus(
             sourcePath: root.path,
             status: _statusFromFileSystemError(error),
+            sourceState: scanDirectory.sourceState,
           ),
         );
       }
@@ -542,6 +701,7 @@ class SessionScanner {
         final status = ScannedFileStatus(
           sourcePath: candidate.file.path,
           status: SessionFileStatus.available,
+          sourceState: candidate.sourceState,
         );
         skippedFiles.add(status);
         fileStatuses.add(status);
@@ -584,6 +744,7 @@ class SessionScanner {
         ScannedFileStatus(
           sourcePath: candidate.file.path,
           status: SessionFileStatus.changedPendingParse,
+          sourceState: candidate.sourceState,
         ),
       );
       final _ParsedCandidate parsedFile;
@@ -599,11 +760,14 @@ class SessionScanner {
         }
         rethrow;
       }
-      parsed.add(parsedFile);
+      if (retainParsedSessions || parsedFile.error != null) {
+        parsed.add(parsedFile);
+      }
       if (parsedFile.error == null) {
         final status = ScannedFileStatus(
           sourcePath: parsedFile.session!.sourcePath,
-          status: SessionFileStatus.available,
+          status: parsedFile.session!.status,
+          sourceState: parsedFile.session!.sourceState,
         );
         fileStatuses.add(status);
         statusEvents.add(status);
@@ -611,6 +775,7 @@ class SessionScanner {
         final status = ScannedFileStatus(
           sourcePath: parsedFile.error!.sourcePath,
           status: parsedFile.error!.status,
+          sourceState: candidate.sourceState,
         );
         fileStatuses.add(status);
         statusEvents.add(status);
@@ -643,12 +808,12 @@ class SessionScanner {
         );
       }
       progress.filesParsed++;
-      final session = ScannedSessionFile(
+      final session = ScannedSessionFile.fromParseResult(
         sourcePath: candidate.file.path,
         sourceType: candidate.sourceType,
-        status: SessionFileStatus.available,
+        sourceState: candidate.sourceState,
         mappedPath: mappedPath,
-        parsedSession: parseResult.session!,
+        parseResult: parseResult,
       );
       await onSessionParsed?.call(session, progress.snapshot());
       _emitProgress(progress);
@@ -673,11 +838,13 @@ class SessionScanner {
         .map(_canonicalScanPath)
         .toSet();
     for (final cached in cachedSessions) {
-      if (foundPaths.contains(_canonicalScanPath(cached.sourcePath))) {
+      final cachedPathKeys = _snapshotPathKeys(cached);
+      if (cachedPathKeys.any(foundPaths.contains)) {
         continue;
       }
-      if (!reachableRoots.any(
-        (root) => _isPathUnderRoot(cached.sourcePath, root),
+      if (!cachedPathKeys.any(
+        (cachedPath) =>
+            reachableRoots.any((root) => _isPathUnderRoot(cachedPath, root)),
       )) {
         continue;
       }
@@ -694,12 +861,14 @@ class SessionScanner {
         ScannedFileStatus(
           sourcePath: cached.sourcePath,
           status: SessionFileStatus.missing,
+          sourceState: SessionSourceState.missing,
         ),
       );
       statusEvents.add(
         ScannedFileStatus(
           sourcePath: cached.sourcePath,
           status: SessionFileStatus.missing,
+          sourceState: SessionSourceState.missing,
         ),
       );
     }
@@ -755,6 +924,8 @@ class SessionScanner {
       workerCount: maxConcurrentParses,
       maxToolOutputPreviewChars: parser.maxToolOutputPreviewChars,
       maxMessageContentChars: parser.maxMessageContentChars,
+      isolateEntrypoint: parserIsolateEntrypoint,
+      workerStartupTimeout: parserWorkerStartupTimeout,
       onClosing: onParserPoolClosing,
     );
     await pool.start();
@@ -778,6 +949,8 @@ class SessionScanner {
 
 Future<FileStat> _defaultFileStatReader(File file) => file.stat();
 Future<bool> _defaultRootExists(Directory directory) => directory.exists();
+Future<FileSystemEntityType> _defaultSourceRootTypeReader(String path) =>
+    FileSystemEntity.type(path, followLinks: false);
 
 bool _isWslUncPath(String rootPath) {
   final normalized = rootPath.replaceAll('/', r'\').toLowerCase();
@@ -787,6 +960,7 @@ bool _isWslUncPath(String rootPath) {
 
 class SessionScanRequest {
   const SessionScanRequest({
+    this.roots = const [],
     this.windowsRoot,
     this.wslRoot,
     this.cachedSessions = const [],
@@ -794,17 +968,39 @@ class SessionScanRequest {
     this.cancellationToken,
   });
 
+  final List<SessionScanRoot> roots;
   final String? windowsRoot;
   final String? wslRoot;
   final List<CachedSessionSnapshot> cachedSessions;
   final ForceReparsePlan forceReparsePlan;
   final ScanCancellationToken? cancellationToken;
+
+  List<SessionScanRoot> get effectiveRoots {
+    if (roots.isNotEmpty) {
+      return roots;
+    }
+    return [
+      if (windowsRoot != null && windowsRoot!.isNotEmpty)
+        SessionScanRoot(
+          path: windowsRoot!,
+          sourceType: SessionSourceType.windows,
+          sourceState: SessionSourceState.active,
+        ),
+      if (wslRoot != null && wslRoot!.isNotEmpty)
+        SessionScanRoot(
+          path: wslRoot!,
+          sourceType: SessionSourceType.wsl,
+          sourceState: SessionSourceState.active,
+        ),
+    ];
+  }
 }
 
 class SessionScanResult {
   const SessionScanResult({
     required this.progress,
     this.cancelled = false,
+    required this.allConfiguredRootsReachable,
     required this.sessions,
     required this.errors,
     required this.fileStatuses,
@@ -815,12 +1011,18 @@ class SessionScanResult {
 
   final ScanProgress progress;
   final bool cancelled;
+  final bool allConfiguredRootsReachable;
   final List<ScannedSessionFile> sessions;
   final List<ScanFileError> errors;
   final List<ScannedFileStatus> fileStatuses;
   final List<ScannedFileStatus> statusEvents;
   final List<ScannedFileStatus> skippedFiles;
   final List<CachedSessionSnapshot> cachedSessions;
+
+  bool get canRunCacheRepair =>
+      allConfiguredRootsReachable &&
+      !cancelled &&
+      errors.every((error) => error.status == SessionFileStatus.missing);
 }
 
 class ScanProgress {
@@ -876,13 +1078,51 @@ class ScannedSessionFile {
     required this.status,
     required this.mappedPath,
     required this.parsedSession,
+    this.sourceState = SessionSourceState.active,
+    this.sourceSnapshotSize,
+    this.sourceSnapshotModifiedUtc,
+    this.sourceChangedDuringParse = false,
   });
+
+  factory ScannedSessionFile.fromParseResult({
+    required String sourcePath,
+    required SessionSourceType sourceType,
+    required SessionSourceState sourceState,
+    required MappedSessionPath mappedPath,
+    required CodexParseResult parseResult,
+  }) {
+    final parsedSession = parseResult.session;
+    if (parsedSession == null) {
+      throw ArgumentError.value(
+        parseResult,
+        'parseResult',
+        'A successful parse result is required.',
+      );
+    }
+    return ScannedSessionFile(
+      sourcePath: sourcePath,
+      sourceType: sourceType,
+      sourceState: sourceState,
+      status: parseResult.sourceChangedDuringParse
+          ? SessionFileStatus.changedPendingParse
+          : SessionFileStatus.available,
+      mappedPath: mappedPath,
+      parsedSession: parsedSession,
+      sourceSnapshotSize: parseResult.sourceSnapshotSize,
+      sourceSnapshotModifiedUtc: parseResult.sourceSnapshotModifiedUtc,
+      sourceChangedDuringParse: parseResult.sourceChangedDuringParse,
+    );
+  }
 
   final String sourcePath;
   final SessionSourceType sourceType;
   final SessionFileStatus status;
   final MappedSessionPath mappedPath;
   final CodexParsedSession parsedSession;
+  final SessionSourceState sourceState;
+  final int? sourceSnapshotSize;
+  final DateTime? sourceSnapshotModifiedUtc;
+  final bool sourceChangedDuringParse;
 }
 
 class ScanFileError {
@@ -898,16 +1138,22 @@ class ScanFileError {
 }
 
 class ScannedFileStatus {
-  const ScannedFileStatus({required this.sourcePath, required this.status});
+  const ScannedFileStatus({
+    required this.sourcePath,
+    required this.status,
+    this.sourceState = SessionSourceState.active,
+  });
 
   final String sourcePath;
   final SessionFileStatus status;
+  final SessionSourceState sourceState;
 }
 
 class CachedSessionSnapshot {
   const CachedSessionSnapshot({
     required this.sourcePath,
     required this.status,
+    this.sourceState = SessionSourceState.active,
     this.sourceFileUncPath,
     this.sourceFileSize,
     this.sourceModifiedUtc,
@@ -921,6 +1167,7 @@ class CachedSessionSnapshot {
     File file, {
     required SessionFileStatus status,
     required int parserVersion,
+    SessionSourceState sourceState = SessionSourceState.active,
     String? sourceFileUncPath,
     DateTime? lastScannedUtc,
     DateTime? lastParsedUtc,
@@ -929,10 +1176,10 @@ class CachedSessionSnapshot {
     return CachedSessionSnapshot(
       sourcePath: file.path,
       status: status,
+      sourceState: sourceState,
       sourceFileUncPath: sourceFileUncPath,
       sourceFileSize: stat.size,
       sourceModifiedUtc: stat.modified.toUtc(),
-      sourceContentHash: await _contentHash(file),
       parserVersion: parserVersion,
       lastScannedUtc: lastScannedUtc,
       lastParsedUtc: lastParsedUtc,
@@ -941,6 +1188,7 @@ class CachedSessionSnapshot {
 
   final String sourcePath;
   final SessionFileStatus status;
+  final SessionSourceState sourceState;
   final String? sourceFileUncPath;
   final int? sourceFileSize;
   final DateTime? sourceModifiedUtc;
@@ -957,6 +1205,7 @@ class CachedSessionSnapshot {
   CachedSessionSnapshot copyWith({
     String? sourcePath,
     SessionFileStatus? status,
+    SessionSourceState? sourceState,
     Object? sourceFileUncPath = _sentinel,
     Object? sourceFileSize = _sentinel,
     Object? sourceModifiedUtc = _sentinel,
@@ -967,6 +1216,7 @@ class CachedSessionSnapshot {
   }) => CachedSessionSnapshot(
     sourcePath: sourcePath ?? this.sourcePath,
     status: status ?? this.status,
+    sourceState: sourceState ?? this.sourceState,
     sourceFileUncPath: sourceFileUncPath == _sentinel
         ? this.sourceFileUncPath
         : sourceFileUncPath as String?,
@@ -1123,17 +1373,31 @@ class ScanAlreadyRunningException implements Exception {
 }
 
 class _ScanCandidate {
-  const _ScanCandidate({required this.file, required this.sourceType});
+  const _ScanCandidate({
+    required this.file,
+    required this.sourceType,
+    required this.sourceState,
+  });
 
   final File file;
   final SessionSourceType sourceType;
+  final SessionSourceState sourceState;
 }
 
 class _ScanDirectory {
-  const _ScanDirectory({required this.directory, required this.sourceType});
+  const _ScanDirectory({
+    required this.directory,
+    required this.sourceRootPath,
+    required this.availabilityRootPath,
+    required this.sourceType,
+    required this.sourceState,
+  });
 
   final Directory directory;
+  final String sourceRootPath;
+  final String availabilityRootPath;
   final SessionSourceType sourceType;
+  final SessionSourceState sourceState;
 }
 
 class _ParsedCandidate {
@@ -1288,12 +1552,16 @@ class _ParserIsolatePool {
     required this.workerCount,
     required this.maxToolOutputPreviewChars,
     required this.maxMessageContentChars,
+    required this.isolateEntrypoint,
+    required this.workerStartupTimeout,
     this.onClosing,
   });
 
   final int workerCount;
   final int maxToolOutputPreviewChars;
   final int maxMessageContentChars;
+  final SessionParserIsolateEntrypoint isolateEntrypoint;
+  final Duration workerStartupTimeout;
   final Future<void> Function()? onClosing;
   final Queue<_ParserWorker> _available = Queue<_ParserWorker>();
   final Queue<_ParserJob> _pending = Queue<_ParserJob>();
@@ -1306,14 +1574,23 @@ class _ParserIsolatePool {
 
   Future<void> start() async {
     final count = math.max(1, workerCount);
-    for (var index = 0; index < count; index++) {
-      final worker = await _ParserWorker.start(
-        maxToolOutputPreviewChars: maxToolOutputPreviewChars,
-        maxMessageContentChars: maxMessageContentChars,
-        onResult: _handleResult,
-      );
-      _workers.add(worker);
-      _available.add(worker);
+    try {
+      for (var index = 0; index < count; index++) {
+        final worker = await _ParserWorker.start(
+          maxToolOutputPreviewChars: maxToolOutputPreviewChars,
+          maxMessageContentChars: maxMessageContentChars,
+          isolateEntrypoint: isolateEntrypoint,
+          startupTimeout: workerStartupTimeout,
+          onResult: _handleResult,
+          onFailure: _handleWorkerFailure,
+        );
+        _workers.add(worker);
+        _available.add(worker);
+      }
+    } on Object {
+      _closed = true;
+      await _shutdownWorkers(notifyClosing: false);
+      rethrow;
     }
   }
 
@@ -1334,24 +1611,49 @@ class _ParserIsolatePool {
   }
 
   Future<void> _close() async {
-    if (_closed) {
-      return;
-    }
-    _closed = true;
-    for (final completer in _completers.values) {
-      if (!completer.isCompleted) {
-        completer.completeError(StateError('Parser pool closed.'));
+    if (!_closed) {
+      _closed = true;
+      for (final completer in _completers.values) {
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('Parser pool closed.'));
+        }
       }
+      _completers.clear();
+      _pending.clear();
     }
-    _completers.clear();
-    _pending.clear();
-    await onClosing?.call();
+    await _shutdownWorkers();
+  }
+
+  Future<void> _shutdownWorkers({bool notifyClosing = true}) async {
+    if (notifyClosing) {
+      await onClosing?.call();
+    }
     for (final worker in _workers) {
       await worker.close();
     }
     _available.clear();
     _busyWorkers.clear();
     _workers.clear();
+  }
+
+  void _handleWorkerFailure(
+    _ParserWorker worker,
+    Object error,
+    StackTrace? stackTrace,
+  ) {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    final failure = StateError('Parser worker terminated unexpectedly: $error');
+    for (final completer in _completers.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(failure, stackTrace ?? StackTrace.current);
+      }
+    }
+    _completers.clear();
+    _pending.clear();
+    _closeFuture ??= _shutdownWorkers();
   }
 
   void _pump() {
@@ -1384,44 +1686,140 @@ class _ParserWorker {
     required this.port,
     required this.subscription,
     required this.receivePort,
+    required this.errorSubscription,
+    required this.errorPort,
+    required this.exitSubscription,
+    required this.exitPort,
   });
 
   final Isolate isolate;
   final SendPort port;
   final StreamSubscription<Object?> subscription;
   final ReceivePort receivePort;
+  final StreamSubscription<Object?> errorSubscription;
+  final ReceivePort errorPort;
+  final StreamSubscription<Object?> exitSubscription;
+  final ReceivePort exitPort;
+  var _closing = false;
 
   static Future<_ParserWorker> start({
     required int maxToolOutputPreviewChars,
     required int maxMessageContentChars,
+    required SessionParserIsolateEntrypoint isolateEntrypoint,
+    required Duration startupTimeout,
     required void Function(_ParserWorkerResult result) onResult,
+    required void Function(
+      _ParserWorker worker,
+      Object error,
+      StackTrace? stackTrace,
+    )
+    onFailure,
   }) async {
     final receivePort = ReceivePort();
+    final errorPort = ReceivePort();
+    final exitPort = ReceivePort();
     final ready = Completer<SendPort>();
+    _ParserWorker? worker;
+    (Object, StackTrace?)? pendingFailure;
+
+    void reportFailure(Object error, StackTrace? stackTrace) {
+      if (!ready.isCompleted) {
+        ready.completeError(error, stackTrace ?? StackTrace.current);
+        return;
+      }
+      final startedWorker = worker;
+      if (startedWorker == null) {
+        pendingFailure = (error, stackTrace);
+        return;
+      }
+      onFailure(startedWorker, error, stackTrace);
+    }
+
     late StreamSubscription<Object?> subscription;
     subscription = receivePort.listen((message) {
       if (message is _ParserWorkerReady) {
-        ready.complete(message.port);
+        if (!ready.isCompleted) {
+          ready.complete(message.port);
+        }
         return;
       }
       if (message is _ParserWorkerResult) {
         onResult(message);
       }
     });
-    final isolate = await Isolate.spawn(
-      _parserWorkerEntry,
-      _ParserWorkerStart(
-        replyPort: receivePort.sendPort,
-        maxToolOutputPreviewChars: maxToolOutputPreviewChars,
-        maxMessageContentChars: maxMessageContentChars,
-      ),
-    );
-    return _ParserWorker._(
-      isolate: isolate,
-      port: await ready.future,
-      subscription: subscription,
-      receivePort: receivePort,
-    );
+    final errorSubscription = errorPort.listen((message) {
+      final errorMessage = switch (message) {
+        [final Object error, ...] => error.toString(),
+        _ => message?.toString() ?? 'Unknown isolate error',
+      };
+      final stackTrace = switch (message) {
+        [_, final Object stack, ...] => StackTrace.fromString(stack.toString()),
+        _ => null,
+      };
+      reportFailure(
+        StateError('Parser worker failed: $errorMessage'),
+        stackTrace,
+      );
+    });
+    final exitSubscription = exitPort.listen((_) {
+      reportFailure(
+        StateError(
+          ready.isCompleted
+              ? 'Parser worker exited unexpectedly.'
+              : 'Parser worker exited before becoming ready.',
+        ),
+        null,
+      );
+    });
+    Isolate? isolate;
+    try {
+      isolate = await Isolate.spawn<Object?>(
+        isolateEntrypoint,
+        _ParserWorkerStart(
+          replyPort: receivePort.sendPort,
+          maxToolOutputPreviewChars: maxToolOutputPreviewChars,
+          maxMessageContentChars: maxMessageContentChars,
+        ),
+        onError: errorPort.sendPort,
+        onExit: exitPort.sendPort,
+        errorsAreFatal: true,
+      );
+      final startedWorker = _ParserWorker._(
+        isolate: isolate,
+        port: await ready.future.timeout(
+          startupTimeout,
+          onTimeout: () => throw StateError(
+            'Parser worker did not become ready within '
+            '${startupTimeout.inMilliseconds} ms.',
+          ),
+        ),
+        subscription: subscription,
+        receivePort: receivePort,
+        errorSubscription: errorSubscription,
+        errorPort: errorPort,
+        exitSubscription: exitSubscription,
+        exitPort: exitPort,
+      );
+      worker = startedWorker;
+      final startupFailure = pendingFailure;
+      if (startupFailure != null) {
+        await startedWorker.close();
+        Error.throwWithStackTrace(
+          startupFailure.$1,
+          startupFailure.$2 ?? StackTrace.current,
+        );
+      }
+      return startedWorker;
+    } on Object {
+      isolate?.kill(priority: Isolate.immediate);
+      await subscription.cancel();
+      await errorSubscription.cancel();
+      await exitSubscription.cancel();
+      receivePort.close();
+      errorPort.close();
+      exitPort.close();
+      rethrow;
+    }
   }
 
   void parse(_ParserJob job) {
@@ -1429,10 +1827,18 @@ class _ParserWorker {
   }
 
   Future<void> close() async {
+    if (_closing) {
+      return;
+    }
+    _closing = true;
     port.send(const _ParserWorkerStop());
     isolate.kill(priority: Isolate.immediate);
     await subscription.cancel();
+    await errorSubscription.cancel();
+    await exitSubscription.cancel();
     receivePort.close();
+    errorPort.close();
+    exitPort.close();
   }
 }
 
@@ -1479,7 +1885,8 @@ class _ParserWorkerResult {
   final CodexParseResult result;
 }
 
-Future<void> _parserWorkerEntry(_ParserWorkerStart start) async {
+Future<void> _parserWorkerEntry(Object? message) async {
+  final start = message! as _ParserWorkerStart;
   final receivePort = ReceivePort();
   final parser = CodexSessionParser(
     maxToolOutputPreviewChars: start.maxToolOutputPreviewChars,
@@ -1506,11 +1913,6 @@ Set<String> _snapshotPathKeys(CachedSessionSnapshot snapshot) => {
   if (snapshot.sourceFileUncPath != null)
     _canonicalScanPath(snapshot.sourceFileUncPath!),
 };
-
-Future<String> _contentHash(File file) async {
-  final bytes = await file.readAsBytes();
-  return sha256.convert(bytes).toString();
-}
 
 bool _isModifiedWithinTolerance(
   DateTime currentModifiedUtc,

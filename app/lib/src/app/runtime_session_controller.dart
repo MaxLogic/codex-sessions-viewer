@@ -4,11 +4,11 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 
-import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
 import '../config/app_settings.dart';
 import '../database/database_connection.dart';
+import '../database/session_cache_repair.dart';
 import '../logging/structured_logger.dart';
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
@@ -33,12 +33,16 @@ class RuntimeSessionController {
     required this.databaseFile,
     this.scanBatchingPolicy = defaultScanBatchingPolicy,
     this.wslProjectResolver = const ProcessWslProjectResolver(),
-  });
+    this.parserWorkerCountOverride,
+  }) : assert(
+         parserWorkerCountOverride == null || parserWorkerCountOverride > 0,
+       );
 
   final File settingsFile;
   final File databaseFile;
   final ScanBatchingPolicy scanBatchingPolicy;
   final WslProjectResolver wslProjectResolver;
+  final int? parserWorkerCountOverride;
 
   CancellableSessionScanOperation startRefreshOperation({
     SessionsRefreshProgressCallback? onProgress,
@@ -342,6 +346,7 @@ class RuntimeSessionController {
             select
               id,
               source_type,
+              source_state,
               source_file_path,
               source_file_unc_path,
               display_path,
@@ -385,12 +390,12 @@ class RuntimeSessionController {
                 normalizePathKey(unc),
             },
           );
-          final scannedSession = ScannedSessionFile(
+          final scannedSession = ScannedSessionFile.fromParseResult(
             sourcePath: sourcePath,
             sourceType: sourceType,
-            status: SessionFileStatus.available,
+            sourceState: _sourceState(row['source_state'] as String?),
             mappedPath: mappedPath,
-            parsedSession: parseResult.session!,
+            parseResult: parseResult,
           );
           final projectResolver = await Profiling.spanAsync(
             'scan.runtime.reload_session_detail.project_resolver',
@@ -471,6 +476,8 @@ class RuntimeSessionController {
           sendPort: messages.sendPort,
           parsedSessionFlushBatchSize:
               scanBatchingPolicy.parsedSessionFlushBatchSize,
+          parsedSessionFlushSourceBytes:
+              scanBatchingPolicy.parsedSessionFlushSourceBytes,
           fullRowSnapshotBatchSize: scanBatchingPolicy.fullRowSnapshotBatchSize,
         ),
         onError: errors.sendPort,
@@ -545,25 +552,32 @@ class RuntimeSessionController {
     return Profiling.spanAsync('scan.runtime.refresh', () async {
       final settings = await SettingsRepository(settingsFile).loadOrCreate();
       final db = openFileBackedDatabase(databaseFile);
-      ToolOutputSearchIndex(
-        db,
-      ).configure(enabled: settings.toolOutput.indexToolOutput);
-      final logger = StructuredLogger(db: db, settings: settings.logging);
-      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      StructuredLogger? logger;
       int? scanRunId;
       var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
-      final pendingParsedSessions = <ScannedSessionFile>[];
-      var persistenceFlushCount = 0;
-      var fullRowSnapshotCount = 0;
-      var lastFullRowSnapshotParsedCount = 0;
-      var persistenceFlushQueue = Future<void>.value();
-      final threadNamesBySessionId = await _readSessionIndexThreadNames(
-        settings.paths,
-      );
-      final projectResolutionCache = _WslProjectResolutionCache(
-        wslProjectResolver,
-      );
       try {
+        ToolOutputSearchIndex(
+          db,
+        ).configure(enabled: settings.toolOutput.indexToolOutput);
+        final activeLogger = StructuredLogger(
+          db: db,
+          settings: settings.logging,
+        );
+        logger = activeLogger;
+        final pricing = PricingRepository(db).loadCached(settings.pricing);
+        final pendingParsedSessions = <ScannedSessionFile>[];
+        var pendingParsedSourceBytes = 0;
+        final parsedProjectCandidates = <_ParsedProjectCandidate>[];
+        var persistenceFlushCount = 0;
+        var fullRowSnapshotCount = 0;
+        var lastFullRowSnapshotParsedCount = 0;
+        var persistenceFlushQueue = Future<void>.value();
+        final threadNamesBySessionId = await _readSessionIndexThreadNames(
+          settings.paths,
+        );
+        final projectResolutionCache = _WslProjectResolutionCache(
+          wslProjectResolver,
+        );
         _cleanSessionMetadataPlaceholders(db);
         scanRunId = _startScanRun(db);
         final activeScanRunId = scanRunId;
@@ -596,6 +610,7 @@ class RuntimeSessionController {
           if (pendingParsedSessions.isNotEmpty) {
             final batch = List<ScannedSessionFile>.of(pendingParsedSessions);
             pendingParsedSessions.clear();
+            pendingParsedSourceBytes = 0;
             await persistParsedBatch(batch);
           } else if (forceFullRowSnapshot) {
             await persistenceFlushQueue;
@@ -609,6 +624,7 @@ class RuntimeSessionController {
               pendingParsedSessions,
             );
             pendingParsedSessions.clear();
+            pendingParsedSourceBytes = 0;
             await persistParsedBatch(finalBatch);
           }
           if (forceFullRowSnapshot) {
@@ -647,7 +663,7 @@ class RuntimeSessionController {
           );
         }
 
-        await logger.write(
+        await activeLogger.writeBestEffort(
           LogEntryDraft(
             level: LogLevel.info,
             category: LogCategory.scanner,
@@ -665,9 +681,20 @@ class RuntimeSessionController {
           wslLinuxHome: settings.wsl.linuxHome,
           wslUncRoot: settings.wsl.linuxRootUnc,
         );
-        final parserWorkerCount = _defaultParserWorkerCount();
+        final parserWorkerCount =
+            parserWorkerCountOverride ?? _defaultParserWorkerCount();
         final directoryWorkerCount = _defaultDirectoryWorkerCount();
         final metadataWorkerCount = _defaultMetadataWorkerCount();
+        final scanRoots = [
+          ..._sessionScanRoots(
+            settings.paths.windowsCodexPath,
+            SessionSourceType.windows,
+          ),
+          ..._sessionScanRoots(
+            settings.paths.wslCodexUncPath,
+            SessionSourceType.wsl,
+          ),
+        ];
         final scanner = SessionScanner(
           parser: CodexSessionParser(
             maxToolOutputPreviewChars:
@@ -677,6 +704,7 @@ class RuntimeSessionController {
           maxConcurrentParses: parserWorkerCount,
           maxConcurrentDirectoryScans: directoryWorkerCount,
           maxConcurrentMetadataChecks: metadataWorkerCount,
+          retainParsedSessions: false,
           onProgress: onProgress == null
               ? null
               : (progress) {
@@ -693,23 +721,28 @@ class RuntimeSessionController {
                     ),
                   );
                 },
-          onSessionParsed: onProgress == null
-              ? null
-              : (session, progress) async {
-                  pendingParsedSessions.add(session);
-                  if (pendingParsedSessions.length >=
-                      scanBatchingPolicy.parsedSessionFlushBatchSize) {
-                    await flushParsedSessions(progress);
-                  }
-                },
+          onSessionParsed: (session, progress) async {
+            pendingParsedSessions.add(session);
+            pendingParsedSourceBytes += session.sourceSnapshotSize ?? 0;
+            parsedProjectCandidates.add((
+              sessionId: session.parsedSession.internalId,
+              workingDirectory: session.parsedSession.workingDirectoryDisplay,
+              sourceType: session.sourceType,
+            ));
+            if (scanBatchingPolicy.shouldFlushParsedSessions(
+              pendingCount: pendingParsedSessions.length,
+              pendingSourceBytes: pendingParsedSourceBytes,
+            )) {
+              await flushParsedSessions(progress);
+            }
+          },
         );
         final result = await Profiling.spanAsync(
           'scan.runtime.scanner_scan',
           () {
             return scanner.scan(
               SessionScanRequest(
-                windowsRoot: _sessionScanRoot(settings.paths.windowsCodexPath),
-                wslRoot: _sessionScanRoot(settings.paths.wslCodexUncPath),
+                roots: scanRoots,
                 cachedSessions: _cachedSessions(db),
                 cancellationToken: cancellationToken,
               ),
@@ -723,16 +756,14 @@ class RuntimeSessionController {
           return flushParsedSessions(
             result.progress,
             forceFullRowSnapshot: true,
-            beforeFullRowSnapshot: onProgress == null
-                ? null
-                : () => Profiling.spanAsync(
-                    'scan.runtime.apply_resolved_projects',
-                    () => _applyResolvedProjectsForParsedSessions(
-                      db,
-                      result.sessions,
-                      wslProjects: projectResolutionCache,
-                    ),
-                  ),
+            beforeFullRowSnapshot: () => Profiling.spanAsync(
+              'scan.runtime.apply_resolved_projects',
+              () => _applyResolvedProjectsForParsedCandidates(
+                db,
+                parsedProjectCandidates,
+                wslProjects: projectResolutionCache,
+              ),
+            ),
           );
         });
         await Profiling.spanAsync('scan.runtime.persist_scan', () {
@@ -740,27 +771,83 @@ class RuntimeSessionController {
             db,
             result,
             scanRunId: activeScanRunId,
-            persistSessions: onProgress == null,
+            persistSessions: false,
             threadNamesBySessionId: threadNamesBySessionId,
             wslProjects: projectResolutionCache,
           );
         });
         _applySessionIndexThreadNames(db, threadNamesBySessionId);
+        try {
+          final repair = await SessionCacheRepair(databaseFile: databaseFile)
+              .run(
+                db: db,
+                roots: scanRoots,
+                discoveryComplete: result.canRunCacheRepair,
+                isCancellationRequested: () =>
+                    cancellationToken.isCancellationRequested,
+                onProgress: (phase) {
+                  onProgress?.call(
+                    SessionsRefreshProgress(
+                      statusMessage: _cacheRepairProgressMessage(phase),
+                    ),
+                  );
+                },
+              );
+          final audit = repair.audit;
+          await activeLogger.writeBestEffort(
+            LogEntryDraft(
+              level:
+                  repair.status == SessionCacheRepairStatus.postponed &&
+                      repair.reasonCode != 'cancelled'
+                  ? LogLevel.warning
+                  : LogLevel.info,
+              category: LogCategory.database,
+              message: repair.status == SessionCacheRepairStatus.postponed
+                  ? 'Session cache repair postponed.'
+                  : 'Session cache repair checked.',
+              details: {
+                'status': repair.status.name,
+                'reason_code': repair.reasonCode,
+                'deleted_rows': repair.deletedCount,
+                if (audit != null)
+                  for (final entry in audit.categoryCounts.entries)
+                    'category_${entry.key.wireName}': entry.value,
+                if (repair.backupFile != null)
+                  'backup_file': p.basename(repair.backupFile!.path),
+              },
+            ),
+          );
+        } on Object catch (error) {
+          await activeLogger.writeBestEffort(
+            LogEntryDraft(
+              level: LogLevel.warning,
+              category: LogCategory.database,
+              message: 'Session cache repair postponed.',
+              details: {
+                'status': 'postponed',
+                'reason_code': 'unexpected_repair_error',
+                'error_type': error.runtimeType.toString(),
+              },
+            ),
+          );
+        }
         final rows = Profiling.spanSync(
           'scan.runtime.final_load_rows',
           () => _loadRowsProfiled(db, pricing: pricing),
         );
+        final refreshCancelled =
+            result.cancelled || cancellationToken.isCancellationRequested;
         await Profiling.spanAsync('scan.runtime.write_finish_log', () {
-          return logger.write(
+          return activeLogger.writeBestEffort(
             LogEntryDraft(
               level: LogLevel.info,
               category: LogCategory.scanner,
-              message: result.cancelled
+              message: refreshCancelled
                   ? 'Session scan cancelled.'
                   : 'Session scan finished.',
               details: {
                 ..._progressLogDetails(result.progress),
-                'cancelled': result.cancelled,
+                'cancelled': refreshCancelled,
                 'visible_sessions': rows.length,
                 'directory_workers': directoryWorkerCount,
                 'metadata_workers': metadataWorkerCount,
@@ -774,22 +861,27 @@ class RuntimeSessionController {
           statusMessage: _statusMessage(
             result,
             visibleSessionCount: rows.length,
+            cancelled: refreshCancelled,
           ),
-          cancelled: result.cancelled,
+          cancelled: refreshCancelled,
           persistenceFlushCount: persistenceFlushCount,
           fullRowSnapshotCount: fullRowSnapshotCount,
         );
       } on Object catch (error) {
         final progress = latestProgress.finish();
         if (scanRunId != null) {
-          _updateScanRun(
-            db,
-            scanRunId,
-            progress,
-            status: _ScanRunStatus.failed,
-          );
+          try {
+            _updateScanRun(
+              db,
+              scanRunId,
+              progress,
+              status: _ScanRunStatus.failed,
+            );
+          } on Object {
+            // Preserve the scan failure even if failure bookkeeping also fails.
+          }
         }
-        await logger.write(
+        await logger?.writeBestEffort(
           LogEntryDraft(
             level: LogLevel.error,
             category: LogCategory.scanner,
@@ -908,6 +1000,8 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
           databaseFile: File(request.databaseFilePath),
           scanBatchingPolicy: ScanBatchingPolicy(
             parsedSessionFlushBatchSize: request.parsedSessionFlushBatchSize,
+            parsedSessionFlushSourceBytes:
+                request.parsedSessionFlushSourceBytes,
             fullRowSnapshotBatchSize: request.fullRowSnapshotBatchSize,
           ),
         ).startRefreshOperation(
@@ -1076,6 +1170,7 @@ class _BackgroundRefreshRequest {
     required this.databaseFilePath,
     required this.sendPort,
     required this.parsedSessionFlushBatchSize,
+    required this.parsedSessionFlushSourceBytes,
     required this.fullRowSnapshotBatchSize,
   });
 
@@ -1083,6 +1178,7 @@ class _BackgroundRefreshRequest {
   final String databaseFilePath;
   final SendPort sendPort;
   final int parsedSessionFlushBatchSize;
+  final int parsedSessionFlushSourceBytes;
   final int fullRowSnapshotBatchSize;
 }
 
@@ -1359,16 +1455,17 @@ Future<void> _persistParsedSessions(
   required _WslProjectResolutionCache wslProjects,
   bool resolveWslProjects = true,
 }) async {
+  final canonicalSessions = _canonicalScannedSessions(sessions);
   final resolver = resolveWslProjects
       ? await _ProjectPathResolver.create(
-          _projectPathCandidatesForSessions(sessions),
+          _projectPathCandidatesForSessions(canonicalSessions),
           wslProjects: wslProjects,
         )
       : _ProjectPathResolver();
   db.execute('begin immediate');
   try {
     final now = DateTime.now().toUtc().toIso8601String();
-    for (final session in sessions) {
+    for (final session in canonicalSessions) {
       _upsertParsedSession(
         db,
         session,
@@ -1448,6 +1545,7 @@ List<CachedSessionSnapshot> _cachedSessions(Database db) {
       source_file_path,
       source_file_unc_path,
       scan_status,
+      source_state,
       file_size,
       modified_utc,
       content_hash,
@@ -1462,6 +1560,7 @@ List<CachedSessionSnapshot> _cachedSessions(Database db) {
         sourcePath: row['source_file_path'] as String,
         sourceFileUncPath: row['source_file_unc_path'] as String?,
         status: _scanStatus(row['scan_status'] as String?),
+        sourceState: _sourceState(row['source_state'] as String?),
         sourceFileSize: row['file_size'] as int?,
         sourceModifiedUtc: _dateTime(row['modified_utc'] as String?),
         sourceContentHash: row['content_hash'] as String?,
@@ -1480,9 +1579,10 @@ Future<void> _persistScan(
   required Map<String, CodexThreadNameEntry> threadNamesBySessionId,
   required _WslProjectResolutionCache wslProjects,
 }) async {
+  final canonicalSessions = _canonicalScannedSessions(result.sessions);
   final resolver = persistSessions
       ? await _ProjectPathResolver.create(
-          _projectPathCandidatesForSessions(result.sessions),
+          _projectPathCandidatesForSessions(canonicalSessions),
           wslProjects: wslProjects,
         )
       : null;
@@ -1518,7 +1618,7 @@ Future<void> _persistScan(
       );
     }
     if (persistSessions) {
-      for (final session in result.sessions) {
+      for (final session in canonicalSessions) {
         _upsertParsedSession(
           db,
           session,
@@ -1528,16 +1628,7 @@ Future<void> _persistScan(
         );
       }
     }
-    final parsedSessionPaths = {
-      for (final session in result.sessions) session.sourcePath,
-    };
-    final statusesToPersist = [
-      for (final status in result.fileStatuses)
-        if (!parsedSessionPaths.contains(status.sourcePath) &&
-            status.status != SessionFileStatus.available)
-          status,
-    ];
-    _upsertScanStatusesOnly(db, statusesToPersist, now);
+    _upsertScanStatusesOnly(db, result.fileStatuses, now);
     db.execute('commit');
   } on Object {
     db.execute('rollback');
@@ -1553,6 +1644,13 @@ void _upsertParsedSession(
   Map<String, CodexThreadNameEntry> threadNamesBySessionId = const {},
 }) {
   final parsed = scannedSession.parsedSession;
+  final identityMerge = _captureIdentityMergeState(db, scannedSession);
+  if (!_candidateShouldReplacePersistedSession(db, scannedSession)) {
+    if (identityMerge != null) {
+      _applyIdentityMerge(db, parsed.internalId, identityMerge);
+    }
+    return;
+  }
   final resolvedThreadName =
       threadNamesBySessionId[parsed.sessionId]?.threadName.trim().isNotEmpty ==
           true
@@ -1561,7 +1659,15 @@ void _upsertParsedSession(
   final sourceType = scannedSession.sourceType == SessionSourceType.windows
       ? SessionSearchSourceType.windows
       : SessionSearchSourceType.wsl;
-  final stat = File(scannedSession.sourcePath).statSync();
+  final needsCurrentStat =
+      scannedSession.sourceSnapshotSize == null ||
+      scannedSession.sourceSnapshotModifiedUtc == null;
+  final stat = needsCurrentStat
+      ? File(scannedSession.sourcePath).statSync()
+      : null;
+  final sourceSnapshotSize = scannedSession.sourceSnapshotSize ?? stat!.size;
+  final sourceSnapshotModifiedUtc =
+      scannedSession.sourceSnapshotModifiedUtc ?? stat!.modified.toUtc();
   final hasErrors =
       parsed.messages.any((message) => message.hasError) ||
       parsed.toolCalls.any((tool) => tool.hasError);
@@ -1610,6 +1716,7 @@ void _upsertParsedSession(
       agent_role = ?,
       subagent_depth = ?,
       source_file_unc_path = ?,
+      source_state = ?,
       working_directory_display = ?,
       working_directory_platform = ?,
       working_directory_unc = ?,
@@ -1645,12 +1752,13 @@ void _upsertParsedSession(
       parsed.agentRole,
       parsed.subagentDepth,
       scannedSession.mappedPath.sourceFileUncPath,
+      scannedSession.sourceState.wireName,
       parsed.workingDirectoryDisplay,
       parsed.workingDirectoryPlatform,
       parsed.workingDirectoryUnc,
-      stat.size,
-      stat.modified.toUtc().toIso8601String(),
-      _readHash(scannedSession.sourcePath),
+      sourceSnapshotSize,
+      sourceSnapshotModifiedUtc.toIso8601String(),
+      null,
       CodexSessionParser.currentVersion,
       parsed.messages.length,
       parsed.messages
@@ -1682,6 +1790,602 @@ void _upsertParsedSession(
   }
   _replaceMessages(db, parsed, now);
   _replaceToolCalls(db, parsed);
+  if (identityMerge != null) {
+    _applyIdentityMerge(db, parsed.internalId, identityMerge);
+  }
+}
+
+_IdentityMergeState? _captureIdentityMergeState(
+  Database db,
+  ScannedSessionFile candidate,
+) {
+  final stableSessionId = candidate.parsedSession.sessionId?.trim() ?? '';
+  if (stableSessionId.isEmpty) {
+    return null;
+  }
+  final canonicalId = candidate.parsedSession.internalId;
+  final caseSensitivePaths = candidate.sourceType == SessionSourceType.wsl;
+  final pathKeys =
+      <String>{
+            candidate.sourcePath,
+            candidate.mappedPath.sourceFilePath,
+            candidate.mappedPath.displayPath,
+            candidate.mappedPath.platformPath,
+            if (!caseSensitivePaths) ...candidate.mappedPath.normalizedPathKeys,
+            ?candidate.mappedPath.sourceFileUncPath,
+          }
+          .map(
+            (path) =>
+                _normalizeIdentityPath(path, caseSensitive: caseSensitivePaths),
+          )
+          .where((path) => path.isNotEmpty)
+          .toList();
+  final pathParameters = List.filled(pathKeys.length, '?').join(', ');
+  String normalizedSqlPath(String column) => caseSensitivePaths
+      ? "replace(coalesce($column, ''), '\\', '/')"
+      : "replace(lower(coalesce($column, '')), '\\', '/')";
+  final rows = db.select(
+    '''
+    select rowid as session_rowid, *
+    from sessions
+    where id = ?
+       or (
+         id <> ?
+         and (
+           trim(coalesce(session_id, '')) = ?
+           or (
+             trim(coalesce(session_id, '')) = ''
+             and source_type = ?
+             and (
+               ${normalizedSqlPath('source_file_path')}
+                 in ($pathParameters)
+               or ${normalizedSqlPath('source_file_unc_path')}
+                 in ($pathParameters)
+               or ${normalizedSqlPath('display_path')}
+                 in ($pathParameters)
+               or ${normalizedSqlPath('platform_path')}
+                 in ($pathParameters)
+               or (
+                 id like 'source:%'
+                 and source_type = 'windows'
+                 and ${caseSensitivePaths ? "replace(substr(id, 8), '\\', '/')" : "replace(lower(substr(id, 8)), '\\', '/')"}
+                   in ($pathParameters)
+               )
+               or (
+                 id like 'source-status:%'
+                 and source_type = 'windows'
+                 and ${caseSensitivePaths ? "replace(substr(id, 15), '\\', '/')" : "replace(lower(substr(id, 15)), '\\', '/')"}
+                   in ($pathParameters)
+               )
+             )
+           )
+         )
+       )
+    ''',
+    [
+      canonicalId,
+      canonicalId,
+      stableSessionId,
+      candidate.sourceType == SessionSourceType.wsl ? 'wsl' : 'windows',
+      for (var repeat = 0; repeat < 6; repeat++) ...pathKeys,
+    ],
+  );
+  final alternateRows = rows
+      .where((row) => row['id'] != canonicalId)
+      .toList(growable: false);
+  if (alternateRows.isEmpty) {
+    return null;
+  }
+  final snapshots = [
+    for (final row in rows) _SessionMetadataSnapshot.fromRow(row),
+  ];
+  _SessionMetadataSnapshot? canonical;
+  for (final snapshot in snapshots) {
+    if (snapshot.id == canonicalId) {
+      canonical = snapshot;
+      break;
+    }
+  }
+  final project = _latestMetadataSnapshot(
+    snapshots,
+    canonical: canonical,
+    timestamp: (snapshot) => snapshot.updatedAtUtc,
+  );
+  final archive = _latestMetadataSnapshot(
+    snapshots,
+    canonical: canonical,
+    timestamp: (snapshot) => snapshot.archivedAtUtc,
+  );
+  final evaluation = _latestMetadataSnapshot(
+    snapshots,
+    canonical: canonical,
+    timestamp: (snapshot) => snapshot.evalUpdatedAtUtc,
+  );
+  final ownerIds = snapshots.map((snapshot) => snapshot.id).toList();
+  final ownerParameters = List.filled(ownerIds.length, '?').join(', ');
+  final tagCreatedAtById = <int, String>{};
+  for (final row in db.select('''
+    select tag_id, created_at_utc
+    from session_tags
+    where session_id in ($ownerParameters)
+    ''', ownerIds)) {
+    final tagId = row['tag_id'] as int;
+    final createdAt = row['created_at_utc'] as String;
+    final existing = tagCreatedAtById[tagId];
+    if (existing == null || createdAt.compareTo(existing) < 0) {
+      tagCreatedAtById[tagId] = createdAt;
+    }
+  }
+  final pathAliases = <String>{
+    for (final row in db.select('''
+      select path_key
+      from session_path_keys
+      where session_id in ($ownerParameters)
+      ''', ownerIds))
+      row['path_key'] as String,
+  };
+  return _IdentityMergeState(
+    alternateIds: [for (final row in alternateRows) row['id'] as String],
+    alternateRowIds: [
+      for (final row in alternateRows) row['session_rowid'] as int,
+    ],
+    isPinned: snapshots.any((snapshot) => snapshot.isPinned),
+    project: project,
+    archive: archive,
+    evaluation: evaluation,
+    tagCreatedAtById: tagCreatedAtById,
+    pathAliases: pathAliases,
+  );
+}
+
+_SessionMetadataSnapshot _latestMetadataSnapshot(
+  List<_SessionMetadataSnapshot> snapshots, {
+  required _SessionMetadataSnapshot? canonical,
+  required DateTime? Function(_SessionMetadataSnapshot snapshot) timestamp,
+}) {
+  var winner = canonical ?? snapshots.first;
+  for (final snapshot in snapshots) {
+    if (identical(snapshot, winner)) {
+      continue;
+    }
+    final candidateTime = timestamp(snapshot);
+    final winnerTime = timestamp(winner);
+    final timestampCompare = _compareNullableDateTime(
+      candidateTime,
+      winnerTime,
+    );
+    if (timestampCompare > 0 ||
+        (canonical == null &&
+            timestampCompare == 0 &&
+            _compareMetadataTieBreak(snapshot, winner) > 0)) {
+      winner = snapshot;
+    }
+  }
+  return winner;
+}
+
+int _compareMetadataTieBreak(
+  _SessionMetadataSnapshot left,
+  _SessionMetadataSnapshot right,
+) {
+  int identityPreference(String id) {
+    if (id.startsWith('source:')) {
+      return 2;
+    }
+    if (id.startsWith('source-status:')) {
+      return 1;
+    }
+    return 0;
+  }
+
+  final identityCompare = identityPreference(
+    left.id,
+  ).compareTo(identityPreference(right.id));
+  if (identityCompare != 0) {
+    return identityCompare;
+  }
+  final idCompare = right.id.compareTo(left.id);
+  if (idCompare != 0) {
+    return idCompare;
+  }
+  return right.rowId.compareTo(left.rowId);
+}
+
+void _applyIdentityMerge(
+  Database db,
+  String canonicalId,
+  _IdentityMergeState merge,
+) {
+  db.execute(
+    '''
+    update sessions
+    set is_pinned = ?,
+        project_override = ?,
+        project_id = ?,
+        project_name_snapshot = ?,
+        is_archived = ?,
+        archived_at_utc = ?,
+        archive_reason = ?,
+        eval_ready = ?,
+        eval_status = ?,
+        eval_notes = ?,
+        eval_expected_output = ?,
+        eval_reviewed_at_utc = ?,
+        eval_updated_at_utc = ?,
+        updated_at_utc = case
+          when julianday(?) > julianday(updated_at_utc) then ?
+          else updated_at_utc
+        end
+    where id = ?
+    ''',
+    [
+      merge.isPinned ? 1 : 0,
+      merge.project.projectOverride ? 1 : 0,
+      merge.project.projectId,
+      merge.project.projectName,
+      merge.archive.isArchived ? 1 : 0,
+      merge.archive.archivedAtValue,
+      merge.archive.archiveReason,
+      merge.evaluation.evalReady ? 1 : 0,
+      merge.evaluation.evalStatus,
+      merge.evaluation.evalNotes,
+      merge.evaluation.evalExpectedOutput,
+      merge.evaluation.evalReviewedAtValue,
+      merge.evaluation.evalUpdatedAtValue,
+      merge.project.updatedAtValue,
+      merge.project.updatedAtValue,
+      canonicalId,
+    ],
+  );
+
+  for (final alternateId in merge.alternateIds) {
+    db.execute('delete from tool_calls where session_id = ?', [alternateId]);
+    db.execute('delete from messages where session_id = ?', [alternateId]);
+    db.execute('delete from session_tags where session_id = ?', [alternateId]);
+    db.execute('delete from session_path_keys where session_id = ?', [
+      alternateId,
+    ]);
+  }
+  for (final rowId in merge.alternateRowIds) {
+    db.execute('delete from session_search where rowid = ?', [rowId]);
+  }
+  for (final alternateId in merge.alternateIds) {
+    db.execute('delete from sessions where id = ?', [alternateId]);
+  }
+  for (final entry in merge.tagCreatedAtById.entries) {
+    db.execute(
+      '''
+      insert or ignore into session_tags (session_id, tag_id, created_at_utc)
+      values (?, ?, ?)
+      ''',
+      [canonicalId, entry.key, entry.value],
+    );
+  }
+  for (final pathAlias in merge.pathAliases) {
+    db.execute(
+      '''
+      insert or ignore into session_path_keys (session_id, path_key)
+      values (?, ?)
+      ''',
+      [canonicalId, pathAlias],
+    );
+  }
+  _refreshSessionSearchRow(db, canonicalId);
+  final foreignKeyErrors = db.select('pragma foreign_key_check');
+  if (foreignKeyErrors.isNotEmpty) {
+    throw StateError(
+      'Session identity reconciliation left foreign-key violations.',
+    );
+  }
+}
+
+void _refreshSessionSearchRow(Database db, String sessionId) {
+  final rows = db.select(
+    '''
+    select
+      s.rowid as session_rowid,
+      coalesce(s.title, '') as title,
+      coalesce(s.summary, '') as summary,
+      coalesce((
+        select group_concat(tc.tool_name, ' ')
+        from tool_calls tc where tc.session_id = s.id
+      ), '') as tool_names,
+      coalesce(s.display_path, '') as display_path,
+      coalesce((
+        select group_concat(pk.path_key, ' ')
+        from session_path_keys pk where pk.session_id = s.id
+      ), '') as normalized_path_keys,
+      coalesce(s.project_name_snapshot, p.name, '') as project_name,
+      coalesce((
+        select group_concat(t.name, ' ')
+        from session_tags st
+        join tags t on t.id = st.tag_id
+        where st.session_id = s.id
+      ), '') as tags
+    from sessions s
+    left join projects p on p.id = s.project_id
+    where s.id = ?
+    ''',
+    [sessionId],
+  );
+  if (rows.isEmpty) {
+    return;
+  }
+  final row = rows.single;
+  final rowId = row['session_rowid'] as int;
+  db.execute('delete from session_search where rowid = ?', [rowId]);
+  db.execute(
+    '''
+    insert into session_search (
+      rowid, title, summary, tool_names, display_path,
+      normalized_path_keys, project_name, tags
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+    ''',
+    [
+      rowId,
+      row['title'],
+      row['summary'],
+      row['tool_names'],
+      row['display_path'],
+      row['normalized_path_keys'],
+      row['project_name'],
+      row['tags'],
+    ],
+  );
+}
+
+String _normalizeIdentityPath(String path, {required bool caseSensitive}) {
+  final normalized = path.trim().replaceAll(r'\', '/');
+  return caseSensitive ? normalized : normalized.toLowerCase();
+}
+
+class _IdentityMergeState {
+  const _IdentityMergeState({
+    required this.alternateIds,
+    required this.alternateRowIds,
+    required this.isPinned,
+    required this.project,
+    required this.archive,
+    required this.evaluation,
+    required this.tagCreatedAtById,
+    required this.pathAliases,
+  });
+
+  final List<String> alternateIds;
+  final List<int> alternateRowIds;
+  final bool isPinned;
+  final _SessionMetadataSnapshot project;
+  final _SessionMetadataSnapshot archive;
+  final _SessionMetadataSnapshot evaluation;
+  final Map<int, String> tagCreatedAtById;
+  final Set<String> pathAliases;
+}
+
+class _SessionMetadataSnapshot {
+  const _SessionMetadataSnapshot({
+    required this.rowId,
+    required this.id,
+    required this.isPinned,
+    required this.projectOverride,
+    required this.projectId,
+    required this.projectName,
+    required this.updatedAtValue,
+    required this.isArchived,
+    required this.archivedAtValue,
+    required this.archiveReason,
+    required this.evalReady,
+    required this.evalStatus,
+    required this.evalNotes,
+    required this.evalExpectedOutput,
+    required this.evalReviewedAtValue,
+    required this.evalUpdatedAtValue,
+  });
+
+  factory _SessionMetadataSnapshot.fromRow(Row row) => _SessionMetadataSnapshot(
+    rowId: row['session_rowid'] as int,
+    id: row['id'] as String,
+    isPinned: (row['is_pinned'] as int? ?? 0) == 1,
+    projectOverride: (row['project_override'] as int? ?? 0) == 1,
+    projectId: row['project_id'] as int?,
+    projectName: row['project_name_snapshot'] as String?,
+    updatedAtValue: row['updated_at_utc'] as String?,
+    isArchived: (row['is_archived'] as int? ?? 0) == 1,
+    archivedAtValue: row['archived_at_utc'] as String?,
+    archiveReason: row['archive_reason'] as String?,
+    evalReady: (row['eval_ready'] as int? ?? 0) == 1,
+    evalStatus: row['eval_status'] as String?,
+    evalNotes: row['eval_notes'] as String?,
+    evalExpectedOutput: row['eval_expected_output'] as String?,
+    evalReviewedAtValue: row['eval_reviewed_at_utc'] as String?,
+    evalUpdatedAtValue: row['eval_updated_at_utc'] as String?,
+  );
+
+  final int rowId;
+  final String id;
+  final bool isPinned;
+  final bool projectOverride;
+  final int? projectId;
+  final String? projectName;
+  final String? updatedAtValue;
+  final bool isArchived;
+  final String? archivedAtValue;
+  final String? archiveReason;
+  final bool evalReady;
+  final String? evalStatus;
+  final String? evalNotes;
+  final String? evalExpectedOutput;
+  final String? evalReviewedAtValue;
+  final String? evalUpdatedAtValue;
+
+  DateTime? get updatedAtUtc => _dateTime(updatedAtValue);
+  DateTime? get archivedAtUtc => _dateTime(archivedAtValue);
+  DateTime? get evalUpdatedAtUtc => _dateTime(evalUpdatedAtValue);
+}
+
+List<ScannedSessionFile> _canonicalScannedSessions(
+  Iterable<ScannedSessionFile> sessions,
+) {
+  final winners = <String, _SessionCandidateEvidence>{};
+  for (final session in sessions) {
+    final evidence = _SessionCandidateEvidence.fromScanned(session);
+    final existing = winners[session.parsedSession.internalId];
+    if (existing == null || _compareSessionCandidates(evidence, existing) > 0) {
+      winners[session.parsedSession.internalId] = evidence;
+    }
+  }
+  final result = winners.values
+      .map((evidence) => evidence.scannedSession!)
+      .toList(growable: false);
+  result.sort(
+    (left, right) =>
+        left.parsedSession.internalId.compareTo(right.parsedSession.internalId),
+  );
+  return result;
+}
+
+bool _candidateShouldReplacePersistedSession(
+  Database db,
+  ScannedSessionFile candidate,
+) {
+  final rows = db.select(
+    '''
+    select source_type, source_file_path, source_state, parse_status,
+           coalesce(last_message_at_utc, started_at_utc) as last_evidence_utc,
+           modified_utc, file_size
+    from sessions
+    where id = ?
+    ''',
+    [candidate.parsedSession.internalId],
+  );
+  if (rows.isEmpty) {
+    return true;
+  }
+  final row = rows.single;
+  final existing = _SessionCandidateEvidence(
+    sourcePath: row['source_file_path'] as String,
+    sourceType: row['source_type'] == 'wsl'
+        ? SessionSourceType.wsl
+        : SessionSourceType.windows,
+    sourceState: _sourceState(row['source_state'] as String?),
+    isValidParse: row['parse_status'] == 'available',
+    lastEvidenceUtc: _dateTime(row['last_evidence_utc'] as String?),
+    modifiedUtc: _dateTime(row['modified_utc'] as String?),
+    fileSize: row['file_size'] as int? ?? 0,
+  );
+  return _compareSessionCandidates(
+        _SessionCandidateEvidence.fromScanned(candidate),
+        existing,
+      ) >=
+      0;
+}
+
+int _compareSessionCandidates(
+  _SessionCandidateEvidence left,
+  _SessionCandidateEvidence right,
+) {
+  final validityCompare = (left.isValidParse ? 1 : 0).compareTo(
+    right.isValidParse ? 1 : 0,
+  );
+  if (validityCompare != 0) {
+    return validityCompare;
+  }
+  final evidenceCompare = _compareNullableDateTime(
+    left.lastEvidenceUtc,
+    right.lastEvidenceUtc,
+  );
+  if (evidenceCompare != 0) {
+    return evidenceCompare;
+  }
+  final modifiedCompare = _compareNullableDateTime(
+    left.modifiedUtc,
+    right.modifiedUtc,
+  );
+  if (modifiedCompare != 0) {
+    return modifiedCompare;
+  }
+  final sizeCompare = left.fileSize.compareTo(right.fileSize);
+  if (sizeCompare != 0) {
+    return sizeCompare;
+  }
+  final lifecycleCompare = _sourceLifecyclePreference(
+    left.sourceState,
+  ).compareTo(_sourceLifecyclePreference(right.sourceState));
+  if (lifecycleCompare != 0) {
+    return lifecycleCompare;
+  }
+  final caseSensitivePaths =
+      left.sourceType == SessionSourceType.wsl ||
+      right.sourceType == SessionSourceType.wsl;
+  final leftPath = caseSensitivePaths
+      ? left.sourcePath
+      : left.sourcePath.toLowerCase();
+  final rightPath = caseSensitivePaths
+      ? right.sourcePath
+      : right.sourcePath.toLowerCase();
+  return rightPath.compareTo(leftPath);
+}
+
+int _compareNullableDateTime(DateTime? left, DateTime? right) {
+  if (left == null) {
+    return right == null ? 0 : -1;
+  }
+  if (right == null) {
+    return 1;
+  }
+  return left.compareTo(right);
+}
+
+int _sourceLifecyclePreference(SessionSourceState state) => switch (state) {
+  SessionSourceState.active => 2,
+  SessionSourceState.codexArchived => 1,
+  SessionSourceState.missing => 0,
+};
+
+class _SessionCandidateEvidence {
+  const _SessionCandidateEvidence({
+    required this.sourcePath,
+    required this.sourceType,
+    required this.sourceState,
+    required this.isValidParse,
+    required this.lastEvidenceUtc,
+    required this.modifiedUtc,
+    required this.fileSize,
+    this.scannedSession,
+  });
+
+  factory _SessionCandidateEvidence.fromScanned(ScannedSessionFile session) {
+    FileStat? liveStat;
+    if (session.sourceSnapshotSize == null ||
+        session.sourceSnapshotModifiedUtc == null) {
+      try {
+        liveStat = File(session.sourcePath).statSync();
+      } on FileSystemException {
+        liveStat = null;
+      }
+    }
+    return _SessionCandidateEvidence(
+      sourcePath: session.sourcePath,
+      sourceType: session.sourceType,
+      sourceState: session.sourceState,
+      isValidParse: true,
+      lastEvidenceUtc:
+          session.parsedSession.lastMessageAtUtc ??
+          session.parsedSession.startedAtUtc,
+      modifiedUtc:
+          session.sourceSnapshotModifiedUtc ?? liveStat?.modified.toUtc(),
+      fileSize: session.sourceSnapshotSize ?? liveStat?.size ?? 0,
+      scannedSession: session,
+    );
+  }
+
+  final String sourcePath;
+  final SessionSourceType sourceType;
+  final SessionSourceState sourceState;
+  final bool isValidParse;
+  final DateTime? lastEvidenceUtc;
+  final DateTime? modifiedUtc;
+  final int fileSize;
+  final ScannedSessionFile? scannedSession;
 }
 
 ({int user, int assistant, int tool}) _messageTokenBuckets(
@@ -1810,21 +2514,26 @@ void _upsertScanStatusesOnly(
     return;
   }
 
+  db.execute('drop table if exists temp_scan_statuses');
   db.execute('''
-    create temp table if not exists temp_scan_statuses (
+    create temp table temp_scan_statuses (
       source_path text primary key,
-      status text not null
+      status text not null,
+      source_state text not null
     )
     ''');
-  db.execute('delete from temp_scan_statuses');
 
   final insertStatus = db.prepare('''
-    insert or replace into temp_scan_statuses (source_path, status)
-    values (?, ?)
+    insert or replace into temp_scan_statuses (source_path, status, source_state)
+    values (?, ?, ?)
     ''');
   try {
     for (final status in statuses) {
-      insertStatus.execute([status.sourcePath, status.status.wireName]);
+      insertStatus.execute([
+        status.sourcePath,
+        status.status.wireName,
+        status.sourceState.wireName,
+      ]);
     }
   } finally {
     insertStatus.close();
@@ -1841,6 +2550,13 @@ void _upsertScanStatusesOnly(
            or t.source_path = sessions.source_file_unc_path
         limit 1
       ),
+      source_state = (
+        select t.source_state
+        from temp_scan_statuses t
+        where t.source_path = sessions.source_file_path
+           or t.source_path = sessions.source_file_unc_path
+        limit 1
+      ),
       parse_status = case
         when (
           select t.status
@@ -1851,8 +2567,26 @@ void _upsertScanStatusesOnly(
         ) = 'parse_error' then 'parse_error'
         else parse_status
       end,
-      updated_at_utc = ?,
-      last_scanned_utc = ?
+      updated_at_utc = case
+        when (
+          select t.status
+          from temp_scan_statuses t
+          where t.source_path = sessions.source_file_path
+             or t.source_path = sessions.source_file_unc_path
+          limit 1
+        ) = 'available' then updated_at_utc
+        else ?
+      end,
+      last_scanned_utc = case
+        when (
+          select t.status
+          from temp_scan_statuses t
+          where t.source_path = sessions.source_file_path
+             or t.source_path = sessions.source_file_unc_path
+          limit 1
+        ) = 'available' then last_scanned_utc
+        else ?
+      end
     where exists (
       select 1
       from temp_scan_statuses t
@@ -1864,9 +2598,11 @@ void _upsertScanStatusesOnly(
   );
 
   final missingStatuses = db.select('''
-    select t.source_path, t.status
+    select t.source_path, t.status, t.source_state
     from temp_scan_statuses t
-    where not exists (
+    where t.status not in ('available', 'missing', 'path_unreachable')
+      and
+      not exists (
       select 1
       from sessions s
       where s.source_file_path = t.source_path
@@ -1881,13 +2617,15 @@ void _upsertScanStatusesOnly(
       display_path,
       platform_path,
       scan_status,
+      source_state,
       parse_status,
       created_at_utc,
       updated_at_utc,
       last_scanned_utc
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
       scan_status = excluded.scan_status,
+      source_state = excluded.source_state,
       updated_at_utc = excluded.updated_at_utc,
       last_scanned_utc = excluded.last_scanned_utc
     ''');
@@ -1895,6 +2633,7 @@ void _upsertScanStatusesOnly(
     for (final row in missingStatuses) {
       final sourcePath = row['source_path'] as String;
       final status = row['status'] as String;
+      final sourceState = row['source_state'] as String;
       insertMissing.execute([
         _sourceStatusId(sourcePath),
         _sourceTypeLabel(sourcePath),
@@ -1902,6 +2641,7 @@ void _upsertScanStatusesOnly(
         sourcePath,
         sourcePath,
         status,
+        sourceState,
         status == SessionFileStatus.parseError.wireName
             ? 'parse_error'
             : 'available',
@@ -1948,6 +2688,7 @@ List<SessionRowViewModel> _loadRows(
       s.agent_role,
       s.subagent_depth,
       s.source_type,
+      s.source_state,
       s.source_file_path,
       s.source_file_unc_path,
       s.display_path,
@@ -2073,6 +2814,7 @@ SessionRowViewModel _loadRow(
     platform: sourceType == 'wsl'
         ? SessionRowPlatform.wsl
         : SessionRowPlatform.windows,
+    sourceState: _sessionRowSourceState(row['source_state'] as String?),
     project: row['project_name_snapshot'] as String? ?? '',
     path:
         row['working_directory_display'] as String? ??
@@ -2115,6 +2857,14 @@ SessionRowViewModel _loadRow(
         ? _loadMessages(db, row['id'] as String)
         : const [],
   );
+}
+
+SessionRowSourceState _sessionRowSourceState(String? value) {
+  return switch (value) {
+    'codex_archived' => SessionRowSourceState.codexArchived,
+    'missing' => SessionRowSourceState.missing,
+    _ => SessionRowSourceState.active,
+  };
 }
 
 Map<String, List<String>> _loadTagsBySessionId(
@@ -2574,29 +3324,58 @@ Future<void> _backfillAutomaticProjects(
   _applyResolvedProjectRows(db, resolvedRows);
 }
 
-Future<void> _applyResolvedProjectsForParsedSessions(
+typedef _ParsedProjectCandidate = ({
+  String sessionId,
+  String? workingDirectory,
+  SessionSourceType sourceType,
+});
+
+Future<void> _applyResolvedProjectsForParsedCandidates(
   Database db,
-  Iterable<ScannedSessionFile> sessions, {
+  Iterable<_ParsedProjectCandidate> parsedCandidates, {
   required _WslProjectResolutionCache wslProjects,
 }) async {
-  final sessionList = sessions.toList(growable: false);
-  if (sessionList.isEmpty) {
+  final sessionIds = parsedCandidates
+      .map((candidate) => candidate.sessionId)
+      .toSet()
+      .toList(growable: false);
+  if (sessionIds.isEmpty) {
     return;
   }
-  final resolver = await _ProjectPathResolver.create(
-    _projectPathCandidatesForSessions(sessionList),
-    wslProjects: wslProjects,
-  );
+  final candidates = <_ParsedProjectCandidate>[];
+  const queryBatchSize = 500;
+  for (var offset = 0; offset < sessionIds.length; offset += queryBatchSize) {
+    final end = math.min(offset + queryBatchSize, sessionIds.length);
+    final batch = sessionIds.sublist(offset, end);
+    final parameters = List.filled(batch.length, '?').join(', ');
+    for (final row in db.select('''
+      select id, working_directory_display, source_type
+      from sessions
+      where id in ($parameters)
+      ''', batch)) {
+      candidates.add((
+        sessionId: row['id'] as String,
+        workingDirectory: row['working_directory_display'] as String?,
+        sourceType: row['source_type'] == 'wsl'
+            ? SessionSourceType.wsl
+            : SessionSourceType.windows,
+      ));
+    }
+  }
+  final resolver = await _ProjectPathResolver.create([
+    for (final candidate in candidates)
+      _ProjectPathCandidate(candidate.workingDirectory, candidate.sourceType),
+  ], wslProjects: wslProjects);
   final resolvedRows = <({String sessionId, String projectName})>[];
-  for (final session in sessionList) {
+  for (final candidate in candidates) {
     final autoProject = resolver.resolve(
-      session.parsedSession.workingDirectoryDisplay,
-      sourceType: session.sourceType,
+      candidate.workingDirectory,
+      sourceType: candidate.sourceType,
     );
     final projectName = autoProject?.name.trim() ?? '';
     if (projectName.isNotEmpty) {
       resolvedRows.add((
-        sessionId: session.parsedSession.internalId,
+        sessionId: candidate.sessionId,
         projectName: projectName,
       ));
     }
@@ -2789,10 +3568,11 @@ class _ProjectPathResolver {
 String _statusMessage(
   SessionScanResult result, {
   required int visibleSessionCount,
+  bool? cancelled,
 }) {
   final available = _plural(visibleSessionCount, 'session');
   final parsed = _plural(result.progress.filesParsed, 'new or changed session');
-  if (result.cancelled) {
+  if (cancelled ?? result.cancelled) {
     return 'Scan cancelled. $available available. $parsed parsed before cancellation.';
   }
   if (result.errors.any(
@@ -2809,6 +3589,16 @@ String _statusMessage(
     return 'Scan finished. No supported files found.';
   }
   return 'Scan finished. $available available. $parsed parsed.';
+}
+
+String _cacheRepairProgressMessage(SessionCacheRepairPhase phase) {
+  final activity = switch (phase) {
+    SessionCacheRepairPhase.auditing => 'auditing cached rows',
+    SessionCacheRepairPhase.creatingBackup => 'creating backup',
+    SessionCacheRepairPhase.verifyingBackup => 'verifying backup',
+    SessionCacheRepairPhase.applying => 'applying verified cleanup',
+  };
+  return 'Maintaining session cache: $activity...';
 }
 
 String _progressStatusMessage(ScanProgress progress) {
@@ -2840,12 +3630,48 @@ int _estimatedProgressPercent(ScanProgress progress) {
   return ((processed / totalKnown) * 100).clamp(0, 99).round();
 }
 
-String _sessionScanRoot(String rootPath) {
-  final sessions = Directory(p.join(rootPath, 'sessions'));
-  if (sessions.existsSync()) {
-    return sessions.path;
+List<SessionScanRoot> _sessionScanRoots(
+  String configuredPath,
+  SessionSourceType sourceType,
+) {
+  final trimmed = configuredPath.trim();
+  if (trimmed.isEmpty) {
+    return const [];
   }
-  return rootPath;
+  final normalized = p.normalize(trimmed);
+  final leaf = p.basename(normalized).toLowerCase();
+  final isNamedSessionRoot = leaf == 'sessions' || leaf == 'archived_sessions';
+  final codexRoot = isNamedSessionRoot ? p.dirname(normalized) : normalized;
+  final activePath = p.join(codexRoot, 'sessions');
+  final archivedPath = p.join(codexRoot, 'archived_sessions');
+  final isCodexRoot =
+      isNamedSessionRoot ||
+      leaf == '.codex' ||
+      Directory(activePath).existsSync() ||
+      Directory(archivedPath).existsSync();
+  if (!isCodexRoot) {
+    return [
+      SessionScanRoot(
+        path: normalized,
+        sourceType: sourceType,
+        sourceState: SessionSourceState.active,
+      ),
+    ];
+  }
+  return [
+    SessionScanRoot(
+      path: activePath,
+      availabilityRootPath: codexRoot,
+      sourceType: sourceType,
+      sourceState: SessionSourceState.active,
+    ),
+    SessionScanRoot(
+      path: archivedPath,
+      availabilityRootPath: codexRoot,
+      sourceType: sourceType,
+      sourceState: SessionSourceState.codexArchived,
+    ),
+  ];
 }
 
 Map<String, Object?> _progressLogDetails(ScanProgress progress) => {
@@ -2912,12 +3738,17 @@ SessionFileStatus _scanStatus(String? value) {
   return SessionFileStatus.available;
 }
 
+SessionSourceState _sourceState(String? value) {
+  for (final state in SessionSourceState.values) {
+    if (state.wireName == value) {
+      return state;
+    }
+  }
+  return SessionSourceState.active;
+}
+
 DateTime? _dateTime(String? value) =>
     value == null ? null : DateTime.tryParse(value)?.toUtc();
-
-String _readHash(String path) {
-  return sha256.convert(File(path).readAsBytesSync()).toString();
-}
 
 String _sourceStatusId(String sourcePath) =>
     'source-status:${p.normalize(sourcePath).toLowerCase()}';

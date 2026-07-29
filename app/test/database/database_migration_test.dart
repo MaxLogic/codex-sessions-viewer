@@ -8,6 +8,8 @@ import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
+import 'package:sqlite3/sqlite3.dart';
 
 void main() {
   late Directory tempDir;
@@ -54,6 +56,7 @@ void main() {
       'session_search',
       'message_search',
       'tool_output_search',
+      'session_cache_repair_manifest',
     ]) {
       expect(_tableExists(db, table), isTrue, reason: '$table should exist');
     }
@@ -62,7 +65,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 12);
+    expect(versionRows.length, 14);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -111,6 +114,17 @@ void main() {
     expect(versionRows[11]['filename'], '012_external_content_search.sql');
     expect(versionRows[11]['checksum_length'], greaterThan(20));
     expect(versionRows[11]['success'], 1);
+    expect(versionRows[12]['version'], 13);
+    expect(versionRows[12]['filename'], '013_session_source_state.sql');
+    expect(versionRows[12]['checksum_length'], greaterThan(20));
+    expect(versionRows[12]['success'], 1);
+    expect(versionRows[13]['version'], 14);
+    expect(
+      versionRows[13]['filename'],
+      '014_session_cache_repair_manifest.sql',
+    );
+    expect(versionRows[13]['checksum_length'], greaterThan(20));
+    expect(versionRows[13]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -122,10 +136,171 @@ void main() {
     expect(_columnExists(db, 'sessions', 'eval_status'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_notes'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_expected_output'), isTrue);
+    expect(_columnExists(db, 'sessions', 'source_state'), isTrue);
+    expect(_indexExists(db, 'idx_sessions_source_state'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_reviewed_at_utc'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_updated_at_utc'), isTrue);
     expect(_indexExists(db, 'idx_sessions_session_id'), isTrue);
   });
+
+  test('marks interrupted scan runs failed on the next startup', () async {
+    final migrator = DatabaseMigrator(sqlRoot: Directory('../sql'));
+    final firstStartup = await migrator.openAndMigrate(dbFile);
+    expect(firstStartup.canStartNormalUi, isTrue);
+
+    final db = openFileBackedDatabase(dbFile);
+    db.execute(
+      '''
+      insert into scan_runs (started_at_utc, status)
+      values (?, 'running')
+      ''',
+      ['2026-07-26T10:00:00Z'],
+    );
+    db.close();
+
+    final recoveredStartup = await migrator.openAndMigrate(dbFile);
+
+    expect(recoveredStartup.canStartNormalUi, isTrue);
+    final recovered = openFileBackedDatabase(dbFile);
+    addTearDown(recovered.close);
+    final run = recovered
+        .select(
+          'select status, finished_at_utc from scan_runs order by id desc limit 1',
+        )
+        .single;
+    expect(run['status'], 'failed');
+    expect(run['finished_at_utc'], isNotNull);
+  });
+
+  test(
+    'migrates session source lifecycle separately from local archive state',
+    () async {
+      final sqlRoot = await _copySqlRoot(tempDir);
+      final db = openFileBackedDatabase(dbFile);
+      final sqlFiles = <File>[
+        File(p.join(sqlRoot.path, 'init', '001_initial_schema.sql')),
+        ...await Directory(p.join(sqlRoot.path, 'migration'))
+            .list()
+            .where((entity) => entity is File)
+            .cast<File>()
+            .where((file) => p.extension(file.path) == '.sql')
+            .where(
+              (file) => int.parse(p.basename(file.path).split('_').first) <= 12,
+            )
+            .toList(),
+      ]..sort((left, right) => left.path.compareTo(right.path));
+      for (final file in sqlFiles) {
+        await _applySqlFile(db, file);
+      }
+      for (final row in [
+        (
+          id: 'active-source',
+          path: r'C:\Users\pawel\.codex\sessions\active.jsonl',
+          scanStatus: 'available',
+          localArchived: 1,
+        ),
+        (
+          id: 'codex-archived-source',
+          path: r'C:\Users\pawel\.codex\archived_sessions\archived.jsonl',
+          scanStatus: 'available',
+          localArchived: 0,
+        ),
+        (
+          id: 'missing-source',
+          path: '/home/pawel/.codex/sessions/missing.jsonl',
+          scanStatus: 'missing',
+          localArchived: 1,
+        ),
+      ]) {
+        db.execute(
+          '''
+          insert into sessions (
+            id, source_type, source_file_path, display_path, platform_path,
+            scan_status, is_archived, created_at_utc, updated_at_utc
+          ) values (?, 'windows', ?, ?, ?, ?, ?, ?, ?)
+          ''',
+          [
+            row.id,
+            row.path,
+            row.path,
+            row.path,
+            row.scanStatus,
+            row.localArchived,
+            '2026-07-27T10:00:00Z',
+            '2026-07-27T10:00:00Z',
+          ],
+        );
+      }
+      db.execute(r'''
+        insert into sessions (
+          id, source_type, source_file_path, source_file_unc_path,
+          display_path, platform_path, scan_status, is_archived,
+          created_at_utc, updated_at_utc
+        ) values (
+          'archived-wsl-unc', 'wsl',
+          '/home/pawel/.codex/sessions/stale.jsonl',
+          '\\wsl.localhost\Ubuntu\home\pawel\.codex\archived_sessions\stale.jsonl',
+          '/home/pawel/.codex/sessions/stale.jsonl',
+          '/home/pawel/.codex/sessions/stale.jsonl',
+          'available', 1, '2026-07-27T10:00:00Z', '2026-07-27T10:00:00Z'
+        )
+        ''');
+      db.execute(r'''
+        insert into sessions (
+          id, source_type, source_file_path, display_path, platform_path,
+          scan_status, is_archived, created_at_utc, updated_at_utc
+        ) values (
+          'archived-empty-primary', 'wsl', '',
+          '/home/pawel/.codex/archived_sessions/empty-primary.jsonl',
+          '/home/pawel/.codex/sessions/empty-primary.jsonl',
+          'available', 0, '2026-07-27T10:00:00Z', '2026-07-27T10:00:00Z'
+        )
+        ''');
+      db.close();
+
+      final result = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.summary,
+      );
+      expect(result.lastAppliedSchemaVersion, 14);
+      final migrated = openFileBackedDatabase(dbFile);
+      addTearDown(migrated.close);
+      final rows = migrated.select(
+        'select id, source_state, is_archived from sessions order by id',
+      );
+      expect(
+        {for (final row in rows) row['id']: row['source_state']},
+        {
+          'active-source': 'active',
+          'archived-empty-primary': 'codex_archived',
+          'archived-wsl-unc': 'codex_archived',
+          'codex-archived-source': 'codex_archived',
+          'missing-source': 'missing',
+        },
+      );
+      expect(
+        {for (final row in rows) row['id']: row['is_archived']},
+        {
+          'active-source': 1,
+          'archived-empty-primary': 0,
+          'archived-wsl-unc': 1,
+          'codex-archived-source': 0,
+          'missing-source': 1,
+        },
+      );
+      expect(
+        () => migrated.execute(
+          "update sessions set source_state = 'invalid' where id = 'active-source'",
+        ),
+        throwsA(isA<SqliteException>()),
+      );
+    },
+  );
 
   test(
     'migration 012 removes copied conversation text from search indexes',
@@ -139,7 +314,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.summary,
       );
-      expect(result.lastAppliedSchemaVersion, 12);
+      expect(result.lastAppliedSchemaVersion, 14);
 
       final db = openFileBackedDatabase(dbFile);
       addTearDown(db.close);
@@ -208,7 +383,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 12);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 14);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -245,14 +420,29 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}012_external_content_search.sql',
     );
+    final copiedSourceStateMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}013_session_source_state.sql',
+    );
+    final copiedRepairManifestMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}014_session_cache_repair_manifest.sql',
+    );
     await copiedMigration.delete();
     await copiedProjectOverrideMigration.delete();
     await copiedStableIdentityMigration.delete();
     await copiedExternalContentMigration.delete();
+    await copiedSourceStateMigration.delete();
+    await copiedRepairManifestMigration.delete();
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
-    expect(firstRun.canStartNormalUi, isTrue);
+    expect(
+      firstRun.canStartNormalUi,
+      isTrue,
+      reason:
+          '${firstRun.fatalError?.summary}: ${firstRun.fatalError?.details}',
+    );
 
     final db = openFileBackedDatabase(dbFile);
     db.execute('''
@@ -384,6 +574,12 @@ void main() {
     await File(
       '../sql/migration/012_external_content_search.sql',
     ).copy(copiedExternalContentMigration.path);
+    await File(
+      '../sql/migration/013_session_source_state.sql',
+    ).copy(copiedSourceStateMigration.path);
+    await File(
+      '../sql/migration/014_session_cache_repair_manifest.sql',
+    ).copy(copiedRepairManifestMigration.path);
 
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
@@ -429,13 +625,28 @@ void main() {
         '${sqlRoot.path}${Platform.pathSeparator}migration'
         '${Platform.pathSeparator}012_external_content_search.sql',
       );
+      final copiedSourceStateMigration = File(
+        '${sqlRoot.path}${Platform.pathSeparator}migration'
+        '${Platform.pathSeparator}013_session_source_state.sql',
+      );
+      final copiedRepairManifestMigration = File(
+        '${sqlRoot.path}${Platform.pathSeparator}migration'
+        '${Platform.pathSeparator}014_session_cache_repair_manifest.sql',
+      );
       await copiedProjectOverrideMigration.delete();
       await copiedStableIdentityMigration.delete();
       await copiedExternalContentMigration.delete();
+      await copiedSourceStateMigration.delete();
+      await copiedRepairManifestMigration.delete();
       final firstRun = await DatabaseMigrator(
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
-      expect(firstRun.canStartNormalUi, isTrue);
+      expect(
+        firstRun.canStartNormalUi,
+        isTrue,
+        reason:
+            '${firstRun.fatalError?.summary}: ${firstRun.fatalError?.details}',
+      );
 
       final db = openFileBackedDatabase(dbFile);
       db.execute('''
@@ -497,6 +708,12 @@ void main() {
       await File(
         '../sql/migration/012_external_content_search.sql',
       ).copy(copiedExternalContentMigration.path);
+      await File(
+        '../sql/migration/013_session_source_state.sql',
+      ).copy(copiedSourceStateMigration.path);
+      await File(
+        '../sql/migration/014_session_cache_repair_manifest.sql',
+      ).copy(copiedRepairManifestMigration.path);
 
       final result = await DatabaseMigrator(
         sqlRoot: sqlRoot,
@@ -539,7 +756,12 @@ void main() {
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
-    expect(firstRun.canStartNormalUi, isTrue);
+    expect(
+      firstRun.canStartNormalUi,
+      isTrue,
+      reason:
+          '${firstRun.fatalError?.summary}: ${firstRun.fatalError?.details}',
+    );
 
     final db = openFileBackedDatabase(dbFile);
     db.execute('''
@@ -748,6 +970,14 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}012_external_content_search.sql',
     );
+    final sourceStateMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}013_session_source_state.sql',
+    );
+    final repairManifestMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}014_session_cache_repair_manifest.sql',
+    );
     if (await evalMigration.exists()) {
       await evalMigration.delete();
     }
@@ -757,10 +987,21 @@ void main() {
     if (await externalContentMigration.exists()) {
       await externalContentMigration.delete();
     }
+    if (await sourceStateMigration.exists()) {
+      await sourceStateMigration.delete();
+    }
+    if (await repairManifestMigration.exists()) {
+      await repairManifestMigration.delete();
+    }
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
-    expect(firstRun.canStartNormalUi, isTrue);
+    expect(
+      firstRun.canStartNormalUi,
+      isTrue,
+      reason:
+          '${firstRun.fatalError?.summary}: ${firstRun.fatalError?.details}',
+    );
 
     final db = openFileBackedDatabase(dbFile);
     db.execute('''
@@ -793,12 +1034,18 @@ void main() {
     await File(
       '../sql/migration/012_external_content_search.sql',
     ).copy(externalContentMigration.path);
+    await File(
+      '../sql/migration/013_session_source_state.sql',
+    ).copy(sourceStateMigration.path);
+    await File(
+      '../sql/migration/014_session_cache_repair_manifest.sql',
+    ).copy(repairManifestMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 12);
+    expect(migrator.supportedSchemaVersion, 14);
     final result = await migrator.openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
-    expect(result.lastAppliedSchemaVersion, 12);
+    expect(result.lastAppliedSchemaVersion, 14);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -916,7 +1163,7 @@ void main() {
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
       expect(result.canStartNormalUi, isTrue);
-      expect(result.lastAppliedSchemaVersion, 12);
+      expect(result.lastAppliedSchemaVersion, 14);
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);

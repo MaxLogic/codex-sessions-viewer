@@ -171,6 +171,63 @@ void main() {
     expect(await logFile.readAsString(), contains('single active file'));
   });
 
+  test(
+    'keeps SQLite logging available when the text log cannot open',
+    () async {
+      final unavailableLogFile = Directory(
+        '${temp.path}${Platform.pathSeparator}unavailable.log',
+      );
+      await unavailableLogFile.create();
+      logger = StructuredLogger(
+        db: db,
+        settings: LoggingSettings(
+          level: 'info',
+          logFile: unavailableLogFile.path,
+          maxLogFiles: 3,
+          maxLogSizeMb: 1,
+        ),
+        nowUtc: () => DateTime.utc(2026, 6, 13, 10),
+      );
+
+      await logger.write(
+        const LogEntryDraft(
+          level: LogLevel.info,
+          category: LogCategory.scanner,
+          message: 'Session scan started.',
+        ),
+      );
+
+      expect(logger.query(const LogQuery()).map((entry) => entry.message), [
+        'Text log write failed; continuing with SQLite logging.',
+        'Session scan started.',
+      ]);
+    },
+  );
+
+  test('best-effort logging does not propagate a database failure', () async {
+    final closedDb = sqlite3.openInMemory()..close();
+    final bestEffortLogger = StructuredLogger(
+      db: closedDb,
+      settings: LoggingSettings(
+        level: 'info',
+        logFile: logFile.path,
+        maxLogFiles: 3,
+        maxLogSizeMb: 1,
+      ),
+    );
+
+    await expectLater(
+      bestEffortLogger.writeBestEffort(
+        const LogEntryDraft(
+          level: LogLevel.error,
+          category: LogCategory.scanner,
+          message: 'Session scan failed.',
+        ),
+      ),
+      completes,
+    );
+  });
+
   test('omits raw session content from details and unsafe messages', () async {
     await logger.write(
       const LogEntryDraft(

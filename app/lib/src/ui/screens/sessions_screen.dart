@@ -1921,6 +1921,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         previous.summary != next.summary ||
         previous.project != next.project ||
         previous.path != next.path ||
+        previous.sourceState != next.sourceState ||
         previous.status != next.status ||
         previous.lastMessageAtUtc != next.lastMessageAtUtc ||
         previous.messageCount != next.messageCount ||
@@ -2496,13 +2497,13 @@ class _FilterBar extends StatelessWidget {
                 SizedBox(
                   width: 150,
                   child: _FilterSemantics(
-                    label: 'Archived filter',
+                    label: 'Viewer archive filter',
                     child: DropdownButtonFormField<SessionsArchivedFilter>(
                       key: ValueKey(archivedFilter),
                       initialValue: archivedFilter,
                       isExpanded: true,
                       decoration: const InputDecoration(
-                        labelText: 'Archived',
+                        labelText: 'Viewer archive',
                         isDense: true,
                       ),
                       items: const [
@@ -3461,6 +3462,8 @@ class _PathCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final rowLabel = _rowAccessibleLabel(row);
+    final isCodexArchived =
+        row.sourceState == SessionRowSourceState.codexArchived;
     return SizedBox(
       width: width,
       child: Padding(
@@ -3469,13 +3472,34 @@ class _PathCell extends StatelessWidget {
           children: [
             Expanded(
               child: Semantics(
-                label: '${row.platformLabel} path ${row.path}',
+                label:
+                    '${row.platformLabel} path ${row.path}'
+                    '${isCodexArchived ? ', Codex source archived' : ''}',
                 container: true,
                 child: ExcludeSemantics(
                   child: Row(
                     children: [
                       _PlatformGlyph(platform: row.platform),
                       const SizedBox(width: 8),
+                      if (isCodexArchived) ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.secondaryContainer,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            'Codex archived',
+                            style: Theme.of(context).textTheme.labelSmall,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                      ],
                       Expanded(
                         child: Text(row.path, overflow: TextOverflow.ellipsis),
                       ),
@@ -4058,7 +4082,9 @@ String _rowAccessibleLabel(SessionRowViewModel row) {
 String _rowState(SessionRowViewModel row) {
   return [
     if (row.isPinned) 'Pinned',
-    if (row.isArchived) 'Archived',
+    if (row.isArchived) 'Viewer archived',
+    if (row.sourceState == SessionRowSourceState.codexArchived)
+      'Codex source archived',
     row.status,
   ].join(', ');
 }
