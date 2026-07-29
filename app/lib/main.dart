@@ -3,16 +3,27 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'src/benchmark/scan_memory_benchmark.dart';
 import 'src/database/database_migrator.dart';
 import 'src/app/codex_sessions_viewer_app.dart';
 import 'src/config/app_settings.dart';
+import 'src/platform/application_working_directory.dart';
 import 'src/platform/app_instance_lock.dart';
 import 'src/window/window_state.dart';
 import 'src/platform/windows_startup_registration.dart';
 
 final _processLifetimeInstanceLocks = <AppInstanceLock>[];
 
-Future<void> main() async {
+Future<void> main(List<String> arguments) async {
+  useExecutableDirectoryAsWorkingDirectory();
+  if (arguments.contains(scanMemoryBenchmarkFlag)) {
+    final request = ScanMemoryBenchmarkRequest.tryParse(arguments);
+    exit(
+      await (request == null
+          ? Future<int>.value(64)
+          : runScanMemoryBenchmark(request)),
+    );
+  }
   WidgetsFlutterBinding.ensureInitialized();
   final databaseFile = defaultDatabaseFile();
   final instanceLock = AppInstanceLock(
