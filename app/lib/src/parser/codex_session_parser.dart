@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import '../utils/injected_context_filter.dart';
 
@@ -14,33 +15,68 @@ enum CodexMessageAuthorType {
   unknown,
 }
 
+typedef CodexJsonlByteStreamReader =
+    Stream<List<int>> Function(File source, int endExclusive);
+
 class CodexSessionParser {
   CodexSessionParser({
     this.maxToolOutputPreviewChars = 2000,
     this.maxMessageContentChars = 12000,
-  });
+    this.maxLegacyJsonBytes = 8 * 1024 * 1024,
+    this.jsonFormatProbeBytes = 64 * 1024,
+    CodexJsonlByteStreamReader? jsonlByteStreamReader,
+  }) : assert(maxLegacyJsonBytes > 0),
+       assert(jsonFormatProbeBytes > 0),
+       jsonlByteStreamReader =
+           jsonlByteStreamReader ?? _defaultJsonlByteStreamReader;
 
-  static const int currentVersion = 1;
+  static const int currentVersion = 2;
 
   final int maxToolOutputPreviewChars;
   final int maxMessageContentChars;
+  final int maxLegacyJsonBytes;
+  final int jsonFormatProbeBytes;
+  final CodexJsonlByteStreamReader jsonlByteStreamReader;
 
   Future<CodexParseResult> parseFile(File source) async {
     try {
-      final text = await source.readAsString();
-      if (_looksLikeJsonl(source, text)) {
-        final jsonl = _decodeJsonl(source, text);
-        if (jsonl.error != null) {
-          return CodexParseResult.failure(jsonl.error!);
-        }
-        return CodexParseResult.success(
-          _parseJsonlSession(source, jsonl.records, text),
+      final snapshot = await source.stat();
+      if (source.path.toLowerCase().endsWith('.jsonl')) {
+        return await _parseJsonlSnapshot(source, snapshot);
+      }
+      final probeEnd = math.min(snapshot.size, jsonFormatProbeBytes);
+      final probe = await _readUtf8Snapshot(
+        source,
+        probeEnd,
+        allowMalformed: probeEnd < snapshot.size,
+      );
+      if (_looksLikeJsonl(probe)) {
+        return await _parseJsonlSnapshot(source, snapshot);
+      }
+      if (snapshot.size > maxLegacyJsonBytes) {
+        return CodexParseResult.failure(
+          CodexParseError(
+            sourcePath: source.path,
+            kind: CodexParseErrorKind.unsupportedRoot,
+            message:
+                'Legacy JSON session exceeds the configured size limit of '
+                '$maxLegacyJsonBytes bytes and was not recognized as JSONL.',
+          ),
         );
       }
+      final text = snapshot.size <= jsonFormatProbeBytes
+          ? probe
+          : await _readUtf8Snapshot(source, snapshot.size);
       final decoded = jsonDecode(text);
       if (decoded is Map<String, Object?>) {
+        final afterParse = await source.stat();
         return CodexParseResult.success(
-          _parseJsonObjectSession(source, decoded, text),
+          _parseJsonObjectSession(source, decoded),
+          sourceSnapshotSize: snapshot.size,
+          sourceSnapshotModifiedUtc: snapshot.modified.toUtc(),
+          sourceChangedDuringParse:
+              afterParse.size != snapshot.size ||
+              afterParse.modified.toUtc() != snapshot.modified.toUtc(),
         );
       }
       return CodexParseResult.failure(
@@ -50,6 +86,8 @@ class CodexSessionParser {
           message: 'Session root must be a JSON object or JSONL records.',
         ),
       );
+    } on _JsonlParseException catch (error) {
+      return CodexParseResult.failure(error.error);
     } on FormatException catch (error) {
       return CodexParseResult.failure(
         CodexParseError.fromFormatException(source.path, error),
@@ -65,10 +103,51 @@ class CodexSessionParser {
     }
   }
 
+  Future<String> _readUtf8Snapshot(
+    File source,
+    int endExclusive, {
+    bool allowMalformed = false,
+  }) async {
+    var bytesRead = 0;
+    final text = await source
+        .openRead(0, endExclusive)
+        .map((chunk) {
+          bytesRead += chunk.length;
+          return chunk;
+        })
+        .transform(Utf8Decoder(allowMalformed: allowMalformed))
+        .join();
+    if (bytesRead != endExclusive) {
+      throw FileSystemException(
+        'Session source changed while being parsed.',
+        source.path,
+      );
+    }
+    return text;
+  }
+
+  Future<CodexParseResult> _parseJsonlSnapshot(
+    File source,
+    FileStat snapshot,
+  ) async {
+    final session = await _parseJsonlSession(
+      source,
+      _decodeJsonl(source, snapshot.size),
+    );
+    final afterParse = await source.stat();
+    return CodexParseResult.success(
+      session,
+      sourceSnapshotSize: snapshot.size,
+      sourceSnapshotModifiedUtc: snapshot.modified.toUtc(),
+      sourceChangedDuringParse:
+          afterParse.size != snapshot.size ||
+          afterParse.modified.toUtc() != snapshot.modified.toUtc(),
+    );
+  }
+
   CodexParsedSession _parseJsonObjectSession(
     File source,
     Map<String, Object?> json,
-    String rawText,
   ) {
     final sourcePath = _string(json['source_file_path']) ?? source.path;
     final sourceType = _sourceType(_string(json['source_type']), sourcePath);
@@ -172,11 +251,10 @@ class CodexSessionParser {
     );
   }
 
-  CodexParsedSession _parseJsonlSession(
+  Future<CodexParsedSession> _parseJsonlSession(
     File source,
-    List<Map<String, Object?>> records,
-    String rawText,
-  ) {
+    Stream<Map<String, Object?>> records,
+  ) async {
     var sourcePath = source.path;
     String? sourceFileUncPath;
     String? displayPath;
@@ -203,12 +281,12 @@ class CodexSessionParser {
     var hasAggregateUsage = false;
     var lastTurnUsage = const CodexUsage.empty();
 
-    for (final record in records) {
+    await for (final record in records) {
       final recordType = _string(record['type']);
       final timestamp = _dateTime(record['timestamp']);
       final payload = _map(record['payload']);
       if (recordType == 'session_meta') {
-        sessionId = _string(payload['id']) ?? sessionId;
+        sessionId ??= _string(payload['id']);
         threadName =
             _cleanThreadName(
               _string(payload['thread_name']) ??
@@ -528,14 +606,22 @@ class CodexSessionParser {
     );
   }
 
-  bool _looksLikeJsonl(File source, String text) {
-    if (source.path.endsWith('.jsonl')) {
-      return true;
-    }
+  bool _looksLikeJsonl(String text) {
     final trimmed = text.trimLeft();
-    return trimmed.startsWith('{') &&
-        trimmed.contains('\n{') &&
-        !trimmed.startsWith('{\n  "');
+    final firstLineEnd = trimmed.indexOf('\n');
+    if (firstLineEnd < 0) {
+      return false;
+    }
+    final following = trimmed.substring(firstLineEnd + 1).trimLeft();
+    if (!following.startsWith('{')) {
+      return false;
+    }
+    try {
+      return jsonDecode(trimmed.substring(0, firstLineEnd).trimRight())
+          is Map<String, Object?>;
+    } on FormatException {
+      return false;
+    }
   }
 
   String _internalId({required String sourcePath, required String? sessionId}) {
@@ -546,12 +632,22 @@ class CodexSessionParser {
     return 'source:$sourcePath';
   }
 
-  _JsonlDecodeResult _decodeJsonl(File source, String text) {
-    final records = <Map<String, Object?>>[];
+  Stream<Map<String, Object?>> _decodeJsonl(
+    File source,
+    int endExclusive,
+  ) async* {
     var offset = 0;
-    final lines = const LineSplitter().convert(text);
-    for (var index = 0; index < lines.length; index++) {
-      final line = lines[index];
+    var lineNumber = 0;
+    var bytesRead = 0;
+    final byteStream = jsonlByteStreamReader(source, endExclusive).map((chunk) {
+      bytesRead += chunk.length;
+      return chunk;
+    });
+    final lines = byteStream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
+    await for (final line in lines) {
+      lineNumber++;
       final normalizedLine = _stripLeadingNulPadding(line);
       final leadingPadding = line.length - normalizedLine.length;
       if (normalizedLine.trim().isEmpty) {
@@ -561,36 +657,44 @@ class CodexSessionParser {
       try {
         final decoded = jsonDecode(normalizedLine);
         if (decoded is! Map<String, Object?>) {
-          return _JsonlDecodeResult.error(
+          throw _JsonlParseException(
             CodexParseError(
               sourcePath: source.path,
               kind: CodexParseErrorKind.unsupportedRoot,
               message: 'JSONL record must be a JSON object.',
               offset: offset,
-              line: index + 1,
+              line: lineNumber,
               column: 1,
             ),
           );
         }
-        records.add(decoded);
+        yield decoded;
       } on FormatException catch (error) {
         final column = error.offset == null
             ? null
             : leadingPadding + error.offset! + 1;
-        return _JsonlDecodeResult.error(
+        throw _JsonlParseException(
           CodexParseError(
             sourcePath: source.path,
             kind: CodexParseErrorKind.malformedJson,
             message: error.message,
             offset: offset + leadingPadding + (error.offset ?? 0),
-            line: index + 1,
+            line: lineNumber,
             column: column,
           ),
         );
       }
       offset += line.length + 1;
     }
-    return _JsonlDecodeResult.records(records);
+    if (bytesRead != endExclusive) {
+      throw _JsonlParseException(
+        CodexParseError(
+          sourcePath: source.path,
+          kind: CodexParseErrorKind.io,
+          message: 'Session file changed while being parsed.',
+        ),
+      );
+    }
   }
 
   String _stripLeadingNulPadding(String line) {
@@ -660,16 +764,34 @@ String _reasoningSummary(Object? value) {
 }
 
 class CodexParseResult {
-  const CodexParseResult._({this.session, this.error});
+  const CodexParseResult._({
+    this.session,
+    this.error,
+    this.sourceSnapshotSize,
+    this.sourceSnapshotModifiedUtc,
+    this.sourceChangedDuringParse = false,
+  });
 
-  factory CodexParseResult.success(CodexParsedSession session) =>
-      CodexParseResult._(session: session);
+  factory CodexParseResult.success(
+    CodexParsedSession session, {
+    int? sourceSnapshotSize,
+    DateTime? sourceSnapshotModifiedUtc,
+    bool sourceChangedDuringParse = false,
+  }) => CodexParseResult._(
+    session: session,
+    sourceSnapshotSize: sourceSnapshotSize,
+    sourceSnapshotModifiedUtc: sourceSnapshotModifiedUtc,
+    sourceChangedDuringParse: sourceChangedDuringParse,
+  );
 
   factory CodexParseResult.failure(CodexParseError error) =>
       CodexParseResult._(error: error);
 
   final CodexParsedSession? session;
   final CodexParseError? error;
+  final int? sourceSnapshotSize;
+  final DateTime? sourceSnapshotModifiedUtc;
+  final bool sourceChangedDuringParse;
 
   bool get isSuccess => session != null;
 }
@@ -1116,7 +1238,8 @@ int? _sumNullable(int? left, int? right) {
 }
 
 String _firstLine(String value) {
-  final line = value.split(RegExp(r'\r?\n')).first.trim();
+  final newline = value.indexOf('\n');
+  final line = (newline < 0 ? value : value.substring(0, newline)).trim();
   return _truncate(line, 240).value;
 }
 
@@ -1134,15 +1257,13 @@ class _TruncatedText {
   final bool truncated;
 }
 
-class _JsonlDecodeResult {
-  const _JsonlDecodeResult._({required this.records, this.error});
+class _JsonlParseException implements Exception {
+  const _JsonlParseException(this.error);
 
-  factory _JsonlDecodeResult.records(List<Map<String, Object?>> records) =>
-      _JsonlDecodeResult._(records: records);
-
-  factory _JsonlDecodeResult.error(CodexParseError error) =>
-      _JsonlDecodeResult._(records: const [], error: error);
-
-  final List<Map<String, Object?>> records;
-  final CodexParseError? error;
+  final CodexParseError error;
 }
+
+Stream<List<int>> _defaultJsonlByteStreamReader(
+  File source,
+  int endExclusive,
+) => source.openRead(0, endExclusive);

@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/parser/parsed_session_store.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
@@ -136,6 +138,272 @@ void main() {
     expect(session.usage.outputTokens, 21);
     expect(session.usage.cachedInputTokens, isNull);
     expect(session.usage.totalTokens, 63);
+  });
+
+  test('streams a large JSONL session stored with a json extension', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_sniff_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}misnamed.json');
+    await source.writeAsString(
+      [
+        '{"type":"session_meta","payload":{"id":"misnamed","cwd":"F:\\\\repo"}}',
+        '{"type":"event_msg","payload":{"type":"user_message","message":"stream me"}}',
+      ].join('\n'),
+    );
+    var streamed = false;
+    final boundedParser = CodexSessionParser(
+      maxLegacyJsonBytes: 32,
+      jsonFormatProbeBytes: 128,
+      jsonlByteStreamReader: (file, endExclusive) {
+        streamed = true;
+        return file.openRead(0, endExclusive);
+      },
+    );
+
+    final result = await boundedParser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.sessionId, 'misnamed');
+    expect(streamed, isTrue);
+  });
+
+  test(
+    'rejects an oversized legacy JSON object before materializing it',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('csv_parser_limit_');
+      addTearDown(() => temp.delete(recursive: true));
+      final source = File('${temp.path}${Platform.pathSeparator}legacy.json');
+      await source.writeAsString(
+        '{"messages":[{"type":"user","content":"${List.filled(128, 'x').join()}"}]}',
+      );
+      final boundedParser = CodexSessionParser(
+        maxLegacyJsonBytes: 32,
+        jsonFormatProbeBytes: 32,
+      );
+
+      final result = await boundedParser.parseFile(source);
+
+      expect(result.isSuccess, isFalse);
+      expect(result.error!.kind, CodexParseErrorKind.unsupportedRoot);
+      expect(result.error!.message, contains('size limit'));
+    },
+  );
+
+  test('bounded format probe may end inside a UTF-8 scalar', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_utf8_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}legacy.json');
+    await source.writeAsString('{"title":"€","messages":[]}');
+    final boundedParser = CodexSessionParser(
+      jsonFormatProbeBytes: utf8.encode('{"title":"').length + 1,
+    );
+
+    final result = await boundedParser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.title, '€');
+  });
+
+  test('streaming JSONL matches canonical persisted projection', () async {
+    expect(CodexSessionParser.currentVersion, 2);
+    final temp = await Directory.systemTemp.createTemp('csv_parser_oracle_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}oracle.jsonl');
+    final records = <Map<String, Object?>>[
+      {
+        'timestamp': '2026-07-27T10:00:00Z',
+        'type': 'session_meta',
+        'payload': {
+          'id': 'oracle-session',
+          'cwd': r'F:\repo',
+          'title': ' Oracle title ',
+          'source_file_unc_path': r'\\localhost\F$\oracle.jsonl',
+          'source': {
+            'subagent': {
+              'thread_spawn': {
+                'parent_thread_id': 'parent',
+                'agent_nickname': 'Ada',
+                'agent_role': 'reviewer',
+                'depth': 2,
+              },
+            },
+          },
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:01Z',
+        'type': 'turn_context',
+        'payload': {
+          'cwd': r'F:\repo\child',
+          'working_directory_unc': r'\\localhost\F$\repo\child',
+          'summary': ' Oracle summary ',
+          'model': 'gpt-oracle',
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:02Z',
+        'type': 'event_msg',
+        'payload': {'type': 'user_message', 'message': 'same prompt'},
+      },
+      {
+        'timestamp': '2026-07-27T10:00:03Z',
+        'type': 'response_item',
+        'payload': {
+          'type': 'message',
+          'role': 'user',
+          'content': [
+            {'type': 'input_text', 'text': 'same prompt'},
+          ],
+          'usage': {'input_tokens': 3},
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:04Z',
+        'type': 'response_item',
+        'payload': {
+          'type': 'message',
+          'role': 'assistant',
+          'content': [
+            {'type': 'output_text', 'text': 'assistant output beyond limit'},
+          ],
+          'usage': {'output_tokens': 5},
+          'model': 'gpt-oracle',
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:05Z',
+        'type': 'response_item',
+        'payload': {
+          'type': 'reasoning',
+          'summary': [
+            {'text': 'reason one'},
+            {'text': 'reason two'},
+          ],
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:06Z',
+        'type': 'response_item',
+        'payload': {
+          'type': 'function_call',
+          'call_id': 'call-1',
+          'name': 'shell_command',
+          'arguments': '1234567890',
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:07Z',
+        'type': 'response_item',
+        'payload': {
+          'type': 'function_call_output',
+          'call_id': 'call-1',
+          'output': 'abcdefghijk',
+          'status': 'success',
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:08Z',
+        'type': 'response_item',
+        'payload': {
+          'type': 'custom_tool_call_output',
+          'call_id': 'orphan',
+          'output': 'orphan',
+          'error': 'failed',
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:09Z',
+        'type': 'response_item',
+        'payload': {
+          'type': 'tool_search_call',
+          'call_id': 'search-1',
+          'query': 'search me',
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:10Z',
+        'type': 'event_msg',
+        'payload': {
+          'type': 'token_count',
+          'info': {
+            'total_token_usage': {
+              'input_tokens': 10,
+              'output_tokens': 20,
+              'cached_input_tokens': 2,
+              'reasoning_output_tokens': 4,
+              'total_tokens': 36,
+            },
+            'last_token_usage': {
+              'input_tokens': 1,
+              'output_tokens': 2,
+              'total_tokens': 3,
+            },
+          },
+        },
+      },
+      {
+        'timestamp': '2026-07-27T10:00:11Z',
+        'type': 'response_item',
+        'payload': {'type': 'ghost_snapshot', 'ignored': true},
+      },
+      {
+        'timestamp': '2026-07-27T10:00:12Z',
+        'type': 'event_msg',
+        'payload': {'type': 'context_compacted', 'detail': 'kept as unknown'},
+      },
+      {
+        'timestamp': '2026-07-27T10:00:13Z',
+        'type': 'response_item',
+        'payload': {'type': 'future_response', 'value': 7},
+      },
+      {
+        'timestamp': '2026-07-27T10:00:14Z',
+        'type': 'event_msg',
+        'payload': {'type': 'future_event', 'value': 8},
+      },
+      {
+        'timestamp': '2026-07-27T10:00:15Z',
+        'type': 'future_record',
+        'payload': {'type': 'future_container'},
+      },
+      {
+        'timestamp': '2026-07-27T10:00:16Z',
+        'type': 'compacted',
+        'payload': {'type': 'ignored'},
+      },
+    ];
+    await source.writeAsString(records.map(jsonEncode).join('\n'));
+
+    final result = await CodexSessionParser(
+      maxMessageContentChars: 12,
+      maxToolOutputPreviewChars: 8,
+    ).parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    final projectionJson = jsonEncode(_persistedProjection(result.session!));
+    expect(
+      sha256.convert(utf8.encode(projectionJson)).toString(),
+      '0d6a3c70259896b63d9dd3f31d7796f47a8a75821a26bdadb8127a2030c0b0b0',
+    );
+  });
+
+  test('keeps the first session_meta id as the file identity', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File(
+      '${temp.path}${Platform.pathSeparator}first-session.jsonl',
+    );
+    await source.writeAsString('''
+{"timestamp":"2026-06-10T10:00:00Z","type":"session_meta","payload":{"id":"first-session","cwd":"F:\\\\first"}}
+{"timestamp":"2026-06-10T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"First session message."}]}}
+{"timestamp":"2026-06-10T10:00:02Z","type":"session_meta","payload":{"id":"embedded-session","cwd":"F:\\\\embedded"}}
+''');
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.sessionId, 'first-session');
+    expect(result.session!.internalId, 'session:first-session');
   });
 
   test('uses explicit JSONL title metadata and ignores auto summary', () async {
@@ -326,6 +594,26 @@ void main() {
     expect(result.error?.details, isNull);
   });
 
+  test('rejects a short read of the fixed JSONL snapshot', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_short_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}short.jsonl');
+    const first = '{"type":"session_meta","payload":{"id":"short-read"}}';
+    const second =
+        '{"type":"response_item","payload":{"type":"message","role":"user","content":"must be read"}}';
+    await source.writeAsString('$first\n$second');
+    final parser = CodexSessionParser(
+      jsonlByteStreamReader: (file, endExclusive) =>
+          file.openRead(0, utf8.encode('$first\n').length),
+    );
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isFalse);
+    expect(result.error?.kind, CodexParseErrorKind.io);
+    expect(result.error?.message, contains('changed while being parsed'));
+  });
+
   test('tolerates NUL-padded JSONL records from interrupted writes', () async {
     final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
     addTearDown(() => temp.delete(recursive: true));
@@ -456,3 +744,71 @@ void main() {
 File _fixture(String name) {
   return File('../samples/sessions/$name');
 }
+
+Map<String, Object?> _persistedProjection(CodexParsedSession session) => {
+  'session_id': session.sessionId,
+  'thread_name': session.threadName,
+  'thread_source': session.threadSource,
+  'parent_thread_id': session.parentThreadId,
+  'agent_nickname': session.agentNickname,
+  'agent_role': session.agentRole,
+  'subagent_depth': session.subagentDepth,
+  'source_file_unc_path': session.sourceFileUncPath,
+  'working_directory_display': session.workingDirectoryDisplay,
+  'working_directory_unc': session.workingDirectoryUnc,
+  'title': session.title,
+  'summary': session.summary,
+  'started_at_utc': session.startedAtUtc?.toIso8601String(),
+  'last_message_at_utc': session.lastMessageAtUtc?.toIso8601String(),
+  'models': session.modelIds.toList()..sort(),
+  'usage': _usageProjection(session.usage),
+  'last_turn_usage': _usageProjection(session.lastTurnUsage),
+  'messages': [
+    for (final message in session.messages)
+      {
+        'index': message.index,
+        'author': message.authorType.name,
+        'raw_type': message.rawType,
+        'created_at_utc': message.createdAtUtc?.toIso8601String(),
+        'first_line': message.firstLine,
+        'content': message.contentPlain,
+        'preview': message.contentPreview,
+        'truncated': message.contentTruncated,
+        'usage': _usageProjection(message.usage),
+        'model': message.model,
+        'has_tool_calls': message.hasToolCalls,
+        'has_error': message.hasError,
+      },
+  ],
+  'tools': [
+    for (final tool in session.toolCalls)
+      {
+        'message_index': tool.messageIndex,
+        'tool_index': tool.toolIndex,
+        'name': tool.toolName,
+        'status': tool.status,
+        'started_at_utc': tool.startedAtUtc?.toIso8601String(),
+        'finished_at_utc': tool.finishedAtUtc?.toIso8601String(),
+        'input': tool.inputPreview,
+        'output': tool.outputPreview,
+        'output_truncated': tool.outputTruncated,
+        'error': tool.errorMessage,
+      },
+  ],
+  'warnings': [
+    for (final warning in session.warnings)
+      {
+        'code': warning.code,
+        'record_type': warning.recordType,
+        'payload_type': warning.payloadType,
+      },
+  ],
+};
+
+Map<String, Object?> _usageProjection(CodexUsage usage) => {
+  'input': usage.inputTokens,
+  'output': usage.outputTokens,
+  'cached': usage.cachedInputTokens,
+  'reasoning': usage.reasoningOutputTokens,
+  'total': usage.totalTokens,
+};
