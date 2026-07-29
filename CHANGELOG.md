@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added explicit active/archived Codex source lifecycle tracking and a one-time, audited legacy-cache repair with verified SQLite backup and fail-closed recovery checks.
 - Added resumable background backfill for historical message search rows plus a Settings diagnostic for indexed and remaining message-search counts.
 - Added a persisted `app.start_with_windows` setting, defaulted on, exposed in Settings under Application, and wired to the current-user Windows Run key.
 - Added subagent-aware session grouping, main/subagent usage rollups, and origin breakdowns in Usage statistics.
@@ -18,6 +19,9 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- Supervised parser-worker failures and made cache maintenance cancellable, skipping no-op backups and removing backups from failed or cancelled repair attempts.
+- Made packaged startup resolve logs, SQL, settings, and other executable-owned resources from the executable directory even when launched with another working directory.
+- Streamed fixed-snapshot JSONL parsing and serialized persistence in count- and byte-bounded batches, removing redundant full-file hash reads and sharply reducing forced-scan memory use.
 - Prevented duplicate viewer processes from racing database startup and migrations by holding a process-lifetime app-instance lock.
 - Indexed migration 11's temporary identity tables so large existing databases avoid unindexed correlated lookups during the stable-session rewrite.
 - Added bounded, cancellation-aware retries for temporarily unavailable WSL session roots while keeping Windows roots fail-fast.
