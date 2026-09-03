@@ -6,10 +6,18 @@ import '../number_formatting.dart';
 
 class UsageScreen extends StatefulWidget {
   // ignore: prefer_const_constructors_in_immutables
-  UsageScreen({super.key, this.summary, this.announcer});
+  UsageScreen({
+    super.key,
+    this.summary,
+    this.announcer,
+    this.isRefreshing = false,
+    this.refreshFailed = false,
+  });
 
   final UsageSummary? summary;
   final ScreenReaderAnnouncer? announcer;
+  final bool isRefreshing;
+  final bool refreshFailed;
 
   @override
   State<UsageScreen> createState() => _UsageScreenState();
@@ -97,6 +105,13 @@ class _UsageScreenState extends State<UsageScreen>
                         style: Theme.of(context).textTheme.titleMedium,
                       ),
                       const SizedBox(height: 8),
+                      _UsageStatus(
+                        summary: summary,
+                        isRefreshing: widget.isRefreshing,
+                        refreshFailed: widget.refreshFailed,
+                        hasSummary: widget.summary != null,
+                      ),
+                      const SizedBox(height: 12),
                       _SummaryCards(summary: summary),
                       const SizedBox(height: 20),
                       TabBar(
@@ -198,6 +213,98 @@ class _UsageScreenState extends State<UsageScreen>
           ),
         ),
       ),
+    );
+  }
+}
+
+class _UsageStatus extends StatelessWidget {
+  const _UsageStatus({
+    required this.summary,
+    required this.isRefreshing,
+    required this.refreshFailed,
+    required this.hasSummary,
+  });
+
+  final UsageSummary summary;
+  final bool isRefreshing;
+  final bool refreshFailed;
+  final bool hasSummary;
+
+  @override
+  Widget build(BuildContext context) {
+    final coverage = summary.projectionCoverage;
+    final pricing = summary.pricingStatus;
+    final zeroUsageUnit = coverage.completeZeroUsageSessions == 1
+        ? 'session'
+        : 'sessions';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Semantics(
+          key: const Key('usage-status-semantics'),
+          liveRegion: true,
+          container: true,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (coverage.projectionVersion case final version?)
+                Text('Usage projection version $version'),
+              if (coverage.projectionVersion != null)
+                Text(
+                  '${coverage.currentCompleteSessions} of '
+                  '${coverage.availableSessions} sessions current and complete',
+                ),
+              if (isRefreshing) const Text('Refreshing usage status…'),
+              if (refreshFailed)
+                Text(
+                  hasSummary
+                      ? 'Usage status refresh failed; showing the last '
+                            'successful snapshot.'
+                      : 'Usage status refresh failed.',
+                ),
+            ],
+          ),
+        ),
+        if (coverage.projectionVersion != null)
+          Text(
+            'Omitted: ${coverage.legacyPendingSessions} pending, '
+            '${coverage.ambiguousSessions} ambiguous, '
+            '${coverage.missingParentSessions} missing parent',
+          ),
+        if (coverage.outdatedProjectionSessions > 0)
+          Text(
+            '${coverage.outdatedProjectionSessions} outdated '
+            '${coverage.outdatedProjectionSessions == 1 ? 'projection' : 'projections'}',
+          ),
+        if (coverage.projectionVersion != null)
+          Text(
+            '${coverage.completeZeroUsageSessions} complete zero-usage '
+            '$zeroUsageUnit',
+          ),
+        Semantics(
+          container: true,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Estimated cost at current cached/override rates'),
+              if (!pricing.refreshSucceeded)
+                const Text(
+                  'Pricing refresh failed; cached/override rates are being '
+                  'shown.',
+                ),
+              if (pricing.openRouterFetchedAtUtc case final fetchedAt?)
+                Text(
+                  'OpenRouter cache fetched '
+                  '${_formatUtcMinute(fetchedAt)}',
+                ),
+              for (final model in pricing.models.take(8))
+                Text(_pricingModelStatus(model)),
+              if (pricing.models.length > 8)
+                Text('${pricing.models.length - 8} more pricing models'),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -697,6 +804,24 @@ String _compactSessionText(int count) =>
 
 String _formatInt(int value) {
   return formatCompactInt(value);
+}
+
+String _formatUtcMinute(DateTime value) {
+  final utc = value.toUtc();
+  String twoDigits(int part) => part.toString().padLeft(2, '0');
+  return '${utc.year}-${twoDigits(utc.month)}-${twoDigits(utc.day)} '
+      '${twoDigits(utc.hour)}:${twoDigits(utc.minute)} UTC';
+}
+
+String _pricingModelStatus(UsageModelPricingStatus model) {
+  final fetched = model.fetchedAtUtc == null
+      ? 'fetch time unavailable'
+      : 'fetched ${_formatUtcMinute(model.fetchedAtUtc!)}';
+  return 'Raw: ${model.rawModelId}; '
+      'effective: ${model.effectiveModelId}; resolved: '
+      '${model.resolvedModelId ?? 'unresolved'}; '
+      '${model.resolutionMethod.name}; ${model.cacheState}; '
+      '${model.source ?? 'unavailable'}; $fetched';
 }
 
 final _emptySummary = UsageSummary(

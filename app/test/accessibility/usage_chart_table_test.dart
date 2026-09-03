@@ -5,6 +5,31 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('usage status is an accessible live region', (tester) async {
+    final semantics = tester.ensureSemantics();
+    await tester.pumpWidget(
+      MaterialApp(home: UsageScreen(summary: _summary())),
+    );
+
+    final status = tester.getSemantics(
+      find.byKey(const Key('usage-status-semantics')),
+    );
+    expect(status.flagsCollection.isLiveRegion, isTrue);
+    expect(status.label, contains('Usage projection version 3'));
+    expect(status.label, contains('3 of 3 sessions current and complete'));
+    expect(status.label, isNot(contains('Estimated cost')));
+    expect(status.label, isNot(contains('Raw:')));
+    expect(
+      find.text('Estimated cost at current cached/override rates'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Raw: requested-model; effective: effective-model'),
+      findsOneWidget,
+    );
+    semantics.dispose();
+  });
+
   testWidgets('charts expose readable summaries and table equivalents', (
     tester,
   ) async {
@@ -89,6 +114,27 @@ UsageSummary _summary() {
     totalTokens: 2700,
     estimatedCostText: r'$0.13',
     costUnknown: false,
+    projectionCoverage: const UsageProjectionCoverage(
+      projectionVersion: 3,
+      availableSessions: 3,
+      currentCompleteSessions: 3,
+      legacyPendingSessions: 0,
+      ambiguousSessions: 0,
+      missingParentSessions: 0,
+      completeZeroUsageSessions: 0,
+    ),
+    pricingStatus: const UsagePricingStatus(
+      openRouterFetchedAtUtc: null,
+      models: [
+        UsageModelPricingStatus(
+          rawModelId: 'requested-model',
+          effectiveModelId: 'effective-model',
+          resolvedModelId: 'openai/effective-model',
+          resolutionMethod: UsageModelResolutionMethod.exact,
+          source: 'override',
+        ),
+      ],
+    ),
     mostUsedModel: 'gpt-5.4',
     mostActiveProject: 'Codex Viewer',
     mostActivePlatform: 'Windows',

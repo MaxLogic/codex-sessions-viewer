@@ -150,7 +150,7 @@ void main() {
     expect(summary.totalSessions, 2);
     expect(
       summary.byPlatform.map((row) => row.key),
-      containsAll(['windows', 'wsl']),
+      containsAll(['Windows', 'WSL']),
     );
     expect(
       summary.byArchiveState.map((row) => row.key),
@@ -164,6 +164,7 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: SessionsScreen(
+          now: () => DateTime.utc(2026, 6, 13, 12),
           initialRows: [_row('windows', SessionRowPlatform.windows)],
           onRefresh: () async => [
             _row(

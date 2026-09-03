@@ -6,6 +6,79 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('shows branch-aware coverage and current-rate cost status', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 1200));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: UsageScreen(
+          summary: _summary(
+            projectionCoverage: const UsageProjectionCoverage(
+              projectionVersion: 3,
+              availableSessions: 6,
+              currentCompleteSessions: 3,
+              legacyPendingSessions: 1,
+              ambiguousSessions: 1,
+              missingParentSessions: 1,
+              completeZeroUsageSessions: 1,
+            ),
+            pricingStatus: UsagePricingStatus(
+              openRouterFetchedAtUtc: DateTime.utc(2026, 7, 29, 8),
+              refreshSucceeded: false,
+              models: [
+                UsageModelPricingStatus(
+                  rawModelId: 'gpt-5.6-sol-requested',
+                  effectiveModelId: 'gpt-5.6-sol',
+                  resolvedModelId: 'openai/gpt-5.6-sol',
+                  resolutionMethod: UsageModelResolutionMethod.openAiExact,
+                  source: 'openrouter',
+                  fetchedAtUtc: DateTime.utc(2026, 7, 29, 7, 30),
+                ),
+              ],
+            ),
+            costUnknown: true,
+          ),
+          isRefreshing: true,
+        ),
+      ),
+    );
+
+    expect(find.text('Usage projection version 3'), findsOneWidget);
+    expect(find.text('3 of 6 sessions current and complete'), findsOneWidget);
+    expect(
+      find.text('Omitted: 1 pending, 1 ambiguous, 1 missing parent'),
+      findsOneWidget,
+    );
+    expect(find.text('1 complete zero-usage session'), findsOneWidget);
+    expect(
+      find.text('Estimated cost at current cached/override rates'),
+      findsOneWidget,
+    );
+    expect(find.text('Cost unknown'), findsOneWidget);
+    expect(find.text('Refreshing usage status…'), findsOneWidget);
+    expect(
+      find.text(
+        'Raw: gpt-5.6-sol-requested; effective: gpt-5.6-sol; '
+        'resolved: openai/gpt-5.6-sol; '
+        'openAiExact; cached; openrouter; fetched 2026-07-29 07:30 UTC',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.text('OpenRouter cache fetched 2026-07-29 08:00 UTC'),
+      findsOneWidget,
+    );
+    expect(
+      find.text(
+        'Pricing refresh failed; cached/override rates are being shown.',
+      ),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('shows period filters, summary cards, tabs, and chart content', (
     tester,
   ) async {
@@ -102,7 +175,12 @@ void main() {
   });
 }
 
-UsageSummary _summary() {
+UsageSummary _summary({
+  UsageProjectionCoverage projectionCoverage =
+      const UsageProjectionCoverage.empty(),
+  UsagePricingStatus pricingStatus = const UsagePricingStatus.empty(),
+  bool costUnknown = false,
+}) {
   return UsageSummary(
     period: UsageDateRange(
       startUtc: DateTime.utc(2026, 6, 1),
@@ -115,7 +193,9 @@ UsageSummary _summary() {
     cachedInputTokens: 900,
     totalTokens: 7300,
     estimatedCostText: r'$0.34',
-    costUnknown: false,
+    costUnknown: costUnknown,
+    projectionCoverage: projectionCoverage,
+    pricingStatus: pricingStatus,
     mostUsedModel: 'gpt-5.4',
     mostActiveProject: 'Codex Viewer',
     mostActivePlatform: 'Windows',

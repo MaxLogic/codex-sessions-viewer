@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui';
 
 import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
@@ -8,6 +9,104 @@ import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('failed usage refresh retains last successful snapshot', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 1200));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    var loadCalls = 0;
+    await tester.pumpWidget(
+      CodexSessionsViewerApp(
+        databaseStartup: Future.value(
+          DatabaseStartupResult.ready(lastAppliedSchemaVersion: 15),
+        ),
+        settingsStartup: Future.value(_usageTestSettings()),
+        deferInitialSessionLoad: (_) {},
+        usageSummaryLoader: (_) {
+          loadCalls++;
+          return loadCalls == 1
+              ? Future.value(
+                  _summary(
+                    title: 'Retained usage',
+                    inputTokens: 11,
+                    totalTokens: 12,
+                  ),
+                )
+              : Future.error(StateError('private failure details'));
+        },
+        sessionRefresh: () async => const SessionsRefreshResult(
+          rows: [],
+          statusMessage: 'Scan finished.',
+        ),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.text('Refresh'));
+    await _pumpFrames(tester);
+    await tester.tap(find.bySemanticsLabel('Usage navigation'));
+    await _pumpFrames(tester);
+
+    expect(
+      find.text(
+        'Usage status refresh failed; showing the last successful snapshot.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('12'), findsWidgets);
+    expect(find.textContaining('private failure details'), findsNothing);
+  });
+
+  testWidgets('usage status refreshes without blocking', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 1200));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final refreshed = Completer<UsageSummary?>();
+    var loadCalls = 0;
+    await tester.pumpWidget(
+      CodexSessionsViewerApp(
+        databaseStartup: Future.value(
+          DatabaseStartupResult.ready(lastAppliedSchemaVersion: 15),
+        ),
+        settingsStartup: Future.value(_usageTestSettings()),
+        deferInitialSessionLoad: (_) {},
+        usageSummaryLoader: (_) {
+          loadCalls++;
+          return loadCalls == 1
+              ? Future.value(
+                  _summary(
+                    title: 'Retained usage',
+                    inputTokens: 11,
+                    totalTokens: 12,
+                  ),
+                )
+              : refreshed.future;
+        },
+        sessionRefresh: () async => const SessionsRefreshResult(
+          rows: [],
+          statusMessage: 'Scan finished.',
+        ),
+      ),
+    );
+    await _pumpFrames(tester);
+
+    await tester.tap(find.text('Refresh'));
+    await _pumpFrames(tester, count: 2);
+    expect(find.text('Scan finished.'), findsOneWidget);
+    await tester.tap(find.bySemanticsLabel('Usage navigation'));
+    await _pumpFrames(tester, count: 2);
+
+    expect(find.text('Refreshing usage status…'), findsOneWidget);
+    expect(find.text('12'), findsWidgets);
+
+    refreshed.complete(
+      _summary(title: 'Refreshed usage', inputTokens: 20, totalTokens: 25),
+    );
+    await _pumpFrames(tester);
+
+    expect(find.text('Refreshing usage status…'), findsNothing);
+    expect(find.text('25'), findsWidgets);
+  });
+
   testWidgets('usage screen displays refreshed calculated statistics', (
     tester,
   ) async {

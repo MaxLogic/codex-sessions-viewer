@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -89,6 +90,8 @@ class CodexSessionsViewerApp extends StatefulWidget {
 class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   AppSettings? _settings;
   UsageSummary? _usageSummary;
+  var _usageIsRefreshing = false;
+  var _usageRefreshFailed = false;
   var _usageLoadGeneration = 0;
   var _usageLoadScheduled = false;
   bool? _lastSyncedStartupPreference;
@@ -192,7 +195,11 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                   deferInitialLoad: widget.deferInitialSessionLoad,
                   onOpenResult: _openContextResult,
                 ),
-                usageScreen: UsageScreen(summary: _usageSummary),
+                usageScreen: UsageScreen(
+                  summary: _usageSummary,
+                  isRefreshing: _usageIsRefreshing,
+                  refreshFailed: _usageRefreshFailed,
+                ),
                 settingsScreen: SettingsScreen(
                   initialSettings: settings,
                   diagnostics: DatabaseSettingsDiagnostics(widget.databaseFile),
@@ -247,8 +254,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       }
     }
     return SessionsRefreshOperation(
-      result: operation.result.then((result) async {
-        await _loadUsageSummary(_settings ?? AppSettings.defaults());
+      result: operation.result.then((result) {
+        unawaited(_loadUsageSummary(_settings ?? AppSettings.defaults()));
         return result;
       }),
       cancel: operation.cancel,
@@ -330,34 +337,17 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
 
   Future<void> _loadUsageSummary(AppSettings settings) async {
     final generation = ++_usageLoadGeneration;
-    final loader = widget.usageSummaryLoader;
-    if (loader != null) {
-      final summary = await loader(settings);
-      if (!mounted || generation != _usageLoadGeneration) {
-        return;
-      }
+    if (mounted) {
       setState(() {
-        _usageSummary = summary;
+        _usageIsRefreshing = true;
+        _usageRefreshFailed = false;
       });
-      return;
     }
-    await _loadUsageSummaryFromDatabase(settings, generation);
-  }
-
-  Future<void> _loadUsageSummaryFromDatabase(
-    AppSettings settings,
-    int generation,
-  ) async {
-    final db = openFileBackedDatabase(widget.databaseFile);
     try {
-      final pricingResult = await PricingRepository(db).load(settings.pricing);
-      final summary = UsageSummaryRepository(db).summarize(
-        UsageSummaryRequest(
-          period: UsagePeriod.last30Days,
-          nowUtc: DateTime.now().toUtc(),
-        ),
-        pricing: pricingResult.catalog,
-      );
+      final loader = widget.usageSummaryLoader;
+      final summary = loader == null
+          ? await _loadUsageSummaryFromDatabase(settings)
+          : await loader(settings);
       if (!mounted || generation != _usageLoadGeneration) {
         return;
       }
@@ -365,15 +355,43 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         _usageSummary = summary;
       });
     } on Object {
-      if (!mounted || generation != _usageLoadGeneration) {
-        return;
+      if (mounted && generation == _usageLoadGeneration) {
+        setState(() {
+          _usageRefreshFailed = true;
+        });
       }
-      setState(() {
-        _usageSummary = null;
-      });
     } finally {
-      db.close();
+      if (mounted && generation == _usageLoadGeneration) {
+        setState(() {
+          _usageIsRefreshing = false;
+        });
+      }
     }
+  }
+
+  Future<UsageSummary> _loadUsageSummaryFromDatabase(
+    AppSettings settings,
+  ) async {
+    final databasePath = widget.databaseFile.path;
+    return Isolate.run(() async {
+      final db = openFileBackedDatabase(File(databasePath));
+      try {
+        final pricingResult = await PricingRepository(
+          db,
+        ).load(settings.pricing);
+        return UsageSummaryRepository(db).summarize(
+          UsageSummaryRequest(
+            period: UsagePeriod.last30Days,
+            nowUtc: DateTime.now().toUtc(),
+            projectionVersion: CodexSessionParser.currentVersion,
+          ),
+          pricing: pricingResult.catalog,
+          pricingRefreshSucceeded: pricingResult.success,
+        );
+      } finally {
+        db.close();
+      }
+    });
   }
 
   Future<void> _handleSessionAction(SessionActionRequest request) async {
