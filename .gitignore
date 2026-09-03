@@ -14,3 +14,5 @@ app/flutter_*.log
 *.sqlite-shm
 *.db-wal
 *.db-shm
+.codex/
+.claude/skills/
