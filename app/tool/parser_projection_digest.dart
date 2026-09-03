@@ -43,7 +43,7 @@ Future<void> main() async {
   ].join('\n');
   stdout.writeln(
     jsonEncode({
-      'projection_version': 2,
+      'projection_version': 3,
       'parser_version': CodexSessionParser.currentVersion,
       'requested_files': files.length,
       'parsed_files': entries.length,
@@ -67,6 +67,12 @@ Map<String, Object?> _projection(CodexParsedSession session) => {
   'thread_name': session.threadName,
   'thread_source': session.threadSource,
   'parent_thread_id': session.parentThreadId,
+  'forked_from_id': session.forkedFromId,
+  'history_base_thread_id': session.historyBaseThreadId,
+  'history_base_end_ordinal_exclusive': session.historyBaseEndOrdinalExclusive,
+  'history_base_end_byte_offset': session.historyBaseEndByteOffset,
+  'subagent_history_start_ordinal': session.subagentHistoryStartOrdinal,
+  'usage_projection_status': session.usageProjectionStatus,
   'agent_nickname': session.agentNickname,
   'agent_role': session.agentRole,
   'subagent_depth': session.subagentDepth,
@@ -82,9 +88,27 @@ Map<String, Object?> _projection(CodexParsedSession session) => {
   'summary': session.summary,
   'started_at_utc': session.startedAtUtc?.toIso8601String(),
   'last_message_at_utc': session.lastMessageAtUtc?.toIso8601String(),
-  'models': session.modelIds.toList(),
+  'models': session.modelIds.toList()..sort(),
   'usage': _usage(session.usage),
   'last_turn_usage': _usage(session.lastTurnUsage),
+  'usage_events': [
+    for (final event in session.usageEvents)
+      {
+        'source_record_ordinal': event.sourceRecordOrdinal,
+        'rollout_ordinal': event.rolloutOrdinal,
+        'turn_ordinal': event.turnOrdinal,
+        'counter_epoch': event.counterEpoch,
+        'occurred_at_utc': event.occurredAtUtc?.toIso8601String(),
+        'model': event.model,
+        'working_directory': event.workingDirectory,
+        'working_directory_unc': event.workingDirectoryUnc,
+        'usage': _usage(event.usage),
+        'cumulative_usage': _usage(event.cumulativeUsage),
+        'branch_scope': event.branchScope,
+        'derivation': event.derivation,
+        'event_fingerprint': event.eventFingerprint,
+      },
+  ],
   'messages': [
     for (final message in session.messages)
       {
@@ -132,6 +156,7 @@ Map<String, Object?> _usage(CodexUsage usage) => {
   'input_tokens': usage.inputTokens,
   'output_tokens': usage.outputTokens,
   'cached_input_tokens': usage.cachedInputTokens,
+  'cache_write_input_tokens': usage.cacheWriteInputTokens,
   'reasoning_output_tokens': usage.reasoningOutputTokens,
   'total_tokens': usage.totalTokens,
 };

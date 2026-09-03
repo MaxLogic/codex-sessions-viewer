@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:crypto/crypto.dart';
+
 import '../utils/injected_context_filter.dart';
 
 enum CodexSessionSourceType { windows, wsl, unknown }
@@ -30,7 +32,7 @@ class CodexSessionParser {
        jsonlByteStreamReader =
            jsonlByteStreamReader ?? _defaultJsonlByteStreamReader;
 
-  static const int currentVersion = 2;
+  static const int currentVersion = 4;
 
   final int maxToolOutputPreviewChars;
   final int maxMessageContentChars;
@@ -248,6 +250,9 @@ class CodexSessionParser {
       warnings: List.unmodifiable(warnings),
       usage: usage,
       lastTurnUsage: const CodexUsage.empty(),
+      usageProjectionStatus: _hasPositiveUsage(usage)
+          ? 'ambiguous'
+          : 'complete',
     );
   }
 
@@ -267,6 +272,11 @@ class CodexSessionParser {
     String? threadName;
     String? threadSource;
     String? parentThreadId;
+    String? forkedFromId;
+    String? historyBaseThreadId;
+    int? historyBaseEndOrdinalExclusive;
+    int? historyBaseEndByteOffset;
+    int? subagentHistoryStartOrdinal;
     String? agentNickname;
     String? agentRole;
     int? subagentDepth;
@@ -275,18 +285,36 @@ class CodexSessionParser {
     final messages = <CodexParsedMessage>[];
     final toolCalls = <CodexParsedToolCall>[];
     final warnings = <CodexParseWarning>[];
+    final usageEvents = <CodexParsedUsageEvent>[];
     final modelIds = <String>{};
     final pendingToolCalls = <String, CodexParsedToolCall>{};
     var usage = const CodexUsage.empty();
     var hasAggregateUsage = false;
     var lastTurnUsage = const CodexUsage.empty();
+    var previousCumulativeUsage = const CodexUsage.zero();
+    var hasCumulativeUsage = false;
+    var sourceRecordOrdinal = -1;
+    int? turnOrdinal;
+    var counterEpoch = 0;
+    var pendingCounterReset = false;
+    String? effectiveModel;
+    String? effectiveWorkingDirectory;
+    String? effectiveWorkingDirectoryUnc;
+    var usageProjectionStatus = 'complete';
 
     await for (final record in records) {
+      sourceRecordOrdinal++;
       final recordType = _string(record['type']);
       final timestamp = _dateTime(record['timestamp']);
       final payload = _map(record['payload']);
       if (recordType == 'session_meta') {
-        sessionId ??= _string(payload['id']);
+        final metadataSessionId = _string(payload['id']);
+        if (metadataSessionId == null ||
+            metadataSessionId.trim().isEmpty ||
+            sessionId != null) {
+          continue;
+        }
+        sessionId = metadataSessionId;
         threadName =
             _cleanThreadName(
               _string(payload['thread_name']) ??
@@ -297,6 +325,16 @@ class CodexSessionParser {
             threadName;
         threadSource = _string(payload['thread_source']) ?? threadSource;
         parentThreadId = _string(payload['parent_thread_id']) ?? parentThreadId;
+        forkedFromId = _string(payload['forked_from_id']);
+        final historyBase = _map(payload['history_base']);
+        historyBaseThreadId = _string(historyBase['thread_id']);
+        historyBaseEndOrdinalExclusive = _int(
+          historyBase['end_ordinal_exclusive'],
+        );
+        historyBaseEndByteOffset = _int(historyBase['end_byte_offset']);
+        subagentHistoryStartOrdinal = _int(
+          payload['subagent_history_start_ordinal'],
+        );
         agentNickname = _string(payload['agent_nickname']) ?? agentNickname;
         agentRole = _string(payload['agent_role']) ?? agentRole;
         subagentDepth = _int(payload['subagent_depth']) ?? subagentDepth;
@@ -312,7 +350,18 @@ class CodexSessionParser {
           agentRole = _string(threadSpawn['agent_role']) ?? agentRole;
           subagentDepth = _int(threadSpawn['depth']) ?? subagentDepth;
         }
-        workingDirectory = _string(payload['cwd']) ?? workingDirectory;
+        if (historyBaseThreadId == null &&
+            subagentHistoryStartOrdinal == null &&
+            (forkedFromId != null || parentThreadId != null)) {
+          usageProjectionStatus = 'legacy_pending';
+        }
+        final ownerWorkingDirectory = _string(payload['cwd']);
+        workingDirectory = ownerWorkingDirectory ?? workingDirectory;
+        if (ownerWorkingDirectory != null) {
+          workingDirectoryUnc = _string(payload['working_directory_unc']);
+          effectiveWorkingDirectory = ownerWorkingDirectory;
+          effectiveWorkingDirectoryUnc = workingDirectoryUnc;
+        }
         title = _cleanTitle(_string(payload['title'])) ?? title;
         sourceFileUncPath = _string(payload['source_file_unc_path']);
         startedAtUtc =
@@ -320,9 +369,27 @@ class CodexSessionParser {
         continue;
       }
       if (recordType == 'turn_context') {
-        workingDirectory = _string(payload['cwd']) ?? workingDirectory;
-        workingDirectoryUnc =
-            _string(payload['working_directory_unc']) ?? workingDirectoryUnc;
+        if (_isInheritedProjectedRecord(
+          record,
+          historyBaseThreadId: historyBaseThreadId,
+          subagentHistoryStartOrdinal: subagentHistoryStartOrdinal,
+        )) {
+          continue;
+        }
+        turnOrdinal = (turnOrdinal ?? -1) + 1;
+        final contextWorkingDirectory = _string(payload['cwd']);
+        final contextWorkingDirectoryUnc = _string(
+          payload['working_directory_unc'],
+        );
+        if (contextWorkingDirectory != null) {
+          workingDirectory = contextWorkingDirectory;
+          workingDirectoryUnc = contextWorkingDirectoryUnc;
+          effectiveWorkingDirectory = contextWorkingDirectory;
+          effectiveWorkingDirectoryUnc = contextWorkingDirectoryUnc;
+        } else if (contextWorkingDirectoryUnc != null) {
+          workingDirectoryUnc = contextWorkingDirectoryUnc;
+          effectiveWorkingDirectoryUnc = contextWorkingDirectoryUnc;
+        }
         threadName =
             _cleanThreadName(
               _string(payload['thread_name']) ??
@@ -335,6 +402,49 @@ class CodexSessionParser {
         summary = _cleanSummary(_string(payload['summary'])) ?? summary;
         final model = _string(payload['model']);
         if (model != null && model.isNotEmpty) {
+          effectiveModel = model;
+          modelIds.add(model);
+        }
+        continue;
+      }
+      if (recordType == 'event_msg' &&
+          payload['type'] == 'thread_settings_applied') {
+        if (_isInheritedProjectedRecord(
+          record,
+          historyBaseThreadId: historyBaseThreadId,
+          subagentHistoryStartOrdinal: subagentHistoryStartOrdinal,
+        )) {
+          continue;
+        }
+        final settings = _map(payload['thread_settings']);
+        final model = _string(settings['model']);
+        if (model != null && model.isNotEmpty) {
+          effectiveModel = model;
+          modelIds.add(model);
+        }
+        final settingsWorkingDirectory = _string(settings['cwd']);
+        final settingsWorkingDirectoryUnc = _string(
+          settings['working_directory_unc'],
+        );
+        if (settingsWorkingDirectory != null) {
+          effectiveWorkingDirectory = settingsWorkingDirectory;
+          effectiveWorkingDirectoryUnc = settingsWorkingDirectoryUnc;
+        } else if (settingsWorkingDirectoryUnc != null) {
+          effectiveWorkingDirectoryUnc = settingsWorkingDirectoryUnc;
+        }
+        continue;
+      }
+      if (recordType == 'event_msg' && payload['type'] == 'model_reroute') {
+        if (_isInheritedProjectedRecord(
+          record,
+          historyBaseThreadId: historyBaseThreadId,
+          subagentHistoryStartOrdinal: subagentHistoryStartOrdinal,
+        )) {
+          continue;
+        }
+        final model = _string(payload['to_model']);
+        if (model != null && model.isNotEmpty) {
+          effectiveModel = model;
           modelIds.add(model);
         }
         continue;
@@ -349,6 +459,90 @@ class CodexSessionParser {
         final lastTokenUsage = CodexUsage.fromJson(info['last_token_usage']);
         if (!lastTokenUsage.isEmpty) {
           lastTurnUsage = lastTokenUsage;
+        }
+        if (!totalTokenUsage.isEmpty && !totalTokenUsage.hasPositiveValue) {
+          if (!hasCumulativeUsage) {
+            previousCumulativeUsage = totalTokenUsage;
+            hasCumulativeUsage = true;
+          } else if (!totalTokenUsage.hasSameVector(previousCumulativeUsage)) {
+            previousCumulativeUsage = totalTokenUsage;
+            pendingCounterReset = true;
+          }
+        }
+        if (!totalTokenUsage.isEmpty &&
+            totalTokenUsage.hasPositiveValue &&
+            (!hasCumulativeUsage ||
+                !totalTokenUsage.hasSameVector(previousCumulativeUsage))) {
+          final resetFromZero = pendingCounterReset;
+          final counterReset =
+              resetFromZero ||
+              (hasCumulativeUsage &&
+                  !totalTokenUsage.isComponentwiseAtLeast(
+                    previousCumulativeUsage,
+                  ));
+          final delta = counterReset
+              ? totalTokenUsage.nonNegative()
+              : totalTokenUsage.differenceFrom(previousCumulativeUsage);
+          final firstLegacyEvent =
+              usageEvents.isEmpty && usageProjectionStatus == 'legacy_pending';
+          final useLastTokenUsage =
+              !lastTokenUsage.isEmpty &&
+              lastTokenUsage.isNonNegative &&
+              (counterReset
+                  ? resetFromZero
+                        ? lastTokenUsage.hasSameVector(delta)
+                        : totalTokenUsage.isComponentwiseAtLeast(lastTokenUsage)
+                  : firstLegacyEvent
+                  ? totalTokenUsage.isComponentwiseAtLeast(lastTokenUsage)
+                  : lastTokenUsage.hasSameVector(delta));
+          if (counterReset) {
+            counterEpoch++;
+            pendingCounterReset = false;
+          }
+          final eventUsage = (useLastTokenUsage ? lastTokenUsage : delta)
+              .withComponentTotal();
+          final rolloutOrdinal = _int(record['rollout_ordinal']);
+          final branchScope = historyBaseThreadId != null
+              ? 'local'
+              : switch (subagentHistoryStartOrdinal) {
+                  int _ when rolloutOrdinal == null => 'ambiguous',
+                  int boundary when rolloutOrdinal! < boundary => 'inherited',
+                  _
+                      when subagentHistoryStartOrdinal == null &&
+                          (forkedFromId != null || parentThreadId != null) =>
+                    'ambiguous',
+                  _ => 'local',
+                };
+          if (branchScope == 'ambiguous' &&
+              subagentHistoryStartOrdinal != null) {
+            usageProjectionStatus = 'ambiguous';
+          }
+          usageEvents.add(
+            CodexParsedUsageEvent(
+              sourceRecordOrdinal: sourceRecordOrdinal,
+              rolloutOrdinal: rolloutOrdinal,
+              turnOrdinal: turnOrdinal,
+              counterEpoch: counterEpoch,
+              occurredAtUtc: timestamp,
+              model: effectiveModel,
+              workingDirectory: effectiveWorkingDirectory,
+              workingDirectoryUnc: effectiveWorkingDirectoryUnc,
+              usage: eventUsage,
+              branchScope: branchScope,
+              derivation: counterReset
+                  ? 'counter_reset'
+                  : useLastTokenUsage
+                  ? 'last_token_usage'
+                  : 'cumulative_delta',
+              cumulativeUsage: totalTokenUsage,
+              eventFingerprint: _usageEventFingerprint(
+                timestamp: timestamp,
+                cumulativeUsage: totalTokenUsage,
+              ),
+            ),
+          );
+          previousCumulativeUsage = totalTokenUsage;
+          hasCumulativeUsage = true;
         }
         continue;
       }
@@ -552,12 +746,24 @@ class CodexSessionParser {
 
     displayPath ??= sourcePath;
     platformPath ??= displayPath;
+    if (usageEvents.isEmpty) {
+      usageProjectionStatus = _hasPositiveUsage(usage)
+          ? 'ambiguous'
+          : 'complete';
+    }
     return CodexParsedSession(
       internalId: _internalId(sourcePath: sourcePath, sessionId: sessionId),
       sessionId: sessionId,
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
+      forkedFromId: forkedFromId,
+      historyBaseThreadId: historyBaseThreadId,
+      historyBaseEndOrdinalExclusive: historyBaseEndOrdinalExclusive,
+      historyBaseEndByteOffset: historyBaseEndByteOffset,
+      subagentHistoryStartOrdinal: subagentHistoryStartOrdinal,
+      usageEvents: List.unmodifiable(usageEvents),
+      usageProjectionStatus: usageProjectionStatus,
       agentNickname: agentNickname,
       agentRole: agentRole,
       subagentDepth: subagentDepth,
@@ -857,6 +1063,13 @@ class CodexParsedSession {
     this.threadSource,
     this.threadName,
     this.parentThreadId,
+    this.forkedFromId,
+    this.historyBaseThreadId,
+    this.historyBaseEndOrdinalExclusive,
+    this.historyBaseEndByteOffset,
+    this.subagentHistoryStartOrdinal,
+    this.usageEvents = const [],
+    this.usageProjectionStatus = 'complete',
     this.agentNickname,
     this.agentRole,
     this.subagentDepth,
@@ -867,6 +1080,13 @@ class CodexParsedSession {
   final String? threadName;
   final String? threadSource;
   final String? parentThreadId;
+  final String? forkedFromId;
+  final String? historyBaseThreadId;
+  final int? historyBaseEndOrdinalExclusive;
+  final int? historyBaseEndByteOffset;
+  final int? subagentHistoryStartOrdinal;
+  final List<CodexParsedUsageEvent> usageEvents;
+  final String usageProjectionStatus;
   final String? agentNickname;
   final String? agentRole;
   final int? subagentDepth;
@@ -888,6 +1108,38 @@ class CodexParsedSession {
   final List<CodexParseWarning> warnings;
   final CodexUsage usage;
   final CodexUsage lastTurnUsage;
+}
+
+class CodexParsedUsageEvent {
+  const CodexParsedUsageEvent({
+    required this.sourceRecordOrdinal,
+    required this.usage,
+    required this.derivation,
+    this.rolloutOrdinal,
+    this.turnOrdinal,
+    this.counterEpoch = 0,
+    this.occurredAtUtc,
+    this.model,
+    this.workingDirectory,
+    this.workingDirectoryUnc,
+    this.branchScope = 'local',
+    this.cumulativeUsage = const CodexUsage.empty(),
+    this.eventFingerprint = '',
+  });
+
+  final int sourceRecordOrdinal;
+  final int? rolloutOrdinal;
+  final int? turnOrdinal;
+  final int counterEpoch;
+  final DateTime? occurredAtUtc;
+  final String? model;
+  final String? workingDirectory;
+  final String? workingDirectoryUnc;
+  final CodexUsage usage;
+  final String derivation;
+  final String branchScope;
+  final CodexUsage cumulativeUsage;
+  final String eventFingerprint;
 }
 
 class CodexParseWarning {
@@ -984,6 +1236,7 @@ class CodexUsage {
     this.inputTokens,
     this.outputTokens,
     this.cachedInputTokens,
+    this.cacheWriteInputTokens,
     this.reasoningOutputTokens,
     int? totalTokens,
   }) : _explicitTotalTokens = totalTokens;
@@ -992,8 +1245,17 @@ class CodexUsage {
     : inputTokens = null,
       outputTokens = null,
       cachedInputTokens = null,
+      cacheWriteInputTokens = null,
       reasoningOutputTokens = null,
       _explicitTotalTokens = null;
+
+  const CodexUsage.zero()
+    : inputTokens = 0,
+      outputTokens = 0,
+      cachedInputTokens = 0,
+      cacheWriteInputTokens = 0,
+      reasoningOutputTokens = 0,
+      _explicitTotalTokens = 0;
 
   factory CodexUsage.fromJson(Object? json) {
     if (json is! Map) {
@@ -1004,6 +1266,7 @@ class CodexUsage {
       inputTokens: _int(map['input_tokens']),
       outputTokens: _int(map['output_tokens']),
       cachedInputTokens: _int(map['cached_input_tokens']),
+      cacheWriteInputTokens: _int(map['cache_write_input_tokens']),
       reasoningOutputTokens: _int(map['reasoning_output_tokens']),
       totalTokens: _int(map['total_tokens']),
     );
@@ -1012,6 +1275,7 @@ class CodexUsage {
   final int? inputTokens;
   final int? outputTokens;
   final int? cachedInputTokens;
+  final int? cacheWriteInputTokens;
   final int? reasoningOutputTokens;
   final int? _explicitTotalTokens;
 
@@ -1019,6 +1283,7 @@ class CodexUsage {
       inputTokens == null &&
       outputTokens == null &&
       cachedInputTokens == null &&
+      cacheWriteInputTokens == null &&
       reasoningOutputTokens == null &&
       _explicitTotalTokens == null;
 
@@ -1029,28 +1294,118 @@ class CodexUsage {
     if (inputTokens == null &&
         outputTokens == null &&
         cachedInputTokens == null &&
+        cacheWriteInputTokens == null &&
         reasoningOutputTokens == null) {
       return null;
     }
     return _componentTotalTokens;
   }
 
-  int get _componentTotalTokens =>
-      (inputTokens ?? 0) +
-      (outputTokens ?? 0) +
-      (cachedInputTokens ?? 0) +
-      (reasoningOutputTokens ?? 0);
+  int get _componentTotalTokens => (inputTokens ?? 0) + (outputTokens ?? 0);
+
+  List<int> get _vector => [
+    inputTokens ?? 0,
+    cachedInputTokens ?? 0,
+    cacheWriteInputTokens ?? 0,
+    outputTokens ?? 0,
+    reasoningOutputTokens ?? 0,
+    _componentTotalTokens,
+  ];
+
+  bool hasSameVector(CodexUsage other) {
+    final left = _vector;
+    final right = other._vector;
+    for (var index = 0; index < left.length; index++) {
+      if (left[index] != right[index]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool isComponentwiseAtLeast(CodexUsage other) {
+    final current = _vector;
+    final minimum = other._vector;
+    for (var index = 0; index < current.length; index++) {
+      if (current[index] < minimum[index]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool get isNonNegative => _vector.every((value) => value >= 0);
+
+  bool get hasPositiveValue => _vector.any((value) => value > 0);
+
+  CodexUsage nonNegative() => CodexUsage(
+    inputTokens: math.max(inputTokens ?? 0, 0),
+    cachedInputTokens: math.max(cachedInputTokens ?? 0, 0),
+    cacheWriteInputTokens: math.max(cacheWriteInputTokens ?? 0, 0),
+    outputTokens: math.max(outputTokens ?? 0, 0),
+    reasoningOutputTokens: math.max(reasoningOutputTokens ?? 0, 0),
+    totalTokens: math.max(totalTokens ?? 0, 0),
+  );
+
+  CodexUsage withComponentTotal() => CodexUsage(
+    inputTokens: inputTokens,
+    cachedInputTokens: cachedInputTokens,
+    cacheWriteInputTokens: cacheWriteInputTokens,
+    outputTokens: outputTokens,
+    reasoningOutputTokens: reasoningOutputTokens,
+    totalTokens: _componentTotalTokens,
+  );
+
+  CodexUsage differenceFrom(CodexUsage previous) {
+    final current = _vector;
+    final before = previous._vector;
+    return CodexUsage(
+      inputTokens: current[0] - before[0],
+      cachedInputTokens: current[1] - before[1],
+      cacheWriteInputTokens: current[2] - before[2],
+      outputTokens: current[3] - before[3],
+      reasoningOutputTokens: current[4] - before[4],
+      totalTokens: current[5] - before[5],
+    );
+  }
 
   CodexUsage operator +(CodexUsage other) => CodexUsage(
     inputTokens: _sumNullable(inputTokens, other.inputTokens),
     outputTokens: _sumNullable(outputTokens, other.outputTokens),
     cachedInputTokens: _sumNullable(cachedInputTokens, other.cachedInputTokens),
+    cacheWriteInputTokens: _sumNullable(
+      cacheWriteInputTokens,
+      other.cacheWriteInputTokens,
+    ),
     reasoningOutputTokens: _sumNullable(
       reasoningOutputTokens,
       other.reasoningOutputTokens,
     ),
     totalTokens: _sumNullable(totalTokens, other.totalTokens),
   );
+}
+
+String _usageEventFingerprint({
+  required DateTime? timestamp,
+  required CodexUsage cumulativeUsage,
+}) {
+  final safeProjection = jsonEncode([
+    timestamp?.toUtc().toIso8601String(),
+    ...cumulativeUsage._vector,
+  ]);
+  return sha256.convert(utf8.encode(safeProjection)).toString();
+}
+
+bool _isInheritedProjectedRecord(
+  Map<String, Object?> record, {
+  required String? historyBaseThreadId,
+  required int? subagentHistoryStartOrdinal,
+}) {
+  if (historyBaseThreadId != null || subagentHistoryStartOrdinal == null) {
+    return false;
+  }
+  final rolloutOrdinal = _int(record['rollout_ordinal']);
+  return rolloutOrdinal == null || rolloutOrdinal < subagentHistoryStartOrdinal;
 }
 
 CodexSessionSourceType _sourceType(String? value, [String? path]) {
@@ -1168,10 +1523,12 @@ const _knownEventPayloadTypes = {
   'error',
   'exec_command_end',
   'mcp_tool_call_end',
+  'model_reroute',
   'patch_apply_end',
   'task_complete',
   'task_started',
   'thread_goal_updated',
+  'thread_settings_applied',
   'token_count',
   'turn_aborted',
   'user_message',
@@ -1183,6 +1540,14 @@ Map<String, Object?> _map(Object? value) =>
     value is Map ? value.cast<String, Object?>() : <String, Object?>{};
 
 String? _string(Object? value) => value is String ? value : null;
+
+bool _hasPositiveUsage(CodexUsage usage) =>
+    (usage.inputTokens ?? 0) > 0 ||
+    (usage.cachedInputTokens ?? 0) > 0 ||
+    (usage.cacheWriteInputTokens ?? 0) > 0 ||
+    (usage.outputTokens ?? 0) > 0 ||
+    (usage.reasoningOutputTokens ?? 0) > 0 ||
+    (usage.totalTokens ?? 0) > 0;
 
 String? _cleanTitle(String? value) {
   final trimmed = value?.trim();

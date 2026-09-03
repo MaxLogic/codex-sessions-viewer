@@ -40,6 +40,7 @@ void main() {
       expect(session.usage.inputTokens, 24);
       expect(session.usage.outputTokens, 16);
       expect(session.usage.cachedInputTokens, 3);
+      expect(session.usageProjectionStatus, 'ambiguous');
       expect(session.lastMessageAtUtc, DateTime.utc(2026, 6, 10, 8, 0, 4));
     },
   );
@@ -140,6 +141,30 @@ void main() {
     expect(session.usage.totalTokens, 63);
   });
 
+  test('marks positive JSONL usage without events ambiguous', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_parser_unprojectable_usage_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}${Platform.pathSeparator}positive.jsonl');
+    await source.writeAsString(
+      [
+        '{"type":"session_meta","payload":{"id":"positive-jsonl"}}',
+        '{"type":"response_item","payload":{"type":"message",'
+            '"role":"assistant","content":[{"type":"output_text",'
+            '"text":"response"}],"usage":{"input_tokens":4,'
+            '"output_tokens":2}}}',
+      ].join('\n'),
+    );
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.usageEvents, isEmpty);
+    expect(result.session!.usage.totalTokens, 6);
+    expect(result.session!.usageProjectionStatus, 'ambiguous');
+  });
+
   test('streams a large JSONL session stored with a json extension', () async {
     final temp = await Directory.systemTemp.createTemp('csv_parser_sniff_');
     addTearDown(() => temp.delete(recursive: true));
@@ -205,7 +230,7 @@ void main() {
   });
 
   test('streaming JSONL matches canonical persisted projection', () async {
-    expect(CodexSessionParser.currentVersion, 2);
+    expect(CodexSessionParser.currentVersion, 4);
     final temp = await Directory.systemTemp.createTemp('csv_parser_oracle_');
     addTearDown(() => temp.delete(recursive: true));
     final source = File('${temp.path}${Platform.pathSeparator}oracle.jsonl');
@@ -383,20 +408,21 @@ void main() {
     final projectionJson = jsonEncode(_persistedProjection(result.session!));
     expect(
       sha256.convert(utf8.encode(projectionJson)).toString(),
-      '0d6a3c70259896b63d9dd3f31d7796f47a8a75821a26bdadb8127a2030c0b0b0',
+      '870a3d0b8687b5677a84a2def7f954ec78af6339e15118c4393817ebd2540f5e',
     );
   });
 
-  test('keeps the first session_meta id as the file identity', () async {
+  test('keeps owning fork metadata authoritative', () async {
     final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
     addTearDown(() => temp.delete(recursive: true));
     final source = File(
       '${temp.path}${Platform.pathSeparator}first-session.jsonl',
     );
     await source.writeAsString('''
-{"timestamp":"2026-06-10T10:00:00Z","type":"session_meta","payload":{"id":"first-session","cwd":"F:\\\\first"}}
+{"timestamp":"2026-06-10T09:59:59Z","type":"session_meta","payload":{"id":"","cwd":"F:\\\\invalid","thread_source":"subagent"}}
+{"timestamp":"2026-06-10T10:00:00Z","type":"session_meta","payload":{"id":"first-session","cwd":"F:\\\\first","thread_source":"user","parent_thread_id":"fork-parent","forked_from_id":"original-session","history_base":{"thread_id":"original-session","end_ordinal_exclusive":42,"end_byte_offset":4096},"subagent_history_start_ordinal":37}}
 {"timestamp":"2026-06-10T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"First session message."}]}}
-{"timestamp":"2026-06-10T10:00:02Z","type":"session_meta","payload":{"id":"embedded-session","cwd":"F:\\\\embedded"}}
+{"timestamp":"2026-06-10T10:00:02Z","type":"session_meta","payload":{"id":"embedded-session","cwd":"F:\\\\embedded","thread_source":"subagent","parent_thread_id":"wrong-parent"}}
 ''');
 
     final result = await parser.parseFile(source);
@@ -404,6 +430,239 @@ void main() {
     expect(result.isSuccess, isTrue);
     expect(result.session!.sessionId, 'first-session');
     expect(result.session!.internalId, 'session:first-session');
+    expect(result.session!.threadSource, 'user');
+    expect(result.session!.parentThreadId, 'fork-parent');
+    expect(result.session!.forkedFromId, 'original-session');
+    expect(result.session!.historyBaseThreadId, 'original-session');
+    expect(result.session!.historyBaseEndOrdinalExclusive, 42);
+    expect(result.session!.historyBaseEndByteOffset, 4096);
+    expect(result.session!.subagentHistoryStartOrdinal, 37);
+    expect(result.session!.workingDirectoryPlatform, r'F:\first');
+    expect(result.session!.startedAtUtc, DateTime.utc(2026, 6, 10, 10));
+
+    final subagentSource = File(
+      '${temp.path}${Platform.pathSeparator}subagent-fork.jsonl',
+    );
+    await subagentSource.writeAsString('''
+{"timestamp":"2026-06-10T11:00:00Z","type":"session_meta","payload":{"id":"subagent-session","cwd":"F:\\\\repo","forked_from_id":"first-session","subagent_history_start_ordinal":12,"source":{"subagent":{"thread_spawn":{"parent_thread_id":"first-session","depth":1,"agent_nickname":"Lovelace","agent_role":"default"}}}}}
+''');
+
+    final subagentResult = await parser.parseFile(subagentSource);
+
+    expect(subagentResult.isSuccess, isTrue);
+    expect(subagentResult.session!.threadSource, 'subagent');
+    expect(subagentResult.session!.parentThreadId, 'first-session');
+    expect(subagentResult.session!.forkedFromId, 'first-session');
+    expect(subagentResult.session!.subagentHistoryStartOrdinal, 12);
+
+    final forkOfForkSource = File(
+      '${temp.path}${Platform.pathSeparator}fork-of-fork.jsonl',
+    );
+    await forkOfForkSource.writeAsString('''
+{"timestamp":"2026-06-10T12:00:00Z","type":"session_meta","payload":{"id":"grandchild-session","cwd":"F:\\\\repo","forked_from_id":"subagent-session","history_base":{"thread_id":"subagent-session","end_ordinal_exclusive":9,"end_byte_offset":2048}}}
+''');
+
+    final forkOfForkResult = await parser.parseFile(forkOfForkSource);
+
+    expect(forkOfForkResult.isSuccess, isTrue);
+    expect(forkOfForkResult.session!.forkedFromId, 'subagent-session');
+    expect(forkOfForkResult.session!.historyBaseThreadId, 'subagent-session');
+    expect(forkOfForkResult.session!.historyBaseEndOrdinalExclusive, 9);
+  });
+
+  test('emits each distinct branch-local usage advancement once', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File(
+      '${temp.path}${Platform.pathSeparator}usage-advancements.jsonl',
+    );
+    await source.writeAsString('''
+{"timestamp":"2026-07-29T10:00:00Z","type":"session_meta","payload":{"id":"usage-session","cwd":"F:\\\\repo","working_directory_unc":"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\user\\\\repo"}}
+{"timestamp":"2026-07-29T10:00:01Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.5","cwd":"F:\\\\pre-turn"}}}
+{"timestamp":"2026-07-29T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-07-29T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}}
+{"timestamp":"2026-07-29T10:00:04Z","type":"turn_context","payload":{"cwd":"F:\\\\repo","model":"gpt-5.6-sol"}}
+{"timestamp":"2026-07-29T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":18,"cached_input_tokens":4,"cache_write_input_tokens":2,"output_tokens":7,"reasoning_output_tokens":3,"total_tokens":25},"last_token_usage":{"input_tokens":8,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":4,"reasoning_output_tokens":2,"total_tokens":12}}}}
+{"timestamp":"2026-07-29T10:00:06Z","type":"event_msg","payload":{"type":"model_reroute","from_model":"gpt-5.6-sol","to_model":"gpt-5.6-terra"}}
+{"timestamp":"2026-07-29T10:00:07Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"cached_input_tokens":5,"cache_write_input_tokens":3,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":35},"last_token_usage":{"input_tokens":99,"cached_input_tokens":99,"cache_write_input_tokens":99,"output_tokens":99,"reasoning_output_tokens":99,"total_tokens":198}}}}
+{"timestamp":"2026-07-29T10:00:08Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.5","cwd":"F:\\\\other"}}}
+{"timestamp":"2026-07-29T10:00:09Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":6},"last_token_usage":{"input_tokens":4,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":6}}}}
+''');
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.warnings, isEmpty);
+    expect(result.session!.messages, isEmpty);
+    expect(
+      const CodexUsage(
+        inputTokens: 10,
+        cachedInputTokens: 5,
+        cacheWriteInputTokens: 2,
+        outputTokens: 3,
+        reasoningOutputTokens: 2,
+      ).totalTokens,
+      13,
+    );
+    final events = result.session!.usageEvents;
+    expect(events, hasLength(4));
+    expect(events.map((event) => event.sourceRecordOrdinal), [2, 5, 7, 9]);
+    expect(events.map((event) => event.usage.inputTokens), [10, 8, 7, 4]);
+    expect(events.map((event) => event.derivation), [
+      'last_token_usage',
+      'last_token_usage',
+      'cumulative_delta',
+      'counter_reset',
+    ]);
+    expect(events.map((event) => event.turnOrdinal), [null, 0, 0, 0]);
+    expect(events.map((event) => event.rolloutOrdinal), everyElement(isNull));
+    expect(events.map((event) => event.counterEpoch), [0, 0, 0, 1]);
+    expect(events.map((event) => event.model), [
+      'gpt-5.5',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.5',
+    ]);
+    expect(events.map((event) => event.workingDirectory), [
+      r'F:\pre-turn',
+      r'F:\repo',
+      r'F:\repo',
+      r'F:\other',
+    ]);
+    expect(
+      events.map((event) => event.workingDirectoryUnc),
+      everyElement(isNull),
+    );
+    expect(events.map((event) => event.branchScope), everyElement('local'));
+    expect(events.first.occurredAtUtc, DateTime.utc(2026, 7, 29, 10, 0, 2));
+    expect(events.first.cumulativeUsage.cacheWriteInputTokens, 1);
+    expect(
+      events.map((event) => event.eventFingerprint).toSet(),
+      hasLength(events.length),
+    );
+    expect(
+      events.map((event) => event.eventFingerprint),
+      everyElement(isNotEmpty),
+    );
+    expect(
+      events.expand(
+        (event) => [
+          event.usage.inputTokens,
+          event.usage.cachedInputTokens,
+          event.usage.cacheWriteInputTokens,
+          event.usage.outputTokens,
+          event.usage.reasoningOutputTokens,
+          event.usage.totalTokens,
+        ],
+      ),
+      everyElement(isNonNegative),
+    );
+    expect(result.session!.usageProjectionStatus, 'complete');
+
+    Future<CodexParsedSession> parseBranch(String name, String records) async {
+      final branchSource = File(
+        '${temp.path}${Platform.pathSeparator}$name.jsonl',
+      );
+      await branchSource.writeAsString(records);
+      final branchResult = await parser.parseFile(branchSource);
+      expect(branchResult.isSuccess, isTrue);
+      return branchResult.session!;
+    }
+
+    final paginatedFork = await parseBranch('paginated-fork', '''
+{"timestamp":"2026-07-29T11:00:00Z","type":"session_meta","payload":{"id":"paginated-child","cwd":"F:\\\\base","forked_from_id":"parent","history_base":{"thread_id":"parent","end_ordinal_exclusive":500,"end_byte_offset":9000},"subagent_history_start_ordinal":100}}
+{"rollout_ordinal":90,"timestamp":"2026-07-29T11:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6},"last_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}}
+''');
+    expect(paginatedFork.usageProjectionStatus, 'complete');
+    expect(paginatedFork.usageEvents.single.branchScope, 'local');
+    expect(paginatedFork.usageEvents.single.workingDirectory, r'F:\base');
+
+    final projectedSubagent = await parseBranch('projected-subagent', '''
+{"timestamp":"2026-07-29T12:00:00Z","type":"session_meta","payload":{"id":"projected-child","cwd":"F:\\\\child-base","forked_from_id":"parent","subagent_history_start_ordinal":100}}
+{"rollout_ordinal":70,"timestamp":"2026-07-29T12:00:00.250Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"parent-settings-model","cwd":"F:\\\\parent-settings"}}}
+{"rollout_ordinal":75,"timestamp":"2026-07-29T12:00:00.375Z","type":"event_msg","payload":{"type":"model_reroute","from_model":"parent-settings-model","to_model":"parent-reroute-model"}}
+{"rollout_ordinal":80,"timestamp":"2026-07-29T12:00:00.500Z","type":"turn_context","payload":{"cwd":"F:\\\\parent","model":"parent-model"}}
+{"rollout_ordinal":90,"timestamp":"2026-07-29T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12},"last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}
+{"rollout_ordinal":105,"timestamp":"2026-07-29T12:00:01.500Z","type":"turn_context","payload":{"cwd":"F:\\\\child","model":"child-model"}}
+{"rollout_ordinal":110,"timestamp":"2026-07-29T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"output_tokens":3,"total_tokens":18},"last_token_usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}}
+''');
+    expect(projectedSubagent.usageProjectionStatus, 'complete');
+    expect(projectedSubagent.usageEvents.map((event) => event.branchScope), [
+      'inherited',
+      'local',
+    ]);
+    expect(projectedSubagent.usageEvents.map((event) => event.rolloutOrdinal), [
+      90,
+      110,
+    ]);
+    expect(projectedSubagent.usageEvents.map((event) => event.turnOrdinal), [
+      null,
+      0,
+    ]);
+    expect(projectedSubagent.usageEvents.first.model, isNull);
+    expect(
+      projectedSubagent.usageEvents.first.workingDirectory,
+      r'F:\child-base',
+    );
+    expect(projectedSubagent.usageEvents.last.model, 'child-model');
+    expect(projectedSubagent.usageEvents.last.workingDirectory, r'F:\child');
+    expect(projectedSubagent.workingDirectoryPlatform, r'F:\child');
+
+    final unprojectedSubagent = await parseBranch('unprojected-subagent', '''
+{"timestamp":"2026-07-29T13:00:00Z","type":"session_meta","payload":{"id":"unprojected-child","cwd":"F:\\\\base","forked_from_id":"parent","subagent_history_start_ordinal":100}}
+{"timestamp":"2026-07-29T13:00:00.500Z","type":"turn_context","payload":{"cwd":"F:\\\\unproven","model":"unproven-model"}}
+{"timestamp":"2026-07-29T13:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6},"last_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}}
+''');
+    expect(unprojectedSubagent.usageProjectionStatus, 'ambiguous');
+    expect(unprojectedSubagent.usageEvents.single.branchScope, 'ambiguous');
+    expect(unprojectedSubagent.usageEvents.single.turnOrdinal, isNull);
+    expect(unprojectedSubagent.workingDirectoryPlatform, r'F:\base');
+
+    final legacyFork = await parseBranch('legacy-fork', '''
+{"timestamp":"2026-07-29T14:00:00Z","type":"session_meta","payload":{"id":"legacy-child","cwd":"F:\\\\child","forked_from_id":"parent"}}
+{"timestamp":"2026-07-29T14:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40,"output_tokens":10,"total_tokens":50},"last_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}}
+''');
+    expect(legacyFork.usageProjectionStatus, 'legacy_pending');
+    expect(legacyFork.usageEvents.single.branchScope, 'ambiguous');
+    expect(legacyFork.usageEvents.single.usage.inputTokens, 4);
+
+    final nestedOnlyFork = await parseBranch('nested-only-fork', '''
+{"timestamp":"2026-07-29T14:30:00Z","type":"session_meta","payload":{"id":"nested-child","cwd":"F:\\\\child","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent","depth":1}}}}}
+{"timestamp":"2026-07-29T14:30:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6},"last_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}}
+''');
+    expect(nestedOnlyFork.parentThreadId, 'parent');
+    expect(nestedOnlyFork.usageProjectionStatus, 'legacy_pending');
+    expect(nestedOnlyFork.usageEvents.single.branchScope, 'ambiguous');
+
+    final legacyParent = await parseBranch('legacy-parent', '''
+{"timestamp":"2026-07-29T14:00:00Z","type":"session_meta","payload":{"id":"parent","cwd":"F:\\\\parent"}}
+{"timestamp":"2026-07-29T14:00:00.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":36,"output_tokens":8,"total_tokens":44},"last_token_usage":{"input_tokens":36,"output_tokens":8,"total_tokens":44}}}}
+{"timestamp":"2026-07-29T14:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40,"output_tokens":10,"total_tokens":50},"last_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}}
+''');
+    expect(
+      legacyParent.usageEvents.last.eventFingerprint,
+      legacyFork.usageEvents.single.eventFingerprint,
+    );
+
+    final zeroWorkFork = await parseBranch('zero-work-fork', '''
+{"timestamp":"2026-07-29T15:00:00Z","type":"session_meta","payload":{"id":"zero-work-child","forked_from_id":"parent"}}
+{"timestamp":"2026-07-29T15:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}}}}
+''');
+    expect(zeroWorkFork.usageEvents, isEmpty);
+    expect(zeroWorkFork.usageProjectionStatus, 'complete');
+
+    final zeroReset = await parseBranch('zero-reset', '''
+{"timestamp":"2026-07-29T16:00:00Z","type":"session_meta","payload":{"id":"zero-reset"}}
+{"timestamp":"2026-07-29T16:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6},"last_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}}
+{"timestamp":"2026-07-29T16:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}}
+{"timestamp":"2026-07-29T16:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14},"last_token_usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}}
+''');
+    expect(zeroReset.usageEvents.map((event) => event.usage.inputTokens), [
+      4,
+      10,
+    ]);
+    expect(zeroReset.usageEvents.map((event) => event.counterEpoch), [0, 1]);
+    expect(zeroReset.usageEvents.last.derivation, 'counter_reset');
   });
 
   test('uses explicit JSONL title metadata and ignores auto summary', () async {
@@ -426,6 +685,26 @@ void main() {
       result.session!.messages.single.firstLine,
       '# AGENTS.md instructions',
     );
+  });
+
+  test('invalid explicit token total falls back to components', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_parser_test_');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File(
+      '${temp.path}${Platform.pathSeparator}invalid-total.jsonl',
+    );
+    await source.writeAsString('''
+{"timestamp":"2026-07-29T17:00:00Z","type":"session_meta","payload":{"id":"invalid-total"}}
+{"timestamp":"2026-07-29T17:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":121600},"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":121600},"model_context_window":121600}}}
+{"timestamp":"2026-07-29T17:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":121600},"last_token_usage":{"input_tokens":4,"output_tokens":2,"total_tokens":121600}}}}
+''');
+
+    final result = await parser.parseFile(source);
+
+    expect(result.isSuccess, isTrue);
+    expect(result.session!.usage.totalTokens, 121600);
+    expect(result.session!.usageEvents, hasLength(1));
+    expect(result.session!.usageEvents.single.usage.totalTokens, 6);
   });
 
   test('extracts subagent origin metadata from JSONL session_meta', () async {
@@ -750,6 +1029,12 @@ Map<String, Object?> _persistedProjection(CodexParsedSession session) => {
   'thread_name': session.threadName,
   'thread_source': session.threadSource,
   'parent_thread_id': session.parentThreadId,
+  'forked_from_id': session.forkedFromId,
+  'history_base_thread_id': session.historyBaseThreadId,
+  'history_base_end_ordinal_exclusive': session.historyBaseEndOrdinalExclusive,
+  'history_base_end_byte_offset': session.historyBaseEndByteOffset,
+  'subagent_history_start_ordinal': session.subagentHistoryStartOrdinal,
+  'usage_projection_status': session.usageProjectionStatus,
   'agent_nickname': session.agentNickname,
   'agent_role': session.agentRole,
   'subagent_depth': session.subagentDepth,
@@ -763,6 +1048,24 @@ Map<String, Object?> _persistedProjection(CodexParsedSession session) => {
   'models': session.modelIds.toList()..sort(),
   'usage': _usageProjection(session.usage),
   'last_turn_usage': _usageProjection(session.lastTurnUsage),
+  'usage_events': [
+    for (final event in session.usageEvents)
+      {
+        'source_record_ordinal': event.sourceRecordOrdinal,
+        'rollout_ordinal': event.rolloutOrdinal,
+        'turn_ordinal': event.turnOrdinal,
+        'counter_epoch': event.counterEpoch,
+        'occurred_at_utc': event.occurredAtUtc?.toIso8601String(),
+        'model': event.model,
+        'working_directory': event.workingDirectory,
+        'working_directory_unc': event.workingDirectoryUnc,
+        'usage': _usageProjection(event.usage),
+        'cumulative_usage': _usageProjection(event.cumulativeUsage),
+        'branch_scope': event.branchScope,
+        'derivation': event.derivation,
+        'event_fingerprint': event.eventFingerprint,
+      },
+  ],
   'messages': [
     for (final message in session.messages)
       {
@@ -809,6 +1112,7 @@ Map<String, Object?> _usageProjection(CodexUsage usage) => {
   'input': usage.inputTokens,
   'output': usage.outputTokens,
   'cached': usage.cachedInputTokens,
+  'cache_write': usage.cacheWriteInputTokens,
   'reasoning': usage.reasoningOutputTokens,
   'total': usage.totalTokens,
 };
