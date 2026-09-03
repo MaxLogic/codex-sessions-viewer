@@ -319,7 +319,8 @@ class PricingRepository {
     final rows = db.select('''
       select
         model_id, prompt_price_per_token, completion_price_per_token,
-        input_cache_read_price_per_token, source, fetched_at_utc
+        input_cache_read_price_per_token, input_cache_write_price_per_token,
+        internal_reasoning_price_per_token, source, fetched_at_utc
       from model_pricing_cache
       ${where.isEmpty ? '' : 'where ${where.join(' and ')}'}
       order by case source when 'openrouter' then 0 else 1 end, model_id
@@ -343,6 +344,12 @@ class PricingRepository {
           completionPricePerToken: row['completion_price_per_token'] as String?,
           cachedInputPricePerToken:
               row['input_cache_read_price_per_token'] as String?,
+          cacheWriteInputPricePerToken:
+              row['input_cache_write_price_per_token'] as String?,
+          internalReasoningPricePerToken:
+              row['internal_reasoning_price_per_token'] as String?,
+          source: row['source'] as String?,
+          fetchedAtUtc: _dateTimeUtc(row['fetched_at_utc']),
         ),
       );
     }
@@ -355,6 +362,9 @@ class PricingRepository {
             promptPricePerToken: override.prompt,
             completionPricePerToken: override.completion,
             cachedInputPricePerToken: override.inputCacheRead,
+            cacheWriteInputPricePerToken: override.inputCacheWrite,
+            internalReasoningPricePerToken: override.internalReasoning,
+            source: 'override',
           );
         }
       }
@@ -558,3 +568,6 @@ String? _stringOrNumber(Object? value) {
   }
   return null;
 }
+
+DateTime? _dateTimeUtc(Object? value) =>
+    value is String ? DateTime.tryParse(value)?.toUtc() : null;

@@ -8,6 +8,7 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/session_cache_repair.dart';
+import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
@@ -123,6 +124,331 @@ void main() {
       expect(spanNames, contains('scan.runtime.resolve_wsl_project'));
     },
   );
+
+  test('persists and reconciles branch-aware usage atomically', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_branch_usage_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    await _writeAggregateJsonlFixture(windowsRoot);
+    final aggregateOnlyParentFile = await _writeAggregateOnlyJsonFixture(
+      windowsRoot,
+    );
+    await _writeJsonFixture(windowsRoot, 'zero-usage');
+    await _writeLegacyForkUsageFixture(windowsRoot, child: true);
+    await _writeLegacyForkUsageFixture(
+      windowsRoot,
+      child: true,
+      zeroPostFork: true,
+    );
+    await _writeSelfCycleUsageFixture(windowsRoot);
+    await _writeSelfCycleUsageFixture(windowsRoot, withUsage: false);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final refresh = await controller.refresh();
+    expect(refresh.rows, hasLength(7));
+
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(() {
+      try {
+        db.close();
+      } on StateError {
+        // The success path closes this handle before the parent-late refresh.
+      }
+    });
+    final projectionRows = db.select('''
+      select session_id, usage_projection_status
+      from sessions
+      order by session_id
+      ''');
+    expect(
+      projectionRows
+          .map((row) => (row['session_id'], row['usage_projection_status']))
+          .toList(),
+      [
+        ('aggregate-jsonl-001', 'complete'),
+        ('aggregate-only-parent', 'ambiguous'),
+        ('legacy-child', 'missing_parent'),
+        ('legacy-zero-child', 'missing_parent'),
+        ('self-cycle', 'ambiguous'),
+        ('self-cycle-zero', 'ambiguous'),
+        ('zero-usage', 'complete'),
+      ],
+    );
+    final event = db.select('''
+      select
+        source_record_ordinal,
+        occurred_at_utc,
+        model,
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+        branch_scope,
+        derivation,
+        length(event_fingerprint) as fingerprint_length
+      from usage_events
+      where session_row_id = (
+        select id from sessions where session_id = 'aggregate-jsonl-001'
+      )
+      ''').single;
+    expect(event['source_record_ordinal'], 4);
+    expect(event['occurred_at_utc'], '2026-06-10T10:00:04.000Z');
+    expect(event['model'], 'gpt-5.5-thinking');
+    expect(event['input_tokens'], 42);
+    expect(event['cached_input_tokens'], 7);
+    expect(event['cache_write_input_tokens'], 0);
+    expect(event['output_tokens'], 21);
+    expect(event['reasoning_output_tokens'], 0);
+    expect(event['total_tokens'], 63);
+    expect(event['branch_scope'], 'local');
+    expect(event['derivation'], 'cumulative_delta');
+    expect(event['fingerprint_length'], 64);
+    expect(
+      db
+          .select('select count(*) as count from billable_usage_events')
+          .single['count'],
+      1,
+    );
+    db.execute('''
+      insert into sessions (
+        id, session_id, forked_from_id, usage_projection_status,
+        source_type, source_file_path, display_path, platform_path,
+        parser_version, created_at_utc, updated_at_utc
+      ) values (
+        'old-child-row', 'old-child', 'legacy-parent', 'legacy_pending',
+        'windows', 'old-child.jsonl', 'old-child.jsonl', 'old-child.jsonl',
+        2, '2026-07-28T10:00:00Z', '2026-07-28T10:00:00Z'
+      )
+      ''');
+    db.execute(
+      '''
+      insert into sessions (
+        id, session_id, forked_from_id, usage_projection_status,
+        source_type, source_file_path, display_path, platform_path,
+        parser_version, created_at_utc, updated_at_utc
+      ) values (
+        'aggregate-child-row', 'aggregate-child', 'aggregate-only-parent',
+        'ambiguous', 'windows', 'aggregate-child.jsonl',
+        'aggregate-child.jsonl', 'aggregate-child.jsonl', ?,
+        '2026-07-28T10:00:00Z', '2026-07-28T10:00:00Z'
+      )
+      ''',
+      [CodexSessionParser.currentVersion],
+    );
+    db.execute(
+      '''
+      insert into usage_events (
+        session_row_id, source_record_ordinal, epoch, input_tokens,
+        cached_input_tokens, cache_write_input_tokens, output_tokens,
+        reasoning_output_tokens, total_tokens, branch_scope, derivation,
+        event_fingerprint
+      ) values ('aggregate-child-row', 1, 0, 3, 0, 0, 2, 0, 5,
+        'ambiguous', 'cumulative_delta', ?)
+      ''',
+      ['e' * 64],
+    );
+
+    db.close();
+    await aggregateOnlyParentFile.writeAsString(
+      '${await aggregateOnlyParentFile.readAsString()}\n',
+      flush: true,
+    );
+    final parentFile = await _writeLegacyForkUsageFixture(
+      windowsRoot,
+      child: false,
+    );
+    final parentRefresh = await controller.refresh();
+    expect(parentRefresh.rows, hasLength(10));
+
+    final reconciledDb = openFileBackedDatabase(databaseFile);
+    addTearDown(reconciledDb.close);
+    expect(
+      reconciledDb
+          .select(
+            "select usage_projection_status from sessions "
+            "where session_id = 'legacy-child'",
+          )
+          .single['usage_projection_status'],
+      'complete',
+    );
+    expect(
+      reconciledDb
+          .select(
+            "select usage_projection_status from sessions "
+            "where session_id = 'old-child'",
+          )
+          .single['usage_projection_status'],
+      'legacy_pending',
+    );
+    expect(
+      reconciledDb
+          .select(
+            "select usage_projection_status from sessions "
+            "where session_id = 'aggregate-child'",
+          )
+          .single['usage_projection_status'],
+      'ambiguous',
+    );
+    expect(
+      reconciledDb
+          .select(
+            "select branch_scope from usage_events "
+            "where session_row_id = 'aggregate-child-row'",
+          )
+          .single['branch_scope'],
+      'ambiguous',
+    );
+    expect(
+      reconciledDb
+          .select('''
+            select branch_scope
+            from usage_events
+            where session_row_id = (
+              select id from sessions where session_id = 'legacy-child'
+            )
+            order by source_record_ordinal
+            ''')
+          .map((row) => row['branch_scope'])
+          .toList(),
+      ['inherited', 'inherited', 'local'],
+    );
+    final childBillable = reconciledDb.select('''
+      select count(*) as event_count, sum(total_tokens) as total_tokens
+      from billable_usage_events
+      where session_row_id = (
+        select id from sessions where session_id = 'legacy-child'
+      )
+      ''').single;
+    expect(childBillable['event_count'], 1);
+    expect(childBillable['total_tokens'], 10);
+    expect(
+      reconciledDb
+          .select('''
+            select branch_scope
+            from usage_events
+            where session_row_id = (
+              select id from sessions where session_id = 'legacy-zero-child'
+            )
+            order by source_record_ordinal
+            ''')
+          .map((row) => row['branch_scope'])
+          .toList(),
+      ['inherited', 'inherited'],
+    );
+    expect(
+      reconciledDb.select('''
+            select count(*) as count
+            from billable_usage_events
+            where session_row_id = (
+              select id from sessions where session_id = 'legacy-zero-child'
+            )
+            ''').single['count'],
+      0,
+    );
+    expect(
+      reconciledDb
+          .select('select count(*) as count from usage_events')
+          .single['count'],
+      11,
+    );
+
+    await _writeLegacyGrandchildUsageFixture(windowsRoot);
+    final grandchildRefresh = await controller.refresh();
+    expect(grandchildRefresh.rows, hasLength(11));
+    expect(
+      reconciledDb
+          .select('''
+            select branch_scope
+            from usage_events
+            where session_row_id = (
+              select id from sessions where session_id = 'legacy-grandchild'
+            )
+            order by source_record_ordinal
+            ''')
+          .map((row) => row['branch_scope'])
+          .toList(),
+      ['inherited', 'inherited', 'inherited', 'local'],
+    );
+    expect(
+      reconciledDb.select('''
+            select sum(total_tokens) as total_tokens
+            from billable_usage_events
+            where session_row_id = (
+              select id from sessions where session_id = 'legacy-grandchild'
+            )
+            ''').single['total_tokens'],
+      6,
+    );
+
+    await parentFile.writeAsString(
+      '${await parentFile.readAsString()}\n',
+      flush: true,
+    );
+    await controller.refresh();
+    expect(
+      reconciledDb
+          .select('select count(*) as count from usage_events')
+          .single['count'],
+      15,
+    );
+    expect(
+      reconciledDb
+          .select('''
+            select branch_scope
+            from usage_events
+            where session_row_id = (
+              select id from sessions where session_id = 'legacy-child'
+            )
+            order by source_record_ordinal
+            ''')
+          .map((row) => row['branch_scope'])
+          .toList(),
+      ['inherited', 'inherited', 'local'],
+    );
+
+    final cancelledOperation = controller.startRefreshOperation();
+    await cancelledOperation.cancel();
+    final cancelledRefresh = await cancelledOperation.result;
+    expect(cancelledRefresh.cancelled, isTrue);
+    expect(
+      reconciledDb
+          .select('select count(*) as count from usage_events')
+          .single['count'],
+      15,
+    );
+  });
 
   test('background runtime scan emits progress and returns rows', () async {
     final temp = await Directory.systemTemp.createTemp(
@@ -925,6 +1251,18 @@ void main() {
       ''',
       [fallbackId],
     );
+    db.execute(
+      '''
+      insert into usage_events (
+        session_row_id, source_record_ordinal, epoch, input_tokens,
+        cached_input_tokens, cache_write_input_tokens, output_tokens,
+        reasoning_output_tokens, total_tokens, branch_scope, derivation,
+        event_fingerprint
+      ) values (?, 1, 0, 1, 0, 0, 1, 0, 2, 'local',
+        'cumulative_delta', ?)
+      ''',
+      [fallbackId, 'c' * 64],
+    );
     final fallbackRowId = db.select('select rowid from sessions where id = ?', [
       fallbackId,
     ]).single['rowid'];
@@ -1064,6 +1402,14 @@ void main() {
         reason: '$table must not retain fallback ownership',
       );
     }
+    expect(
+      migrated.select(
+        'select count(*) as count from usage_events '
+        'where session_row_id = ?',
+        [fallbackId],
+      ).single['count'],
+      0,
+    );
     expect(migrated.select('pragma foreign_key_check'), isEmpty);
   });
 
@@ -1163,6 +1509,18 @@ void main() {
       'insert into session_path_keys (session_id, path_key) values (?, ?)',
       [fallbackId, 'c:/old/fallback-rollback.jsonl'],
     );
+    db.execute(
+      '''
+      insert into usage_events (
+        session_row_id, source_record_ordinal, epoch, input_tokens,
+        cached_input_tokens, cache_write_input_tokens, output_tokens,
+        reasoning_output_tokens, total_tokens, branch_scope, derivation,
+        event_fingerprint
+      ) values ('session:fallback-rollback', 9, 0, 4, 0, 0, 2, 0, 6,
+        'local', 'cumulative_delta', ?)
+      ''',
+      ['d' * 64],
+    );
     db.execute('''
       create trigger fail_identity_reconciliation
       before delete on sessions
@@ -1216,7 +1574,177 @@ void main() {
         reason: '$table must roll back with the identity transaction',
       );
     }
+    expect(
+      rolledBack.select('''
+            select source_record_ordinal, total_tokens
+            from usage_events
+            where session_row_id = 'session:fallback-rollback'
+            ''').single,
+      containsPair('total_tokens', 6),
+    );
     expect(rolledBack.select('pragma foreign_key_check'), isEmpty);
+  });
+
+  test('non-winning identity cleanup retries dependent usage', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_nonwinning_usage_merge_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    final candidateFile = await _writeIdentityFixture(
+      windowsRoot,
+      fileName: 'merge-parent.json',
+      sessionId: 'merge-parent',
+      messages: const [
+        ('user', '2026-07-27T14:00:00Z', 'older duplicate candidate'),
+      ],
+    );
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final alternateId = 'source:${candidateFile.path}';
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(() {
+      try {
+        db.close();
+      } on StateError {
+        // The success path closes this setup handle before scanning.
+      }
+    });
+    db.execute('drop index idx_sessions_session_id_unique');
+    for (final row in [
+      (
+        id: 'session:merge-parent',
+        sessionId: 'merge-parent',
+        sourcePath: 'canonical-parent.jsonl',
+        projectionStatus: 'complete',
+      ),
+      (
+        id: alternateId,
+        sessionId: 'merge-parent',
+        sourcePath: candidateFile.path,
+        projectionStatus: 'legacy_pending',
+      ),
+      (
+        id: 'session:merge-child',
+        sessionId: 'merge-child',
+        sourcePath: 'merge-child.jsonl',
+        projectionStatus: 'ambiguous',
+      ),
+    ]) {
+      db.execute(
+        '''
+        insert into sessions (
+          id, session_id, forked_from_id, usage_projection_status,
+          source_type, source_file_path, display_path, platform_path,
+          parser_version, parse_status, scan_status, last_message_at_utc,
+          modified_utc, file_size, created_at_utc, updated_at_utc
+        ) values (?, ?, ?, ?, 'windows', ?, ?, ?, ?, 'available',
+          'available', ?, '2026-07-27T14:00:00Z', 100,
+          '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
+        ''',
+        [
+          row.id,
+          row.sessionId,
+          row.id == 'session:merge-child' ? 'merge-parent' : null,
+          row.projectionStatus,
+          row.sourcePath,
+          row.sourcePath,
+          row.sourcePath,
+          CodexSessionParser.currentVersion,
+          row.id == 'session:merge-parent'
+              ? '2027-07-27T14:00:00Z'
+              : '2026-07-27T14:00:00Z',
+        ],
+      );
+    }
+    for (final event in [
+      (
+        session: 'session:merge-parent',
+        ordinal: 1,
+        scope: 'local',
+        fingerprint: 'a' * 64,
+      ),
+      (
+        session: 'session:merge-child',
+        ordinal: 1,
+        scope: 'ambiguous',
+        fingerprint: 'a' * 64,
+      ),
+      (
+        session: 'session:merge-child',
+        ordinal: 2,
+        scope: 'ambiguous',
+        fingerprint: 'b' * 64,
+      ),
+    ]) {
+      db.execute(
+        '''
+        insert into usage_events (
+          session_row_id, source_record_ordinal, epoch, input_tokens,
+          cached_input_tokens, cache_write_input_tokens, output_tokens,
+          reasoning_output_tokens, total_tokens, branch_scope, derivation,
+          event_fingerprint
+        ) values (?, ?, 0, 1, 0, 0, 1, 0, 2, ?,
+          'cumulative_delta', ?)
+        ''',
+        [event.session, event.ordinal, event.scope, event.fingerprint],
+      );
+    }
+    db.close();
+
+    await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
+
+    final reconciled = openFileBackedDatabase(databaseFile);
+    addTearDown(reconciled.close);
+    expect(
+      reconciled.select('select id from sessions where id = ?', [alternateId]),
+      isEmpty,
+    );
+    expect(
+      reconciled
+          .select(
+            "select usage_projection_status from sessions "
+            "where id = 'session:merge-child'",
+          )
+          .single['usage_projection_status'],
+      'complete',
+    );
+    expect(
+      reconciled
+          .select('''
+            select branch_scope from usage_events
+            where session_row_id = 'session:merge-child'
+            order by source_record_ordinal
+            ''')
+          .map((row) => row['branch_scope'])
+          .toList(),
+      ['inherited', 'local'],
+    );
   });
 
   test('keeps case-distinct WSL fallback identities unresolved', () async {
@@ -2237,9 +2765,9 @@ void main() {
       databaseFile: databaseFile,
     ).loadSessionDetail(cached.rows.single.id);
 
-    expect(detail?.estimatedCostDisplay, '\$0.0575');
+    expect(detail?.estimatedCostDisplay, '\$0.0545');
     expect(detail?.userMessageTokens, 12);
-    expect(detail?.assistantResponseTokens, 31);
+    expect(detail?.assistantResponseTokens, 28);
     expect(detail?.modelsUsedForDetail, ['gpt-5.5-thinking']);
   });
 
@@ -2959,6 +3487,250 @@ void main() {
     expect(second.rows.single.project, 'Manual Project');
   });
 
+  test('project mask changes remap usage events', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_usage_project_remap_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(() {
+      try {
+        db.close();
+      } on StateError {
+        // The setup handle is closed before the controller opens the database.
+      }
+    });
+    final now = DateTime.utc(2026, 6, 12, 12).toIso8601String();
+    for (final name in ['Old Auto', 'Masked', 'Manual']) {
+      db.execute(
+        '''
+        insert into projects (name, is_active, created_at_utc, updated_at_utc)
+        values (?, 1, ?, ?)
+        ''',
+        [name, now, now],
+      );
+    }
+    int projectId(String name) =>
+        db.select('select id from projects where name = ?', [name]).single['id']
+            as int;
+    final oldAutoId = projectId('Old Auto');
+    final maskedId = projectId('Masked');
+    final manualId = projectId('Manual');
+    for (final session in [
+      (id: 'automatic', projectId: oldAutoId, name: 'Old Auto', manual: 0),
+      (id: 'manual', projectId: manualId, name: 'Manual', manual: 1),
+    ]) {
+      db.execute(
+        '''
+        insert into sessions (
+          id, source_type, source_file_path, display_path, platform_path,
+          parse_status, scan_status, started_at_utc, last_message_at_utc,
+          title, message_count, model_primary, project_id,
+          project_name_snapshot, project_override, working_directory_display,
+          parser_version, usage_projection_status, created_at_utc,
+          updated_at_utc
+        ) values (?, 'windows', ?, ?, ?, 'available', 'available', ?, ?, ?,
+          1, 'gpt-5.5-thinking', ?, ?, ?, ?, ?, 'complete', ?, ?)
+        ''',
+        [
+          session.id,
+          '${session.id}.jsonl',
+          '${session.id}.jsonl',
+          '${session.id}.jsonl',
+          now,
+          now,
+          session.id,
+          session.projectId,
+          session.name,
+          session.manual,
+          r'C:\work\client\repo',
+          CodexSessionParser.currentVersion,
+          now,
+          now,
+        ],
+      );
+      final rowid = db.select('select rowid from sessions where id = ?', [
+        session.id,
+      ]).single['rowid'];
+      db.execute(
+        '''
+        insert into session_search (
+          rowid, project_name
+        ) values (?, ?)
+        ''',
+        [rowid, session.name],
+      );
+      db.execute(
+        '''
+        insert into usage_events (
+          session_row_id, source_record_ordinal, epoch, occurred_at_utc,
+          model, working_directory_display, project_id, input_tokens,
+          cached_input_tokens, cache_write_input_tokens, output_tokens,
+          reasoning_output_tokens, total_tokens, branch_scope, derivation,
+          event_fingerprint
+        ) values (?, 1, 0, ?, 'gpt-5.5-thinking', ?, ?, 10, 0, 0, 5, 0,
+          15, 'local', 'last_token_usage', ?)
+        ''',
+        [
+          session.id,
+          now,
+          r'C:\work\client\repo',
+          oldAutoId,
+          session.id.substring(0, 1) * 64,
+        ],
+      );
+    }
+    for (var ordinal = 2; ordinal <= 520; ordinal++) {
+      db.execute(
+        '''
+        insert into usage_events (
+          session_row_id, source_record_ordinal, epoch, occurred_at_utc,
+          model, working_directory_display, project_id, input_tokens,
+          cached_input_tokens, cache_write_input_tokens, output_tokens,
+          reasoning_output_tokens, total_tokens, branch_scope, derivation,
+          event_fingerprint
+        ) values ('automatic', ?, 0, ?, 'gpt-5.5-thinking', ?, ?, 1, 0, 0,
+          0, 0, 1, 'local', 'last_token_usage', ?)
+        ''',
+        [
+          ordinal,
+          now,
+          r'C:\work\client\repo',
+          oldAutoId,
+          ordinal.toRadixString(16).padLeft(64, '0'),
+        ],
+      );
+    }
+    db.execute(
+      '''
+      insert into usage_daily (
+        day_utc, model, project_id, source_type, is_archived, total_tokens
+      ) values ('2026-06-12', 'gpt-5.5-thinking', ?, 'windows', 0, 999)
+      ''',
+      [oldAutoId],
+    );
+    db.close();
+
+    await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).upsertProjectMaskAndRecalculate(
+      projectId: maskedId,
+      pathMask: 'c:/work/client/*',
+      priority: 1,
+    );
+
+    final remapped = openFileBackedDatabase(databaseFile);
+    addTearDown(remapped.close);
+    expect(
+      remapped
+          .select(
+            'select distinct project_id from usage_events order by project_id',
+          )
+          .map((row) => row['project_id'])
+          .toList(),
+      [maskedId],
+    );
+    expect(
+      remapped
+          .select('select id, project_id from sessions order by id')
+          .map((row) => (row['id'], row['project_id']))
+          .toList(),
+      [('automatic', maskedId), ('manual', manualId)],
+    );
+    expect(
+      remapped
+          .select('''
+            select s.id, ss.project_name
+            from sessions s join session_search ss on ss.rowid = s.rowid
+            order by s.id
+            ''')
+          .map((row) => (row['id'], row['project_name']))
+          .toList(),
+      [('automatic', 'Masked'), ('manual', 'Manual')],
+    );
+    expect(
+      remapped
+          .select('''
+            select project_id, total_tokens, estimated_cost_text
+            from usage_daily
+            order by project_id
+            ''')
+          .map(
+            (row) => (
+              row['project_id'],
+              row['total_tokens'],
+              row['estimated_cost_text'],
+            ),
+          )
+          .toList(),
+      [(maskedId, 534, '0.539'), (manualId, 15, '0.02')],
+    );
+
+    final dailyBeforeFailure = remapped
+        .select('select * from usage_daily order by project_id')
+        .map((row) => Map<String, Object?>.from(row))
+        .toList(growable: false);
+    remapped.execute('''
+      create trigger reject_usage_daily_rebuild
+      before insert on usage_daily
+      begin
+        select raise(abort, 'rejected usage daily rebuild');
+      end
+      ''');
+    await expectLater(
+      RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      ).upsertProjectMaskAndRecalculate(
+        projectId: oldAutoId,
+        pathMask: 'c:/work/client/*',
+        priority: 0,
+      ),
+      throwsA(isA<Object>()),
+    );
+    expect(
+      remapped
+          .select(
+            'select project_id from project_path_masks order by project_id',
+          )
+          .map((row) => row['project_id'])
+          .toList(),
+      [maskedId],
+    );
+    expect(
+      remapped
+          .select('select distinct project_id from usage_events')
+          .single['project_id'],
+      maskedId,
+    );
+    expect(
+      remapped
+          .select('select * from usage_daily order by project_id')
+          .map((row) => Map<String, Object?>.from(row))
+          .toList(growable: false),
+      dailyBeforeFailure,
+    );
+    remapped.execute('drop trigger reject_usage_daily_rebuild');
+  });
+
   test(
     'runtime falls back to aggregate token counts for JSONL message rows',
     () async {
@@ -3003,8 +3775,8 @@ void main() {
       expect(row.userMessageTokens, 42);
       expect(row.assistantResponseTokens, 21);
       expect(row.toolCallTokens, 0);
-      expect(row.totalTokens, 70);
-      expect(row.estimatedCostDisplay, '\$0.0875');
+      expect(row.totalTokens, 63);
+      expect(row.estimatedCostDisplay, '\$0.0805');
 
       final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
@@ -3356,6 +4128,186 @@ Future<File> _writeAggregateJsonlFixture(Directory destination) async {
   );
   return file;
 }
+
+Future<File> _writeAggregateOnlyJsonFixture(Directory destination) async {
+  final file = File(p.join(destination.path, 'aggregate-only-parent.json'));
+  await file.writeAsString('''
+{
+  "session_id": "aggregate-only-parent",
+  "source_type": "windows",
+  "working_directory": "F:\\\\projects\\\\MaxLogic\\\\codex-sessions-viewer",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5
+  },
+  "messages": []
+}
+''');
+  return file;
+}
+
+Future<File> _writeLegacyForkUsageFixture(
+  Directory destination, {
+  required bool child,
+  bool zeroPostFork = false,
+}) async {
+  final id = child
+      ? zeroPostFork
+            ? 'legacy-zero-child'
+            : 'legacy-child'
+      : 'legacy-parent';
+  final file = File(p.join(destination.path, '$id.jsonl'));
+  final metadata = <String, Object?>{
+    'id': id,
+    'timestamp': '2026-06-11T10:00:00.000Z',
+    'cwd': r'F:\projects\MaxLogic\codex-sessions-viewer',
+    if (child) 'forked_from_id': 'legacy-parent',
+  };
+  final lines = <Map<String, Object?>>[
+    {
+      'timestamp': '2026-06-11T10:00:00.000Z',
+      'type': 'session_meta',
+      'payload': metadata,
+    },
+    {
+      'timestamp': '2026-06-11T10:00:00.500Z',
+      'type': 'turn_context',
+      'payload': {
+        'cwd': r'F:\projects\MaxLogic\codex-sessions-viewer',
+        'model': 'gpt-5.6-sol',
+      },
+    },
+    _usageFixtureRecord(
+      timestamp: '2026-06-11T10:00:01.000Z',
+      input: 10,
+      output: 5,
+      lastInput: 10,
+      lastOutput: 5,
+    ),
+    _usageFixtureRecord(
+      timestamp: '2026-06-11T10:00:02.000Z',
+      input: 20,
+      output: 10,
+      lastInput: 10,
+      lastOutput: 5,
+    ),
+    if (!zeroPostFork)
+      _usageFixtureRecord(
+        timestamp: child
+            ? '2026-06-11T10:00:03.000Z'
+            : '2026-06-11T10:00:04.000Z',
+        input: child ? 27 : 30,
+        output: child ? 13 : 15,
+        lastInput: child ? 7 : 10,
+        lastOutput: child ? 3 : 5,
+      ),
+  ];
+  await file.writeAsString(lines.map(jsonEncode).join('\n'));
+  return file;
+}
+
+Future<File> _writeLegacyGrandchildUsageFixture(Directory destination) async {
+  final file = File(p.join(destination.path, 'legacy-grandchild.jsonl'));
+  final lines = <Map<String, Object?>>[
+    {
+      'timestamp': '2026-06-11T10:00:00.000Z',
+      'type': 'session_meta',
+      'payload': {
+        'id': 'legacy-grandchild',
+        'forked_from_id': 'legacy-child',
+        'cwd': r'F:\projects\MaxLogic\codex-sessions-viewer',
+      },
+    },
+    {
+      'timestamp': '2026-06-11T10:00:00.500Z',
+      'type': 'turn_context',
+      'payload': {
+        'cwd': r'F:\projects\MaxLogic\codex-sessions-viewer',
+        'model': 'gpt-5.6-sol',
+      },
+    },
+    _usageFixtureRecord(
+      timestamp: '2026-06-11T10:00:01.000Z',
+      input: 10,
+      output: 5,
+      lastInput: 10,
+      lastOutput: 5,
+    ),
+    _usageFixtureRecord(
+      timestamp: '2026-06-11T10:00:02.000Z',
+      input: 20,
+      output: 10,
+      lastInput: 10,
+      lastOutput: 5,
+    ),
+    _usageFixtureRecord(
+      timestamp: '2026-06-11T10:00:03.000Z',
+      input: 27,
+      output: 13,
+      lastInput: 7,
+      lastOutput: 3,
+    ),
+    _usageFixtureRecord(
+      timestamp: '2026-06-11T10:00:05.000Z',
+      input: 31,
+      output: 15,
+      lastInput: 4,
+      lastOutput: 2,
+    ),
+  ];
+  await file.writeAsString(lines.map(jsonEncode).join('\n'));
+  return file;
+}
+
+Future<File> _writeSelfCycleUsageFixture(
+  Directory destination, {
+  bool withUsage = true,
+}) async {
+  final id = withUsage ? 'self-cycle' : 'self-cycle-zero';
+  final file = File(p.join(destination.path, '$id.jsonl'));
+  final lines = <Map<String, Object?>>[
+    {
+      'timestamp': '2026-06-12T10:00:00.000Z',
+      'type': 'session_meta',
+      'payload': {
+        'id': id,
+        'forked_from_id': id,
+        'cwd': r'F:\projects\MaxLogic\codex-sessions-viewer',
+      },
+    },
+    if (withUsage)
+      _usageFixtureRecord(
+        timestamp: '2026-06-12T10:00:01.000Z',
+        input: 2,
+        output: 1,
+        lastInput: 2,
+        lastOutput: 1,
+      ),
+  ];
+  await file.writeAsString(lines.map(jsonEncode).join('\n'));
+  return file;
+}
+
+Map<String, Object?> _usageFixtureRecord({
+  required String timestamp,
+  required int input,
+  required int output,
+  required int lastInput,
+  required int lastOutput,
+}) => {
+  'timestamp': timestamp,
+  'type': 'event_msg',
+  'payload': {
+    'type': 'token_count',
+    'info': {
+      'total_token_usage': {'input_tokens': input, 'output_tokens': output},
+      'last_token_usage': {
+        'input_tokens': lastInput,
+        'output_tokens': lastOutput,
+      },
+    },
+  },
+};
 
 Future<File> _writeGrowingJsonlFixture(
   Directory destination, {

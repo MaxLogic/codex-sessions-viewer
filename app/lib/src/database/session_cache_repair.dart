@@ -10,7 +10,7 @@ import '../path_mapping/path_mapper.dart';
 import '../scanner/session_scanner.dart';
 import 'database_connection.dart';
 
-const sessionCacheRepairVersion = 2;
+const sessionCacheRepairVersion = 3;
 const sessionCacheRepairCompletionKey =
     'session_cache_repair.v$sessionCacheRepairVersion.completed';
 
@@ -330,6 +330,7 @@ class SessionCacheRepair {
           throw StateError('Repair candidate disappeared before deletion.');
         }
         final id = rows.single['id'] as String;
+        db.execute('delete from usage_events where session_row_id = ?', [id]);
         db.execute('delete from tool_calls where session_id = ?', [id]);
         db.execute('delete from messages where session_id = ?', [id]);
         db.execute('delete from session_tags where session_id = ?', [id]);
@@ -603,7 +604,7 @@ void _verifyBackupSnapshot(File file, SessionCacheRepairAudit repairAudit) {
           'select coalesce(max(version), 0) as version from schema_version',
         )
         .single['version'];
-    if (schemaVersion != 14) {
+    if (schemaVersion != 15) {
       throw StateError(
         'Repair backup schema version is not the expected version.',
       );
@@ -655,6 +656,8 @@ List<_RepairEntry> _classifyRows(
         as owned_message_count,
       (select count(*) from tool_calls tc where tc.session_id = s.id)
         as owned_tool_count,
+      (select count(*) from usage_events ue where ue.session_row_id = s.id)
+        as owned_usage_count,
       (select count(*) from session_tags st where st.session_id = s.id)
         as owned_tag_count
     from sessions s
@@ -721,6 +724,7 @@ _RepairEntry _classifyRow(
             row['eval_updated_at_utc'],
             row['owned_message_count'],
             row['owned_tool_count'],
+            row['owned_usage_count'],
             row['owned_tag_count'],
           ]),
         ),
@@ -788,7 +792,8 @@ _RepairEntry _classifyRow(
         (row['parser_version'] as int) == 1 &&
         !_hasProtectedMetadata(row) &&
         (row['owned_message_count'] as int) == 0 &&
-        (row['owned_tool_count'] as int) == 0;
+        (row['owned_tool_count'] as int) == 0 &&
+        (row['owned_usage_count'] as int) == 0;
     return entry(
       SessionCacheRepairCategory.fallbackDuplicate,
       isEmptyLegacyFallback
@@ -820,6 +825,9 @@ _RepairEntry _classifyRow(
   }
   if ((row['owned_tool_count'] as int) != 0) {
     return entry(SessionCacheRepairCategory.unresolved, 'owns_tools');
+  }
+  if ((row['owned_usage_count'] as int) != 0) {
+    return entry(SessionCacheRepairCategory.unresolved, 'owns_usage_events');
   }
   if ((row['parser_version'] as int) != 1) {
     return entry(

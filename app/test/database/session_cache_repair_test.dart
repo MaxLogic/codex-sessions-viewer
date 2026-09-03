@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/session_cache_repair.dart';
+import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/path_mapping/path_mapper.dart';
 import 'package:codex_sessions_viewer/src/scanner/session_scanner.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -258,6 +259,52 @@ void main() {
       ));
     },
   );
+
+  test('protects legacy fallbacks that own usage events', () async {
+    final fixture = await _RepairFixture.create();
+    addTearDown(fixture.dispose);
+
+    final activeFile = await fixture.file('sessions/usage-owner.jsonl');
+    fixture.insertSession(
+      id: 'session:usage-owner',
+      sessionId: 'usage-owner',
+      sourcePath: activeFile.path,
+      parserVersion: CodexSessionParser.currentVersion,
+    );
+    final fallbackId = 'source:${activeFile.path}';
+    fixture.insertSession(
+      id: fallbackId,
+      sourcePath: activeFile.path,
+      parserVersion: 1,
+    );
+    fixture.insertUsageEvent(fallbackId);
+
+    final result = await SessionCacheRepair(
+      databaseFile: fixture.databaseFile,
+    ).run(db: fixture.db, roots: fixture.roots, discoveryComplete: true);
+
+    expect(result.status, SessionCacheRepairStatus.completed);
+    expect(result.deletedCount, 0);
+    expect(
+      fixture.db.select('select id from sessions where id = ?', [fallbackId]),
+      hasLength(1),
+    );
+    expect(
+      fixture.db
+          .select(
+            '''
+            select reason_code
+            from session_cache_repair_manifest
+            where session_rowid = (
+              select rowid from sessions where id = ?
+            )
+            ''',
+            [fallbackId],
+          )
+          .single['reason_code'],
+      'canonical_path_match_requires_reconciliation',
+    );
+  });
 
   test('deletes only rows satisfying every legacy allowlist predicate', () async {
     final fixture = await _RepairFixture.create();
@@ -1174,6 +1221,21 @@ class _RepairFixture {
         '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
       ''',
       [sessionId],
+    );
+  }
+
+  void insertUsageEvent(String sessionId) {
+    db.execute(
+      '''
+      insert into usage_events (
+        session_row_id, source_record_ordinal, epoch, input_tokens,
+        cached_input_tokens, cache_write_input_tokens, output_tokens,
+        reasoning_output_tokens, total_tokens, branch_scope, derivation,
+        event_fingerprint
+      ) values (?, 1, 0, 1, 0, 0, 1, 0, 2, 'local',
+        'cumulative_delta', ?)
+      ''',
+      [sessionId, 'a' * 64],
     );
   }
 

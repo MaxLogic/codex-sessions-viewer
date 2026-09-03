@@ -65,7 +65,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 14);
+    expect(versionRows.length, 15);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -125,6 +125,10 @@ void main() {
     );
     expect(versionRows[13]['checksum_length'], greaterThan(20));
     expect(versionRows[13]['success'], 1);
+    expect(versionRows[14]['version'], 15);
+    expect(versionRows[14]['filename'], '015_branch_aware_usage.sql');
+    expect(versionRows[14]['checksum_length'], greaterThan(20));
+    expect(versionRows[14]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -141,6 +145,181 @@ void main() {
     expect(_columnExists(db, 'sessions', 'eval_reviewed_at_utc'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_updated_at_utc'), isTrue);
     expect(_indexExists(db, 'idx_sessions_session_id'), isTrue);
+  });
+
+  test('migration 15 adds branch-aware usage schema', () async {
+    final result = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+    ).openAndMigrate(dbFile);
+
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
+    expect(result.lastAppliedSchemaVersion, 15);
+
+    final db = openFileBackedDatabase(dbFile);
+    addTearDown(db.close);
+
+    for (final column in [
+      'forked_from_id',
+      'history_base_thread_id',
+      'history_base_end_ordinal',
+      'history_base_end_byte_offset',
+      'subagent_history_start_ordinal',
+      'usage_projection_status',
+    ]) {
+      expect(_columnExists(db, 'sessions', column), isTrue, reason: column);
+    }
+    expect(_tableExists(db, 'usage_events'), isTrue);
+    expect(_tableExists(db, 'billable_usage_events'), isTrue);
+    for (final index in [
+      'idx_sessions_forked_from_id',
+      'idx_sessions_parent_thread_id',
+      'idx_usage_events_time_project',
+      'idx_usage_events_model_time',
+    ]) {
+      expect(_indexExists(db, index), isTrue, reason: index);
+    }
+    for (final expectation in [
+      (
+        sql: "select id from sessions where forked_from_id = 'parent'",
+        index: 'idx_sessions_forked_from_id',
+      ),
+      (
+        sql: "select id from sessions where parent_thread_id = 'parent'",
+        index: 'idx_sessions_parent_thread_id',
+      ),
+    ]) {
+      final plan = db
+          .select('explain query plan ${expectation.sql}')
+          .map((row) => row['detail'])
+          .join(' ');
+      expect(plan, contains(expectation.index));
+    }
+
+    final usageColumns = db.select('pragma table_info(usage_events)');
+    expect(
+      usageColumns
+          .where((row) => (row['pk'] as int) > 0)
+          .map((row) => row['name'])
+          .toList(),
+      ['session_row_id', 'source_record_ordinal'],
+    );
+    final sessionForeignKey = db
+        .select('pragma foreign_key_list(usage_events)')
+        .singleWhere((row) => row['from'] == 'session_row_id');
+    expect(sessionForeignKey['table'], 'sessions');
+    expect(sessionForeignKey['from'], 'session_row_id');
+    expect(sessionForeignKey['to'], 'id');
+    expect((sessionForeignKey['on_delete'] as String).toLowerCase(), 'cascade');
+
+    final viewSql =
+        db.select(
+              "select sql from sqlite_master where type = 'view' and name = ?",
+              ['billable_usage_events'],
+            ).single['sql']
+            as String;
+    expect(viewSql.toLowerCase(), contains("branch_scope = 'local'"));
+
+    db.execute('''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        created_at_utc, updated_at_utc
+      ) values (
+        'legacy-row', 'windows', 'legacy.jsonl', 'legacy.jsonl',
+        'legacy.jsonl', '2026-07-29T10:00:00Z', '2026-07-29T10:00:00Z'
+      )
+      ''');
+    expect(
+      db.select('select usage_projection_status from sessions where id = ?', [
+        'legacy-row',
+      ]).single['usage_projection_status'],
+      'legacy_pending',
+    );
+
+    db.execute(
+      '''
+      insert into usage_events (
+        session_row_id, source_record_ordinal, epoch, input_tokens,
+        cached_input_tokens, cache_write_input_tokens, output_tokens,
+        reasoning_output_tokens, total_tokens, branch_scope, derivation,
+        event_fingerprint
+      ) values (?, 7, 0, 10, 2, 1, 4, 1, 14, 'local',
+        'last_token_usage', ?)
+      ''',
+      ['legacy-row', 'a' * 64],
+    );
+    expect(
+      db
+          .select('select count(*) as count from billable_usage_events')
+          .single['count'],
+      1,
+    );
+    expect(
+      () => db.execute(
+        '''
+        insert into usage_events (
+          session_row_id, source_record_ordinal, epoch, input_tokens,
+          cached_input_tokens, cache_write_input_tokens, output_tokens,
+          reasoning_output_tokens, total_tokens, branch_scope, derivation,
+          event_fingerprint
+        ) values (?, 8, 0, -1, 0, 0, 0, 0, 0, 'local',
+          'cumulative_delta', ?)
+        ''',
+        ['legacy-row', 'b' * 64],
+      ),
+      throwsA(isA<SqliteException>()),
+    );
+
+    final upgradeSqlRoot = await _copySqlRoot(tempDir);
+    final copiedMigration = File(
+      '${upgradeSqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}015_branch_aware_usage.sql',
+    );
+    await copiedMigration.delete();
+    final upgradeDbFile = File(
+      '${tempDir.path}${Platform.pathSeparator}upgrade-from-14.sqlite',
+    );
+    final version14 = await DatabaseMigrator(
+      sqlRoot: upgradeSqlRoot,
+    ).openAndMigrate(upgradeDbFile);
+    expect(version14.canStartNormalUi, isTrue);
+    expect(version14.lastAppliedSchemaVersion, 14);
+    final version14Db = openFileBackedDatabase(upgradeDbFile);
+    version14Db.execute('''
+      insert into sessions (
+        id, session_id, source_type, source_file_path, display_path,
+        platform_path, parser_version, created_at_utc, updated_at_utc
+      ) values (
+        'legacy-upgrade', 'legacy-upgrade', 'windows', 'legacy.jsonl',
+        'legacy.jsonl', 'legacy.jsonl', 2,
+        '2026-07-28T10:00:00Z', '2026-07-28T10:00:00Z'
+      )
+      ''');
+    version14Db.close();
+    await File(
+      '../sql/migration/015_branch_aware_usage.sql',
+    ).copy(copiedMigration.path);
+
+    final upgraded = await DatabaseMigrator(
+      sqlRoot: upgradeSqlRoot,
+    ).openAndMigrate(upgradeDbFile);
+    expect(upgraded.canStartNormalUi, isTrue);
+    expect(upgraded.lastAppliedSchemaVersion, 15);
+    final upgradedDb = openFileBackedDatabase(upgradeDbFile);
+    addTearDown(upgradedDb.close);
+    expect(
+      upgradedDb.select(
+        'select session_id, parser_version, usage_projection_status '
+        'from sessions where id = ?',
+        ['legacy-upgrade'],
+      ).single,
+      containsPair('usage_projection_status', 'legacy_pending'),
+    );
+    expect(
+      upgradedDb
+          .select('select count(*) as count from usage_events')
+          .single['count'],
+      0,
+    );
   });
 
   test('marks interrupted scan runs failed on the next startup', () async {
@@ -267,7 +446,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.summary,
       );
-      expect(result.lastAppliedSchemaVersion, 14);
+      expect(result.lastAppliedSchemaVersion, 15);
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
       final rows = migrated.select(
@@ -314,7 +493,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.summary,
       );
-      expect(result.lastAppliedSchemaVersion, 14);
+      expect(result.lastAppliedSchemaVersion, 15);
 
       final db = openFileBackedDatabase(dbFile);
       addTearDown(db.close);
@@ -383,7 +562,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 14);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 15);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -428,12 +607,17 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}014_session_cache_repair_manifest.sql',
     );
+    final copiedBranchUsageMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}015_branch_aware_usage.sql',
+    );
     await copiedMigration.delete();
     await copiedProjectOverrideMigration.delete();
     await copiedStableIdentityMigration.delete();
     await copiedExternalContentMigration.delete();
     await copiedSourceStateMigration.delete();
     await copiedRepairManifestMigration.delete();
+    await copiedBranchUsageMigration.delete();
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
@@ -580,6 +764,9 @@ void main() {
     await File(
       '../sql/migration/014_session_cache_repair_manifest.sql',
     ).copy(copiedRepairManifestMigration.path);
+    await File(
+      '../sql/migration/015_branch_aware_usage.sql',
+    ).copy(copiedBranchUsageMigration.path);
 
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
@@ -633,11 +820,16 @@ void main() {
         '${sqlRoot.path}${Platform.pathSeparator}migration'
         '${Platform.pathSeparator}014_session_cache_repair_manifest.sql',
       );
+      final copiedBranchUsageMigration = File(
+        '${sqlRoot.path}${Platform.pathSeparator}migration'
+        '${Platform.pathSeparator}015_branch_aware_usage.sql',
+      );
       await copiedProjectOverrideMigration.delete();
       await copiedStableIdentityMigration.delete();
       await copiedExternalContentMigration.delete();
       await copiedSourceStateMigration.delete();
       await copiedRepairManifestMigration.delete();
+      await copiedBranchUsageMigration.delete();
       final firstRun = await DatabaseMigrator(
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
@@ -714,6 +906,9 @@ void main() {
       await File(
         '../sql/migration/014_session_cache_repair_manifest.sql',
       ).copy(copiedRepairManifestMigration.path);
+      await File(
+        '../sql/migration/015_branch_aware_usage.sql',
+      ).copy(copiedBranchUsageMigration.path);
 
       final result = await DatabaseMigrator(
         sqlRoot: sqlRoot,
@@ -978,6 +1173,10 @@ void main() {
       '${sqlRoot.path}${Platform.pathSeparator}migration'
       '${Platform.pathSeparator}014_session_cache_repair_manifest.sql',
     );
+    final branchUsageMigration = File(
+      '${sqlRoot.path}${Platform.pathSeparator}migration'
+      '${Platform.pathSeparator}015_branch_aware_usage.sql',
+    );
     if (await evalMigration.exists()) {
       await evalMigration.delete();
     }
@@ -992,6 +1191,9 @@ void main() {
     }
     if (await repairManifestMigration.exists()) {
       await repairManifestMigration.delete();
+    }
+    if (await branchUsageMigration.exists()) {
+      await branchUsageMigration.delete();
     }
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
@@ -1040,12 +1242,15 @@ void main() {
     await File(
       '../sql/migration/014_session_cache_repair_manifest.sql',
     ).copy(repairManifestMigration.path);
+    await File(
+      '../sql/migration/015_branch_aware_usage.sql',
+    ).copy(branchUsageMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 14);
+    expect(migrator.supportedSchemaVersion, 15);
     final result = await migrator.openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
-    expect(result.lastAppliedSchemaVersion, 14);
+    expect(result.lastAppliedSchemaVersion, 15);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -1163,7 +1368,7 @@ void main() {
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
       expect(result.canStartNormalUi, isTrue);
-      expect(result.lastAppliedSchemaVersion, 14);
+      expect(result.lastAppliedSchemaVersion, 15);
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);

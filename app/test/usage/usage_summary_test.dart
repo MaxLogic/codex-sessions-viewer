@@ -20,6 +20,9 @@ void main() {
     db.execute(
       File('../sql/migration/006_session_origin.sql').readAsStringSync(),
     );
+    db.execute(
+      File('../sql/migration/015_branch_aware_usage.sql').readAsStringSync(),
+    );
     repository = UsageSummaryRepository(db);
   });
 
@@ -93,8 +96,8 @@ void main() {
     expect(summary.inputTokens, 120);
     expect(summary.outputTokens, 80);
     expect(summary.cachedInputTokens, 10);
-    expect(summary.totalTokens, 210);
-    expect(summary.estimatedCostText, '1.005');
+    expect(summary.totalTokens, 200);
+    expect(summary.estimatedCostText, '0.995');
     expect(summary.costUnknown, isFalse);
     expect(summary.mostUsedModel, 'GPT A');
     expect(summary.mostActiveProject, 'Viewer');
@@ -107,6 +110,311 @@ void main() {
     expect(summary.topSessionsByTokens.first.sessionId, 'alpha');
     expect(summary.topSessionsByMessageCount.first.sessionId, 'alpha');
     expect(summary.topSessionsByEstimatedCost.first.sessionId, 'beta');
+  });
+
+  test('aggregates branch-local usage by event time model and project', () {
+    final autoA = _insertProject(db, 'Auto A');
+    final autoB = _insertProject(db, 'Auto B');
+    final manual = _insertProject(db, 'Manual');
+    _insertSession(
+      db,
+      id: 'parent',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 11, 23),
+      messageCount: 9,
+      modelPrimary: 'gpt-5.5',
+      projectId: autoA,
+      projectName: 'Auto A',
+    );
+    _insertSession(
+      db,
+      id: 'child',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12, 9),
+      messageCount: 4,
+      modelPrimary: 'gpt-5.6-sol',
+      projectId: autoA,
+      projectName: 'Auto A',
+    );
+    _insertSession(
+      db,
+      id: 'manual-child',
+      sourceType: 'wsl',
+      startedAtUtc: DateTime.utc(2026, 6, 12, 10),
+      messageCount: 2,
+      modelPrimary: 'gpt-5.5',
+      projectId: manual,
+      projectName: 'Manual',
+      projectOverride: true,
+    );
+    _insertSession(
+      db,
+      id: 'grandchild',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12, 11),
+      messageCount: 1,
+      modelPrimary: 'gpt-5.6-terra',
+      projectId: autoA,
+      projectName: 'Auto A',
+    );
+    db.execute("update sessions set usage_projection_status = 'complete'");
+
+    _insertUsageEvent(
+      db,
+      sessionId: 'parent',
+      ordinal: 1,
+      occurredAtUtc: DateTime.utc(2026, 6, 12),
+      model: 'gpt-5.5',
+      projectId: autoA,
+      inputTokens: 10,
+      cachedInputTokens: 2,
+      cacheWriteInputTokens: 1,
+      outputTokens: 5,
+      totalTokens: 15,
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'parent',
+      ordinal: 2,
+      occurredAtUtc: DateTime.utc(2026, 6, 13),
+      model: 'gpt-5.5',
+      projectId: autoA,
+      inputTokens: 1000,
+      outputTokens: 1000,
+      totalTokens: 2000,
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'child',
+      ordinal: 1,
+      occurredAtUtc: DateTime.utc(2026, 6, 12, 8),
+      model: 'gpt-5.5',
+      projectId: autoA,
+      inputTokens: 100,
+      outputTokens: 50,
+      totalTokens: 150,
+      branchScope: 'inherited',
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'child',
+      ordinal: 2,
+      occurredAtUtc: DateTime.utc(2026, 6, 12, 10),
+      model: 'gpt-5.6-sol',
+      projectId: autoB,
+      inputTokens: 20,
+      cachedInputTokens: 4,
+      cacheWriteInputTokens: 2,
+      outputTokens: 10,
+      totalTokens: 30,
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'child',
+      ordinal: 3,
+      occurredAtUtc: DateTime.utc(2026, 6, 12, 11),
+      model: 'gpt-5.6-terra',
+      projectId: autoB,
+      inputTokens: 8,
+      cachedInputTokens: 1,
+      outputTokens: 4,
+      totalTokens: 12,
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'manual-child',
+      ordinal: 1,
+      occurredAtUtc: DateTime.utc(2026, 6, 12, 12),
+      model: 'gpt-5.5',
+      projectId: autoB,
+      inputTokens: 5,
+      outputTokens: 2,
+      totalTokens: 7,
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'grandchild',
+      ordinal: 1,
+      occurredAtUtc: DateTime.utc(2026, 6, 12, 11, 30),
+      model: 'gpt-5.6-terra',
+      projectId: autoA,
+      inputTokens: 8,
+      outputTokens: 4,
+      totalTokens: 12,
+      branchScope: 'inherited',
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'grandchild',
+      ordinal: 2,
+      occurredAtUtc: DateTime.utc(2026, 6, 12, 12, 30),
+      model: 'gpt-5.6-terra',
+      projectId: autoA,
+      inputTokens: 3,
+      outputTokens: 1,
+      totalTokens: 4,
+    );
+
+    final summary = repository.summarize(
+      UsageSummaryRequest(
+        period: UsagePeriod.today,
+        nowUtc: DateTime.utc(2026, 6, 12, 15),
+      ),
+      pricing: const UsagePricingCatalog({
+        'openai/gpt-5.5': UsageModelPricing(
+          promptPricePerToken: '0.01',
+          completionPricePerToken: '0.02',
+          cachedInputPricePerToken: '0.001',
+          cacheWriteInputPricePerToken: '0.02',
+        ),
+        'openai/gpt-5.6-sol': UsageModelPricing(
+          promptPricePerToken: '0.02',
+          completionPricePerToken: '0.03',
+          cachedInputPricePerToken: '0.002',
+          cacheWriteInputPricePerToken: '0.04',
+        ),
+        'openai/gpt-5.6-terra': UsageModelPricing(
+          promptPricePerToken: '0.005',
+          completionPricePerToken: '0.01',
+          cachedInputPricePerToken: '0.001',
+          cacheWriteInputPricePerToken: '0.02',
+        ),
+      }),
+    );
+
+    expect(summary.totalSessions, 3);
+    expect(summary.totalMessages, 7);
+    expect(summary.inputTokens, 46);
+    expect(summary.outputTokens, 22);
+    expect(summary.cachedInputTokens, 7);
+    expect(summary.totalTokens, 68);
+    expect(summary.estimatedCostText, '1.051');
+    expect(summary.byModel.map((row) => (row.key, row.totalTokens)), [
+      ('GPT 5.6 Sol', 30),
+      ('GPT 5.5', 22),
+      ('GPT 5.6 Terra', 16),
+    ]);
+    expect(summary.byProject.map((row) => (row.key, row.totalTokens)), [
+      ('Auto B', 42),
+      ('Auto A', 19),
+      ('Manual', 7),
+    ]);
+    expect(summary.byPlatform.map((row) => (row.key, row.totalTokens)), [
+      ('Windows', 61),
+      ('WSL', 7),
+    ]);
+    expect(summary.topSessionsByTokens.first.sessionId, 'child');
+    expect(summary.topSessionsByTokens.first.totalTokens, 42);
+    expect(summary.topSessionsByEstimatedCost.first.sessionId, 'child');
+  });
+
+  test('reports projection coverage and pricing diagnostics', () {
+    for (final id in const [
+      'current',
+      'zero',
+      'inherited-only',
+      'stale',
+      'pending',
+      'ambiguous',
+      'missing',
+    ]) {
+      final hasUsage = id == 'current' || id == 'stale';
+      _insertSession(
+        db,
+        id: id,
+        sourceType: 'windows',
+        startedAtUtc: DateTime.utc(2026, 6, 12, 8),
+        modelPrimary: id == 'current'
+            ? 'gpt-5.6-sol'
+            : id == 'stale'
+            ? 'gpt-stale'
+            : null,
+        inputTokens: hasUsage ? 10 : 0,
+        outputTokens: hasUsage ? 5 : 0,
+        totalTokens: hasUsage ? 15 : 0,
+      );
+    }
+    db.execute(
+      "update sessions set parser_version = 3 where id in ('current', 'zero', 'inherited-only')",
+    );
+    db.execute("update sessions set parser_version = 2 where id = 'stale'");
+    db.execute(
+      "update sessions set parser_version = 3, usage_projection_status = 'legacy_pending' where id = 'pending'",
+    );
+    db.execute(
+      "update sessions set parser_version = 3, usage_projection_status = 'ambiguous' where id = 'ambiguous'",
+    );
+    db.execute(
+      "update sessions set parser_version = 3, usage_projection_status = 'missing_parent' where id = 'missing'",
+    );
+    _insertUsageEvent(
+      db,
+      sessionId: 'inherited-only',
+      ordinal: 1,
+      occurredAtUtc: DateTime.utc(2026, 6, 12, 9),
+      model: 'gpt-5.5',
+      projectId: null,
+      inputTokens: 100,
+      outputTokens: 50,
+      totalTokens: 150,
+      branchScope: 'inherited',
+    );
+    final fetchedAt = DateTime.utc(2026, 7, 29, 8);
+
+    final summary = repository.summarize(
+      UsageSummaryRequest(
+        period: UsagePeriod.today,
+        nowUtc: DateTime.utc(2026, 6, 12, 12),
+        projectionVersion: 3,
+      ),
+      pricing: UsagePricingCatalog({
+        'openai/gpt-5.6-sol': UsageModelPricing(
+          promptPricePerToken: '0.000005',
+          completionPricePerToken: '0.00003',
+          source: 'openrouter',
+          fetchedAtUtc: fetchedAt,
+        ),
+      }),
+    );
+
+    expect(
+      summary.projectionCoverage,
+      isA<UsageProjectionCoverage>()
+          .having((value) => value.projectionVersion, 'version', 3)
+          .having((value) => value.availableSessions, 'available', 7)
+          .having((value) => value.currentCompleteSessions, 'complete', 3)
+          .having((value) => value.outdatedProjectionSessions, 'outdated', 1)
+          .having((value) => value.legacyPendingSessions, 'pending', 1)
+          .having((value) => value.ambiguousSessions, 'ambiguous', 1)
+          .having((value) => value.missingParentSessions, 'missing parent', 1)
+          .having((value) => value.completeZeroUsageSessions, 'zero usage', 2),
+    );
+    expect(summary.pricingStatus.openRouterFetchedAtUtc, fetchedAt);
+    expect(summary.totalTokens, 15);
+    expect(summary.byModel.where((row) => row.totalTokens > 0), hasLength(1));
+    expect(summary.pricingStatus.models, hasLength(1));
+    expect(
+      summary.pricingStatus.models.single,
+      isA<UsageModelPricingStatus>()
+          .having((value) => value.rawModelId, 'raw model', 'gpt-5.6-sol')
+          .having(
+            (value) => value.effectiveModelId,
+            'effective model',
+            'gpt-5.6-sol',
+          )
+          .having(
+            (value) => value.resolvedModelId,
+            'resolved model',
+            'openai/gpt-5.6-sol',
+          )
+          .having(
+            (value) => value.resolutionMethod,
+            'method',
+            UsageModelResolutionMethod.openAiExact,
+          )
+          .having((value) => value.cacheState, 'cache state', 'cached')
+          .having((value) => value.fetchedAtUtc, 'fetched at', fetchedAt),
+    );
   });
 
   test('breaks down origin without double-counting raw totals', () {
@@ -171,13 +479,13 @@ void main() {
     );
 
     expect(summary.totalSessions, 3);
-    expect(summary.totalTokens, 175);
-    expect(summary.byProject.single.totalTokens, 175);
+    expect(summary.totalTokens, 145);
+    expect(summary.byProject.single.totalTokens, 145);
     expect(
       summary.byOrigin.map(
         (row) => (row.key, row.sessionCount, row.totalTokens),
       ),
-      [('User', 1, 100), ('Subagent', 1, 50), ('Unknown', 1, 25)],
+      [('User', 1, 80), ('Subagent', 1, 45), ('Unknown', 1, 20)],
     );
     expect(summary.topSessionsByTokens[1].originLabel, 'Subagent');
   });
@@ -224,7 +532,7 @@ void main() {
         }),
         includeSessionIds: const {'precise'},
       );
-      expect(preciseOnly.estimatedCostText, '0.000000000000000014');
+      expect(preciseOnly.estimatedCostText, '0.000000000000000011');
 
       final withUnknown = repository.summarize(
         UsageSummaryRequest(
@@ -273,9 +581,100 @@ void main() {
       }),
     );
 
-    expect(estimate.estimatedCostText, '0.0575');
+    expect(estimate.estimatedCostText, '0.0545');
     expect(estimate.costUnknown, isFalse);
-    expect(estimate.estimatedCostDisplay, '\$0.0575');
+    expect(estimate.estimatedCostDisplay, '\$0.0545');
+  });
+
+  test('prices mutually exclusive input buckets exactly once', () {
+    const pricing = UsagePricingCatalog({
+      'openai/gpt-current': UsageModelPricing(
+        promptPricePerToken: '0.01',
+        completionPricePerToken: '0.02',
+        cachedInputPricePerToken: '0.001',
+        cacheWriteInputPricePerToken: '0.02',
+        internalReasoningPricePerToken: '9',
+      ),
+    });
+
+    final estimate = estimateUsageCost(
+      inputTokens: 100,
+      cachedInputTokens: 20,
+      cacheWriteInputTokens: 10,
+      outputTokens: 30,
+      reasoningOutputTokens: 5,
+      model: 'openai/gpt-current',
+      pricing: pricing,
+    );
+
+    expect(estimate.estimatedCostText, '1.52');
+    expect(estimate.costUnknown, isFalse);
+
+    final invalidOverlap = estimateUsageCost(
+      inputTokens: 10,
+      cachedInputTokens: 7,
+      cacheWriteInputTokens: 4,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      model: 'openai/gpt-current',
+      pricing: pricing,
+    );
+    expect(invalidOverlap.costUnknown, isTrue);
+
+    final invalidReasoning = estimateUsageCost(
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      outputTokens: 3,
+      reasoningOutputTokens: 4,
+      model: 'openai/gpt-current',
+      pricing: pricing,
+    );
+    expect(invalidReasoning.costUnknown, isTrue);
+
+    final unpricedWrite = estimateUsageCost(
+      inputTokens: 1,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 1,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      model: 'openai/no-write-price',
+      pricing: const UsagePricingCatalog({
+        'openai/no-write-price': UsageModelPricing(
+          promptPricePerToken: '0.01',
+          completionPricePerToken: '0.02',
+          cachedInputPricePerToken: '0.001',
+        ),
+      }),
+    );
+    expect(unpricedWrite.costUnknown, isTrue);
+
+    final zeroWriteNeedsNoWritePrice = estimateUsageCost(
+      inputTokens: 1,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      model: 'openai/no-write-price',
+      pricing: const UsagePricingCatalog({
+        'openai/no-write-price': UsageModelPricing(promptPricePerToken: '0.01'),
+      }),
+    );
+    expect(zeroWriteNeedsNoWritePrice.estimatedCostText, '0.01');
+    expect(zeroWriteNeedsNoWritePrice.costUnknown, isFalse);
+
+    final negativePrice = estimateUsageCost(
+      inputTokens: 1,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      model: 'openai/negative',
+      pricing: const UsagePricingCatalog({
+        'openai/negative': UsageModelPricing(promptPricePerToken: '-0.01'),
+      }),
+    );
+    expect(negativePrice.costUnknown, isTrue);
   });
 
   test('rebuilds usage_daily with persisted decimal cost text', () {
@@ -305,8 +704,28 @@ void main() {
       projectId: 7,
       projectName: 'Viewer',
     );
+    _insertSession(
+      db,
+      id: 'daily-stale',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12, 10),
+      inputTokens: 100,
+      outputTokens: 50,
+      cachedInputTokens: 0,
+      totalTokens: 150,
+      modelPrimary: 'openai/gpt-a',
+      projectId: 7,
+      projectName: 'Viewer',
+    );
+    db.execute(
+      "update sessions set parser_version = 3 where id in ('daily-a', 'daily-b')",
+    );
+    db.execute(
+      "update sessions set parser_version = 2 where id = 'daily-stale'",
+    );
 
     repository.rebuildDailyUsage(
+      projectionVersion: 3,
       pricing: const UsagePricingCatalog({
         'openai/gpt-a': UsageModelPricing(
           promptPricePerToken: '0.1',
@@ -321,13 +740,13 @@ void main() {
     expect(row['model'], 'openai/gpt-a');
     expect(row['project_id'], 7);
     expect(row['source_type'], 'windows');
-    expect(row['session_count'], 2);
+    expect(row['session_count'], 3);
     expect(row['message_count'], 0);
     expect(row['input_tokens'], 11);
     expect(row['output_tokens'], 6);
     expect(row['cached_input_tokens'], 2);
-    expect(row['total_tokens'], 19);
-    expect(row['estimated_cost_text'], '2.4');
+    expect(row['total_tokens'], 17);
+    expect(row['estimated_cost_text'], '2.2');
   });
 
   test('treats malformed prices and partial token usage as cost unknown', () {
@@ -373,9 +792,9 @@ void main() {
       }),
     );
 
-    expect(summary.inputTokens, 20);
+    expect(summary.inputTokens, 10);
     expect(summary.outputTokens, 1);
-    expect(summary.totalTokens, 31);
+    expect(summary.totalTokens, 11);
     expect(summary.costUnknown, isTrue);
     expect(summary.estimatedCostDisplay, 'Cost unknown');
   });
@@ -400,6 +819,57 @@ void main() {
 
     expect(summary.byWeek.single.key, '2025-W01');
   });
+
+  test('uses indexed SQLite aggregation for usage events', () {
+    final projectId = _insertProject(db, 'Large');
+    _insertSession(
+      db,
+      id: 'large',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12),
+      modelPrimary: 'gpt-5.6-sol',
+      projectId: projectId,
+      projectName: 'Large',
+    );
+    db.execute('begin');
+    try {
+      for (var ordinal = 0; ordinal < 2000; ordinal++) {
+        _insertUsageEvent(
+          db,
+          sessionId: 'large',
+          ordinal: ordinal,
+          occurredAtUtc: DateTime.utc(
+            2026,
+            6,
+            12,
+            1,
+          ).add(Duration(milliseconds: ordinal)),
+          model: 'gpt-5.6-sol',
+          projectId: projectId,
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+        );
+      }
+      db.execute('commit');
+    } on Object {
+      db.execute('rollback');
+      rethrow;
+    }
+
+    final request = UsageSummaryRequest(
+      period: UsagePeriod.today,
+      nowUtc: DateTime.utc(2026, 6, 12, 12),
+    );
+    final summary = repository.summarize(request);
+    final plan = repository.explainUsageEventAggregation(request).join('\n');
+
+    expect(summary.totalTokens, 4000);
+    expect(summary.byModel.single.totalTokens, 4000);
+    expect(plan, contains('idx_usage_events_time_project'));
+    expect(plan, contains('sqlite_autoindex_sessions_1'));
+    expect(plan, isNot(contains('SCAN usage_events')));
+  });
 }
 
 void _insertSession(
@@ -418,8 +888,12 @@ void _insertSession(
   String? projectName,
   bool isArchived = false,
   String? threadSource,
+  bool projectOverride = false,
 }) {
   final now = DateTime.utc(2026, 6, 12, 12).toIso8601String();
+  final effectiveProjectId =
+      projectId ??
+      (projectName == null ? null : _ensureProject(db, projectName));
   db.execute(
     '''
     insert into sessions (
@@ -427,9 +901,9 @@ void _insertSession(
       parse_status, scan_status, started_at_utc, last_message_at_utc,
       title, message_count, input_tokens, output_tokens, cached_input_tokens,
       total_tokens, model_primary, models_used, project_id,
-      project_name_snapshot, is_archived, thread_source, created_at_utc,
+      project_name_snapshot, project_override, is_archived, thread_source, created_at_utc,
       updated_at_utc
-    ) values (?, ?, ?, ?, ?, 'available', 'available', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (?, ?, ?, ?, ?, 'available', 'available', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''',
     [
       id,
@@ -447,12 +921,95 @@ void _insertSession(
       totalTokens,
       modelPrimary,
       modelPrimary == null ? null : '|$modelPrimary|',
-      projectId,
+      effectiveProjectId,
       projectName,
+      projectOverride ? 1 : 0,
       isArchived ? 1 : 0,
       threadSource,
       now,
       now,
+    ],
+  );
+  db.execute(
+    "update sessions set usage_projection_status = 'complete' where id = ?",
+    [id],
+  );
+  if (inputTokens != null &&
+      outputTokens != null &&
+      cachedInputTokens != null &&
+      inputTokens + outputTokens + cachedInputTokens > 0) {
+    _insertUsageEvent(
+      db,
+      sessionId: id,
+      ordinal: 999,
+      occurredAtUtc: startedAtUtc,
+      model: modelPrimary,
+      projectId: effectiveProjectId,
+      inputTokens: inputTokens,
+      cachedInputTokens: cachedInputTokens,
+      outputTokens: outputTokens,
+      totalTokens: totalTokens ?? inputTokens + outputTokens,
+    );
+  }
+}
+
+int _insertProject(Database db, String name) {
+  final now = DateTime.utc(2026, 6, 12).toIso8601String();
+  db.execute(
+    '''
+    insert into projects (name, is_active, created_at_utc, updated_at_utc)
+    values (?, 1, ?, ?)
+    ''',
+    [name, now, now],
+  );
+  return db.lastInsertRowId;
+}
+
+int _ensureProject(Database db, String name) {
+  final existing = db.select('select id from projects where name = ?', [name]);
+  return existing.isEmpty
+      ? _insertProject(db, name)
+      : existing.single['id'] as int;
+}
+
+void _insertUsageEvent(
+  Database db, {
+  required String sessionId,
+  required int ordinal,
+  required DateTime occurredAtUtc,
+  required String? model,
+  required int? projectId,
+  required int inputTokens,
+  int cachedInputTokens = 0,
+  int cacheWriteInputTokens = 0,
+  required int outputTokens,
+  int reasoningOutputTokens = 0,
+  required int totalTokens,
+  String branchScope = 'local',
+}) {
+  db.execute(
+    '''
+    insert into usage_events (
+      session_row_id, source_record_ordinal, epoch, occurred_at_utc, model,
+      project_id, input_tokens, cached_input_tokens,
+      cache_write_input_tokens, output_tokens, reasoning_output_tokens,
+      total_tokens, branch_scope, derivation, event_fingerprint
+    ) values (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'last_token_usage', ?)
+    ''',
+    [
+      sessionId,
+      ordinal,
+      occurredAtUtc.toIso8601String(),
+      model,
+      projectId,
+      inputTokens,
+      cachedInputTokens,
+      cacheWriteInputTokens,
+      outputTokens,
+      reasoningOutputTokens,
+      totalTokens,
+      branchScope,
+      '$sessionId:$ordinal'.padRight(64, '0').substring(0, 64),
     ],
   );
 }

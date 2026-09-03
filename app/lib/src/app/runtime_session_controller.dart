@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 
 import '../config/app_settings.dart';
 import '../database/database_connection.dart';
+import '../database/project_tag_state.dart';
 import '../database/session_cache_repair.dart';
 import '../logging/structured_logger.dart';
 import '../parser/codex_session_parser.dart';
@@ -543,6 +544,29 @@ class RuntimeSessionController {
     SessionsRefreshProgressCallback? onProgress,
   }) {
     return startRefreshOperation(onProgress: onProgress).result;
+  }
+
+  Future<int> upsertProjectMaskAndRecalculate({
+    required int projectId,
+    required String pathMask,
+    int priority = 100,
+    bool isActive = true,
+  }) async {
+    final settings = await SettingsRepository(settingsFile).loadOrCreate();
+    final db = openFileBackedDatabase(databaseFile);
+    try {
+      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      return ProjectTagStateStore(db).upsertProjectMaskAndRecalculate(
+        projectId: projectId,
+        pathMask: pathMask,
+        priority: priority,
+        isActive: isActive,
+        projectionVersion: CodexSessionParser.currentVersion,
+        pricing: pricing,
+      );
+    } finally {
+      db.close();
+    }
   }
 
   Future<SessionsRefreshResult> _refresh({
@@ -1648,6 +1672,11 @@ void _upsertParsedSession(
   if (!_candidateShouldReplacePersistedSession(db, scannedSession)) {
     if (identityMerge != null) {
       _applyIdentityMerge(db, parsed.internalId, identityMerge);
+      _reconcileAffectedLegacyUsage(
+        db,
+        replacedSessionRowId: parsed.internalId,
+        replacedLogicalSessionId: parsed.sessionId,
+      );
     }
     return;
   }
@@ -1712,6 +1741,12 @@ void _upsertParsedSession(
       thread_name = ?,
       thread_source = ?,
       parent_thread_id = ?,
+      forked_from_id = ?,
+      history_base_thread_id = ?,
+      history_base_end_ordinal = ?,
+      history_base_end_byte_offset = ?,
+      subagent_history_start_ordinal = ?,
+      usage_projection_status = ?,
       agent_nickname = ?,
       agent_role = ?,
       subagent_depth = ?,
@@ -1748,6 +1783,12 @@ void _upsertParsedSession(
       resolvedThreadName,
       parsed.threadSource,
       parsed.parentThreadId,
+      parsed.forkedFromId,
+      parsed.historyBaseThreadId,
+      parsed.historyBaseEndOrdinalExclusive,
+      parsed.historyBaseEndByteOffset,
+      parsed.subagentHistoryStartOrdinal,
+      parsed.usageProjectionStatus,
       parsed.agentNickname,
       parsed.agentRole,
       parsed.subagentDepth,
@@ -1790,9 +1831,21 @@ void _upsertParsedSession(
   }
   _replaceMessages(db, parsed, now);
   _replaceToolCalls(db, parsed);
+  _replaceUsageEvents(
+    db,
+    parsed,
+    now,
+    projectResolver,
+    sourceType: scannedSession.sourceType,
+  );
   if (identityMerge != null) {
     _applyIdentityMerge(db, parsed.internalId, identityMerge);
   }
+  _reconcileAffectedLegacyUsage(
+    db,
+    replacedSessionRowId: parsed.internalId,
+    replacedLogicalSessionId: parsed.sessionId,
+  );
 }
 
 _IdentityMergeState? _captureIdentityMergeState(
@@ -2039,6 +2092,9 @@ void _applyIdentityMerge(
   );
 
   for (final alternateId in merge.alternateIds) {
+    db.execute('delete from usage_events where session_row_id = ?', [
+      alternateId,
+    ]);
     db.execute('delete from tool_calls where session_id = ?', [alternateId]);
     db.execute('delete from messages where session_id = ?', [alternateId]);
     db.execute('delete from session_tags where session_id = ?', [alternateId]);
@@ -2503,6 +2559,337 @@ void _replaceToolCalls(Database db, CodexParsedSession parsed) {
       ],
     );
   }
+}
+
+void _replaceUsageEvents(
+  Database db,
+  CodexParsedSession parsed,
+  String now,
+  _ProjectPathResolver projectResolver, {
+  required SessionSourceType sourceType,
+}) {
+  db.execute('delete from usage_events where session_row_id = ?', [
+    parsed.internalId,
+  ]);
+  if (parsed.usageEvents.isEmpty) {
+    return;
+  }
+
+  final projectIdsByName = <String, int>{};
+  final insert = db.prepare('''
+    insert into usage_events (
+      session_row_id,
+      source_record_ordinal,
+      rollout_ordinal,
+      turn_ordinal,
+      epoch,
+      occurred_at_utc,
+      model,
+      working_directory_display,
+      working_directory_platform,
+      working_directory_unc,
+      project_id,
+      input_tokens,
+      cached_input_tokens,
+      cache_write_input_tokens,
+      output_tokens,
+      reasoning_output_tokens,
+      total_tokens,
+      branch_scope,
+      derivation,
+      event_fingerprint
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''');
+  try {
+    for (final event in parsed.usageEvents) {
+      final autoProject = projectResolver.resolve(
+        event.workingDirectory,
+        sourceType: sourceType,
+      );
+      final projectId = autoProject == null
+          ? null
+          : projectIdsByName.putIfAbsent(
+              autoProject.name,
+              () => _upsertAutoProject(db, autoProject.name, now),
+            );
+      final usage = event.usage;
+      insert.execute([
+        parsed.internalId,
+        event.sourceRecordOrdinal,
+        event.rolloutOrdinal,
+        event.turnOrdinal,
+        event.counterEpoch,
+        event.occurredAtUtc?.toIso8601String(),
+        event.model,
+        event.workingDirectory,
+        event.workingDirectory,
+        event.workingDirectoryUnc,
+        projectId,
+        usage.inputTokens ?? 0,
+        usage.cachedInputTokens ?? 0,
+        usage.cacheWriteInputTokens ?? 0,
+        usage.outputTokens ?? 0,
+        usage.reasoningOutputTokens ?? 0,
+        usage.totalTokens ?? 0,
+        event.branchScope,
+        event.derivation,
+        event.eventFingerprint,
+      ]);
+    }
+  } finally {
+    insert.close();
+  }
+}
+
+void _reconcileAffectedLegacyUsage(
+  Database db, {
+  required String replacedSessionRowId,
+  required String? replacedLogicalSessionId,
+}) {
+  const legacyColumns = '''
+    id,
+    session_id,
+    forked_from_id,
+    parent_thread_id,
+    parser_version,
+    usage_projection_status,
+    input_tokens,
+    output_tokens,
+    cached_input_tokens,
+    total_tokens
+    ''';
+  const legacyPredicate = '''
+    history_base_thread_id is null
+    and subagent_history_start_ordinal is null
+    and (
+      (forked_from_id is not null and forked_from_id <> '')
+      or (parent_thread_id is not null and parent_thread_id <> '')
+    )
+    ''';
+  final affected = <String, _LegacyUsageSession>{};
+  for (final row in db.select(
+    'select $legacyColumns from sessions '
+    'where id = ? and $legacyPredicate',
+    [replacedSessionRowId],
+  )) {
+    final session = _LegacyUsageSession.fromRow(row);
+    affected[session.rowId] = session;
+  }
+  final logicalId = replacedLogicalSessionId?.trim() ?? '';
+  if (logicalId.isNotEmpty) {
+    for (final row in db.select(
+      '''
+      select $legacyColumns
+      from sessions
+      where $legacyPredicate
+        and (
+          forked_from_id = ?
+          or (
+            (forked_from_id is null or forked_from_id = '')
+            and parent_thread_id = ?
+          )
+        )
+      ''',
+      [logicalId, logicalId],
+    )) {
+      final session = _LegacyUsageSession.fromRow(row);
+      affected[session.rowId] = session;
+    }
+  }
+
+  final parentCache = <String, List<_LegacyUsageSession>>{};
+  final fingerprintCache = <String, List<String>>{};
+  List<_LegacyUsageSession> parentsFor(String parentLogicalId) {
+    return parentCache.putIfAbsent(parentLogicalId, () {
+      return db
+          .select(
+            '''
+            select $legacyColumns
+            from sessions
+            where session_id = ?
+            order by id
+            ''',
+            [parentLogicalId],
+          )
+          .map(_LegacyUsageSession.fromRow)
+          .toList(growable: false);
+    });
+  }
+
+  List<String> fingerprintsFor(String rowId) {
+    return fingerprintCache.putIfAbsent(rowId, () {
+      return db
+          .select(
+            '''
+            select event_fingerprint
+            from usage_events
+            where session_row_id = ?
+            order by source_record_ordinal
+            ''',
+            [rowId],
+          )
+          .map((row) => row['event_fingerprint'] as String)
+          .toList(growable: false);
+    });
+  }
+
+  bool hasCycle(_LegacyUsageSession child) {
+    final visited = <String>{child.rowId};
+    var current = child;
+    while (current.parentLogicalId.isNotEmpty) {
+      final parents = parentsFor(current.parentLogicalId);
+      if (parents.length != 1) {
+        return false;
+      }
+      final parent = parents.single;
+      if (!visited.add(parent.rowId)) {
+        return true;
+      }
+      current = parent;
+    }
+    return false;
+  }
+
+  for (final child in affected.values) {
+    if (child.parserVersion != CodexSessionParser.currentVersion) {
+      _markUsageProjectionUnresolved(db, child.rowId, 'legacy_pending');
+      continue;
+    }
+    if (hasCycle(child)) {
+      _markUsageProjectionAmbiguous(db, child.rowId);
+      continue;
+    }
+    final childFingerprints = fingerprintsFor(child.rowId);
+    if (childFingerprints.isEmpty) {
+      if (child.projectionStatus == 'complete' && !child.hasAggregateUsage) {
+        _setUsageProjectionStatus(db, child.rowId, 'complete');
+      } else {
+        _markUsageProjectionAmbiguous(db, child.rowId);
+      }
+      continue;
+    }
+    final parents = parentsFor(child.parentLogicalId);
+    if (parents.isEmpty) {
+      _markUsageProjectionUnresolved(db, child.rowId, 'missing_parent');
+      continue;
+    }
+    if (parents.length != 1) {
+      _markUsageProjectionAmbiguous(db, child.rowId);
+      continue;
+    }
+    final parent = parents.single;
+    if (parent.parserVersion != CodexSessionParser.currentVersion) {
+      _markUsageProjectionUnresolved(db, child.rowId, 'legacy_pending');
+      continue;
+    }
+
+    final parentFingerprints = fingerprintsFor(parent.rowId);
+    if (parentFingerprints.isEmpty &&
+        (parent.projectionStatus != 'complete' || parent.hasAggregateUsage)) {
+      _markUsageProjectionAmbiguous(db, child.rowId);
+      continue;
+    }
+    var prefixLength = 0;
+    final comparableLength = math.min(
+      parentFingerprints.length,
+      childFingerprints.length,
+    );
+    while (prefixLength < comparableLength &&
+        parentFingerprints[prefixLength] == childFingerprints[prefixLength]) {
+      prefixLength++;
+    }
+    if (parentFingerprints.isNotEmpty && prefixLength == 0) {
+      _markUsageProjectionAmbiguous(db, child.rowId);
+      continue;
+    }
+
+    if (prefixLength == 0) {
+      db.execute(
+        "update usage_events set branch_scope = 'local' "
+        'where session_row_id = ?',
+        [child.rowId],
+      );
+    } else {
+      final inheritedEndOrdinal =
+          db
+                  .select(
+                    '''
+            select source_record_ordinal
+            from usage_events
+            where session_row_id = ?
+            order by source_record_ordinal
+            limit 1 offset ?
+            ''',
+                    [child.rowId, prefixLength - 1],
+                  )
+                  .single['source_record_ordinal']
+              as int;
+      db.execute(
+        '''
+        update usage_events
+        set branch_scope = case
+          when source_record_ordinal <= ? then 'inherited'
+          else 'local'
+        end
+        where session_row_id = ?
+        ''',
+        [inheritedEndOrdinal, child.rowId],
+      );
+    }
+    _setUsageProjectionStatus(db, child.rowId, 'complete');
+  }
+}
+
+void _setUsageProjectionStatus(Database db, String rowId, String status) {
+  db.execute('update sessions set usage_projection_status = ? where id = ?', [
+    status,
+    rowId,
+  ]);
+}
+
+void _markUsageProjectionAmbiguous(Database db, String rowId) {
+  _markUsageProjectionUnresolved(db, rowId, 'ambiguous');
+}
+
+void _markUsageProjectionUnresolved(Database db, String rowId, String status) {
+  db.execute(
+    "update usage_events set branch_scope = 'ambiguous' "
+    'where session_row_id = ?',
+    [rowId],
+  );
+  _setUsageProjectionStatus(db, rowId, status);
+}
+
+class _LegacyUsageSession {
+  const _LegacyUsageSession({
+    required this.rowId,
+    required this.parentLogicalId,
+    required this.parserVersion,
+    required this.projectionStatus,
+    required this.hasAggregateUsage,
+  });
+
+  factory _LegacyUsageSession.fromRow(Row row) {
+    final forkedFromId = (row['forked_from_id'] as String?)?.trim() ?? '';
+    final parentThreadId = (row['parent_thread_id'] as String?)?.trim() ?? '';
+    return _LegacyUsageSession(
+      rowId: row['id'] as String,
+      parentLogicalId: forkedFromId.isNotEmpty ? forkedFromId : parentThreadId,
+      parserVersion: row['parser_version'] as int,
+      projectionStatus: row['usage_projection_status'] as String,
+      hasAggregateUsage:
+          (row['input_tokens'] as int? ?? 0) > 0 ||
+          (row['output_tokens'] as int? ?? 0) > 0 ||
+          (row['cached_input_tokens'] as int? ?? 0) > 0 ||
+          (row['total_tokens'] as int? ?? 0) > 0,
+    );
+  }
+
+  final String rowId;
+  final String parentLogicalId;
+  final int parserVersion;
+  final String projectionStatus;
+  final bool hasAggregateUsage;
 }
 
 void _upsertScanStatusesOnly(
@@ -3438,6 +3825,9 @@ Iterable<_ProjectPathCandidate> _projectPathCandidatesForSessions(
       session.parsedSession.workingDirectoryDisplay,
       session.sourceType,
     );
+    for (final event in session.parsedSession.usageEvents) {
+      yield _ProjectPathCandidate(event.workingDirectory, session.sourceType);
+    }
   }
 }
 

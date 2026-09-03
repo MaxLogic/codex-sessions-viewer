@@ -31,7 +31,7 @@ Directory defaultSqlRoot() {
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 14,
+    this.supportedSchemaVersion = 15,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
@@ -309,6 +309,10 @@ class DatabaseMigrator {
       ..._requiredTables,
       if (lastAppliedVersion >= 12) 'tool_output_search',
       if (lastAppliedVersion >= 14) 'session_cache_repair_manifest',
+      if (lastAppliedVersion >= 15) ...[
+        'usage_events',
+        'billable_usage_events',
+      ],
     ];
     for (final table in requiredTables) {
       final rows = db.select(

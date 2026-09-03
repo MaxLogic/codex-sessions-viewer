@@ -1,5 +1,7 @@
 import 'package:sqlite3/sqlite3.dart';
 
+import '../usage/usage_summary.dart';
+
 class ProjectTagStateStore {
   const ProjectTagStateStore(this.db);
 
@@ -69,6 +71,40 @@ class ProjectTagStateStore {
     return id;
   }
 
+  int upsertProjectMaskAndRecalculate({
+    required int projectId,
+    required String pathMask,
+    int priority = 100,
+    bool isActive = true,
+    required int projectionVersion,
+    UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+  }) {
+    db.execute('begin immediate');
+    try {
+      final maskId = upsertProjectMask(
+        projectId: projectId,
+        pathMask: pathMask,
+        priority: priority,
+        isActive: isActive,
+      );
+      recalculateSessionProjects();
+      _recalculateUsageEventProjects();
+      UsageSummaryRepository(db).rebuildDailyUsageInCurrentTransaction(
+        projectionVersion: projectionVersion,
+        pricing: pricing,
+      );
+      db.execute('commit');
+      return maskId;
+    } on Object {
+      try {
+        db.execute('rollback');
+      } on Object {
+        // Preserve the original failure if SQLite already rolled back.
+      }
+      rethrow;
+    }
+  }
+
   void recalculateSessionProjects() {
     final masks = _activeMasks();
     final sessions = db.select('''
@@ -97,6 +133,68 @@ class ProjectTagStateStore {
         [match?.projectId, match?.projectName, now, sessionId],
       );
       _updateSearchProject(sessionId, match?.projectName ?? '');
+    }
+  }
+
+  void _recalculateUsageEventProjects() {
+    final masks = _activeMasks();
+    final update = db.prepare('''
+      update usage_events
+      set project_id = ?
+      where session_row_id = ? and source_record_ordinal = ?
+      ''');
+    try {
+      int? lastRowId;
+      while (true) {
+        final events = db.select(
+          '''
+          select
+            rowid as usage_event_rowid,
+            session_row_id,
+            source_record_ordinal,
+            project_id,
+            working_directory_display,
+            working_directory_platform,
+            working_directory_unc
+          from usage_events
+          ${lastRowId == null ? '' : 'where rowid > ?'}
+          order by rowid
+          limit 512
+          ''',
+          [?lastRowId],
+        );
+        if (events.isEmpty) {
+          break;
+        }
+        for (final event in events) {
+          final paths = <String>{};
+          for (final column in [
+            'working_directory_display',
+            'working_directory_platform',
+            'working_directory_unc',
+          ]) {
+            final value = event[column] as String?;
+            if (value != null && value.isNotEmpty) {
+              paths.add(_normalizePath(value));
+            }
+          }
+          final projectId = _bestProjectMatch(
+            paths.toList(growable: false),
+            masks,
+          )?.projectId;
+          if (projectId == event['project_id']) {
+            continue;
+          }
+          update.execute([
+            projectId,
+            event['session_row_id'],
+            event['source_record_ordinal'],
+          ]);
+        }
+        lastRowId = events.last['usage_event_rowid'] as int;
+      }
+    } finally {
+      update.close();
     }
   }
 

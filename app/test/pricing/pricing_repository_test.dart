@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/pricing/pricing_repository.dart';
+import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
@@ -68,6 +69,103 @@ void main() {
       expect(row['completion_price_per_token'], '0.000002');
       expect(row['input_cache_read_price_per_token'], '0.0000001');
       expect(row['source'], 'openrouter');
+    },
+  );
+
+  test(
+    'resolves unqualified Codex GPT models to exact OpenRouter entries',
+    () async {
+      final fetchedAt = DateTime.utc(2026, 7, 29, 8, 30);
+      final result = await repository.refresh(
+        settings,
+        client: _FakeOpenRouterClient(
+          response: const OpenRouterModelsResponse([
+            OpenRouterModelPricing(
+              modelId: 'openai/gpt-5.5',
+              provider: 'openai',
+              promptPricePerToken: '0.000005',
+              completionPricePerToken: '0.000030',
+              inputCacheReadPricePerToken: '0.0000005',
+            ),
+            OpenRouterModelPricing(
+              modelId: 'openai/gpt-5.6-sol',
+              provider: 'openai',
+              promptPricePerToken: '0.000005',
+              completionPricePerToken: '0.000030',
+              inputCacheReadPricePerToken: '0.0000005',
+              inputCacheWritePricePerToken: '0.00000625',
+              internalReasoningPricePerToken: '0.000030',
+            ),
+            OpenRouterModelPricing(
+              modelId: 'openai/gpt-5.6-terra',
+              provider: 'openai',
+              promptPricePerToken: '0.00000125',
+              completionPricePerToken: '0.0000075',
+              inputCacheReadPricePerToken: '0.000000125',
+              inputCacheWritePricePerToken: '0.0000015625',
+            ),
+            OpenRouterModelPricing(
+              modelId: 'other/gpt-5.6-sol',
+              provider: 'other',
+              promptPricePerToken: '9',
+            ),
+          ]),
+        ),
+        nowUtc: fetchedAt,
+      );
+
+      expect(result.success, isTrue);
+      expect(
+        result.catalog.resolve('openai/gpt-5.5').resolvedModelId,
+        'openai/gpt-5.5',
+      );
+      expect(
+        result.catalog.resolve('openai/gpt-5.5').method,
+        UsageModelResolutionMethod.exact,
+      );
+      expect(
+        result.catalog.resolve('gpt-5.6-sol').resolvedModelId,
+        'openai/gpt-5.6-sol',
+      );
+      expect(
+        result.catalog.resolve('gpt-5.6-sol').method,
+        UsageModelResolutionMethod.openAiExact,
+      );
+      expect(
+        result.catalog.resolve('gpt-5.6-terra').resolvedModelId,
+        'openai/gpt-5.6-terra',
+      );
+      expect(result.catalog.resolve('gpt-5.6').pricing, isNull);
+      expect(result.catalog.resolve('gpt-5.6-sol-extra').pricing, isNull);
+      expect(result.catalog.resolve('GPT-5.6-SOL').pricing, isNull);
+      expect(
+        result.catalog.resolve('other/gpt-5.6-sol').resolvedModelId,
+        'other/gpt-5.6-sol',
+      );
+
+      final sol = result.catalog['gpt-5.6-sol'];
+      expect(sol?.cacheWriteInputPricePerToken, '0.00000625');
+      expect(sol?.internalReasoningPricePerToken, '0.000030');
+      expect(sol?.source, 'openrouter');
+      expect(sol?.fetchedAtUtc, fetchedAt);
+      expect(result.catalog.openRouterFetchedAtUtc, fetchedAt);
+      expect(
+        result.catalog.openRouterCacheAge(DateTime.utc(2026, 7, 29, 10)),
+        const Duration(hours: 1, minutes: 30),
+      );
+
+      const exactOverrideWins = UsagePricingCatalog({
+        'gpt-5.5': UsageModelPricing(
+          promptPricePerToken: '1',
+          source: 'override',
+        ),
+        'openai/gpt-5.5': UsageModelPricing(
+          promptPricePerToken: '2',
+          source: 'openrouter',
+        ),
+      });
+      expect(exactOverrideWins.resolve('gpt-5.5').resolvedModelId, 'gpt-5.5');
+      expect(exactOverrideWins['gpt-5.5']?.promptPricePerToken, '1');
     },
   );
 
