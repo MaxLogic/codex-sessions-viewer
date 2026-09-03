@@ -168,6 +168,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                       onSessionAction: (request) =>
                           _handleSessionAction(request),
                       onExportMarkdown: _exportConversationMarkdown,
+                      onSaveSessionListCsv: _saveSessionListCsv,
                       onTableStateChanged: (state) {
                         unawaited(_saveSessionTableState(state));
                       },
@@ -513,6 +514,24 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     await File(destination.path).writeAsString(markdown);
   }
 
+  Future<void> _saveSessionListCsv(String csv) async {
+    final timestamp = widget.now().toUtc().toIso8601String().replaceAll(
+      ':',
+      '-',
+    );
+    final destination = await getSaveLocation(
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'CSV', extensions: ['csv']),
+      ],
+      suggestedName: 'sessions-$timestamp.csv',
+      confirmButtonText: 'Save',
+    );
+    if (destination == null) {
+      return;
+    }
+    await File(destination.path).writeAsString(csv);
+  }
+
   String _exportFileName(SessionRowViewModel row) {
     final base = [
       row.lastMessageAtUtc.toUtc().toIso8601String().replaceAll(':', '-'),
@@ -654,6 +673,7 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.onOpenSettings,
     required this.onSessionAction,
     required this.onExportMarkdown,
+    required this.onSaveSessionListCsv,
     required this.onTableStateChanged,
     required this.openTarget,
     required this.openTargetSerial,
@@ -669,6 +689,7 @@ class _SessionsScreenLoader extends StatefulWidget {
   final VoidCallback onOpenSettings;
   final SessionActionCallback onSessionAction;
   final SessionMarkdownExportCallback onExportMarkdown;
+  final SessionListCsvExportCallback onSaveSessionListCsv;
   final SessionTableStateChanged onTableStateChanged;
   final SessionOpenTarget? openTarget;
   final int openTargetSerial;
@@ -759,6 +780,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onRefreshOperation: widget.onRefreshOperation,
       onOpenSettings: widget.onOpenSettings,
       onSessionAction: _handleSessionAction,
+      onSaveSessionListCsv: widget.onSaveSessionListCsv,
       onLoadSessionDetail: _controller.loadSessionDetail,
       onReloadSessionDetailFromSource:
           _controller.reloadSessionDetailFromSource,

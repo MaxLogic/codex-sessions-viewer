@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
+import '../../export/session_list_exporter.dart';
 import '../../usage/usage_summary.dart';
 import '../motion.dart';
 import '../models/conversation_message_view_model.dart';
@@ -67,6 +68,18 @@ enum SessionRowAction {
   reparse,
 }
 
+enum _SessionListAction { copyMarkdown, copyExtendedMarkdown, saveCsv }
+
+class _SessionListMarkdownOptions {
+  const _SessionListMarkdownOptions({
+    required this.includeFirstMessage,
+    required this.includeLastMessage,
+  });
+
+  final bool includeFirstMessage;
+  final bool includeLastMessage;
+}
+
 typedef SessionActionCallback = Future<void> Function(SessionActionRequest);
 typedef SessionsRefreshProgressCallback =
     void Function(SessionsRefreshProgress progress);
@@ -82,6 +95,7 @@ typedef SessionFileWatcher = Stream<Object> Function(String path);
 typedef SessionTableStateChanged = void Function(SessionTableSettings);
 typedef SessionMarkdownExportCallback =
     Future<void> Function(SessionRowViewModel row, String markdown);
+typedef SessionListCsvExportCallback = Future<void> Function(String csv);
 typedef SessionMessagePageLoader =
     Future<List<ConversationMessageViewModel>> Function(
       String sessionId,
@@ -123,6 +137,7 @@ class SessionsScreen extends StatefulWidget {
     this.onSessionAction,
     this.onCopyText,
     this.onExportMarkdown,
+    this.onSaveSessionListCsv,
     this.onLoadSessionDetail,
     this.onReloadSessionDetailFromSource,
     this.onLoadMessagePage,
@@ -147,6 +162,7 @@ class SessionsScreen extends StatefulWidget {
   final SessionActionCallback? onSessionAction;
   final DetailCopyCallback? onCopyText;
   final SessionMarkdownExportCallback? onExportMarkdown;
+  final SessionListCsvExportCallback? onSaveSessionListCsv;
   final SessionDetailLoader? onLoadSessionDetail;
   final SessionDetailLoader? onReloadSessionDetailFromSource;
   final SessionMessagePageLoader? onLoadMessagePage;
@@ -420,6 +436,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                 onColumnWidthChanged: _setColumnWidth,
                                 onSortGesture: _handleSortGesture,
                                 onShowSortOptions: _showSortOptions,
+                                onListAction: _handleListAction,
+                                canSaveCsv: widget.onSaveSessionListCsv != null,
                                 statusMessage: _scanAnnouncement,
                                 isScanning: _isScanning,
                                 animatedRowIds: _rowMotionIds,
@@ -1518,6 +1536,192 @@ class _SessionsScreenState extends State<SessionsScreen> {
     messenger.showSnackBar(
       SnackBar(content: Text('${request.action.label} is not wired yet.')),
     );
+  }
+
+  Future<void> _handleListAction(_SessionListAction action) async {
+    final rows = _visibleRows;
+    if (rows.isEmpty) {
+      return;
+    }
+    final exporter = SessionListExporter(
+      settings: widget.settings ?? AppSettings.defaults(),
+    );
+    switch (action) {
+      case _SessionListAction.copyMarkdown:
+        final markdown = exporter.exportMarkdown(rows);
+        final copy = widget.onCopyText;
+        if (copy == null) {
+          await Clipboard.setData(ClipboardData(text: markdown));
+        } else {
+          await copy(markdown);
+        }
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Copied ${rows.length} visible '
+                '${rows.length == 1 ? 'session' : 'sessions'} as Markdown.',
+              ),
+            ),
+          );
+        }
+        return;
+      case _SessionListAction.copyExtendedMarkdown:
+        final options = await _showExtendedMarkdownOptions();
+        if (options == null || !mounted) {
+          return;
+        }
+        try {
+          final exportRows = await _loadExtendedMarkdownRows(rows, options);
+          final markdown = exporter.exportMarkdown(
+            exportRows,
+            includeFirstMessage: options.includeFirstMessage,
+            includeLastMessage: options.includeLastMessage,
+          );
+          final copy = widget.onCopyText;
+          if (copy == null) {
+            await Clipboard.setData(ClipboardData(text: markdown));
+          } else {
+            await copy(markdown);
+          }
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Copied ${rows.length} visible '
+                  '${rows.length == 1 ? 'session' : 'sessions'} '
+                  'as extended Markdown.',
+                ),
+              ),
+            );
+          }
+        } on Object catch (error) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Could not copy extended Markdown. $error'),
+              ),
+            );
+          }
+        }
+        return;
+      case _SessionListAction.saveCsv:
+        final save = widget.onSaveSessionListCsv;
+        if (save != null) {
+          await save(exporter.exportCsv(rows));
+        }
+        return;
+    }
+  }
+
+  Future<_SessionListMarkdownOptions?> _showExtendedMarkdownOptions() async {
+    var includeFirstMessage = true;
+    var includeLastMessage = true;
+    return showDialog<_SessionListMarkdownOptions>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Copy extended Markdown'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Choose which message content to include for each visible '
+                'session.',
+              ),
+              const SizedBox(height: 12),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Include first message'),
+                value: includeFirstMessage,
+                onChanged: (value) {
+                  setDialogState(() {
+                    includeFirstMessage = value ?? false;
+                  });
+                },
+              ),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Include last message'),
+                value: includeLastMessage,
+                onChanged: (value) {
+                  setDialogState(() {
+                    includeLastMessage = value ?? false;
+                  });
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(
+                _SessionListMarkdownOptions(
+                  includeFirstMessage: includeFirstMessage,
+                  includeLastMessage: includeLastMessage,
+                ),
+              ),
+              child: const Text('Copy'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<List<SessionRowViewModel>> _loadExtendedMarkdownRows(
+    List<SessionRowViewModel> rows,
+    _SessionListMarkdownOptions options,
+  ) async {
+    if (!options.includeFirstMessage && !options.includeLastMessage) {
+      return rows;
+    }
+    final loadedRows = <SessionRowViewModel>[];
+    for (final row in rows) {
+      var messages = row.conversationMessages;
+      if (messages.isEmpty && widget.onLoadSessionDetail != null) {
+        final detail = await widget.onLoadSessionDetail!(row.id);
+        messages = detail?.conversationMessages ?? const [];
+      }
+      if (messages.isNotEmpty && widget.onLoadMessagePage != null) {
+        messages = await _loadRequestedMessageBodies(row.id, messages, options);
+      }
+      loadedRows.add(row.copyWithConversationMessages(messages));
+    }
+    return loadedRows;
+  }
+
+  Future<List<ConversationMessageViewModel>> _loadRequestedMessageBodies(
+    String sessionId,
+    List<ConversationMessageViewModel> messages,
+    _SessionListMarkdownOptions options,
+  ) async {
+    final ordered = [...messages]
+      ..sort((left, right) => left.number.compareTo(right.number));
+    final requested = <ConversationMessageViewModel>{
+      if (options.includeFirstMessage) ordered.first,
+      if (options.includeLastMessage) ordered.last,
+    };
+    final replacements = <int, ConversationMessageViewModel>{};
+    for (final message in requested) {
+      if (message.isBodyLoaded) {
+        continue;
+      }
+      final page = await widget.onLoadMessagePage!(sessionId, message.number);
+      for (final loaded in page) {
+        replacements[loaded.number] = loaded;
+      }
+    }
+    if (replacements.isEmpty) {
+      return messages;
+    }
+    return [
+      for (final message in messages) replacements[message.number] ?? message,
+    ];
   }
 
   Future<void> _handleDetailAction(
@@ -2763,25 +2967,63 @@ class _FilterSemantics extends StatelessWidget {
 }
 
 class _SessionsHeading extends StatelessWidget {
-  const _SessionsHeading({required this.visibleCount});
+  const _SessionsHeading({
+    required this.visibleCount,
+    this.onAction,
+    this.canSaveCsv = false,
+  });
 
   final int visibleCount;
+  final ValueChanged<_SessionListAction>? onAction;
+  final bool canSaveCsv;
 
   @override
   Widget build(BuildContext context) {
     final countStyle = Theme.of(context).textTheme.bodySmall;
-    return Semantics(
-      header: true,
-      label: 'Sessions, $visibleCount visible',
-      child: ExcludeSemantics(
-        child: Row(
-          children: [
-            Text('Sessions', style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(width: 6),
-            Text('($visibleCount)', style: countStyle),
-          ],
+    return Row(
+      children: [
+        Semantics(
+          header: true,
+          label: 'Sessions, $visibleCount visible',
+          child: ExcludeSemantics(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Sessions', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(width: 6),
+                Text('($visibleCount)', style: countStyle),
+              ],
+            ),
+          ),
         ),
-      ),
+        if (onAction != null) ...[
+          const SizedBox(width: 4),
+          Semantics(
+            label: 'Session list actions',
+            button: true,
+            child: PopupMenuButton<_SessionListAction>(
+              tooltip: 'Session list actions',
+              onSelected: onAction,
+              itemBuilder: (context) => [
+                const PopupMenuItem(
+                  value: _SessionListAction.copyMarkdown,
+                  child: Text('Copy visible list as Markdown'),
+                ),
+                const PopupMenuItem(
+                  value: _SessionListAction.copyExtendedMarkdown,
+                  child: Text('Copy visible list as extended Markdown…'),
+                ),
+                PopupMenuItem(
+                  value: _SessionListAction.saveCsv,
+                  enabled: canSaveCsv,
+                  child: const Text('Save visible list as CSV…'),
+                ),
+              ],
+              icon: const Icon(Icons.more_horiz),
+            ),
+          ),
+        ],
+      ],
     );
   }
 }
@@ -3033,6 +3275,8 @@ class _SessionsTable extends StatelessWidget {
     required this.onColumnWidthChanged,
     required this.onSortGesture,
     required this.onShowSortOptions,
+    required this.onListAction,
+    required this.canSaveCsv,
     required this.statusMessage,
     required this.isScanning,
     required this.animatedRowIds,
@@ -3054,6 +3298,8 @@ class _SessionsTable extends StatelessWidget {
   final void Function(String column, double width) onColumnWidthChanged;
   final void Function(String column, _SortGesture gesture) onSortGesture;
   final Future<void> Function(BuildContext context) onShowSortOptions;
+  final ValueChanged<_SessionListAction> onListAction;
+  final bool canSaveCsv;
   final String statusMessage;
   final bool isScanning;
   final Set<String> animatedRowIds;
@@ -3100,7 +3346,11 @@ class _SessionsTable extends StatelessWidget {
       children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-          child: _SessionsHeading(visibleCount: rows.length),
+          child: _SessionsHeading(
+            visibleCount: rows.length,
+            onAction: onListAction,
+            canSaveCsv: canSaveCsv,
+          ),
         ),
         if (statusMessage.isNotEmpty)
           Padding(

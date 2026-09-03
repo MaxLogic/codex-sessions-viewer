@@ -15,6 +15,7 @@ class TestSessionsScreen extends SessionsScreen {
     super.onSessionAction,
     super.onCopyText,
     super.onExportMarkdown,
+    super.onSaveSessionListCsv,
     super.onLoadSessionDetail,
     super.onReloadSessionDetailFromSource,
     super.onLoadMessagePage,

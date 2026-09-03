@@ -1,4 +1,5 @@
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -130,6 +131,173 @@ void main() {
       findsOneWidget,
     );
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
+  });
+
+  testWidgets('copies the filtered visible session list as Markdown', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    String? copied;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TestSessionsScreen(
+            initialRows: [
+              _row(
+                id: 'older',
+                title: 'Older session',
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9),
+              ),
+              _row(
+                id: 'newer',
+                title: 'Newer session',
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 11),
+              ),
+              _row(id: 'archived', title: 'Archived session', isArchived: true),
+            ],
+            onCopyText: (text) async {
+              copied = text;
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.bySemanticsLabel('Session list actions'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Copy visible list as Markdown'));
+    await tester.pumpAndSettle();
+
+    expect(copied, startsWith('# Sessions (2)'));
+    expect(copied, contains('## Newer session — codex-sessions-viewer'));
+    expect(copied, contains('## Older session — codex-sessions-viewer'));
+    expect(copied, isNot(contains('Archived session')));
+    expect(
+      copied!.indexOf('## Newer session'),
+      lessThan(copied!.indexOf('## Older session')),
+    );
+    expect(find.text('Copied 2 visible sessions as Markdown.'), findsOneWidget);
+  });
+
+  testWidgets(
+    'copies extended Markdown with first and last messages selected by default',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      String? copied;
+      var detailLoads = 0;
+      var pageLoads = 0;
+      final row = _row(id: 'visible', title: 'Visible session');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TestSessionsScreen(
+              initialRows: [row],
+              onCopyText: (text) async {
+                copied = text;
+              },
+              onLoadSessionDetail: (id) async {
+                detailLoads++;
+                return row.copyWithConversationMessages([
+                  _message(
+                    id: '$id:first',
+                    number: 1,
+                    author: ConversationAuthor.user,
+                    body: '',
+                    preview: 'Explain the failing parser test.',
+                    isBodyLoaded: false,
+                  ),
+                  _message(
+                    id: '$id:last',
+                    number: 2,
+                    author: ConversationAuthor.assistant,
+                    body: 'The parser now accepts the fixture.',
+                  ),
+                ]);
+              },
+              onLoadMessagePage: (id, anchor) async {
+                pageLoads++;
+                return [
+                  _message(
+                    id: '$id:first',
+                    number: anchor,
+                    author: ConversationAuthor.user,
+                    body: 'Explain the failing parser test in full.',
+                  ),
+                ];
+              },
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.bySemanticsLabel('Session list actions'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Copy visible list as extended Markdown…'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Copy visible list as extended Markdown…'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Copy extended Markdown'), findsOneWidget);
+      expect(find.text('Include first message'), findsOneWidget);
+      expect(find.text('Include last message'), findsOneWidget);
+      final dialogCheckboxes = find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.byType(Checkbox),
+      );
+      final checkboxes = tester
+          .widgetList<Checkbox>(dialogCheckboxes)
+          .toList(growable: false);
+      expect(checkboxes, hasLength(2));
+      expect(checkboxes.every((checkbox) => checkbox.value == true), isTrue);
+
+      await tester.tap(find.widgetWithText(FilledButton, 'Copy'));
+      await tester.pumpAndSettle();
+
+      expect(detailLoads, 1);
+      expect(pageLoads, 1);
+      expect(copied, contains('### First message (User)'));
+      expect(copied, contains('Explain the failing parser test in full.'));
+      expect(copied, contains('### Last message (Assistant)'));
+      expect(copied, contains('The parser now accepts the fixture.'));
+      expect(
+        find.text('Copied 1 visible session as extended Markdown.'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('saves the filtered visible session list as CSV', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    String? saved;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TestSessionsScreen(
+            initialRows: [
+              _row(id: 'visible', title: 'Visible session'),
+              _row(id: 'archived', title: 'Archived session', isArchived: true),
+            ],
+            onSaveSessionListCsv: (csv) async {
+              saved = csv;
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.bySemanticsLabel('Session list actions'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save visible list as CSV…'));
+    await tester.pumpAndSettle();
+
+    expect(saved, startsWith('\ufeffname,thread_name,title,'));
+    expect(saved, contains('Visible session'));
+    expect(saved, isNot(contains('Archived session')));
   });
 
   testWidgets(
@@ -301,6 +469,26 @@ SessionRowViewModel _row({
     isPinned: isPinned,
     isArchived: isArchived,
     hasError: hasError,
+  );
+}
+
+ConversationMessageViewModel _message({
+  required String id,
+  required int number,
+  required ConversationAuthor author,
+  required String body,
+  String? preview,
+  bool isBodyLoaded = true,
+}) {
+  return ConversationMessageViewModel(
+    id: id,
+    number: number,
+    author: author,
+    createdAtUtc: DateTime.utc(2026, 6, 12, 10),
+    preview: preview ?? body,
+    body: body,
+    tokenCount: null,
+    isBodyLoaded: isBodyLoaded,
   );
 }
 
