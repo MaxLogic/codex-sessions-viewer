@@ -71,6 +71,8 @@ class ResumeCommandGenerator {
       defaultTerminalProfile: settings.terminal.defaultTerminal,
       terminalLaunchCommand: terminalCommand.command,
       terminalForkCommand: terminalForkCommand.command,
+      terminalLaunchSpec: terminalCommand.launchSpec,
+      terminalForkLaunchSpec: terminalForkCommand.launchSpec,
       terminalDisabledReason: terminalCommand.disabledReason,
       terminalLaunchCommandFor: (profileName) => _terminalCommand(
         profileName,
@@ -133,6 +135,22 @@ class ResumeCommandGenerator {
       ResumeSessionSourceType.windows => plainCommand,
       ResumeSessionSourceType.wsl => bashResumeCommand,
     };
+    final rawValues = {
+      'terminal_exe': profile.exe,
+      'working_dir': session.workingDirectory,
+      'wsl_distro': settings.wsl.distro,
+      'wsl_working_dir': session.workingDirectory,
+      'resume_command': resumeCommand,
+    };
+    final templateTokens = _splitCommandTemplate(template);
+    if (templateTokens == null ||
+        templateTokens.isEmpty ||
+        templateTokens.first != '{terminal_exe}') {
+      return _TerminalCommand.disabled(
+        'Terminal profile command template cannot be launched safely: '
+        '$profileName.',
+      );
+    }
     return _TerminalCommand(
       command: _expandTemplate(template, {
         'terminal_exe': _quoteWindowsArg(profile.exe),
@@ -141,6 +159,13 @@ class ResumeCommandGenerator {
         'wsl_working_dir': _quoteWindowsArg(session.workingDirectory),
         'resume_command': _quoteWindowsArg(resumeCommand),
       }),
+      launchSpec: TerminalLaunchSpec(
+        executable: profile.exe,
+        arguments: [
+          for (final token in templateTokens.skip(1))
+            _expandTemplate(token, rawValues),
+        ],
+      ),
     );
   }
 }
@@ -154,6 +179,8 @@ class ResumeCommandSet {
     required this.defaultTerminalProfile,
     required this.terminalLaunchCommand,
     required this.terminalForkCommand,
+    required this.terminalLaunchSpec,
+    required this.terminalForkLaunchSpec,
     required this.terminalDisabledReason,
     required String? Function(String profileName) terminalLaunchCommandFor,
   }) : disabledReason = null,
@@ -167,6 +194,8 @@ class ResumeCommandSet {
       defaultTerminalProfile = null,
       terminalLaunchCommand = null,
       terminalForkCommand = null,
+      terminalLaunchSpec = null,
+      terminalForkLaunchSpec = null,
       terminalDisabledReason = null,
       _terminalLaunchCommandFor = null;
 
@@ -178,6 +207,8 @@ class ResumeCommandSet {
   final String? defaultTerminalProfile;
   final String? terminalLaunchCommand;
   final String? terminalForkCommand;
+  final TerminalLaunchSpec? terminalLaunchSpec;
+  final TerminalLaunchSpec? terminalForkLaunchSpec;
   final String? terminalDisabledReason;
   final String? Function(String profileName)? _terminalLaunchCommandFor;
 
@@ -188,12 +219,32 @@ class ResumeCommandSet {
 }
 
 class _TerminalCommand {
-  const _TerminalCommand({required this.command}) : disabledReason = null;
+  const _TerminalCommand({required this.command, required this.launchSpec})
+    : disabledReason = null;
 
-  const _TerminalCommand.disabled(this.disabledReason) : command = null;
+  const _TerminalCommand.disabled(this.disabledReason)
+    : command = null,
+      launchSpec = null;
 
   final String? command;
+  final TerminalLaunchSpec? launchSpec;
   final String? disabledReason;
+}
+
+class TerminalLaunchSpec {
+  const TerminalLaunchSpec({required this.executable, required this.arguments});
+
+  final String executable;
+  final List<String> arguments;
+
+  @override
+  bool operator ==(Object other) =>
+      other is TerminalLaunchSpec &&
+      executable == other.executable &&
+      _listEquals(arguments, other.arguments);
+
+  @override
+  int get hashCode => Object.hash(executable, Object.hashAll(arguments));
 }
 
 String _quoteWindowsArg(String value) {
@@ -255,4 +306,54 @@ String _expandTemplate(String template, Map<String, String> values) {
     result = result.replaceAll('{${entry.key}}', entry.value);
   }
   return result;
+}
+
+List<String>? _splitCommandTemplate(String template) {
+  final result = <String>[];
+  final token = StringBuffer();
+  String? quote;
+  void finishToken() {
+    if (token.isNotEmpty) {
+      result.add(token.toString());
+      token.clear();
+    }
+  }
+
+  for (final rune in template.runes) {
+    final char = String.fromCharCode(rune);
+    if (quote != null) {
+      if (char == quote) {
+        quote = null;
+      } else {
+        token.write(char);
+      }
+      continue;
+    }
+    if (char == '"' || char == "'") {
+      quote = char;
+      continue;
+    }
+    if (RegExp(r'\s').hasMatch(char)) {
+      finishToken();
+      continue;
+    }
+    token.write(char);
+  }
+  if (quote != null) {
+    return null;
+  }
+  finishToken();
+  return result;
+}
+
+bool _listEquals(List<String> left, List<String> right) {
+  if (left.length != right.length) {
+    return false;
+  }
+  for (var index = 0; index < left.length; index++) {
+    if (left[index] != right[index]) {
+      return false;
+    }
+  }
+  return true;
 }

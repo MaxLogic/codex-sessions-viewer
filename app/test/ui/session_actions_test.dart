@@ -110,6 +110,39 @@ void main() {
       ),
       isTrue,
     );
+    expect(
+      actions.every(
+        (action) =>
+            action.launchSpec?.executable ==
+            r'C:\Program Files\Alacritty\alacritty.exe',
+      ),
+      isTrue,
+    );
+  });
+
+  testWidgets('row action menu uses compact desktop item height', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(5000, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TestSessionsScreen(initialRows: [_row(sessionId: 'abc123')]),
+        ),
+      ),
+    );
+
+    await tester.tap(find.bySemanticsLabel('More actions for Parser cache'));
+    await tester.pumpAndSettle();
+
+    final items = tester
+        .widgetList<PopupMenuItem<SessionRowAction>>(
+          find.byType(PopupMenuItem<SessionRowAction>),
+        )
+        .toList();
+    expect(items, isNotEmpty);
+    expect(items.every((item) => item.height == 36), isTrue);
   });
 
   testWidgets('session table labels containing-folder action accurately', (

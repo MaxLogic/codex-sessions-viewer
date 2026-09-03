@@ -27,6 +27,21 @@ void main() {
       r'"C:\Program Files\Alacritty\alacritty.exe" --working-directory "C:\Projects\Client App" -e powershell.exe -NoExit -Command "codex fork abc123"',
     );
     expect(
+      commands.terminalLaunchSpec,
+      const TerminalLaunchSpec(
+        executable: r'C:\Program Files\Alacritty\alacritty.exe',
+        arguments: [
+          '--working-directory',
+          r'C:\Projects\Client App',
+          '-e',
+          'powershell.exe',
+          '-NoExit',
+          '-Command',
+          'codex resume abc123',
+        ],
+      ),
+    );
+    expect(
       commands.terminalLaunchCommandFor('windows_terminal'),
       r'wt.exe -d "C:\Projects\Client App" powershell.exe -NoExit -Command "codex resume abc123"',
     );

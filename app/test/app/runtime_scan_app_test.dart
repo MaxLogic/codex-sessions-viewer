@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
 import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
+import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
@@ -2564,6 +2565,81 @@ void main() {
     expect(find.text('Loaded from runtime scan'), findsOneWidget);
   });
 
+  testWidgets('app shell launches terminal from structured arguments', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    TerminalLaunchSpec? launched;
+    await tester.pumpWidget(
+      CodexSessionsViewerApp(
+        databaseStartup: Future.value(
+          DatabaseStartupResult.ready(lastAppliedSchemaVersion: 3),
+        ),
+        settingsStartup: Future.value(AppSettings.defaults()),
+        sessionRefresh: () async =>
+            SessionsRefreshResult.scanFinished([_resumableRow('resume-row')]),
+        deferInitialSessionLoad: (_) {},
+        terminalLaunch: (spec) async {
+          launched = spec;
+          return 1234;
+        },
+        now: () => DateTime.utc(2026, 6, 15, 12),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.text('Refresh'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.bySemanticsLabel('Open terminal and resume for resume-row'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(launched?.executable, r'C:\Program Files\Alacritty\alacritty.exe');
+    expect(launched?.arguments, contains('codex resume resume-row'));
+    expect(find.text('Opening terminal for resume-row.'), findsOneWidget);
+  });
+
+  testWidgets('terminal launch failure remains visible in a dialog', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      CodexSessionsViewerApp(
+        databaseStartup: Future.value(
+          DatabaseStartupResult.ready(lastAppliedSchemaVersion: 3),
+        ),
+        settingsStartup: Future.value(AppSettings.defaults()),
+        sessionRefresh: () async =>
+            SessionsRefreshResult.scanFinished([_resumableRow('failed-row')]),
+        deferInitialSessionLoad: (_) {},
+        terminalLaunch: (_) async {
+          throw const ProcessException(
+            'alacritty.exe',
+            <String>[],
+            'Access denied',
+          );
+        },
+        now: () => DateTime.utc(2026, 6, 15, 12),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.text('Refresh'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.bySemanticsLabel('Open terminal and resume for failed-row'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Could not open terminal'), findsOneWidget);
+    expect(find.textContaining('Access denied'), findsOneWidget);
+    expect(find.text('Copy resume command'), findsOneWidget);
+    expect(find.text('Close'), findsOneWidget);
+  });
+
   testWidgets('app shell cancels active refresh operation on dispose', (
     tester,
   ) async {
@@ -4519,6 +4595,26 @@ SessionRowViewModel _row(String title, SessionRowPlatform platform) {
     path: r'C:\Users\pawel\.codex\sessions\runtime.jsonl',
     title: title,
     summary: 'Loaded from runtime scan',
+    messageCount: 1,
+    totalTokens: 42,
+    model: 'gpt-5.4',
+    tags: const [],
+    status: 'available',
+  );
+}
+
+SessionRowViewModel _resumableRow(String title) {
+  return SessionRowViewModel(
+    id: title,
+    sessionId: title,
+    startedAtUtc: DateTime.utc(2026, 6, 14, 10),
+    lastMessageAtUtc: DateTime.utc(2026, 6, 14, 11),
+    platform: SessionRowPlatform.windows,
+    project: 'Codex Viewer',
+    path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+    workingDirectory: r'F:\projects\MaxLogic\codex-sessions-viewer',
+    title: title,
+    summary: 'Resumable session',
     messageCount: 1,
     totalTokens: 42,
     model: 'gpt-5.4',

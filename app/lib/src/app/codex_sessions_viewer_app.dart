@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 
 import '../config/app_settings.dart';
 import '../config/settings_diagnostics.dart';
+import '../commands/resume_command_generator.dart';
 import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
 import '../database/project_tag_state.dart';
@@ -16,6 +17,7 @@ import '../database/session_eval_state.dart';
 import '../app/runtime_session_controller.dart';
 import '../export/eval_dataset_exporter.dart';
 import '../parser/codex_session_parser.dart';
+import '../platform/terminal_launcher.dart';
 import '../pricing/pricing_repository.dart';
 import '../search/message_search.dart';
 import '../ui/app_shell.dart';
@@ -36,6 +38,7 @@ typedef FrameDeferredCallback = void Function(VoidCallback callback);
 typedef UsageSummaryLoader =
     Future<UsageSummary?> Function(AppSettings settings);
 typedef StartupPreferenceApplier = Future<void> Function(bool enabled);
+typedef TerminalLaunchCallback = Future<int> Function(TerminalLaunchSpec spec);
 
 class CodexSessionsViewerApp extends StatefulWidget {
   CodexSessionsViewerApp({
@@ -52,6 +55,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
     this.settingsReload,
     this.usageSummaryLoader,
     this.startupPreferenceApplier = _ignoreStartupPreference,
+    this.terminalLaunch = _launchTerminal,
     this.now = DateTime.now,
   }) : databaseStartup =
            databaseStartup ??
@@ -81,6 +85,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
   final SettingsReloadCallback? settingsReload;
   final UsageSummaryLoader? usageSummaryLoader;
   final StartupPreferenceApplier startupPreferenceApplier;
+  final TerminalLaunchCallback terminalLaunch;
   final DateTime Function() now;
 
   @override
@@ -88,6 +93,8 @@ class CodexSessionsViewerApp extends StatefulWidget {
 }
 
 class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  final _scaffoldMessengerKey = GlobalKey<ScaffoldMessengerState>();
   AppSettings? _settings;
   UsageSummary? _usageSummary;
   var _usageIsRefreshing = false;
@@ -104,6 +111,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: _navigatorKey,
+      scaffoldMessengerKey: _scaffoldMessengerKey,
       title: CodexSessionsViewerApp.appTitle,
       debugShowCheckedModeBanner: false,
       theme: CodexAppTheme.themeData(CodexThemeMode.light),
@@ -413,8 +422,14 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         return;
       case SessionRowAction.openTerminalResume:
       case SessionRowAction.openTerminalFork:
-        if (payload != null) {
-          await _runDetachedCommand(payload);
+        final launchSpec = request.launchSpec;
+        if (launchSpec == null) {
+          await _showTerminalLaunchFailure(
+            request,
+            'No safe terminal launch arguments were generated.',
+          );
+        } else {
+          await _runTerminal(request, launchSpec);
         }
         return;
       case SessionRowAction.togglePin:
@@ -616,14 +631,61 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     );
   }
 
-  Future<void> _runDetachedCommand(String command) async {
-    if (command.trim().isEmpty) {
+  Future<void> _runTerminal(
+    SessionActionRequest request,
+    TerminalLaunchSpec launchSpec,
+  ) async {
+    try {
+      await widget.terminalLaunch(launchSpec);
+    } on Object catch (error) {
+      await _showTerminalLaunchFailure(request, error.toString());
       return;
     }
-    await Process.start('cmd.exe', [
-      '/c',
-      command,
-    ], mode: ProcessStartMode.detached);
+    if (!mounted) {
+      return;
+    }
+    _scaffoldMessengerKey.currentState?.showSnackBar(
+      SnackBar(
+        duration: const Duration(seconds: 8),
+        content: Text('Opening terminal for ${request.row.primaryIdentity}.'),
+      ),
+    );
+  }
+
+  Future<void> _showTerminalLaunchFailure(
+    SessionActionRequest request,
+    String details,
+  ) async {
+    if (!mounted) {
+      return;
+    }
+    final dialogContext = _navigatorKey.currentContext;
+    if (dialogContext == null) {
+      return;
+    }
+    await showDialog<void>(
+      context: dialogContext,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Could not open terminal'),
+        content: SelectableText(
+          'The terminal could not be started.\n\n$details',
+        ),
+        actions: [
+          if (request.payload case final command?)
+            TextButton(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: command));
+              },
+              child: const Text('Copy resume command'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _updateSessionFlag(
@@ -679,6 +741,10 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
 }
 
 Future<void> _ignoreStartupPreference(bool enabled) async {}
+
+Future<int> _launchTerminal(TerminalLaunchSpec spec) {
+  return const TerminalLauncher().launch(spec);
+}
 
 class _SessionsScreenLoader extends StatefulWidget {
   const _SessionsScreenLoader({

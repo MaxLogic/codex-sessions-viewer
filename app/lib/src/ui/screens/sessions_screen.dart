@@ -114,12 +114,14 @@ class SessionActionRequest {
     required this.row,
     required this.action,
     this.payload,
+    this.launchSpec,
     this.evalMetadata,
   });
 
   final SessionRowViewModel row;
   final SessionRowAction action;
   final String? payload;
+  final TerminalLaunchSpec? launchSpec;
   final SessionEvalMetadata? evalMetadata;
 }
 
@@ -1771,11 +1773,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
         row: row,
         action: SessionRowAction.openTerminalResume,
         payload: commandSet.terminalLaunchCommand,
+        launchSpec: commandSet.terminalLaunchSpec,
       ),
       SessionDetailAction.openTerminalFork => SessionActionRequest(
         row: row,
         action: SessionRowAction.openTerminalFork,
         payload: commandSet.terminalForkCommand,
+        launchSpec: commandSet.terminalForkLaunchSpec,
       ),
       SessionDetailAction.reparse => SessionActionRequest(
         row: row,
@@ -3902,6 +3906,7 @@ class _ActionsMenu extends StatelessWidget {
                       row: row,
                       action: SessionRowAction.openTerminalResume,
                       payload: commandSet.terminalLaunchCommand,
+                      launchSpec: commandSet.terminalLaunchSpec,
                     ),
                   ),
           ),
@@ -3916,6 +3921,7 @@ class _ActionsMenu extends StatelessWidget {
                 row: row,
                 action: action,
                 payload: _payloadFor(row, commandSet, action),
+                launchSpec: _launchSpecFor(commandSet, action),
               ),
             ),
             itemBuilder: (context) => [
@@ -4005,14 +4011,15 @@ class _ActionsMenu extends StatelessWidget {
         : Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              AppSvgIcon(iconAsset),
-              const SizedBox(width: 10),
+              AppSvgIcon(iconAsset, size: 18),
+              const SizedBox(width: 8),
               Flexible(child: Text(label)),
             ],
           );
     return PopupMenuItem<SessionRowAction>(
       value: action,
       enabled: enabled,
+      height: enabled || disabledReason == null ? 36 : 52,
       child: enabled || disabledReason == null
           ? labelWidget
           : Column(
@@ -4056,6 +4063,17 @@ class _ActionsMenu extends StatelessWidget {
       SessionRowAction.toggleArchive ||
       SessionRowAction.updateEvalMetadata ||
       SessionRowAction.reparse => null,
+    };
+  }
+
+  TerminalLaunchSpec? _launchSpecFor(
+    ResumeCommandSet commandSet,
+    SessionRowAction action,
+  ) {
+    return switch (action) {
+      SessionRowAction.openTerminalResume => commandSet.terminalLaunchSpec,
+      SessionRowAction.openTerminalFork => commandSet.terminalForkLaunchSpec,
+      _ => null,
     };
   }
 
