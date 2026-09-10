@@ -1,0 +1,26 @@
+{
+  "skill_name": "session-history",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Using the supplied Windows-owned session-index fixture, explain what was decided about the shutdown queue in F:/projects/Atlas on September 9, 2026. Cite the messages and distinguish proposals or claims from proven implementation. Stay within this project.",
+      "expected_output": "Relevant excerpts from s-a with message references; proposed lock change and unverified fixed claim; no unrelated sibling project results.",
+      "files": [],
+      "assertions": ["Cites s-a and message indexes", "Excludes sibling project s-b", "Does not claim a verified fix or commit", "Does not modify the database"]
+    },
+    {
+      "id": 2,
+      "prompt": "Find evidence about a quantum banana rewrite in the supplied session-index fixture. Explain what an empty result establishes and whether the index is complete.",
+      "expected_output": "No indexed matches, with incomplete backfill caveat; no invented historical conclusion or indexing/migration action.",
+      "files": [],
+      "assertions": ["Reports no indexed matches", "Recognizes incomplete backfill metadata", "Does not equate no matches with never happened", "Does not modify the database"]
+    },
+    {
+      "id": 3,
+      "prompt": "Retrieve the end of the long assistant message at s-a message index 3 from the supplied fixture. Use bounded output and include a reference that can be checked later.",
+      "expected_output": "Uses bounded text offsets or equivalent native read-only SQL, returns the end, and identifies s-a/message-3 with parsed revision context.",
+      "files": [],
+      "assertions": ["Retrieves the end rather than only the initial preview", "Keeps returned text bounded", "Includes session/message and parsed revision reference", "Does not modify the database"]
+    }
+  ]
+}
