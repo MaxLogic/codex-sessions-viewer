@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../config/app_settings.dart';
+import 'dialogs/keyboard_shortcuts_dialog.dart';
 import 'motion.dart';
 
 typedef SessionsScreenBuilder =
@@ -54,6 +58,40 @@ class _CodexAppShellState extends State<CodexAppShell> {
   var _selectedIndex = 0;
   var _previousIndex = 0;
   var _handledSectionRequestSerial = 0;
+  var _shortcutsOpen = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // A global handler so F1 works even before anything has focus.
+    HardwareKeyboard.instance.addHandler(_handleKey);
+  }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleKey);
+    super.dispose();
+  }
+
+  bool _handleKey(KeyEvent event) {
+    if (event is! KeyDownEvent || event.logicalKey != LogicalKeyboardKey.f1) {
+      return false;
+    }
+    unawaited(_showShortcuts());
+    return true;
+  }
+
+  Future<void> _showShortcuts() async {
+    if (_shortcutsOpen || !mounted) {
+      return;
+    }
+    _shortcutsOpen = true;
+    try {
+      await showKeyboardShortcutsDialog(context);
+    } finally {
+      _shortcutsOpen = false;
+    }
+  }
 
   @override
   void didUpdateWidget(covariant CodexAppShell oldWidget) {
@@ -85,6 +123,17 @@ class _CodexAppShellState extends State<CodexAppShell> {
                     widget.title,
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                ),
+                trailing: Padding(
+                  padding: const EdgeInsets.only(top: 16),
+                  child: Tooltip(
+                    message: 'Keyboard shortcuts (F1)',
+                    child: TextButton.icon(
+                      onPressed: _showShortcuts,
+                      icon: const Icon(Icons.keyboard_outlined),
+                      label: const Text('Shortcuts'),
+                    ),
                   ),
                 ),
                 onDestinationSelected: (index) {
