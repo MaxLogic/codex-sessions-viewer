@@ -239,6 +239,19 @@ class RuntimeSessionController {
     }, arguments: {'session_id': sessionId});
   }
 
+  /// Loads every message body of a session, for export and
+  /// find-in-conversation over paged sessions.
+  Future<List<ConversationMessageViewModel>> loadAllMessages(String sessionId) {
+    return Profiling.spanAsync('scan.runtime.load_all_messages', () async {
+      final db = openFileBackedDatabase(databaseFile);
+      try {
+        return _loadMessages(db, sessionId, tailBodyPageSize: null);
+      } finally {
+        db.close();
+      }
+    }, arguments: {'session_id': sessionId});
+  }
+
   Future<List<ConversationMessageViewModel>> loadMessagePage(
     String sessionId,
     int anchorMessageNumber,

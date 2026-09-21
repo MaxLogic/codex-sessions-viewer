@@ -380,8 +380,7 @@ void main() {
     await tester.tap(find.text('Parser cache').first);
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('Commands'));
-    await tester.pumpAndSettle();
+    await _openDetailTab(tester, 'Details');
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Run'));
     await tester.pumpAndSettle();
@@ -400,13 +399,7 @@ void main() {
     await tester.tap(fork);
     await tester.pumpAndSettle();
 
-    final reparse = find.widgetWithText(
-      OutlinedButton,
-      'Re-parse this session',
-    );
-    await tester.ensureVisible(reparse);
-    await tester.tap(reparse);
-    await tester.pumpAndSettle();
+    await _chooseMoreAction(tester, 'Re-parse this session');
 
     expect(actions.map((action) => action.action), [
       SessionRowAction.openTerminalResume,
@@ -418,14 +411,9 @@ void main() {
     expect(actions[1].payload, 'cmd /c echo edited');
     expect(actions[2].payload, contains('codex fork abc123'));
 
-    expect(
-      tester
-          .widget<OutlinedButton>(
-            find.widgetWithText(OutlinedButton, 'Export Markdown'),
-          )
-          .enabled,
-      isFalse,
-    );
+    await tester.tap(find.text('More'));
+    await tester.pumpAndSettle();
+    expect(_menuItemEnabled(tester, 'Export Markdown…'), isFalse);
   });
 
   testWidgets('session detail hides duplicate resume command actions', (
@@ -443,8 +431,7 @@ void main() {
 
     await tester.tap(find.text('Parser cache').first);
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Commands'));
-    await tester.pumpAndSettle();
+    await _openDetailTab(tester, 'Details');
 
     expect(
       find.widgetWithText(OutlinedButton, 'Copy plain resume command'),
@@ -457,7 +444,7 @@ void main() {
   });
 
   testWidgets(
-    'session detail command actions live in collapsible commands panel',
+    'session detail keeps one primary resume action and commands in Details',
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(5000, 1400));
       addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -477,29 +464,25 @@ void main() {
         findsNothing,
       );
       expect(
-        find.widgetWithText(OutlinedButton, 'Open in terminal and resume'),
-        findsNothing,
+        find.widgetWithText(FilledButton, 'Resume in terminal'),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(OutlinedButton, 'Copy resume command'),
+        findsOneWidget,
       );
       expect(find.text('Plain resume command:'), findsNothing);
 
-      await tester.tap(find.text('Commands'));
-      await tester.pumpAndSettle();
+      await _openDetailTab(tester, 'Details');
 
       expect(
         find.widgetWithText(OutlinedButton, 'Copy plain resume command'),
         findsOneWidget,
       );
       expect(
-        find.widgetWithText(OutlinedButton, 'Open in terminal and resume'),
-        findsOneWidget,
-      );
-      expect(
         find.widgetWithText(OutlinedButton, 'Copy terminal launch command'),
         findsOneWidget,
       );
-      expect(find.text('Plain resume command:'), findsNothing);
-      await tester.tap(find.text('Show command preview'));
-      await tester.pumpAndSettle();
       expect(find.text('Plain resume command:'), findsOneWidget);
     },
   );
@@ -536,10 +519,7 @@ void main() {
       await tester.tap(find.text('Parser cache').first);
       await tester.pumpAndSettle();
 
-      await tester.tap(
-        find.widgetWithText(OutlinedButton, 'Open containing folder'),
-      );
-      await tester.pumpAndSettle();
+      await _chooseMoreAction(tester, 'Open containing folder');
 
       expect(actions.single.action, SessionRowAction.openPath);
       expect(
@@ -579,10 +559,9 @@ void main() {
     await tester.tap(find.text('Parser cache').first);
     await tester.pumpAndSettle();
 
-    final button = tester.widget<OutlinedButton>(
-      find.widgetWithText(OutlinedButton, 'Open containing folder'),
-    );
-    expect(button.enabled, isFalse);
+    await tester.tap(find.text('More'));
+    await tester.pumpAndSettle();
+    expect(_menuItemEnabled(tester, 'Open containing folder'), isFalse);
     expect(actions, isEmpty);
   });
 
@@ -668,13 +647,34 @@ void main() {
 
     await tester.tap(find.text('Parser cache').first);
     await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Export Markdown'));
-    await tester.pumpAndSettle();
+    await _chooseMoreAction(tester, 'Export Markdown…');
 
     expect(exported.single, contains('# Parser cache'));
     expect(exported.single, contains('## Message 1 - User'));
     expect(exported.single, contains('Hello'));
   });
+}
+
+Future<void> _openDetailTab(WidgetTester tester, String label) async {
+  await tester.tap(find.widgetWithText(Tab, label));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _chooseMoreAction(WidgetTester tester, String label) async {
+  await tester.tap(find.text('More'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label));
+  await tester.pumpAndSettle();
+}
+
+bool _menuItemEnabled(WidgetTester tester, String label) {
+  final item = tester.widget<PopupMenuItem<String>>(
+    find.ancestor(
+      of: find.textContaining(label),
+      matching: find.byType(PopupMenuItem<String>),
+    ),
+  );
+  return item.enabled;
 }
 
 SessionRowViewModel _row({

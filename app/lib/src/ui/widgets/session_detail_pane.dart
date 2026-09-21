@@ -6,11 +6,11 @@ import '../../config/app_settings.dart';
 import '../../utils/injected_context_filter.dart';
 import '../models/conversation_message_view_model.dart';
 import '../models/session_row_view_model.dart';
-import '../motion.dart';
 import '../number_formatting.dart';
 import 'command_preview.dart';
 import 'conversation_view.dart';
 import 'focus_reader_view.dart';
+import 'session_stats_view.dart';
 import 'svg_icon.dart';
 
 typedef DetailCopyCallback = Future<void> Function(String text);
@@ -39,11 +39,18 @@ enum SessionDetailAction {
   editEvalMetadata,
 }
 
+/// Tabs of the session detail pane, in display order.
+enum SessionDetailTab { conversation, stats, details, focusReader }
+
 class SessionDetailPane extends StatelessWidget {
   const SessionDetailPane({
     super.key,
     required this.row,
     this.settings,
+    this.subagents = const [],
+    this.parentRow,
+    this.onOpenSession,
+    this.loadActivity,
     this.onCopyText,
     this.onExportMarkdown,
     this.onLoadFullConversationMessages,
@@ -54,10 +61,20 @@ class SessionDetailPane extends StatelessWidget {
     this.initialConversationMessageNumber,
     this.onConversationPositionChanged,
     this.onLoadMessagePage,
+    this.initialTab = SessionDetailTab.conversation,
+    this.onTabChanged,
   });
 
   final SessionRowViewModel row;
   final AppSettings? settings;
+
+  /// Subagent sessions spawned by [row].
+  final List<SessionRowViewModel> subagents;
+
+  /// The session that spawned [row], when [row] is a subagent.
+  final SessionRowViewModel? parentRow;
+  final ValueChanged<String>? onOpenSession;
+  final SessionActivityLoader? loadActivity;
   final DetailCopyCallback? onCopyText;
   final DetailMarkdownExportCallback? onExportMarkdown;
   final FullConversationMessagesLoader? onLoadFullConversationMessages;
@@ -69,13 +86,14 @@ class SessionDetailPane extends StatelessWidget {
   final ConversationPositionChanged? onConversationPositionChanged;
   final ConversationMessagePageLoader? onLoadMessagePage;
 
+  /// The tab shown first. The sessions screen passes the tab the user last
+  /// chose, so comparing stats across sessions keeps the Stats tab open.
+  final SessionDetailTab initialTab;
+  final ValueChanged<SessionDetailTab>? onTabChanged;
+
   @override
   Widget build(BuildContext context) {
     final effectiveSettings = settings ?? AppSettings.defaults();
-    final motionPolicy = CodexMotionPolicy.fromContext(
-      context,
-      mode: effectiveSettings.ui.motion,
-    );
     final commandSet = ResumeCommandGenerator(settings: effectiveSettings)
         .build(
           ResumeCommandSession(
@@ -90,143 +108,151 @@ class SessionDetailPane extends StatelessWidget {
     final visibleMessages = row.conversationMessages
         .where((message) => !_isInjectedContextMessage(message))
         .toList(growable: false);
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _SelectedSessionHeader(row: row),
-          const SizedBox(height: 8),
-          _ActionArea(
-            row: row,
-            commandSet: commandSet,
-            onCopyText: onCopyText,
-            onExportMarkdown: onExportMarkdown,
-            onLoadFullConversationMessages: onLoadFullConversationMessages,
-            onSessionAction: onSessionAction,
-          ),
-          const SizedBox(height: 8),
-          _EvalSummary(row: row),
-          const SizedBox(height: 8),
-          ExpansionTile(
-            tilePadding: EdgeInsets.zero,
-            childrenPadding: EdgeInsets.zero,
-            title: Text(
-              'Details',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            subtitle: Text(_detailsSummary(row)),
-            children: [_MetadataGrid(row: row)],
-          ),
-          const SizedBox(height: 8),
-          ExpansionTile(
-            tilePadding: EdgeInsets.zero,
-            childrenPadding: EdgeInsets.zero,
-            title: Text(
-              'Commands',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
+    final fullLoader = onLoadFullConversationMessages;
+    return DefaultTabController(
+      length: SessionDetailTab.values.length,
+      initialIndex: initialTab.index,
+      child: Builder(
+        builder: (context) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              CodexMotion.expandCollapse(
-                policy: motionPolicy,
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _CommandActionPanel(
+                    _SelectedSessionHeader(
+                      row: row,
+                      parentRow: parentRow,
+                      subagentCount: subagents.length,
+                      onOpenSession: onOpenSession,
+                    ),
+                    const SizedBox(height: 10),
+                    _ActionArea(
+                      row: row,
+                      commandSet: commandSet,
+                      onCopyText: onCopyText,
+                      onExportMarkdown: onExportMarkdown,
+                      onLoadFullConversationMessages:
+                          onLoadFullConversationMessages,
+                      onSessionAction: onSessionAction,
+                      onRunTerminalCommand: onRunTerminalCommand,
+                      onEditTerminalCommand: onEditTerminalCommand,
+                    ),
+                  ],
+                ),
+              ),
+              Semantics(
+                label: 'Session detail view selector',
+                container: true,
+                child: TabBar(
+                  onTap: (index) =>
+                      onTabChanged?.call(SessionDetailTab.values[index]),
+                  isScrollable: true,
+                  tabAlignment: TabAlignment.start,
+                  tabs: [
+                    const Tab(text: 'Conversation'),
+                    Tab(
+                      text: subagents.isEmpty
+                          ? 'Stats'
+                          : 'Stats · ${subagents.length} subagents',
+                    ),
+                    const Tab(text: 'Details'),
+                    const Tab(text: 'Focus reader'),
+                  ],
+                ),
+              ),
+              Divider(
+                height: 1,
+                color: Theme.of(context).colorScheme.outlineVariant,
+              ),
+              Expanded(
+                child: TabBarView(
+                  physics: const NeverScrollableScrollPhysics(),
+                  children: [
+                    _ConversationTab(
+                      messages: visibleMessages,
+                      isLoadingMessages: isLoadingMessages,
+                      onCopyText: onCopyText,
+                      motionMode: effectiveSettings.ui.motion,
+                      initialMessageNumber: initialConversationMessageNumber,
+                      onPositionChanged: onConversationPositionChanged,
+                      onLoadMessagePage: onLoadMessagePage,
+                      onLoadAllMessages: fullLoader == null
+                          ? null
+                          : () => fullLoader(row),
+                    ),
+                    SessionStatsView(
+                      row: row,
+                      subagents: subagents,
+                      loadActivity:
+                          loadActivity ?? loadSessionActivityFromFiles,
+                      onOpenSession: onOpenSession,
+                    ),
+                    _DetailsTab(
+                      row: row,
                       commandSet: commandSet,
                       onCopyText: onCopyText,
                       onSessionAction: onSessionAction,
                       onRunTerminalCommand: onRunTerminalCommand,
                       onEditTerminalCommand: onEditTerminalCommand,
                     ),
-                    const SizedBox(height: 8),
-                    ExpansionTile(
-                      tilePadding: EdgeInsets.zero,
-                      childrenPadding: EdgeInsets.zero,
-                      title: const Text('Show command preview'),
-                      children: [
-                        CommandPreview(
-                          commandSet: commandSet,
-                          onRunTerminalCommand: onRunTerminalCommand,
-                          onEditTerminalCommand: onEditTerminalCommand,
-                          showInlineActions: false,
-                        ),
-                      ],
+                    FocusReaderView(
+                      messages: visibleMessages,
+                      onCopyText: onCopyText,
                     ),
                   ],
                 ),
               ),
             ],
-          ),
-          const SizedBox(height: 8),
-          if (isLoadingMessages)
-            Semantics(
-              liveRegion: true,
-              container: true,
-              excludeSemantics: true,
-              label: 'Loading session conversation messages.',
-              child: const Padding(
-                padding: EdgeInsets.only(bottom: 8),
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                    SizedBox(width: 8),
-                    Text('Loading conversation messages'),
-                  ],
-                ),
-              ),
-            ),
-          if (isLoadingMessages && visibleMessages.isEmpty)
-            const SizedBox(
-              height: 420,
-              child: Center(child: Text('Conversation messages loading')),
-            )
-          else
-            _ConversationTabs(
-              messages: visibleMessages,
-              onCopyText: onCopyText,
-              motionMode: effectiveSettings.ui.motion,
-              initialMessageNumber: initialConversationMessageNumber,
-              onPositionChanged: onConversationPositionChanged,
-              onLoadMessagePage: onLoadMessagePage,
-            ),
-        ],
+          );
+        },
       ),
     );
-  }
-
-  String _detailsSummary(SessionRowViewModel row) {
-    final duration =
-        row.duration ?? row.lastMessageAtUtc.difference(row.startedAtUtc);
-    return [
-      row.status,
-      row.displayTotalTokens > 0
-          ? '${formatCompactInt(row.displayTotalTokens)} tokens'
-          : null,
-      '${formatCompactInt(row.messageCount)} messages',
-      duration.humanDuration,
-    ].whereType<String>().join(' | ');
   }
 }
 
 class _SelectedSessionHeader extends StatelessWidget {
-  const _SelectedSessionHeader({required this.row});
+  const _SelectedSessionHeader({
+    required this.row,
+    required this.parentRow,
+    required this.subagentCount,
+    required this.onOpenSession,
+  });
 
   final SessionRowViewModel row;
+  final SessionRowViewModel? parentRow;
+  final int subagentCount;
+  final ValueChanged<String>? onOpenSession;
 
   @override
   Widget build(BuildContext context) {
-    final title = row.threadName.trim().isNotEmpty
-        ? row.threadName.trim()
-        : row.title.trim().isEmpty
-        ? row.project
-        : row.title.trim();
+    final theme = Theme.of(context);
+    final title = _sessionTitle(row);
     final duration =
         row.duration ?? row.lastMessageAtUtc.difference(row.startedAtUtc);
+    final cost = row.displayEstimatedCost;
+    final facts = <String>[
+      if (row.project.trim().isNotEmpty && row.project.trim() != title)
+        row.project.trim(),
+      row.platformLabel,
+      row.modelLabel,
+      '${formatCompactInt(row.messageCount)} messages',
+      '${formatCompactInt(row.displayTotalTokens)} tokens',
+      if (row.usageRollup != null || !row.costUnknown) cost,
+      duration.humanDuration,
+      row.lastMessageAtUtc.shortDateTime,
+    ];
+    final badges = <String>[
+      if (row.isSubagentSession) row.originLabel,
+      if (row.isPinned) 'Pinned',
+      if (row.isArchived) 'Archived',
+      if (row.hasError) 'Errors',
+      if (row.evalReady) 'Eval-ready',
+      ...row.tags,
+    ];
+    final parent = parentRow;
     return Semantics(
       header: true,
       label: 'Selected session $title',
@@ -235,28 +261,41 @@ class _SelectedSessionHeader extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 6),
+          Text(
+            title,
+            style: theme.textTheme.titleLarge,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 4),
           Wrap(
-            spacing: 8,
+            spacing: 6,
             runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              _HeaderFact(row.platformLabel),
-              _HeaderFact(row.originLabel),
-              if (row.hasThreadName) _HeaderFact('Thread ${row.threadName}'),
-              _HeaderFact(row.modelLabel),
-              _HeaderFact('${formatCompactInt(row.messageCount)} messages'),
-              _HeaderFact('${formatCompactInt(row.displayTotalTokens)} tokens'),
-              if (row.usageRollup != null)
-                _HeaderFact(row.displayEstimatedCost),
-              _HeaderFact(row.lastMessageAtUtc.shortDateTime),
-              _HeaderFact(duration.humanDuration),
-              if (row.isPinned) const _HeaderFact('Pinned'),
-              if (row.isArchived) const _HeaderFact('Archived'),
-              if (row.hasError) const _HeaderFact('Errors'),
+              for (var i = 0; i < facts.length; i++) ...[
+                if (i > 0) const _FactSeparator(),
+                Text(
+                  facts[i],
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+              for (final badge in badges) _HeaderFact(badge),
             ],
           ),
-          const SizedBox(height: 6),
+          if (parent != null) ...[
+            const SizedBox(height: 4),
+            _LinkText(
+              text: 'Spawned by: ${_sessionTitle(parent)}',
+              semanticsLabel: 'Open parent session ${_sessionTitle(parent)}',
+              onTap: onOpenSession == null
+                  ? null
+                  : () => onOpenSession!(parent.id),
+            ),
+          ],
+          const SizedBox(height: 2),
           Semantics(
             label: 'Working directory ${row.workingDirectoryForCommands}',
             readOnly: true,
@@ -267,6 +306,9 @@ class _SelectedSessionHeader extends StatelessWidget {
                   row.workingDirectoryForCommands,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ),
             ),
@@ -277,57 +319,68 @@ class _SelectedSessionHeader extends StatelessWidget {
   }
 }
 
-class _ConversationTabs extends StatelessWidget {
-  const _ConversationTabs({
-    required this.messages,
-    required this.onCopyText,
-    required this.motionMode,
-    required this.initialMessageNumber,
-    required this.onPositionChanged,
-    required this.onLoadMessagePage,
-  });
+String _sessionTitle(SessionRowViewModel row) {
+  if (row.threadName.trim().isNotEmpty) {
+    return row.threadName.trim();
+  }
+  if (row.title.trim().isNotEmpty) {
+    return row.title.trim();
+  }
+  final nickname = row.agentNickname.trim();
+  if (row.isSubagentSession && nickname.isNotEmpty) {
+    return 'Subagent $nickname · ${row.project}';
+  }
+  return row.project;
+}
 
-  final List<ConversationMessageViewModel> messages;
-  final DetailCopyCallback? onCopyText;
-  final AppMotionMode motionMode;
-  final int? initialMessageNumber;
-  final ConversationPositionChanged? onPositionChanged;
-  final ConversationMessagePageLoader? onLoadMessagePage;
+class _FactSeparator extends StatelessWidget {
+  const _FactSeparator();
 
   @override
   Widget build(BuildContext context) {
-    return DefaultTabController(
-      length: 2,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Semantics(
-            label: 'Conversation view selector',
-            container: true,
-            child: const TabBar(
-              tabs: [
-                Tab(text: 'Conversation'),
-                Tab(text: 'Focus reader'),
-              ],
-            ),
-          ),
-          SizedBox(
-            height: 420,
-            child: TabBarView(
-              children: [
-                ConversationView(
-                  messages: messages,
-                  onCopyMessageMarkdown: onCopyText,
-                  motionMode: motionMode,
-                  initialMessageNumber: initialMessageNumber,
-                  onPositionChanged: onPositionChanged,
-                  onLoadMessagePage: onLoadMessagePage,
-                ),
-                FocusReaderView(messages: messages, onCopyText: onCopyText),
-              ],
-            ),
-          ),
-        ],
+    return ExcludeSemantics(
+      child: Text(
+        '·',
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+          color: Theme.of(context).colorScheme.outline,
+        ),
+      ),
+    );
+  }
+}
+
+class _LinkText extends StatelessWidget {
+  const _LinkText({
+    required this.text,
+    required this.semanticsLabel,
+    required this.onTap,
+  });
+
+  final String text;
+  final String semanticsLabel;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final label = Text(
+      text,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: theme.textTheme.bodySmall?.copyWith(
+        color: onTap == null ? null : theme.colorScheme.primary,
+        decoration: onTap == null ? null : TextDecoration.underline,
+      ),
+    );
+    if (onTap == null) {
+      return label;
+    }
+    return Semantics(
+      label: semanticsLabel,
+      button: true,
+      onTap: onTap,
+      child: ExcludeSemantics(
+        child: InkWell(onTap: onTap, child: label),
       ),
     );
   }
@@ -346,14 +399,17 @@ class _HeaderFact extends StatelessWidget {
       child: ExcludeSemantics(
         child: DecoratedBox(
           decoration: BoxDecoration(
-            border: Border.all(
-              color: Theme.of(context).colorScheme.outlineVariant,
-            ),
+            color: Theme.of(context).colorScheme.secondaryContainer,
             borderRadius: BorderRadius.circular(6),
           ),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-            child: Text(text, style: Theme.of(context).textTheme.bodySmall),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            child: Text(
+              text,
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSecondaryContainer,
+              ),
+            ),
           ),
         ),
       ),
@@ -361,121 +417,323 @@ class _HeaderFact extends StatelessWidget {
   }
 }
 
-class _EvalSummary extends StatelessWidget {
-  const _EvalSummary({required this.row});
+class _ConversationTab extends StatelessWidget {
+  const _ConversationTab({
+    required this.messages,
+    required this.isLoadingMessages,
+    required this.onCopyText,
+    required this.motionMode,
+    required this.initialMessageNumber,
+    required this.onPositionChanged,
+    required this.onLoadMessagePage,
+    required this.onLoadAllMessages,
+  });
 
-  final SessionRowViewModel row;
+  final List<ConversationMessageViewModel> messages;
+  final bool isLoadingMessages;
+  final DetailCopyCallback? onCopyText;
+  final AppMotionMode motionMode;
+  final int? initialMessageNumber;
+  final ConversationPositionChanged? onPositionChanged;
+  final ConversationMessagePageLoader? onLoadMessagePage;
+  final ConversationOlderMessagesLoader? onLoadAllMessages;
 
   @override
   Widget build(BuildContext context) {
-    final notes = row.evalNotes.trim();
-    final expected = row.evalExpectedOutput.trim();
-    return Semantics(
+    final loadingBanner = Semantics(
+      liveRegion: true,
       container: true,
-      label: 'Eval metadata ${row.evalStatusLabel}',
-      child: Wrap(
-        spacing: 12,
-        runSpacing: 6,
-        children: [
-          Text(row.evalReady ? 'Eval-ready: Yes' : 'Eval-ready: No'),
-          Text('Eval status: ${row.evalStatusLabel}'),
-          if (notes.isNotEmpty) Text('Notes: $notes'),
-          if (expected.isNotEmpty) Text('Expected output: $expected'),
-        ],
+      excludeSemantics: true,
+      label: 'Loading session conversation messages.',
+      child: const Padding(
+        padding: EdgeInsets.fromLTRB(16, 8, 16, 8),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 8),
+            Text('Loading conversation messages'),
+          ],
+        ),
       ),
+    );
+    if (isLoadingMessages && messages.isEmpty) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          loadingBanner,
+          const Expanded(
+            child: Center(child: Text('Conversation messages loading')),
+          ),
+        ],
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (isLoadingMessages) loadingBanner,
+        Expanded(
+          child: ConversationView(
+            messages: messages,
+            onCopyMessageMarkdown: onCopyText,
+            motionMode: motionMode,
+            initialToolCallVisibility: ToolCallVisibility.hide,
+            initialMessageNumber: initialMessageNumber,
+            onPositionChanged: onPositionChanged,
+            onLoadMessagePage: onLoadMessagePage,
+            onLoadAllMessages: onLoadAllMessages,
+          ),
+        ),
+      ],
     );
   }
 }
 
-class _MetadataGrid extends StatelessWidget {
-  const _MetadataGrid({required this.row});
+class _DetailsTab extends StatelessWidget {
+  const _DetailsTab({
+    required this.row,
+    required this.commandSet,
+    required this.onCopyText,
+    required this.onSessionAction,
+    required this.onRunTerminalCommand,
+    required this.onEditTerminalCommand,
+  });
 
   final SessionRowViewModel row;
+  final ResumeCommandSet commandSet;
+  final DetailCopyCallback? onCopyText;
+  final SessionDetailActionCallback? onSessionAction;
+  final TerminalCommandCallback? onRunTerminalCommand;
+  final TerminalCommandCallback? onEditTerminalCommand;
 
   @override
   Widget build(BuildContext context) {
     final duration =
         row.duration ?? row.lastMessageAtUtc.difference(row.startedAtUtc);
-    return Wrap(
-      spacing: 12,
-      runSpacing: 6,
+    final notes = row.evalNotes.trim();
+    final expected = row.evalExpectedOutput.trim();
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       children: [
-        _DetailText('Platform', row.platformLabel),
-        _DetailText('Origin', row.originLabel),
-        if (row.hasThreadName) _DetailText('Thread name', row.threadName),
-        if (row.parentThreadId.isNotEmpty)
-          _DetailText('Parent thread', row.parentThreadId),
-        if (row.agentRole.isNotEmpty) _DetailText('Agent role', row.agentRole),
-        if (row.subagentDepth != null)
-          _DetailText('Subagent depth', formatGroupedInt(row.subagentDepth!)),
-        _DetailText('Project', row.project),
-        _DetailText('Source file', row.sourcePathForDisplay),
-        _DetailText('Display path', row.displayPathForDetail),
-        _DetailText('Working directory', row.workingDirectoryForCommands),
-        _DetailText('Started', row.startedAtUtc.shortDateTime),
-        _DetailText('Last message', row.lastMessageAtUtc.shortDateTime),
-        _DetailText('Duration', duration.humanDuration),
-        _DetailText('Total messages', formatGroupedInt(row.messageCount)),
-        _DetailText(
-          'User message count',
-          formatGroupedInt(row.userMessageCount),
+        const _DetailsHeading('Session'),
+        _DetailGrid(
+          children: [
+            _DetailText('Platform', row.platformLabel),
+            _DetailText('Origin', row.originLabel),
+            _DetailText('Project', row.project),
+            if (row.hasThreadName) _DetailText('Thread name', row.threadName),
+            if (row.parentThreadId.isNotEmpty)
+              _DetailText('Parent thread', row.parentThreadId),
+            if (row.agentRole.isNotEmpty)
+              _DetailText('Agent role', row.agentRole),
+            if (row.subagentDepth != null)
+              _DetailText(
+                'Subagent depth',
+                formatGroupedInt(row.subagentDepth!),
+              ),
+            _DetailText('Started', row.startedAtUtc.shortDateTime),
+            _DetailText('Last message', row.lastMessageAtUtc.shortDateTime),
+            _DetailText('Duration', duration.humanDuration),
+            _DetailText('Status', row.status),
+            _DetailText('Tags', row.tags.join(', ')),
+            _DetailText('Pinned', row.isPinned ? 'Yes' : 'No'),
+            _DetailText('Archived', row.isArchived ? 'Yes' : 'No'),
+            _DetailText(
+              'Models used',
+              row.modelsUsedForDetail.isEmpty
+                  ? 'Unknown'
+                  : row.modelsUsedForDetail.join(', '),
+              width: 532,
+            ),
+          ],
         ),
-        _DetailText(
-          'Assistant message count',
-          formatGroupedInt(row.assistantMessageCount),
+        const _DetailsHeading('Messages and tokens'),
+        _DetailGrid(
+          children: [
+            _DetailText('Total messages', formatGroupedInt(row.messageCount)),
+            _DetailText(
+              'User message count',
+              formatGroupedInt(row.userMessageCount),
+            ),
+            _DetailText(
+              'Assistant message count',
+              formatGroupedInt(row.assistantMessageCount),
+            ),
+            _DetailText('Tool call count', formatGroupedInt(row.toolCallCount)),
+            if (row.usageRollup case final rollup?) ...[
+              _DetailText(
+                'Usage total',
+                '${formatGroupedInt(rollup.totalTokens)} tokens | ${rollup.totalEstimatedCostDisplay}',
+              ),
+              _DetailText(
+                'Usage main',
+                '${formatGroupedInt(rollup.mainTokens)} tokens | ${rollup.mainEstimatedCostDisplay}',
+              ),
+              _DetailText(
+                'Usage subagents',
+                '${formatGroupedInt(rollup.subagentTokens)} tokens | ${rollup.subagentEstimatedCostDisplay}',
+              ),
+            ],
+            _DetailText(
+              'Total tokens',
+              formatGroupedInt(row.displayTotalTokens),
+            ),
+            _DetailText('Input tokens', formatGroupedInt(row.inputTokens)),
+            _DetailText('Output tokens', formatGroupedInt(row.outputTokens)),
+            _DetailText(
+              'Cached input tokens',
+              _tokensWithShare(row, row.cachedInputTokens),
+            ),
+            _DetailText(
+              'User message tokens',
+              _tokensWithShare(row, row.userMessageTokens),
+            ),
+            _DetailText(
+              'AI response tokens',
+              _tokensWithShare(row, row.assistantResponseTokens),
+            ),
+            _DetailText(
+              'Tool call tokens',
+              _tokensWithShare(row, row.toolCallTokens),
+            ),
+            _DetailText('Estimated cost', row.displayEstimatedCost),
+          ],
         ),
-        _DetailText('Tool call count', formatGroupedInt(row.toolCallCount)),
-        if (row.usageRollup case final rollup?) ...[
-          _DetailText(
-            'Usage total',
-            '${formatGroupedInt(rollup.totalTokens)} tokens | ${rollup.totalEstimatedCostDisplay}',
+        const _DetailsHeading('Paths'),
+        _PathLine(
+          label: 'Source file',
+          value: row.sourcePathForDisplay,
+          onCopyText: onCopyText,
+        ),
+        _PathLine(
+          label: 'Display path',
+          value: row.displayPathForDetail,
+          onCopyText: onCopyText,
+        ),
+        _PathLine(
+          label: 'Working directory',
+          value: row.workingDirectoryForCommands,
+          onCopyText: onCopyText,
+        ),
+        const _DetailsHeading('Resume commands'),
+        _CommandActionPanel(
+          commandSet: commandSet,
+          onCopyText: onCopyText,
+          onSessionAction: onSessionAction,
+          onRunTerminalCommand: onRunTerminalCommand,
+          onEditTerminalCommand: onEditTerminalCommand,
+        ),
+        const SizedBox(height: 12),
+        CommandPreview(
+          commandSet: commandSet,
+          onRunTerminalCommand: onRunTerminalCommand,
+          onEditTerminalCommand: onEditTerminalCommand,
+          showInlineActions: false,
+        ),
+        const _DetailsHeading('Eval'),
+        Semantics(
+          container: true,
+          label: 'Eval metadata ${row.evalStatusLabel}',
+          child: _DetailGrid(
+            children: [
+              _DetailText('Eval-ready', row.evalReady ? 'Yes' : 'No'),
+              _DetailText('Eval status', row.evalStatusLabel),
+              if (notes.isNotEmpty) _DetailText('Notes', notes, width: 532),
+              if (expected.isNotEmpty)
+                _DetailText('Expected output', expected, width: 532),
+            ],
           ),
-          _DetailText(
-            'Usage main',
-            '${formatGroupedInt(rollup.mainTokens)} tokens | ${rollup.mainEstimatedCostDisplay}',
-          ),
-          _DetailText(
-            'Usage subagents',
-            '${formatGroupedInt(rollup.subagentTokens)} tokens | ${rollup.subagentEstimatedCostDisplay}',
-          ),
-        ],
-        _DetailText('Total tokens', formatGroupedInt(row.displayTotalTokens)),
-        _DetailText('Input tokens', formatGroupedInt(row.inputTokens)),
-        _DetailText('Output tokens', formatGroupedInt(row.outputTokens)),
-        _DetailText(
-          'Cached input tokens',
-          _tokensWithShare(row, row.cachedInputTokens),
         ),
-        _DetailText(
-          'User message tokens',
-          _tokensWithShare(row, row.userMessageTokens),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            _LabeledButton(
+              semanticsLabel: row.evalReady
+                  ? 'Remove selected session from evals'
+                  : 'Add selected session to evals',
+              label: row.evalReady ? 'Remove from Evals' : 'Add to Evals',
+              onPressed: onSessionAction == null
+                  ? null
+                  : () => onSessionAction!(
+                      row.evalReady
+                          ? SessionDetailAction.removeFromEvals
+                          : SessionDetailAction.addToEvals,
+                    ),
+            ),
+            _LabeledButton(
+              semanticsLabel: 'Edit eval metadata for selected session',
+              label: 'Edit eval details',
+              onPressed: onSessionAction == null
+                  ? null
+                  : () =>
+                        onSessionAction!(SessionDetailAction.editEvalMetadata),
+            ),
+          ],
         ),
-        _DetailText(
-          'AI response tokens',
-          _tokensWithShare(row, row.assistantResponseTokens),
-        ),
-        _DetailText(
-          'Tool call tokens',
-          _tokensWithShare(row, row.toolCallTokens),
-        ),
-        _DetailText('Estimated cost', row.displayEstimatedCost),
-        _DetailText(
-          'Models used',
-          row.modelsUsedForDetail.isEmpty
-              ? 'Unknown'
-              : row.modelsUsedForDetail.join(', '),
-          width: 532,
-        ),
-        _DetailText('Status', row.status),
-        _DetailText('Tags', row.tags.join(', ')),
-        _DetailText('Pinned', row.isPinned ? 'Yes' : 'No'),
-        _DetailText('Archived', row.isArchived ? 'Yes' : 'No'),
       ],
     );
   }
 
   String _tokensWithShare(SessionRowViewModel row, int tokens) {
     return '${formatGroupedInt(tokens)} (${row.tokenShareText(tokens)})';
+  }
+}
+
+class _LabeledButton extends StatelessWidget {
+  const _LabeledButton({
+    required this.semanticsLabel,
+    required this.label,
+    required this.onPressed,
+  });
+
+  final String semanticsLabel;
+  final String label;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: semanticsLabel,
+      button: true,
+      enabled: onPressed != null,
+      onTap: onPressed,
+      child: ExcludeSemantics(
+        child: OutlinedButton(onPressed: onPressed, child: Text(label)),
+      ),
+    );
+  }
+}
+
+class _DetailsHeading extends StatelessWidget {
+  const _DetailsHeading(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 16, bottom: 8),
+      child: Semantics(
+        header: true,
+        child: Text(text, style: Theme.of(context).textTheme.titleSmall),
+      ),
+    );
+  }
+}
+
+class _DetailGrid extends StatelessWidget {
+  const _DetailGrid({required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(spacing: 12, runSpacing: 6, children: children);
   }
 }
 
@@ -490,11 +748,79 @@ class _DetailText extends StatelessWidget {
   Widget build(BuildContext context) {
     return SizedBox(
       width: width,
-      child: Text('$label: $value', overflow: TextOverflow.ellipsis),
+      child: Tooltip(
+        message: value,
+        waitDuration: const Duration(milliseconds: 600),
+        child: Text('$label: $value', overflow: TextOverflow.ellipsis),
+      ),
     );
   }
 }
 
+class _PathLine extends StatelessWidget {
+  const _PathLine({
+    required this.label,
+    required this.value,
+    required this.onCopyText,
+  });
+
+  final String label;
+  final String value;
+  final DetailCopyCallback? onCopyText;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Tooltip(
+            message: value,
+            waitDuration: const Duration(milliseconds: 600),
+            child: Text(
+              '$label: $value',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ),
+        IconButton(
+          tooltip: 'Copy ${label.toLowerCase()}',
+          visualDensity: VisualDensity.compact,
+          onPressed: value.trim().isEmpty
+              ? null
+              : () => _copyWithFeedback(
+                  context,
+                  onCopyText,
+                  value,
+                  'Copied ${label.toLowerCase()}.',
+                ),
+          icon: const AppSvgIcon(AppIcons.copy),
+        ),
+      ],
+    );
+  }
+}
+
+Future<void> _copyWithFeedback(
+  BuildContext context,
+  DetailCopyCallback? callback,
+  String text,
+  String message,
+) async {
+  if (callback != null) {
+    await callback(text);
+  } else {
+    await Clipboard.setData(ClipboardData(text: text));
+  }
+  if (context.mounted) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+}
+
+/// The always-visible action row: the few actions used on almost every visit,
+/// with everything else in the More menu.
 class _ActionArea extends StatelessWidget {
   const _ActionArea({
     required this.row,
@@ -503,6 +829,8 @@ class _ActionArea extends StatelessWidget {
     required this.onExportMarkdown,
     required this.onLoadFullConversationMessages,
     required this.onSessionAction,
+    required this.onRunTerminalCommand,
+    required this.onEditTerminalCommand,
   });
 
   final SessionRowViewModel row;
@@ -511,75 +839,106 @@ class _ActionArea extends StatelessWidget {
   final DetailMarkdownExportCallback? onExportMarkdown;
   final FullConversationMessagesLoader? onLoadFullConversationMessages;
   final SessionDetailActionCallback? onSessionAction;
+  final TerminalCommandCallback? onRunTerminalCommand;
+  final TerminalCommandCallback? onEditTerminalCommand;
 
   @override
   Widget build(BuildContext context) {
     final hasConversation = row.conversationMessages.isNotEmpty;
+    final resumeCommand =
+        commandSet.platformResumeCommand ?? commandSet.plainResumeCommand;
+    final canRunTerminal =
+        commandSet.terminalLaunchCommand != null && onSessionAction != null;
     return Wrap(
       spacing: 6,
       runSpacing: 6,
+      crossAxisAlignment: WrapCrossAlignment.center,
       children: [
-        _callbackAction(
-          'Open containing folder',
-          SessionDetailAction.openContainingFolder,
-          enabled: row.canOpenContainingFolder,
-          iconAsset: AppIcons.folderOpen,
-          disabledReason:
-              'This WSL path cannot be opened from Windows Explorer.',
+        Tooltip(
+          message: canRunTerminal
+              ? 'Open a terminal in the working directory and resume'
+              : commandSet.terminalDisabledReason ??
+                    commandSet.disabledReason ??
+                    'Terminal resume is not available.',
+          child: FilledButton.icon(
+            onPressed: canRunTerminal
+                ? () => onSessionAction!(SessionDetailAction.openTerminalResume)
+                : null,
+            icon: const AppSvgIcon(AppIcons.terminal),
+            label: const Text('Resume in terminal'),
+          ),
         ),
-        _callbackAction(
-          row.evalReady ? 'Remove from Evals' : 'Add to Evals',
-          row.evalReady
-              ? SessionDetailAction.removeFromEvals
-              : SessionDetailAction.addToEvals,
-          semanticLabel: row.evalReady
-              ? 'Remove selected session from evals'
-              : 'Add selected session to evals',
-        ),
-        _callbackAction(
-          'Edit eval details',
-          SessionDetailAction.editEvalMetadata,
-          semanticLabel: 'Edit eval metadata for selected session',
-        ),
-        _callbackAction(
-          'Export Markdown',
-          SessionDetailAction.exportMarkdown,
-          enabled: hasConversation && onExportMarkdown != null,
-          iconAsset: AppIcons.export,
-          disabledReason: hasConversation
-              ? 'Markdown file export is not available yet.'
-              : 'Conversation messages are not loaded yet.',
-        ),
-        _callbackAction(
-          'Re-parse this session',
-          SessionDetailAction.reparse,
-          iconAsset: AppIcons.reparse,
+        OutlinedButton.icon(
+          onPressed: resumeCommand == null
+              ? null
+              : () => _copyWithFeedback(
+                  context,
+                  onCopyText,
+                  resumeCommand,
+                  'Copied resume command.',
+                ),
+          icon: const AppSvgIcon(AppIcons.copy),
+          label: const Text('Copy resume command'),
         ),
         _callbackAction(
           row.isPinned ? 'Unpin session' : 'Pin session',
           SessionDetailAction.togglePin,
           iconAsset: AppIcons.pin,
+          shortLabel: row.isPinned ? 'Unpin' : 'Pin',
         ),
         _callbackAction(
           row.isArchived ? 'Unarchive session' : 'Archive session',
           SessionDetailAction.toggleArchive,
           iconAsset: AppIcons.archive,
+          shortLabel: row.isArchived ? 'Unarchive' : 'Archive',
         ),
         PopupMenuButton<String>(
           tooltip: 'More actions for selected session',
           onSelected: (value) => _handleMoreAction(context, value),
           itemBuilder: (context) => [
-            _moreItem('copy-session-path', 'Copy session path', AppIcons.copy),
             _moreItem(
-              'copy-working-directory',
-              'Copy working directory',
-              AppIcons.copy,
+              'open-folder',
+              'Open containing folder',
+              AppIcons.folderOpen,
+              enabled: row.canOpenContainingFolder && onSessionAction != null,
+              disabledReason:
+                  'This WSL path cannot be opened from Windows Explorer.',
+            ),
+            _moreItem(
+              'fork',
+              'Open in terminal and fork',
+              AppIcons.fork,
+              enabled:
+                  commandSet.terminalForkCommand != null &&
+                  onSessionAction != null,
+            ),
+            _moreItem(
+              'edit-run',
+              'Edit and run terminal command…',
+              AppIcons.edit,
+              enabled: commandSet.terminalLaunchCommand != null,
+            ),
+            const PopupMenuDivider(),
+            _moreItem(
+              'export-markdown',
+              'Export Markdown…',
+              AppIcons.export,
+              enabled: hasConversation && onExportMarkdown != null,
+              disabledReason: hasConversation
+                  ? 'Markdown file export is not available yet.'
+                  : 'Conversation messages are not loaded yet.',
             ),
             _moreItem(
               'copy-conversation-markdown',
               'Copy conversation Markdown',
               AppIcons.copy,
               enabled: hasConversation,
+            ),
+            _moreItem('copy-session-path', 'Copy session path', AppIcons.copy),
+            _moreItem(
+              'copy-working-directory',
+              'Copy working directory',
+              AppIcons.copy,
             ),
             _moreItem(
               'copy-plain-resume',
@@ -599,20 +958,28 @@ class _ActionArea extends StatelessWidget {
               AppIcons.copy,
               enabled: commandSet.terminalLaunchCommand != null,
             ),
+            const PopupMenuDivider(),
             _moreItem('edit-tags', 'Add/remove tags', AppIcons.tag),
             _moreItem(
-              'assign-project',
-              'Assign/change project',
+              'toggle-eval',
+              row.evalReady ? 'Remove from Evals' : 'Add to Evals',
               null,
-              enabled: false,
-              disabledReason: 'Project assignment is not available yet.',
             ),
+            _moreItem('edit-eval', 'Edit eval details…', AppIcons.edit),
+            _moreItem('reparse', 'Re-parse this session', AppIcons.reparse),
           ],
           child: const Tooltip(
             message: 'More actions for selected session',
             child: Padding(
               padding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              child: Text('More'),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('More'),
+                  SizedBox(width: 2),
+                  Icon(Icons.arrow_drop_down, size: 18),
+                ],
+              ),
             ),
           ),
         ),
@@ -630,10 +997,10 @@ class _ActionArea extends StatelessWidget {
     final child = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (iconAsset != null) ...[
-          AppSvgIcon(iconAsset),
-          const SizedBox(width: 10),
-        ],
+        SizedBox(
+          width: 26,
+          child: iconAsset == null ? null : AppSvgIcon(iconAsset),
+        ),
         Flexible(
           child: Text(
             enabled || disabledReason == null
@@ -648,106 +1015,110 @@ class _ActionArea extends StatelessWidget {
 
   Future<void> _handleMoreAction(BuildContext context, String value) async {
     switch (value) {
+      case 'open-folder':
+        await _invokeAction(SessionDetailAction.openContainingFolder);
+      case 'fork':
+        await _invokeAction(SessionDetailAction.openTerminalFork);
+      case 'edit-run':
+        await _editTerminalCommand(
+          context,
+          commandSet,
+          onEditTerminalCommand ?? onRunTerminalCommand,
+        );
+      case 'export-markdown':
+        await _invokeAction(SessionDetailAction.exportMarkdown);
       case 'copy-session-path':
-        await _copyText(
+        await _copyWithFeedback(
           context,
-          'Copied session path.',
+          onCopyText,
           row.sourcePathForDisplay,
+          'Copied session path.',
         );
-        return;
       case 'copy-working-directory':
-        await _copyText(
+        await _copyWithFeedback(
           context,
-          'Copied working directory.',
+          onCopyText,
           row.workingDirectoryForCommands,
+          'Copied working directory.',
         );
-        return;
       case 'copy-conversation-markdown':
         final markdown = await _conversationMarkdown(row);
         if (!context.mounted) {
           return;
         }
-        await _copyText(context, 'Copied conversation Markdown.', markdown);
-        return;
+        await _copyWithFeedback(
+          context,
+          onCopyText,
+          markdown,
+          'Copied conversation Markdown.',
+        );
       case 'copy-plain-resume':
-        final command = commandSet.plainResumeCommand;
-        if (command != null) {
-          await _copyText(context, 'Copied plain resume command.', command);
+        if (commandSet.plainResumeCommand case final command?) {
+          await _copyWithFeedback(
+            context,
+            onCopyText,
+            command,
+            'Copied plain resume command.',
+          );
         }
-        return;
       case 'copy-platform-resume':
-        final command = commandSet.platformResumeCommand;
-        if (command != null) {
-          await _copyText(context, 'Copied platform resume command.', command);
+        if (commandSet.platformResumeCommand case final command?) {
+          await _copyWithFeedback(
+            context,
+            onCopyText,
+            command,
+            'Copied platform resume command.',
+          );
         }
-        return;
       case 'copy-terminal-command':
-        final command = commandSet.terminalLaunchCommand;
-        if (command != null) {
-          await _copyText(context, 'Copied terminal command.', command);
+        if (commandSet.terminalLaunchCommand case final command?) {
+          await _copyWithFeedback(
+            context,
+            onCopyText,
+            command,
+            'Copied terminal command.',
+          );
         }
-        return;
       case 'edit-tags':
         await _invokeAction(SessionDetailAction.editTags);
-        return;
-      case 'assign-project':
-        await _invokeAction(SessionDetailAction.assignProject);
-        return;
+      case 'toggle-eval':
+        await _invokeAction(
+          row.evalReady
+              ? SessionDetailAction.removeFromEvals
+              : SessionDetailAction.addToEvals,
+        );
+      case 'edit-eval':
+        await _invokeAction(SessionDetailAction.editEvalMetadata);
+      case 'reparse':
+        await _invokeAction(SessionDetailAction.reparse);
     }
   }
 
   Widget _callbackAction(
     String label,
     SessionDetailAction action, {
-    bool enabled = true,
-    String? disabledReason,
-    String? iconAsset,
-    String? semanticLabel,
+    required String iconAsset,
+    required String shortLabel,
   }) {
-    final hasCallback = action == SessionDetailAction.exportMarkdown
-        ? onExportMarkdown != null
-        : onSessionAction != null;
-    final onPressed = enabled && hasCallback
+    final onPressed = onSessionAction != null
         ? () => _invokeAction(action)
         : null;
-    final button = iconAsset == null
-        ? OutlinedButton(onPressed: onPressed, child: Text(label))
-        : OutlinedButton.icon(
+    return Semantics(
+      label: label,
+      button: true,
+      enabled: onPressed != null,
+      onTap: onPressed,
+      child: ExcludeSemantics(
+        child: Tooltip(
+          message: label,
+          child: OutlinedButton.icon(
             onPressed: onPressed,
             icon: AppSvgIcon(iconAsset),
-            label: Text(label),
-          );
-    final result = semanticLabel == null
-        ? button
-        : Semantics(
-            label: semanticLabel,
-            button: true,
-            enabled: onPressed != null,
-            onTap: onPressed,
-            child: ExcludeSemantics(child: button),
-          );
-    if (enabled || disabledReason == null) {
-      return result;
-    }
-    return Tooltip(message: disabledReason, child: result);
-  }
-
-  Future<void> _copyText(
-    BuildContext context,
-    String message,
-    String text,
-  ) async {
-    final callback = onCopyText;
-    if (callback != null) {
-      await callback(text);
-    } else {
-      await Clipboard.setData(ClipboardData(text: text));
-    }
-    if (context.mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-    }
+            label: Text(shortLabel),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _invokeAction(SessionDetailAction action) async {
@@ -828,7 +1199,6 @@ class _CommandActionPanel extends StatelessWidget {
           'Copy plain resume command',
           commandSet.plainResumeCommand,
           enabled: canResume,
-          iconAsset: AppIcons.copy,
         ),
         if (!duplicatePlatformResumeCommand)
           _copyAction(
@@ -836,46 +1206,37 @@ class _CommandActionPanel extends StatelessWidget {
             'Copy platform resume command',
             commandSet.platformResumeCommand,
             enabled: commandSet.platformResumeCommand != null,
-            iconAsset: AppIcons.copy,
           ),
-        _callbackAction(
-          'Open terminal here',
-          SessionDetailAction.openTerminalHere,
-          enabled: false,
-          iconAsset: AppIcons.terminal,
-          disabledReason:
-              'Opening a terminal without resume is not available yet.',
-        ),
-        _callbackAction(
-          'Open in terminal and resume',
-          SessionDetailAction.openTerminalResume,
-          enabled: terminalEnabled,
-          iconAsset: AppIcons.terminal,
-        ),
-        _callbackAction(
-          'Open in terminal and fork',
-          SessionDetailAction.openTerminalFork,
-          enabled: terminalForkEnabled,
-          iconAsset: AppIcons.fork,
-        ),
         _copyAction(
           context,
           'Copy terminal launch command',
           commandSet.terminalLaunchCommand,
           enabled: terminalEnabled,
-          iconAsset: AppIcons.copy,
         ),
-        _commandAction(
-          'Run',
-          enabled: terminalEnabled,
-          iconAsset: AppIcons.play,
-          onPressed: () => _runTerminalCommand(context),
+        OutlinedButton.icon(
+          onPressed: terminalEnabled
+              ? () => _runTerminalCommand(context)
+              : null,
+          icon: const AppSvgIcon(AppIcons.play),
+          label: const Text('Run'),
         ),
-        _commandAction(
-          'Edit and run',
-          enabled: terminalEnabled,
-          iconAsset: AppIcons.edit,
-          onPressed: () => _editTerminalCommand(context),
+        OutlinedButton.icon(
+          onPressed: terminalEnabled
+              ? () => _editTerminalCommand(
+                  context,
+                  commandSet,
+                  onEditTerminalCommand ?? onRunTerminalCommand,
+                )
+              : null,
+          icon: const AppSvgIcon(AppIcons.edit),
+          label: const Text('Edit and run'),
+        ),
+        OutlinedButton.icon(
+          onPressed: terminalForkEnabled && onSessionAction != null
+              ? () => onSessionAction!(SessionDetailAction.openTerminalFork)
+              : null,
+          icon: const AppSvgIcon(AppIcons.fork),
+          label: const Text('Open in terminal and fork'),
         ),
       ],
     );
@@ -886,69 +1247,19 @@ class _CommandActionPanel extends StatelessWidget {
     String label,
     String? text, {
     bool enabled = true,
-    required String iconAsset,
   }) {
     return OutlinedButton.icon(
       onPressed: enabled && text != null
-          ? () => _copyText(context, _copySuccessMessage(label), text)
+          ? () => _copyWithFeedback(
+              context,
+              onCopyText,
+              text,
+              _copySuccessMessage(label),
+            )
           : null,
-      icon: AppSvgIcon(iconAsset),
+      icon: const AppSvgIcon(AppIcons.copy),
       label: Text(label),
     );
-  }
-
-  Widget _callbackAction(
-    String label,
-    SessionDetailAction action, {
-    bool enabled = true,
-    String? disabledReason,
-    String? iconAsset,
-  }) {
-    final onPressed = enabled && onSessionAction != null
-        ? () => onSessionAction!(action)
-        : null;
-    final button = iconAsset == null
-        ? OutlinedButton(onPressed: onPressed, child: Text(label))
-        : OutlinedButton.icon(
-            onPressed: onPressed,
-            icon: AppSvgIcon(iconAsset),
-            label: Text(label),
-          );
-    if (enabled || disabledReason == null) {
-      return button;
-    }
-    return Tooltip(message: disabledReason, child: button);
-  }
-
-  Widget _commandAction(
-    String label, {
-    required bool enabled,
-    required String iconAsset,
-    required Future<void> Function() onPressed,
-  }) {
-    return OutlinedButton.icon(
-      onPressed: enabled ? () => onPressed() : null,
-      icon: AppSvgIcon(iconAsset),
-      label: Text(label),
-    );
-  }
-
-  Future<void> _copyText(
-    BuildContext context,
-    String message,
-    String text,
-  ) async {
-    final callback = onCopyText;
-    if (callback != null) {
-      await callback(text);
-    } else {
-      await Clipboard.setData(ClipboardData(text: text));
-    }
-    if (context.mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-    }
   }
 
   Future<void> _runTerminalCommand(BuildContext context) async {
@@ -972,48 +1283,6 @@ class _CommandActionPanel extends StatelessWidget {
     }
   }
 
-  Future<void> _editTerminalCommand(BuildContext context) async {
-    final command = commandSet.terminalLaunchCommand;
-    if (command == null) {
-      return;
-    }
-    final controller = TextEditingController(text: command);
-    final edited = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Edit terminal command'),
-        content: TextField(
-          controller: controller,
-          maxLines: 4,
-          decoration: const InputDecoration(labelText: 'Command'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton.icon(
-            onPressed: () => Navigator.of(context).pop(controller.text),
-            icon: const AppSvgIcon(AppIcons.play),
-            label: const Text('Run'),
-          ),
-        ],
-      ),
-    );
-    if (edited == null) {
-      return;
-    }
-    final callback = onEditTerminalCommand ?? onRunTerminalCommand;
-    if (callback != null) {
-      await callback(edited);
-    }
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Edited terminal command run requested.')),
-      );
-    }
-  }
-
   String _copySuccessMessage(String label) {
     return switch (label) {
       'Copy plain resume command' => 'Copied plain resume command.',
@@ -1021,6 +1290,55 @@ class _CommandActionPanel extends StatelessWidget {
       'Copy terminal launch command' => 'Copied terminal launch command.',
       _ => 'Copied.',
     };
+  }
+}
+
+Future<void> _editTerminalCommand(
+  BuildContext context,
+  ResumeCommandSet commandSet,
+  TerminalCommandCallback? callback,
+) async {
+  final command = commandSet.terminalLaunchCommand;
+  if (command == null) {
+    return;
+  }
+  final controller = TextEditingController(text: command);
+  final edited = await showDialog<String>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Edit terminal command'),
+      content: SizedBox(
+        width: 560,
+        child: TextField(
+          controller: controller,
+          maxLines: 4,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Command'),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton.icon(
+          onPressed: () => Navigator.of(context).pop(controller.text),
+          icon: const AppSvgIcon(AppIcons.play),
+          label: const Text('Run'),
+        ),
+      ],
+    ),
+  );
+  if (edited == null) {
+    return;
+  }
+  if (callback != null) {
+    await callback(edited);
+  }
+  if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Edited terminal command run requested.')),
+    );
   }
 }
 

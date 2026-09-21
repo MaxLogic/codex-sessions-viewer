@@ -221,6 +221,11 @@ void main() {
 
     await tester.tap(find.text('Parser review').first);
     await tester.pumpAndSettle();
+    await tester.binding.setSurfaceSize(const Size(1600, 2600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(Tab, 'Details'));
+    await tester.pumpAndSettle();
 
     expect(
       find.bySemanticsLabel('Add selected session to evals'),

@@ -37,7 +37,7 @@ void main() {
     await tester.tap(find.bySemanticsLabel('#2 Assistant, 20 tokens'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Selected message 2'), findsOneWidget);
+    expect(find.textContaining('Message 2 of '), findsOneWidget);
   });
 
   testWidgets('collapses long messages and tool output with explicit actions', (
@@ -74,10 +74,16 @@ void main() {
       ),
     );
 
-    expect(find.text('Long assistant answer preview'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('message-card-1')),
+        matching: find.text('Long assistant answer preview'),
+      ),
+      findsOneWidget,
+    );
     expect(find.textContaining('full long message full long'), findsNothing);
     expect(
-      find.widgetWithText(OutlinedButton, 'Show full message'),
+      find.widgetWithText(TextButton, 'Show full message'),
       findsOneWidget,
     );
     expect(
@@ -88,11 +94,11 @@ void main() {
     );
     expect(find.text('line 1\nline 2\nline 3'), findsNothing);
     expect(
-      find.widgetWithText(OutlinedButton, 'Copy message Markdown'),
+      find.bySemanticsLabel(RegExp(r'^Copy message \d+ as Markdown$')),
       findsNWidgets(2),
     );
 
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Expand tool output'));
+    await tester.tap(find.widgetWithText(TextButton, 'Expand tool output'));
     await tester.pumpAndSettle();
     expect(find.text('line 1\nline 2\nline 3'), findsOneWidget);
   });
@@ -122,9 +128,9 @@ void main() {
       ),
     );
 
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Expand tool output'));
+    await tester.tap(find.widgetWithText(TextButton, 'Expand tool output'));
     await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Collapse'));
+    await tester.tap(find.widgetWithText(TextButton, 'Collapse'));
     await tester.pumpAndSettle();
 
     expect(announcer.messages, [
@@ -160,9 +166,7 @@ void main() {
       ),
     );
 
-    await tester.tap(
-      find.widgetWithText(OutlinedButton, 'Copy message Markdown'),
-    );
+    await tester.tap(find.bySemanticsLabel('Copy message 1 as Markdown'));
     await tester.pumpAndSettle();
 
     expect(copied.single, contains('Full message body'));
@@ -192,7 +196,6 @@ void main() {
       ),
     );
 
-    expect(find.textContaining('tokens unknown'), findsOneWidget);
     expect(find.textContaining('0 tokens'), findsNothing);
     expect(find.bySemanticsLabel('#1 User, tokens unknown'), findsOneWidget);
   });
@@ -254,7 +257,7 @@ void main() {
 
       await tester.tap(find.bySemanticsLabel('#5 Assistant, 5 tokens'));
       await tester.pumpAndSettle();
-      expect(find.text('Selected message 5'), findsOneWidget);
+      expect(find.textContaining('Message 5 of '), findsOneWidget);
       expect(find.text('Message 41 body'), findsNothing);
 
       update(() {
@@ -263,7 +266,7 @@ void main() {
       await tester.pump();
       await tester.pumpAndSettle();
 
-      expect(find.text('Selected message 5'), findsOneWidget);
+      expect(find.textContaining('Message 5 of '), findsOneWidget);
       expect(find.text('Message 41 body'), findsNothing);
       expect(find.bySemanticsLabel('Jump to newest message'), findsOneWidget);
 
@@ -307,7 +310,7 @@ void main() {
     expect(announcer.messages, [
       'Newer messages are available. Use Jump to newest to read them.',
     ]);
-    expect(find.text('Selected message 5'), findsOneWidget);
+    expect(find.textContaining('Message 5 of '), findsOneWidget);
     expect(find.bySemanticsLabel('Jump to newest message'), findsOneWidget);
   });
 
@@ -370,7 +373,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('Selected message 24'), findsOneWidget);
+    expect(find.textContaining('Message 24 of '), findsOneWidget);
 
     await tester.tap(find.bySemanticsLabel('#2 Assistant, 2 tokens'));
     await tester.pumpAndSettle();
@@ -410,14 +413,14 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    expect(find.text('Selected message 5'), findsOneWidget);
+    expect(find.textContaining('Message 5 of '), findsOneWidget);
 
     update(() {
       initialMessageNumber = 3;
     });
     await tester.pumpAndSettle();
 
-    expect(find.text('Selected message 3'), findsOneWidget);
+    expect(find.textContaining('Message 3 of '), findsOneWidget);
   });
 
   testWidgets('renders message index without loading all message bodies', (
@@ -598,11 +601,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(requestedAnchors, [1]);
-    expect(find.text('Selected message 1'), findsOneWidget);
+    expect(find.textContaining('Message 1 of '), findsOneWidget);
     expect(find.text('Older prompt body'), findsOneWidget);
   });
 
-  testWidgets('message cards keep a neutral surface background', (
+  testWidgets('user prompts are tinted and assistant replies stay neutral', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -644,7 +647,10 @@ void main() {
       find.byKey(const Key('message-card-2')),
     );
 
-    expect((firstCard.decoration as BoxDecoration).color, scheme.surface);
+    expect(
+      (firstCard.decoration as BoxDecoration).color,
+      isNot(scheme.surface),
+    );
     expect((secondCard.decoration as BoxDecoration).color, scheme.surface);
   });
 }

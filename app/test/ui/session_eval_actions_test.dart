@@ -31,6 +31,11 @@ void main() {
 
     await tester.tap(find.text('Parser cache').first);
     await tester.pumpAndSettle();
+    await tester.binding.setSurfaceSize(const Size(1600, 2600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(Tab, 'Details'));
+    await tester.pumpAndSettle();
 
     expect(find.text('Eval status: Not reviewed'), findsOneWidget);
     expect(find.widgetWithText(OutlinedButton, 'Add to Evals'), findsOneWidget);
@@ -97,6 +102,11 @@ void main() {
     );
 
     await tester.tap(find.text('Parser cache').first);
+    await tester.pumpAndSettle();
+    await tester.binding.setSurfaceSize(const Size(1600, 2600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(Tab, 'Details'));
     await tester.pumpAndSettle();
 
     expect(find.text('Eval status: Not reviewed'), findsOneWidget);
