@@ -52,6 +52,14 @@ class RuntimeSessionController {
   final DatabaseMaintenanceCoordinator? writerCoordinator;
   SendPort? _backgroundWriterPort;
 
+  /// Whether the UI already holds the cached session rows, so a rescan can
+  /// skip resending the full list before it starts scanning.
+  var _rowsDelivered = false;
+
+  /// Whether a scan first reports every cached row. Background scans turn
+  /// this off once the UI has rows.
+  var emitCachedRowsAtScanStart = true;
+
   Future<T> _runWrite<T>(Future<T> Function() work) =>
       writerCoordinator?.runWriter(work) ?? work();
 
@@ -183,14 +191,48 @@ class RuntimeSessionController {
           }
         }
 
+        final loaded = <SessionRowViewModel>[];
+        var loadedTotal = 0;
+        var reportedCount = 0;
+        final sinceReport = Stopwatch();
+        void report() {
+          reportedCount = loaded.length;
+          sinceReport
+            ..reset()
+            ..start();
+          onProgress?.call(
+            SessionsRefreshProgress(
+              rows: List.unmodifiable(loaded),
+              statusMessage:
+                  'Loaded ${loaded.length} of $loadedTotal sessions from the previous scan.',
+            ),
+          );
+        }
+
         messageSubscription = messages.listen((message) {
-          if (message is _BackgroundRefreshProgress) {
-            onProgress?.call(message.progress);
+          if (message is _BackgroundCachedRowsBatch) {
+            loaded.addAll(message.rows);
+            loadedTotal = message.total;
+            // The first batch shows immediately; later ones are coalesced so
+            // the list is not rebuilt for every 250 rows.
+            if (reportedCount == 0 ||
+                sinceReport.elapsed >= _cachedRowsProgressInterval) {
+              report();
+            }
             return;
           }
-          if (message is _BackgroundRefreshDone) {
+          if (message is _BackgroundCachedRowsDone) {
+            if (loaded.length != reportedCount) {
+              report();
+            }
+            _rowsDelivered = true;
             if (!result.isCompleted) {
-              result.complete(message.result);
+              result.complete(
+                SessionsRefreshResult(
+                  rows: List.unmodifiable(loaded),
+                  statusMessage: '',
+                ),
+              );
             }
             return;
           }
@@ -559,6 +601,7 @@ class RuntimeSessionController {
               scanBatchingPolicy.parsedSessionFlushSourceBytes,
           fullRowSnapshotBatchSize: scanBatchingPolicy.fullRowSnapshotBatchSize,
           coordinateWrites: writerCoordinator != null,
+          emitCachedRowsAtScanStart: !_rowsDelivered,
         ),
         onError: errors.sendPort,
         onExit: exits.sendPort,
@@ -606,6 +649,9 @@ class RuntimeSessionController {
         }
         if (message is _BackgroundRefreshDone) {
           activeWriteRelease?.send(null);
+          if (message.result.rows.isNotEmpty) {
+            _rowsDelivered = true;
+          }
           if (!result.isCompleted) {
             result.complete(message.result);
           }
@@ -788,7 +834,9 @@ class RuntimeSessionController {
           }
         }
 
-        final cachedRows = _loadRowsProfiled(db, pricing: pricing);
+        final cachedRows = emitCachedRowsAtScanStart
+            ? _loadRowsProfiled(db, pricing: pricing)
+            : const <SessionRowViewModel>[];
         if (onProgress != null && cachedRows.isNotEmpty) {
           onProgress(
             SessionsRefreshProgress(
@@ -1155,6 +1203,7 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
     if (request.coordinateWrites) {
       controller._backgroundWriterPort = request.sendPort;
     }
+    controller.emitCachedRowsAtScanStart = request.emitCachedRowsAtScanStart;
     final operation = controller.startRefreshOperation(
       onProgress: (progress) {
         request.sendPort.send(_BackgroundRefreshProgress(progress));
@@ -1191,31 +1240,23 @@ Future<void> _backgroundCachedRowsEntry(
         ),
       );
       final total = _visibleRowCount(db);
-      final rows = <SessionRowViewModel>[];
       var offset = 0;
       while (offset < total) {
-        rows.addAll(
-          _loadRowsProfiled(db, limit: request.batchSize, offset: offset),
+        final batch = _loadRowsProfiled(
+          db,
+          limit: request.batchSize,
+          offset: offset,
         );
-        offset = rows.length;
-        request.sendPort.send(
-          _BackgroundRefreshProgress(
-            SessionsRefreshProgress(
-              rows: List.unmodifiable(rows),
-              statusMessage:
-                  'Loaded ${rows.length} of $total sessions from the previous scan.',
-            ),
-          ),
-        );
+        if (batch.isEmpty) {
+          break;
+        }
+        offset += batch.length;
+        // Only the new batch crosses the isolate boundary; the receiver
+        // accumulates. Resending the growing list made the UI isolate decode
+        // every row once per batch at startup.
+        request.sendPort.send(_BackgroundCachedRowsBatch(batch, offset, total));
       }
-      request.sendPort.send(
-        _BackgroundRefreshDone(
-          SessionsRefreshResult(
-            rows: List.unmodifiable(rows),
-            statusMessage: '',
-          ),
-        ),
-      );
+      request.sendPort.send(const _BackgroundCachedRowsDone());
     } finally {
       db.close();
     }
@@ -1329,6 +1370,7 @@ class _BackgroundRefreshRequest {
     required this.parsedSessionFlushSourceBytes,
     required this.fullRowSnapshotBatchSize,
     required this.coordinateWrites,
+    required this.emitCachedRowsAtScanStart,
   });
 
   final String settingsFilePath;
@@ -1338,11 +1380,26 @@ class _BackgroundRefreshRequest {
   final int parsedSessionFlushSourceBytes;
   final int fullRowSnapshotBatchSize;
   final bool coordinateWrites;
+  final bool emitCachedRowsAtScanStart;
 }
 
 class _BackgroundScanWriteRequest {
   const _BackgroundScanWriteRequest(this.grant);
   final SendPort grant;
+}
+
+const _cachedRowsProgressInterval = Duration(milliseconds: 400);
+
+class _BackgroundCachedRowsBatch {
+  const _BackgroundCachedRowsBatch(this.rows, this.loaded, this.total);
+
+  final List<SessionRowViewModel> rows;
+  final int loaded;
+  final int total;
+}
+
+class _BackgroundCachedRowsDone {
+  const _BackgroundCachedRowsDone();
 }
 
 class _BackgroundCachedRowsRequest {

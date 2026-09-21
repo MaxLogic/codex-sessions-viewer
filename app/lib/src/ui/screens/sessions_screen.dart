@@ -207,6 +207,22 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
   var _originFilter = _defaultOriginFilter;
   var _timeFilter = _defaultTimeFilter;
+  ({int start, int? end})? _timeWindowCache;
+  SessionsTimeFilter? _timeWindowCacheFilter;
+  var _timeWindowCacheMinute = -1;
+
+  // Derived views of _rows are rebuilt only when their inputs change. Scan
+  // progress rebuilds the screen often, and recomputing them for thousands of
+  // rows on every frame blocked the UI.
+  var _expansionRevision = 0;
+  List<Object?>? _displayRowsInputs;
+  List<_SessionDisplayRow>? _displayRowsCache;
+  List<Object?>? _hierarchyInputs;
+  _SessionHierarchy? _hierarchyCache;
+  List<SessionRowViewModel>? _facetRows;
+  List<String> _projectOptionsCache = const [];
+  List<String> _modelOptionsCache = const [];
+  List<String> _tagOptionsCache = const [];
   var _newestPerProjectOnly = false;
   var _namedOnly = false;
   String? _projectFilter;
@@ -422,11 +438,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
                           projectFilter: _projectFilter,
                           modelFilter: _modelFilter,
                           tagFilter: _tagFilter,
-                          projectOptions: _facetOptions((row) => [row.project]),
-                          modelOptions: _facetOptions(
-                            (row) => [row.modelLabel],
-                          ),
-                          tagOptions: _facetOptions((row) => row.tags),
+                          projectOptions: _facets.projects,
+                          modelOptions: _facets.models,
+                          tagOptions: _facets.tags,
                           visibleCount: visibleDisplayRows
                               .where((displayRow) => displayRow.depth == 0)
                               .length,
@@ -663,6 +677,60 @@ class _SessionsScreenState extends State<SessionsScreen> {
   ];
 
   List<_SessionDisplayRow> get _visibleDisplayRows {
+    final inputs = <Object?>[
+      _rows,
+      _platformFilter,
+      _archivedFilter,
+      _originFilter,
+      _timeFilter,
+      if (_timeFilter != SessionsTimeFilter.allTime)
+        widget.now().microsecondsSinceEpoch ~/ Duration.microsecondsPerMinute,
+      _newestPerProjectOnly,
+      _namedOnly,
+      _projectFilter,
+      _modelFilter,
+      _tagFilter,
+      _appliedSearch,
+      _appliedPath,
+      _appliedThreadName,
+      _matchingSearchRowIds,
+      _matchingPathRowIds,
+      _matchingThreadNameRowIds,
+      _sorts,
+      _expansionRevision,
+      widget.pricingUpdating,
+      _pricingCostsPending,
+    ];
+    final cached = _displayRowsCache;
+    if (cached != null && _sameInputs(_displayRowsInputs, inputs)) {
+      return cached;
+    }
+    final rows = _computeVisibleDisplayRows();
+    _displayRowsInputs = inputs;
+    _displayRowsCache = rows;
+    return rows;
+  }
+
+  static bool _sameInputs(List<Object?>? previous, List<Object?> next) {
+    if (previous == null || previous.length != next.length) {
+      return false;
+    }
+    for (var i = 0; i < next.length; i++) {
+      final a = previous[i];
+      final b = next[i];
+      if (identical(a, b)) {
+        continue;
+      }
+      // Collections are compared by identity: they are replaced, never
+      // mutated, when their content changes.
+      if (a is Iterable || b is Iterable || a is Map || b is Map || a != b) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  List<_SessionDisplayRow> _computeVisibleDisplayRows() {
     final search = _appliedSearch;
     final path = _appliedPath;
     final threadName = _appliedThreadName;
@@ -721,7 +789,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }) {
     final groups = <List<_SessionDisplayRow>>[];
     for (final parent in _sortedRows(parents)) {
-      final children = _sortedRows(childrenByParentId[parent.id] ?? const []);
+      final childRows = childrenByParentId[parent.id];
+      final children = childRows == null
+          ? const <SessionRowViewModel>[]
+          : _sortedRows(childRows);
       final availableChildren = [
         for (final child in children)
           if (_matchesStructuralFilters(child, path, threadName)) child,
@@ -790,7 +861,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
     List<SessionRowViewModel> children,
   ) {
     if (children.isEmpty) {
-      return parent.copyWithUsageRollup(null);
+      // Most sessions have no subagents; avoid copying every row.
+      return parent.usageRollup == null
+          ? parent
+          : parent.copyWithUsageRollup(null);
     }
     final subagentTokens = children.fold<int>(
       0,
@@ -913,6 +987,22 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   _SessionHierarchy _buildSessionHierarchy() {
+    final inputs = <Object?>[
+      _rows,
+      widget.pricingUpdating,
+      _pricingCostsPending,
+    ];
+    final cached = _hierarchyCache;
+    if (cached != null && _sameInputs(_hierarchyInputs, inputs)) {
+      return cached;
+    }
+    final hierarchy = _computeSessionHierarchy();
+    _hierarchyInputs = inputs;
+    _hierarchyCache = hierarchy;
+    return hierarchy;
+  }
+
+  _SessionHierarchy _computeSessionHierarchy() {
     final parentByKey = <String, SessionRowViewModel>{};
     final parents = <SessionRowViewModel>[];
     final subagents = <SessionRowViewModel>[];
@@ -995,6 +1085,21 @@ class _SessionsScreenState extends State<SessionsScreen> {
       return false;
     }
     return true;
+  }
+
+  ({List<String> projects, List<String> models, List<String> tags})
+  get _facets {
+    if (!identical(_facetRows, _rows)) {
+      _facetRows = _rows;
+      _projectOptionsCache = _facetOptions((row) => [row.project]);
+      _modelOptionsCache = _facetOptions((row) => [row.modelLabel]);
+      _tagOptionsCache = _facetOptions((row) => row.tags);
+    }
+    return (
+      projects: _projectOptionsCache,
+      models: _modelOptionsCache,
+      tags: _tagOptionsCache,
+    );
   }
 
   /// Distinct values for a facet filter, most frequent first.
@@ -1125,53 +1230,68 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (_timeFilter == SessionsTimeFilter.allTime) {
       return true;
     }
-    final value = row.lastMessageAtUtc.toLocal();
-    final now = widget.now().toLocal();
-    final today = DateTime(now.year, now.month, now.day);
-    return switch (_timeFilter) {
-      SessionsTimeFilter.today => _isWithinTimeRange(
-        value,
-        today,
-        today.add(const Duration(days: 1)),
+    final window = _timeWindow();
+    final value = row.lastMessageAtUtc.microsecondsSinceEpoch;
+    return value >= window.start && (window.end == null || value < window.end!);
+  }
+
+  /// The active time filter as epoch-microsecond bounds.
+  ///
+  /// Converting each row to local time costs a time zone lookup per call,
+  /// which made filtering thousands of rows block the UI for hundreds of
+  /// milliseconds on every scan progress update. The local calendar bounds
+  /// are computed once per filter and minute instead.
+  ({int start, int? end}) _timeWindow() {
+    final now = widget.now();
+    final minute = now.microsecondsSinceEpoch ~/ Duration.microsecondsPerMinute;
+    final cached = _timeWindowCache;
+    if (cached != null &&
+        _timeWindowCacheFilter == _timeFilter &&
+        _timeWindowCacheMinute == minute) {
+      return cached;
+    }
+    final localNow = now.toLocal();
+    final today = DateTime(localNow.year, localNow.month, localNow.day);
+    int micros(DateTime value) => value.microsecondsSinceEpoch;
+    final window = switch (_timeFilter) {
+      SessionsTimeFilter.today => (
+        start: micros(today),
+        end: micros(today.add(const Duration(days: 1))),
       ),
-      SessionsTimeFilter.yesterday => _isWithinTimeRange(
-        value,
-        today.subtract(const Duration(days: 1)),
-        today,
+      SessionsTimeFilter.yesterday => (
+        start: micros(today.subtract(const Duration(days: 1))),
+        end: micros(today),
       ),
-      SessionsTimeFilter.thisWeek => _isWithinTimeRange(
-        value,
-        _startOfWeek(today),
-        _startOfWeek(today).add(const Duration(days: 7)),
+      SessionsTimeFilter.thisWeek => (
+        start: micros(_startOfWeek(today)),
+        end: micros(_startOfWeek(today).add(const Duration(days: 7))),
       ),
-      SessionsTimeFilter.lastWeek => _isWithinTimeRange(
-        value,
-        _startOfWeek(today).subtract(const Duration(days: 7)),
-        _startOfWeek(today),
+      SessionsTimeFilter.lastWeek => (
+        start: micros(_startOfWeek(today).subtract(const Duration(days: 7))),
+        end: micros(_startOfWeek(today)),
       ),
-      SessionsTimeFilter.thisMonth => _isWithinTimeRange(
-        value,
-        DateTime(today.year, today.month),
-        DateTime(today.year, today.month + 1),
+      SessionsTimeFilter.thisMonth => (
+        start: micros(DateTime(today.year, today.month)),
+        end: micros(DateTime(today.year, today.month + 1)),
       ),
-      SessionsTimeFilter.lastMonth => _isWithinTimeRange(
-        value,
-        DateTime(today.year, today.month - 1),
-        DateTime(today.year, today.month),
+      SessionsTimeFilter.lastMonth => (
+        start: micros(DateTime(today.year, today.month - 1)),
+        end: micros(DateTime(today.year, today.month)),
       ),
-      SessionsTimeFilter.last30Days => !value.isBefore(
-        now.subtract(const Duration(days: 30)),
+      SessionsTimeFilter.last30Days => (
+        start: micros(localNow.subtract(const Duration(days: 30))),
+        end: null,
       ),
-      SessionsTimeFilter.allTime => true,
+      SessionsTimeFilter.allTime => (start: 0, end: null),
     };
+    _timeWindowCache = window;
+    _timeWindowCacheFilter = _timeFilter;
+    _timeWindowCacheMinute = minute;
+    return window;
   }
 
   DateTime _startOfWeek(DateTime value) {
     return value.subtract(Duration(days: value.weekday - DateTime.monday));
-  }
-
-  bool _isWithinTimeRange(DateTime value, DateTime start, DateTime end) {
-    return !value.isBefore(start) && value.isBefore(end);
   }
 
   bool _matchesPath(SessionRowViewModel row, String path) {
@@ -1347,6 +1467,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (parent != null) {
       setState(() {
         _expandedParentIds.add(parent.id);
+        _expansionRevision++;
       });
     }
     _revealOpenTarget(id);
@@ -1358,6 +1479,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       if (!_expandedParentIds.add(parentId)) {
         _expandedParentIds.remove(parentId);
       }
+      _expansionRevision++;
     });
   }
 
@@ -2317,7 +2439,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (index < 0) {
       return;
     }
-    _rows[index] = replacement;
+    _rows = [..._rows]..[index] = replacement;
     if (widget.onLoadPersistedCosts != null &&
         (_pricingInvalidated || _pricingCostsPending)) {
       _queuePersistedCostRefresh();
