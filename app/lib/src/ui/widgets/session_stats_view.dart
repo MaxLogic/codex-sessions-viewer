@@ -164,10 +164,11 @@ class _StatsContent extends StatelessWidget {
           total + (subagentActivity[child.id]?.activeTime ?? _rowSpan(child)),
     );
     final tools = activity?.tools ?? const <SessionToolUsage>[];
-    final toolTimeTotal = tools.fold<Duration>(
-      Duration.zero,
-      (total, tool) => total + tool.totalTime,
-    );
+    // Share of tool time excludes subagent coordination calls, matching the
+    // Running tools figure in the time split.
+    final toolTimeTotal = tools
+        .where((tool) => !tool.isAgentCoordination)
+        .fold<Duration>(Duration.zero, (total, tool) => total + tool.totalTime);
     final sortedSubagents = [...subagents]
       ..sort((a, b) => b.totalTokens.compareTo(a.totalTokens));
 
@@ -381,10 +382,12 @@ class _StatsContent extends StatelessWidget {
                           ? '–'
                           : formatGroupedInt(tool.failedCount),
                       _humanDuration(tool.totalTime),
-                      _percent(
-                        tool.totalTime.inMilliseconds,
-                        toolTimeTotal.inMilliseconds,
-                      ),
+                      tool.isAgentCoordination
+                          ? '–'
+                          : _percent(
+                              tool.totalTime.inMilliseconds,
+                              toolTimeTotal.inMilliseconds,
+                            ),
                     ],
                   );
                 },

@@ -137,6 +137,55 @@ void main() {
     expect(stats.firstEventAtUtc, DateTime.parse(_t(30)));
   });
 
+  test('a turn without an end record stops at its last record', () {
+    final stats = _analyze([
+      _line(_t(0), 'session_meta', {'timestamp': _t(0)}),
+      _line(_t(0), 'event_msg', {'type': 'task_started'}),
+      _line(_t(2), 'response_item', {'type': 'message', 'role': 'assistant'}),
+      // Interrupted: no task_complete. The next turn starts much later.
+      _line(_t(40), 'event_msg', {'type': 'task_started'}),
+      _line(_t(41), 'event_msg', {'type': 'task_complete'}),
+    ]);
+
+    expect(stats.turnCount, 2);
+    expect(stats.activeTime, const Duration(minutes: 3));
+  });
+
+  test('a long silence inside a turn is idle, not active', () {
+    final stats = _analyze([
+      _line(_t(0), 'session_meta', {'timestamp': _t(0)}),
+      _line(_t(0), 'event_msg', {'type': 'task_started'}),
+      _line(_t(1), 'response_item', {'type': 'message', 'role': 'assistant'}),
+      // 45 minutes waiting for an approval, nothing running.
+      _line(_t(46), 'response_item', {'type': 'message', 'role': 'user'}),
+      _line(_t(47), 'event_msg', {'type': 'task_complete'}),
+    ]);
+
+    expect(stats.turnCount, 1);
+    expect(stats.activeTime, const Duration(minutes: 2));
+  });
+
+  test('a failure in a later output part counts as failed', () {
+    final stats = _analyze([
+      _line(_t(0), 'session_meta', {'timestamp': _t(0)}),
+      _line(_t(0), 'response_item', {
+        'type': 'custom_tool_call',
+        'name': 'exec',
+        'call_id': 'x',
+      }),
+      _line(_t(0, 5), 'response_item', {
+        'type': 'custom_tool_call_output',
+        'call_id': 'x',
+        'output': [
+          {'type': 'input_text', 'text': 'Script completed\nWall time 1s\n'},
+          {'type': 'input_text', 'text': '{"exit_code":1,"output":"boom"}'},
+        ],
+      }),
+    ]);
+
+    expect(stats.tools.single.failedCount, 1);
+  });
+
   test('tolerates malformed lines', () {
     final stats = _analyze(['not json', '[]', '{"type":"event_msg"}']);
 

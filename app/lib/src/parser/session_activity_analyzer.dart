@@ -20,6 +20,47 @@ const _agentCoordinationTools = {
 
 const _agentWaitTools = {'wait_agent', 'wait'};
 
+/// A silence longer than this inside a turn, with no tool call running, is
+/// idle time (for example an unanswered approval prompt), not agent work.
+const _idleGap = Duration(minutes: 30);
+
+/// A task_started this soon after the open turn began restates that turn.
+const _duplicateTurnStart = Duration(seconds: 10);
+
+/// How much of a tool output is searched for a failure marker.
+const _failureScanChars = 20000;
+
+/// Top of a JSONL record: timestamp, optional ordinal, record type, and the
+/// payload type when it is the first payload key.
+final _recordHead = RegExp(
+  r'^\{"timestamp":"([^"]+)"(?:,"ordinal":\d+)?,"type":"(\w+)"'
+  r'(?:,"payload":\{"type":"(\w+)")?',
+);
+final _callIdPattern = RegExp(r'"call_id":"([^"]+)"');
+
+/// Failure markers in tool output, matched in raw JSON (quotes may be
+/// escaped) or in decoded text.
+final _failurePattern = RegExp(
+  r'\\*"exit_code\\*"\s*:\s*[1-9]|Exit code: [1-9]|Script failed',
+);
+
+const _decodedEvents = {
+  'task_started',
+  'task_complete',
+  'turn_aborted',
+  'token_count',
+  'thread_settings_applied',
+};
+
+const _toolCallItems = {
+  'function_call',
+  'custom_tool_call',
+  'local_shell_call',
+  'web_search_call',
+};
+
+const _toolOutputItems = {'function_call_output', 'custom_tool_call_output'};
+
 /// Activity facts derived from one Codex JSONL session file.
 ///
 /// Durations are wall-clock intervals. Parallel tool calls are merged, so
@@ -256,6 +297,9 @@ class SessionActivityAnalyzer {
     if (trimmed.isEmpty) {
       return;
     }
+    if (_addLineFast(trimmed)) {
+      return;
+    }
     Object? decoded;
     try {
       decoded = jsonDecode(trimmed);
@@ -266,6 +310,93 @@ class SessionActivityAnalyzer {
       return;
     }
     addRecord(decoded);
+  }
+
+  /// Handles bulky records (messages, reasoning, tool output, UI events)
+  /// without decoding their JSON. Session files can be hundreds of megabytes,
+  /// and only a few record kinds need their full content.
+  bool _addLineFast(String line) {
+    final head = _recordHead.firstMatch(
+      line.length > 400 ? line.substring(0, 400) : line,
+    );
+    if (head == null) {
+      return false;
+    }
+    final type = head.group(2);
+    final payloadType = head.group(3);
+    if (payloadType == null) {
+      return false;
+    }
+    final isOutput =
+        type == 'response_item' && _toolOutputItems.contains(payloadType);
+    final isSkippable =
+        (type == 'response_item' &&
+            !_toolCallItems.contains(payloadType) &&
+            !isOutput) ||
+        (type == 'event_msg' && !_decodedEvents.contains(payloadType));
+    if (!isOutput && !isSkippable) {
+      return false;
+    }
+    final timestamp = _parseTime(head.group(1));
+    if (timestamp == null || !_accept(timestamp)) {
+      return true;
+    }
+    if (isOutput) {
+      final callId = _callIdPattern.firstMatch(line)?.group(1);
+      final pending = callId == null ? null : _pendingCalls.remove(callId);
+      if (pending != null) {
+        final scanned = line.length > _failureScanChars
+            ? line.substring(0, _failureScanChars)
+            : line;
+        _recordCall(
+          pending.name,
+          pending.startedAt,
+          timestamp,
+          failed: _failurePattern.hasMatch(scanned),
+        );
+      }
+    }
+    return true;
+  }
+
+  /// Tracks the time span and idle gaps; false when the record belongs to a
+  /// parent thread's copied history.
+  bool _accept(DateTime timestamp, {bool startsTurn = false}) {
+    final start = _sessionStart;
+    if (start != null &&
+        timestamp.isBefore(start.subtract(const Duration(seconds: 1)))) {
+      return false;
+    }
+    final previous = _last;
+    final openStart = _openTurnStart;
+    if (openStart != null &&
+        previous != null &&
+        timestamp.difference(previous) > _idleGap &&
+        !_hasRecentPendingCall(timestamp)) {
+      _turnIntervals.add(_Interval(openStart, previous));
+      if (startsTurn) {
+        // The open turn never recorded its end; the new one starts here.
+        _turnCount++;
+        _openTurnStart = null;
+      } else {
+        // Split the turn around the silence; it stays one turn.
+        _openTurnStart = timestamp;
+      }
+    }
+    _first ??= timestamp;
+    if (previous == null || timestamp.isAfter(previous)) {
+      _last = timestamp;
+    }
+    return true;
+  }
+
+  bool _hasRecentPendingCall(DateTime now) {
+    for (final call in _pendingCalls.values) {
+      if (now.difference(call.startedAt) < const Duration(hours: 2)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   void addRecord(Map<String, Object?> record) {
@@ -288,15 +419,13 @@ class SessionActivityAnalyzer {
     if (timestamp == null) {
       return;
     }
-    final start = _sessionStart;
-    if (start != null &&
-        timestamp.isBefore(start.subtract(const Duration(seconds: 1)))) {
-      // Copied history from a parent thread.
+    final previous = _last;
+    final startsTurn =
+        type == 'event_msg' &&
+        payload is Map<String, Object?> &&
+        payload['type'] == 'task_started';
+    if (!_accept(timestamp, startsTurn: startsTurn)) {
       return;
-    }
-    _first ??= timestamp;
-    if (_last == null || timestamp.isAfter(_last!)) {
-      _last = timestamp;
     }
     if (payload is! Map<String, Object?>) {
       return;
@@ -310,7 +439,7 @@ class SessionActivityAnalyzer {
             _currentEffort;
         _countModelTurn();
       case 'event_msg':
-        _addEvent(payload, timestamp);
+        _addEvent(payload, timestamp, previous);
       case 'response_item':
         _addResponseItem(payload, timestamp);
     }
@@ -325,10 +454,24 @@ class SessionActivityAnalyzer {
     _modelTurns[key] = (_modelTurns[key] ?? 0) + 1;
   }
 
-  void _addEvent(Map<String, Object?> payload, DateTime timestamp) {
+  void _addEvent(
+    Map<String, Object?> payload,
+    DateTime timestamp,
+    DateTime? previous,
+  ) {
     switch (payload['type']) {
       case 'task_started':
-        _openTurnStart ??= timestamp;
+        final open = _openTurnStart;
+        if (open == null) {
+          _openTurnStart = timestamp;
+        } else if (timestamp.difference(open) > _duplicateTurnStart &&
+            previous != null) {
+          // The open turn never recorded its end (for example after an
+          // interruption); it ended with its last record.
+          _turnIntervals.add(_Interval(open, previous));
+          _turnCount++;
+          _openTurnStart = timestamp;
+        }
       case 'task_complete' || 'turn_aborted':
         final start = _openTurnStart;
         if (start != null) {
@@ -517,22 +660,25 @@ SessionSpawnedAgent _spawnedAgent(Object? arguments, DateTime timestamp) {
 }
 
 bool _outputLooksFailed(Object? output) {
-  String? text;
+  final buffer = StringBuffer();
   if (output is String) {
-    text = output;
-  } else if (output is List && output.isNotEmpty) {
-    final first = output.first;
-    if (first is Map && first['text'] is String) {
-      text = first['text'] as String;
+    buffer.write(output);
+  } else if (output is List) {
+    for (final part in output) {
+      if (part is Map && part['text'] is String) {
+        buffer.write(part['text'] as String);
+      }
+      if (buffer.length >= _failureScanChars) {
+        break;
+      }
     }
   }
-  if (text == null) {
-    return false;
-  }
-  final head = text.length > 400 ? text.substring(0, 400) : text;
-  return RegExp(
-    r'"exit_code"\s*:\s*[1-9]|Exit code: [1-9]|Script failed',
-  ).hasMatch(head);
+  final text = buffer.toString();
+  return _failurePattern.hasMatch(
+    text.length > _failureScanChars
+        ? text.substring(0, _failureScanChars)
+        : text,
+  );
 }
 
 Duration _mergedDuration(List<_Interval> intervals) {
