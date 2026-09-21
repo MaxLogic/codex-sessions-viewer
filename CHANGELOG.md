@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- Added a keyboard shortcuts dialog (F1 or the Shortcuts button in the navigation rail) and the documented Ctrl+L (go to filters) and Ctrl+E (export the selected session) shortcuts.
+- Wired the Logs screen to the stored log entries, with copy, open log file, open logs folder, and clear entries older than 7 days.
 - Added a session Stats tab: active time split into model work, tool execution, and subagent waits; token split by agent, token type, and message kind; per-tool calls, failures, and time; models with reasoning effort; and a subagent table with kind (preconfigured role or generic), model, tokens and share, tool calls, active time, and cost. Timing is read on demand from the local session files.
 - Added find-in-conversation with match highlighting, a match counter, Enter/Shift+Enter and F3 navigation, per-message match counts in the message index, and full-session search for paged sessions.
 - Added working Project, Model, and Tag session filters, removable chips for every active filter, and a "N of M shown" summary.
@@ -25,6 +27,12 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- Apply the theme, UI density, and font size settings; they were saved but ignored.
+- Show pin and archive changes immediately, and say when an archived session is hidden by the current filter.
+- Re-parse this session now re-reads only that session file and refreshes its row, instead of running an incremental scan of everything.
+- Run and Edit and run in the session details now launch the (edited) command without a shell; they previously always failed.
+- Export Markdown in the session details is enabled; the export callback was not passed to the Sessions screen.
+- The unreachable-path recovery button is labeled Retry scan, which is what it does.
 - Redesigned session detail: a compact header, one primary Resume in terminal action with the rest in More, and Conversation, Stats, Details, and Focus reader tabs that fill the pane instead of a fixed-height conversation below collapsible panels.
 - The conversation shows only user prompts and assistant replies by default; tool calls and reasoning are one toggle away. Long messages expand in place instead of scrolling inside a 150-pixel box, and prompts are tinted so turns are easy to scan.
 - Reorganized session filters into search, time, and refresh, then compact facet menus; viewer archive, named-only, newest-per-project, path, and thread-name filters moved under More filters, which opens automatically when one of them is active.

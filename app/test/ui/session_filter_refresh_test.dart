@@ -948,7 +948,7 @@ void main() {
         find.textContaining('Session root is unreachable'),
         findsOneWidget,
       );
-      expect(find.text('Test WSL path'), findsOneWidget);
+      expect(find.text('Retry scan'), findsOneWidget);
       expect(find.text('Open Settings'), findsOneWidget);
       expect(
         find.textContaining(

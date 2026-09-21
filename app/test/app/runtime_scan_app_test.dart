@@ -2954,7 +2954,7 @@ void main() {
       find.text('Codex session path is currently unreachable.'),
       findsOneWidget,
     );
-    expect(find.text('Test WSL path'), findsOneWidget);
+    expect(find.text('Retry scan'), findsOneWidget);
     expect(find.text('Open Settings'), findsOneWidget);
     expect(
       find.textContaining(
@@ -5078,7 +5078,7 @@ void main() {
       await _pumpFrames(tester);
       expect(refreshCalls, 1);
 
-      await tester.tap(find.text('Test WSL path'));
+      await tester.tap(find.text('Retry scan'));
       await _pumpFrames(tester);
       expect(refreshCalls, 2);
 

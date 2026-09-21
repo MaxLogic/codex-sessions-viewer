@@ -283,6 +283,62 @@ class SessionRowViewModel {
     );
   }
 
+  SessionRowViewModel copyWithFlags({bool? isPinned, bool? isArchived}) {
+    return SessionRowViewModel(
+      id: id,
+      sessionId: sessionId,
+      threadName: threadName,
+      threadSource: threadSource,
+      parentThreadId: parentThreadId,
+      agentNickname: agentNickname,
+      agentRole: agentRole,
+      subagentDepth: subagentDepth,
+      sourceFilePath: sourceFilePath,
+      displayPath: displayPath,
+      workingDirectory: workingDirectory,
+      openablePath: openablePath,
+      startedAtUtc: startedAtUtc,
+      lastMessageAtUtc: lastMessageAtUtc,
+      duration: duration,
+      platform: platform,
+      project: project,
+      path: path,
+      title: title,
+      summary: summary,
+      messageCount: messageCount,
+      userMessageCount: userMessageCount,
+      assistantMessageCount: assistantMessageCount,
+      toolCallCount: toolCallCount,
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+      cachedInputTokens: cachedInputTokens,
+      userMessageTokens: userMessageTokens,
+      assistantResponseTokens: assistantResponseTokens,
+      toolCallTokens: toolCallTokens,
+      estimatedCostText: estimatedCostText,
+      costUnknown: costUnknown,
+      costUpdating: costUpdating,
+      costPartialUnsupportedUnits: costPartialUnsupportedUnits,
+      totalTokens: totalTokens,
+      model: model,
+      modelsUsed: modelsUsed,
+      tags: tags,
+      status: status,
+      conversationMessages: conversationMessages,
+      usageRollup: usageRollup,
+      isPinned: isPinned ?? this.isPinned,
+      isArchived: isArchived ?? this.isArchived,
+      sourceState: sourceState,
+      hasError: hasError,
+      evalReady: evalReady,
+      evalStatus: evalStatus,
+      evalNotes: evalNotes,
+      evalExpectedOutput: evalExpectedOutput,
+      evalReviewedAtUtc: evalReviewedAtUtc,
+      evalUpdatedAtUtc: evalUpdatedAtUtc,
+    );
+  }
+
   SessionRowViewModel copyWithUsageRollup(SessionUsageRollup? rollup) =>
       _copyWithUsage(rollup);
 

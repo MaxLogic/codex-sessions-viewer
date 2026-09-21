@@ -409,6 +409,10 @@ void main() {
     ]);
     expect(actions.first.payload, contains('codex resume abc123'));
     expect(actions[1].payload, 'cmd /c echo edited');
+    // Both run without a shell: the command text becomes program + args.
+    expect(actions.first.launchSpec, isNotNull);
+    expect(actions[1].launchSpec?.executable, 'cmd');
+    expect(actions[1].launchSpec?.arguments, ['/c', 'echo', 'edited']);
     expect(actions[2].payload, contains('codex fork abc123'));
 
     await tester.tap(find.text('More'));
@@ -652,6 +656,72 @@ void main() {
     expect(exported.single, contains('# Parser cache'));
     expect(exported.single, contains('## Message 1 - User'));
     expect(exported.single, contains('Hello'));
+  });
+
+  testWidgets('pin and archive show immediately without a rescan', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(2400, 1400));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final actions = <SessionActionRequest>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TestSessionsScreen(
+            initialRows: [_row(sessionId: 'abc123')],
+            onSessionAction: (request) async => actions.add(request),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Parser cache').first);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.bySemanticsLabel('Pin session'));
+    await tester.pumpAndSettle();
+    expect(actions.single.action, SessionRowAction.togglePin);
+    expect(find.bySemanticsLabel('Unpin session'), findsOneWidget);
+    expect(find.text('Session pinned.'), findsOneWidget);
+
+    await tester.tap(find.bySemanticsLabel('Archive session'));
+    await tester.pumpAndSettle();
+    expect(actions.last.action, SessionRowAction.toggleArchive);
+    expect(
+      find.text('Session archived and hidden by the current filter.'),
+      findsOneWidget,
+    );
+    expect(find.bySemanticsLabel('Sessions, 0 visible'), findsOneWidget);
+  });
+
+  testWidgets('re-parse reloads only the selected session', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(2400, 1400));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final actions = <SessionActionRequest>[];
+    final reloaded = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TestSessionsScreen(
+            initialRows: [_row(sessionId: 'abc123')],
+            onSessionAction: (request) async => actions.add(request),
+            onReloadSessionDetailFromSource: (id) async {
+              reloaded.add(id);
+              return _row(sessionId: 'abc123', path: r'F:\projects\renamed');
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Parser cache').first);
+    await tester.pumpAndSettle();
+    reloaded.clear();
+
+    await _chooseMoreAction(tester, 'Re-parse this session');
+
+    expect(reloaded, ['active']);
+    expect(actions, isEmpty);
+    expect(find.text('Session re-parsed.'), findsOneWidget);
+    expect(find.textContaining(r'F:\projects\renamed'), findsWidgets);
   });
 }
 

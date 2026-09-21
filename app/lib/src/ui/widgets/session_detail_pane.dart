@@ -25,7 +25,6 @@ typedef SessionDetailActionCallback =
 
 enum SessionDetailAction {
   openContainingFolder,
-  openTerminalHere,
   openTerminalResume,
   openTerminalFork,
   exportMarkdown,
@@ -33,7 +32,6 @@ enum SessionDetailAction {
   togglePin,
   toggleArchive,
   editTags,
-  assignProject,
   addToEvals,
   removeFromEvals,
   editEvalMetadata,
@@ -1140,17 +1138,10 @@ class _ActionArea extends StatelessWidget {
   }
 
   Future<String> _conversationMarkdown(SessionRowViewModel row) async {
-    final messages = await _conversationMessagesForFullAction(row);
-    return [
-      if (row.title.trim().isNotEmpty) ...['# ${row.title}', ''],
-      for (final message in messages)
-        if (!_isInjectedContextMessage(message)) ...[
-          '## Message ${message.number} - ${message.authorLabel}',
-          '',
-          message.body,
-          '',
-        ],
-    ].join('\n');
+    return sessionConversationMarkdown(
+      row,
+      await _conversationMessagesForFullAction(row),
+    );
   }
 
   Future<List<ConversationMessageViewModel>> _conversationMessagesForFullAction(
@@ -1340,6 +1331,23 @@ Future<void> _editTerminalCommand(
       const SnackBar(content: Text('Edited terminal command run requested.')),
     );
   }
+}
+
+/// The Markdown written by Export Markdown and Copy conversation Markdown.
+String sessionConversationMarkdown(
+  SessionRowViewModel row,
+  List<ConversationMessageViewModel> messages,
+) {
+  return [
+    if (row.title.trim().isNotEmpty) ...['# ${row.title}', ''],
+    for (final message in messages)
+      if (!_isInjectedContextMessage(message)) ...[
+        '## Message ${message.number} - ${message.authorLabel}',
+        '',
+        message.body,
+        '',
+      ],
+  ].join('\n');
 }
 
 bool _isInjectedContextMessage(ConversationMessageViewModel message) {
