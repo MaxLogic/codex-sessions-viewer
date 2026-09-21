@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- Added a session Stats tab: active time split into model work, tool execution, and subagent waits; token split by agent, token type, and message kind; per-tool calls, failures, and time; models with reasoning effort; and a subagent table with kind (preconfigured role or generic), model, tokens and share, tool calls, active time, and cost. Timing is read on demand from the local session files.
+- Added find-in-conversation with match highlighting, a match counter, Enter/Shift+Enter and F3 navigation, per-message match counts in the message index, and full-session search for paged sessions.
+- Added working Project, Model, and Tag session filters, removable chips for every active filter, and a "N of M shown" summary.
+- Added Ctrl+F (session search, or find in the conversation when it has focus) and F5 (refresh) shortcuts, and a draggable split between the session list and the detail pane.
 - Added a visible startup usage migration with a verified pre-upgrade backup, resumable batches, historical pricing, parity checks, and rollback before normal writes resume.
 - Added configurable daily OpenRouter price refresh and weekly database optimization, with saved job status, bounded retries, manual refresh, and accessible progress in Settings. Database writers share a queue; catalog downloads do not hold it.
 - Added explicit active/archived Codex source lifecycle tracking and a one-time, audited legacy-cache repair with verified SQLite backup and fail-closed recovery checks.
@@ -21,6 +25,9 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- Redesigned session detail: a compact header, one primary Resume in terminal action with the rest in More, and Conversation, Stats, Details, and Focus reader tabs that fill the pane instead of a fixed-height conversation below collapsible panels.
+- The conversation shows only user prompts and assistant replies by default; tool calls and reasoning are one toggle away. Long messages expand in place instead of scrolling inside a 150-pixel box, and prompts are tinted so turns are easy to scan.
+- Reorganized session filters into search, time, and refresh, then compact facet menus; viewer archive, named-only, newest-per-project, path, and thread-name filters moved under More filters, which opens automatically when one of them is active.
 - Let pricing and interactive writes run between session-scan batches while preserving a single scan owner. Distinguish downloaded prices waiting for the database writer from prices being stored.
 - Reduce the parsed-source batch threshold from 512 MiB to 32 MiB to yield the writer more frequently; individual large sessions remain atomic.
 - Index the nullable tool-call message foreign key in schema 17 so replacing messages does not repeatedly scan every unrelated tool call. Preserve cascade behavior and optimize after the migration.

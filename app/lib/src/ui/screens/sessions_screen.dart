@@ -143,6 +143,7 @@ class SessionsScreen extends StatefulWidget {
     this.onLoadSessionDetail,
     this.onReloadSessionDetailFromSource,
     this.onLoadMessagePage,
+    this.onLoadAllMessages,
     this.watchSessionFile = _watchSessionFile,
     this.settings,
     this.initialTableState,
@@ -171,6 +172,8 @@ class SessionsScreen extends StatefulWidget {
   final SessionDetailLoader? onLoadSessionDetail;
   final SessionDetailLoader? onReloadSessionDetailFromSource;
   final SessionMessagePageLoader? onLoadMessagePage;
+  final Future<List<ConversationMessageViewModel>> Function(String sessionId)?
+  onLoadAllMessages;
   final SessionFileWatcher watchSessionFile;
   final AppSettings? settings;
   final SessionTableSettings? initialTableState;
@@ -192,11 +195,12 @@ class SessionsScreen extends StatefulWidget {
 class _SessionsScreenState extends State<SessionsScreen> {
   static const _detailPaneMinWidth = 360.0;
   static const _minimumTablePaneWidth = 520.0;
-  static const _splitDividerWidth = 1.0;
+  static const _splitDividerWidth = 7.0;
   static const _filterDebounceDuration = Duration(milliseconds: 220);
   static const _synchronousTextFilterRowLimit = 200;
 
   final _searchController = TextEditingController();
+  final _searchFocusNode = FocusNode(debugLabel: 'Session search');
   final _pathController = TextEditingController();
   final _threadNameController = TextEditingController();
   var _platformFilter = SessionsPlatformFilter.both;
@@ -205,11 +209,19 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _timeFilter = _defaultTimeFilter;
   var _newestPerProjectOnly = false;
   var _namedOnly = false;
+  String? _projectFilter;
+  String? _modelFilter;
+  String? _tagFilter;
   var _isScanning = false;
   var _isCancellingRefresh = false;
   var _scanAnnouncement = '';
   var _hasRefreshOwnedRows = false;
   String? _selectedId;
+  var _detailTab = SessionDetailTab.conversation;
+
+  /// Width of the table pane chosen by dragging the split, or null for the
+  /// default split.
+  double? _tablePaneWidthOverride;
   String? _loadingDetailId;
   var _rowMotionIds = <String>{};
   var _rowMotionGeneration = 0;
@@ -322,6 +334,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       ..dispose();
     _relativeDateTimer?.cancel();
     _stopSelectedSessionFileWatch();
+    _searchFocusNode.dispose();
     super.dispose();
   }
 
@@ -354,181 +367,248 @@ class _SessionsScreenState extends State<SessionsScreen> {
       for (final displayRow in visibleDisplayRows) displayRow.row,
     ];
     final selectedRow = _selectedRow(visibleRows);
+    final selectedHierarchy = selectedRow == null
+        ? null
+        : _buildSessionHierarchy();
+    final selectedSubagents = selectedRow == null
+        ? const <SessionRowViewModel>[]
+        : selectedHierarchy!.childrenByParentId[selectedRow.id] ??
+              const <SessionRowViewModel>[];
+    final selectedParent = selectedRow == null
+        ? null
+        : selectedHierarchy!.parentByChildId[selectedRow.id];
     final hasRowsHiddenByDefaultOrigin =
         visibleDisplayRows.isEmpty && _hasRowsHiddenOnlyByOrigin;
     return Material(
-      child: FocusTraversalGroup(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final tablePaneWidth = _tablePaneWidth(constraints.maxWidth);
-            return Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                SizedBox(
-                  key: const Key('sessions-left-panel'),
-                  width: tablePaneWidth,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _FilterBar(
-                        searchController: _searchController,
-                        pathController: _pathController,
-                        threadNameController: _threadNameController,
-                        platformFilter: _platformFilter,
-                        timeFilter: _timeFilter,
-                        archivedFilter: _archivedFilter,
-                        originFilter: _originFilter,
-                        newestPerProjectOnly: _newestPerProjectOnly,
-                        namedOnly: _namedOnly,
-                        isScanning: _isScanning,
-                        isCancellingRefresh: _isCancellingRefresh,
-                        onPlatformChanged: (value) {
-                          setState(() {
-                            _platformFilter = value;
-                            _retainSelection();
-                            _markVisibleRowsForMotion();
-                          });
-                        },
-                        onTimeChanged: (value) {
-                          setState(() {
-                            _timeFilter = value;
-                            _retainSelection();
-                            _markVisibleRowsForMotion();
-                          });
-                        },
-                        onArchivedChanged: (value) {
-                          setState(() {
-                            _archivedFilter = value;
-                            _retainSelection();
-                            _markVisibleRowsForMotion();
-                          });
-                        },
-                        onOriginChanged: (value) {
-                          setState(() {
-                            _originFilter = value;
-                            _retainSelection();
-                            _markVisibleRowsForMotion();
-                          });
-                        },
-                        onNewestPerProjectOnlyChanged: (value) {
-                          setState(() {
-                            _newestPerProjectOnly = value;
-                            _retainSelection();
-                            _markVisibleRowsForMotion();
-                          });
-                          _emitTableState();
-                        },
-                        onNamedOnlyChanged: (value) {
-                          setState(() {
-                            _namedOnly = value;
-                            _retainSelection();
-                            _markVisibleRowsForMotion();
-                          });
-                        },
-                        onClearFilters: _clearFilters,
-                        onRefresh: _refresh,
-                      ),
-                      Expanded(
-                        child: visibleDisplayRows.isEmpty
-                            ? _SessionsEmptyState(
-                                hasRows: _rows.isNotEmpty,
-                                hasActiveFilters: _hasActiveFilters,
-                                statusMessage: _scanAnnouncement,
-                                isScanning: _isScanning,
-                                visibleCount: visibleDisplayRows.length,
-                                unreachablePaths: _unreachablePaths,
-                                hasRowsHiddenByDefaultOrigin:
-                                    hasRowsHiddenByDefaultOrigin,
-                                onClearFilters: _clearFilters,
-                                onShowAllOrigins: _showAllOrigins,
-                                onOpenSettings: widget.onOpenSettings,
-                                onTestWslPath: widget.onTestWslPath ?? _refresh,
-                              )
-                            : _SessionsTable(
-                                rows: visibleDisplayRows,
-                                selectedId: _selectedId,
-                                onSelect: _select,
-                                onToggleSubagents: _toggleSubagents,
-                                onAction: _handleSessionAction,
-                                settings:
-                                    widget.settings ?? AppSettings.defaults(),
-                                columnWidths: _columnWidths,
-                                sorts: _sorts,
-                                onColumnWidthChanged: _setColumnWidth,
-                                onSortGesture: _handleSortGesture,
-                                onShowSortOptions: _showSortOptions,
-                                onListAction: _handleListAction,
-                                canSaveCsv: widget.onSaveSessionListCsv != null,
-                                statusMessage: _scanAnnouncement,
-                                isScanning: _isScanning,
-                                animatedRowIds: _rowMotionIds,
-                                rowMotionGeneration: _rowMotionGeneration,
-                                unreachablePaths: _unreachablePaths,
-                                onOpenSettings: widget.onOpenSettings,
-                                onTestWslPath: widget.onTestWslPath ?? _refresh,
-                                now: widget.now,
-                              ),
-                      ),
-                    ],
-                  ),
-                ),
-                VerticalDivider(
-                  width: 1,
-                  thickness: 1,
-                  color: Theme.of(context).colorScheme.outlineVariant,
-                ),
-                Expanded(
-                  child: _SessionDetailPlaceholder(
-                    row: selectedRow,
-                    visibleCount: visibleDisplayRows.length,
-                    hasRows: _rows.isNotEmpty,
-                    hasActiveFilters: _hasActiveFilters,
-                    isScanning: _isScanning,
-                    settings: widget.settings ?? AppSettings.defaults(),
-                    onSessionAction: selectedRow == null
-                        ? null
-                        : (action) => _handleDetailAction(selectedRow, action),
-                    onCopyText: widget.onCopyText,
-                    onExportMarkdown: widget.onExportMarkdown,
-                    onRunTerminalCommand: selectedRow == null
-                        ? null
-                        : (command) => _handleSessionAction(
-                            SessionActionRequest(
-                              row: selectedRow,
-                              action: SessionRowAction.openTerminalResume,
-                              payload: command,
-                            ),
-                          ),
-                    onEditTerminalCommand: selectedRow == null
-                        ? null
-                        : (command) => _handleSessionAction(
-                            SessionActionRequest(
-                              row: selectedRow,
-                              action: SessionRowAction.openTerminalResume,
-                              payload: command,
-                            ),
-                          ),
-                    isLoadingMessages:
-                        selectedRow != null &&
-                        _loadingDetailId == selectedRow.id,
-                    initialConversationMessageNumber: selectedRow == null
-                        ? null
-                        : _conversationPositions[selectedRow.id]?.messageNumber,
-                    onConversationPositionChanged: selectedRow == null
-                        ? null
-                        : (position) {
-                            _conversationPositions[selectedRow.id] = position;
-                          },
-                    onLoadMessagePage:
-                        selectedRow == null || widget.onLoadMessagePage == null
-                        ? null
-                        : (anchor) =>
-                              widget.onLoadMessagePage!(selectedRow.id, anchor),
-                  ),
-                ),
-              ],
+      child: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
+            _searchFocusNode.requestFocus();
+            _searchController.selection = TextSelection(
+              baseOffset: 0,
+              extentOffset: _searchController.text.length,
             );
           },
+          const SingleActivator(LogicalKeyboardKey.f5): () {
+            if (!_isScanning) {
+              unawaited(_refresh());
+            }
+          },
+        },
+        child: FocusTraversalGroup(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final tablePaneWidth = _tablePaneWidth(constraints.maxWidth);
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(
+                    key: const Key('sessions-left-panel'),
+                    width: tablePaneWidth,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _FilterBar(
+                          searchController: _searchController,
+                          searchFocusNode: _searchFocusNode,
+                          pathController: _pathController,
+                          threadNameController: _threadNameController,
+                          platformFilter: _platformFilter,
+                          timeFilter: _timeFilter,
+                          archivedFilter: _archivedFilter,
+                          originFilter: _originFilter,
+                          newestPerProjectOnly: _newestPerProjectOnly,
+                          namedOnly: _namedOnly,
+                          projectFilter: _projectFilter,
+                          modelFilter: _modelFilter,
+                          tagFilter: _tagFilter,
+                          projectOptions: _facetOptions((row) => [row.project]),
+                          modelOptions: _facetOptions(
+                            (row) => [row.modelLabel],
+                          ),
+                          tagOptions: _facetOptions((row) => row.tags),
+                          visibleCount: visibleDisplayRows
+                              .where((displayRow) => displayRow.depth == 0)
+                              .length,
+                          totalCount: _originScopedRowCount,
+                          onProjectChanged: (value) =>
+                              _updateFilter(() => _projectFilter = value),
+                          onModelChanged: (value) =>
+                              _updateFilter(() => _modelFilter = value),
+                          onTagChanged: (value) =>
+                              _updateFilter(() => _tagFilter = value),
+                          isScanning: _isScanning,
+                          isCancellingRefresh: _isCancellingRefresh,
+                          onPlatformChanged: (value) {
+                            setState(() {
+                              _platformFilter = value;
+                              _retainSelection();
+                              _markVisibleRowsForMotion();
+                            });
+                          },
+                          onTimeChanged: (value) {
+                            setState(() {
+                              _timeFilter = value;
+                              _retainSelection();
+                              _markVisibleRowsForMotion();
+                            });
+                          },
+                          onArchivedChanged: (value) {
+                            setState(() {
+                              _archivedFilter = value;
+                              _retainSelection();
+                              _markVisibleRowsForMotion();
+                            });
+                          },
+                          onOriginChanged: (value) {
+                            setState(() {
+                              _originFilter = value;
+                              _retainSelection();
+                              _markVisibleRowsForMotion();
+                            });
+                          },
+                          onNewestPerProjectOnlyChanged: (value) {
+                            setState(() {
+                              _newestPerProjectOnly = value;
+                              _retainSelection();
+                              _markVisibleRowsForMotion();
+                            });
+                            _emitTableState();
+                          },
+                          onNamedOnlyChanged: (value) {
+                            setState(() {
+                              _namedOnly = value;
+                              _retainSelection();
+                              _markVisibleRowsForMotion();
+                            });
+                          },
+                          onClearFilters: _clearFilters,
+                          onRefresh: _refresh,
+                        ),
+                        Expanded(
+                          child: visibleDisplayRows.isEmpty
+                              ? _SessionsEmptyState(
+                                  hasRows: _rows.isNotEmpty,
+                                  hasActiveFilters: _hasActiveFilters,
+                                  statusMessage: _scanAnnouncement,
+                                  isScanning: _isScanning,
+                                  visibleCount: visibleDisplayRows.length,
+                                  unreachablePaths: _unreachablePaths,
+                                  hasRowsHiddenByDefaultOrigin:
+                                      hasRowsHiddenByDefaultOrigin,
+                                  onClearFilters: _clearFilters,
+                                  onShowAllOrigins: _showAllOrigins,
+                                  onOpenSettings: widget.onOpenSettings,
+                                  onTestWslPath:
+                                      widget.onTestWslPath ?? _refresh,
+                                )
+                              : _SessionsTable(
+                                  rows: visibleDisplayRows,
+                                  selectedId: _selectedId,
+                                  onSelect: _select,
+                                  onToggleSubagents: _toggleSubagents,
+                                  onAction: _handleSessionAction,
+                                  settings:
+                                      widget.settings ?? AppSettings.defaults(),
+                                  columnWidths: _columnWidths,
+                                  sorts: _sorts,
+                                  onColumnWidthChanged: _setColumnWidth,
+                                  onSortGesture: _handleSortGesture,
+                                  onShowSortOptions: _showSortOptions,
+                                  onListAction: _handleListAction,
+                                  canSaveCsv:
+                                      widget.onSaveSessionListCsv != null,
+                                  statusMessage: _scanAnnouncement,
+                                  isScanning: _isScanning,
+                                  animatedRowIds: _rowMotionIds,
+                                  rowMotionGeneration: _rowMotionGeneration,
+                                  unreachablePaths: _unreachablePaths,
+                                  onOpenSettings: widget.onOpenSettings,
+                                  onTestWslPath:
+                                      widget.onTestWslPath ?? _refresh,
+                                  now: widget.now,
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  _SplitHandle(
+                    onDrag: (delta) => setState(() {
+                      _tablePaneWidthOverride = _clampTablePaneWidth(
+                        tablePaneWidth + delta,
+                        constraints.maxWidth,
+                      );
+                    }),
+                    onReset: () =>
+                        setState(() => _tablePaneWidthOverride = null),
+                  ),
+                  Expanded(
+                    child: _SessionDetailPlaceholder(
+                      row: selectedRow,
+                      subagents: selectedSubagents,
+                      parentRow: selectedParent,
+                      onOpenSession: _openSession,
+                      detailTab: _detailTab,
+                      onDetailTabChanged: (tab) => _detailTab = tab,
+                      onLoadFullConversationMessages:
+                          widget.onLoadAllMessages == null
+                          ? null
+                          : (row) => widget.onLoadAllMessages!(row.id),
+                      visibleCount: visibleDisplayRows.length,
+                      hasRows: _rows.isNotEmpty,
+                      hasActiveFilters: _hasActiveFilters,
+                      isScanning: _isScanning,
+                      settings: widget.settings ?? AppSettings.defaults(),
+                      onSessionAction: selectedRow == null
+                          ? null
+                          : (action) =>
+                                _handleDetailAction(selectedRow, action),
+                      onCopyText: widget.onCopyText,
+                      onExportMarkdown: widget.onExportMarkdown,
+                      onRunTerminalCommand: selectedRow == null
+                          ? null
+                          : (command) => _handleSessionAction(
+                              SessionActionRequest(
+                                row: selectedRow,
+                                action: SessionRowAction.openTerminalResume,
+                                payload: command,
+                              ),
+                            ),
+                      onEditTerminalCommand: selectedRow == null
+                          ? null
+                          : (command) => _handleSessionAction(
+                              SessionActionRequest(
+                                row: selectedRow,
+                                action: SessionRowAction.openTerminalResume,
+                                payload: command,
+                              ),
+                            ),
+                      isLoadingMessages:
+                          selectedRow != null &&
+                          _loadingDetailId == selectedRow.id,
+                      initialConversationMessageNumber: selectedRow == null
+                          ? null
+                          : _conversationPositions[selectedRow.id]
+                                ?.messageNumber,
+                      onConversationPositionChanged: selectedRow == null
+                          ? null
+                          : (position) {
+                              _conversationPositions[selectedRow.id] = position;
+                            },
+                      onLoadMessagePage:
+                          selectedRow == null ||
+                              widget.onLoadMessagePage == null
+                          ? null
+                          : (anchor) => widget.onLoadMessagePage!(
+                              selectedRow.id,
+                              anchor,
+                            ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
         ),
       ),
     );
@@ -538,6 +618,16 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final tableWidth = _SessionsTable.tableWidthFor(_columnWidths);
     if (!availableWidth.isFinite) {
       return tableWidth;
+    }
+    final override = _tablePaneWidthOverride;
+    if (override != null) {
+      return _clampTablePaneWidth(override, availableWidth);
+    }
+    // By default the detail pane gets at least 45% of the width, so the
+    // conversation and stats stay readable next to a wide table.
+    final defaultMax = availableWidth * 0.55;
+    if (tableWidth > defaultMax) {
+      return _clampTablePaneWidth(defaultMax, availableWidth);
     }
     final contentWidth = (availableWidth - _splitDividerWidth).clamp(
       0.0,
@@ -551,6 +641,21 @@ class _SessionsScreenState extends State<SessionsScreen> {
       contentWidth,
     );
     return tableWidth.clamp(_minimumTablePaneWidth, maxLeftWidth).toDouble();
+  }
+
+  double _clampTablePaneWidth(double width, double availableWidth) {
+    final contentWidth = (availableWidth - _splitDividerWidth).clamp(
+      0.0,
+      availableWidth,
+    );
+    if (contentWidth <= _minimumTablePaneWidth) {
+      return contentWidth;
+    }
+    final maxLeftWidth = (contentWidth - _detailPaneMinWidth).clamp(
+      _minimumTablePaneWidth,
+      contentWidth,
+    );
+    return width.clamp(_minimumTablePaneWidth, maxLeftWidth).toDouble();
   }
 
   List<SessionRowViewModel> get _visibleRows => [
@@ -872,7 +977,51 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _matchesTime(row) &&
         _matchesPath(row, path) &&
         _matchesThreadName(row, threadName) &&
-        (!_namedOnly || row.hasThreadName);
+        (!_namedOnly || row.hasThreadName) &&
+        _matchesFacets(row);
+  }
+
+  bool _matchesFacets(SessionRowViewModel row) {
+    final project = _projectFilter;
+    if (project != null && row.project.trim() != project) {
+      return false;
+    }
+    final model = _modelFilter;
+    if (model != null && row.modelLabel != model) {
+      return false;
+    }
+    final tag = _tagFilter;
+    if (tag != null && !row.tags.contains(tag)) {
+      return false;
+    }
+    return true;
+  }
+
+  /// Distinct values for a facet filter, most frequent first.
+  List<String> _facetOptions(
+    Iterable<String> Function(SessionRowViewModel) of,
+  ) {
+    final counts = <String, int>{};
+    for (final row in _rows) {
+      if (row.isSubagentSession) {
+        continue;
+      }
+      for (final value in of(row)) {
+        final trimmed = value.trim();
+        if (trimmed.isEmpty) {
+          continue;
+        }
+        counts[trimmed] = (counts[trimmed] ?? 0) + 1;
+      }
+    }
+    final values = counts.keys.toList()
+      ..sort((a, b) {
+        final byCount = counts[b]!.compareTo(counts[a]!);
+        return byCount != 0
+            ? byCount
+            : a.toLowerCase().compareTo(b.toLowerCase());
+      });
+    return values;
   }
 
   List<SessionRowViewModel> _newestRowsPerProject(
@@ -1055,7 +1204,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _archivedFilter != SessionsArchivedFilter.activeOnly ||
         _originFilter != _defaultOriginFilter ||
         _newestPerProjectOnly ||
-        _namedOnly;
+        _namedOnly ||
+        _projectFilter != null ||
+        _modelFilter != null ||
+        _tagFilter != null;
   }
 
   bool get _hasRowsHiddenOnlyByOrigin {
@@ -1074,6 +1226,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
           _matchesPath(row, path) &&
           _matchesThreadName(row, threadName) &&
           (!_namedOnly || row.hasThreadName) &&
+          _matchesFacets(row) &&
           _matchesSearch(row, search),
     );
   }
@@ -1174,6 +1327,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _originFilter = SessionsOriginFilter.all;
         _newestPerProjectOnly = false;
         _namedOnly = false;
+        _projectFilter = null;
+        _modelFilter = null;
+        _tagFilter = null;
         _markVisibleRowsForMotion({id});
       });
     } finally {
@@ -1181,6 +1337,20 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _pathController.addListener(_filtersChanged);
       _threadNameController.addListener(_filtersChanged);
     }
+  }
+
+  /// Selects a session from a link inside the detail pane, expanding its
+  /// parent group or relaxing filters so the row is visible in the table.
+  void _openSession(String id) {
+    final hierarchy = _buildSessionHierarchy();
+    final parent = hierarchy.parentByChildId[id];
+    if (parent != null) {
+      setState(() {
+        _expandedParentIds.add(parent.id);
+      });
+    }
+    _revealOpenTarget(id);
+    _select(id);
   }
 
   void _toggleSubagents(String parentId) {
@@ -1408,6 +1578,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _originFilter = _defaultOriginFilter;
         _newestPerProjectOnly = false;
         _namedOnly = false;
+        _projectFilter = null;
+        _modelFilter = null;
+        _tagFilter = null;
         _retainSelection();
         _markVisibleRowsForMotion();
       });
@@ -1417,6 +1590,26 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _pathController.addListener(_filtersChanged);
       _threadNameController.addListener(_filtersChanged);
     }
+  }
+
+  /// Rows the current Show mode can display at the top level, before any
+  /// other filter. Grouped subagents are not counted as separate sessions.
+  int get _originScopedRowCount {
+    return switch (_originFilter) {
+      SessionsOriginFilter.user =>
+        _rows.where((row) => !row.isSubagentSession).length,
+      SessionsOriginFilter.subagent =>
+        _rows.where((row) => row.isSubagentSession).length,
+      SessionsOriginFilter.all => _rows.length,
+    };
+  }
+
+  void _updateFilter(VoidCallback change) {
+    setState(() {
+      change();
+      _retainSelection();
+      _markVisibleRowsForMotion();
+    });
   }
 
   void _showAllOrigins() {
@@ -2671,9 +2864,16 @@ class _UnreachableRecoveryActions extends StatelessWidget {
   }
 }
 
-class _FilterBar extends StatelessWidget {
+/// Filters above the session table.
+///
+/// Row 1 holds the controls used on almost every visit: search, time range,
+/// refresh. Row 2 holds facet filters as compact menu buttons that show their
+/// current value. Active non-default filters are repeated as removable chips so
+/// the user can always see why sessions are hidden.
+class _FilterBar extends StatefulWidget {
   const _FilterBar({
     required this.searchController,
+    required this.searchFocusNode,
     required this.pathController,
     required this.threadNameController,
     required this.platformFilter,
@@ -2682,6 +2882,14 @@ class _FilterBar extends StatelessWidget {
     required this.originFilter,
     required this.newestPerProjectOnly,
     required this.namedOnly,
+    required this.projectFilter,
+    required this.modelFilter,
+    required this.tagFilter,
+    required this.projectOptions,
+    required this.modelOptions,
+    required this.tagOptions,
+    required this.visibleCount,
+    required this.totalCount,
     required this.isScanning,
     required this.isCancellingRefresh,
     required this.onPlatformChanged,
@@ -2690,11 +2898,15 @@ class _FilterBar extends StatelessWidget {
     required this.onOriginChanged,
     required this.onNewestPerProjectOnlyChanged,
     required this.onNamedOnlyChanged,
+    required this.onProjectChanged,
+    required this.onModelChanged,
+    required this.onTagChanged,
     required this.onClearFilters,
     required this.onRefresh,
   });
 
   final TextEditingController searchController;
+  final FocusNode searchFocusNode;
   final TextEditingController pathController;
   final TextEditingController threadNameController;
   final SessionsPlatformFilter platformFilter;
@@ -2703,6 +2915,14 @@ class _FilterBar extends StatelessWidget {
   final SessionsOriginFilter originFilter;
   final bool newestPerProjectOnly;
   final bool namedOnly;
+  final String? projectFilter;
+  final String? modelFilter;
+  final String? tagFilter;
+  final List<String> projectOptions;
+  final List<String> modelOptions;
+  final List<String> tagOptions;
+  final int visibleCount;
+  final int totalCount;
   final bool isScanning;
   final bool isCancellingRefresh;
   final ValueChanged<SessionsPlatformFilter> onPlatformChanged;
@@ -2711,349 +2931,619 @@ class _FilterBar extends StatelessWidget {
   final ValueChanged<SessionsOriginFilter> onOriginChanged;
   final ValueChanged<bool> onNewestPerProjectOnlyChanged;
   final ValueChanged<bool> onNamedOnlyChanged;
+  final ValueChanged<String?> onProjectChanged;
+  final ValueChanged<String?> onModelChanged;
+  final ValueChanged<String?> onTagChanged;
   final VoidCallback onClearFilters;
   final VoidCallback onRefresh;
 
   @override
+  State<_FilterBar> createState() => _FilterBarState();
+}
+
+class _FilterBarState extends State<_FilterBar> {
+  late bool _showMore;
+
+  @override
+  void initState() {
+    super.initState();
+    _showMore =
+        widget.pathController.text.isNotEmpty ||
+        widget.threadNameController.text.isNotEmpty;
+    widget.searchController.addListener(_textChanged);
+    widget.pathController.addListener(_textChanged);
+    widget.threadNameController.addListener(_textChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.searchController.removeListener(_textChanged);
+    widget.pathController.removeListener(_textChanged);
+    widget.threadNameController.removeListener(_textChanged);
+    super.dispose();
+  }
+
+  void _textChanged() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final refreshLabel = isCancellingRefresh
+    final widget = this.widget;
+    final theme = Theme.of(context);
+    final refreshLabel = widget.isCancellingRefresh
         ? 'Cancelling scan...'
-        : isScanning
+        : widget.isScanning
         ? 'Cancel scan'
         : 'Refresh';
-    return Material(
-      color: Theme.of(context).colorScheme.surface,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Wrap(
-              spacing: 10,
-              runSpacing: 8,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                SizedBox(
-                  width: 280,
-                  child: Semantics(
-                    label: 'Session search',
-                    textField: true,
-                    child: TextField(
-                      controller: searchController,
-                      decoration: const InputDecoration(
-                        labelText: 'Search',
-                        isDense: true,
-                      ),
-                    ),
-                  ),
+    final activeChips = _activeFilterChips();
+    final hiddenActiveCount = [
+      widget.archivedFilter != SessionsArchivedFilter.activeOnly,
+      widget.namedOnly,
+      widget.newestPerProjectOnly,
+      widget.pathController.text.trim().isNotEmpty,
+      widget.threadNameController.text.trim().isNotEmpty,
+    ].where((active) => active).length;
+    final showMore = _showMore || hiddenActiveCount > 0;
+    final summary =
+        '${widget.visibleCount} of ${widget.totalCount} sessions shown. '
+        'Filters: ${activeChips.map((chip) => chip.label).join(', ')}.';
+
+    final search = Semantics(
+      label: 'Session search',
+      textField: true,
+      child: TextField(
+        controller: widget.searchController,
+        focusNode: widget.searchFocusNode,
+        decoration: InputDecoration(
+          isDense: true,
+          hintText: 'Search titles, messages, paths, tags (Ctrl+F)',
+          border: const OutlineInputBorder(),
+          prefixIcon: const Icon(Icons.search, size: 18),
+          prefixIconConstraints: const BoxConstraints(
+            minWidth: 34,
+            minHeight: 34,
+          ),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 8,
+            vertical: 10,
+          ),
+          suffixIcon: widget.searchController.text.isEmpty
+              ? null
+              : IconButton(
+                  tooltip: 'Clear search',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: widget.searchController.clear,
+                  icon: const Icon(Icons.close, size: 16),
                 ),
-                SizedBox(
-                  width: 140,
-                  child: _FilterSemantics(
-                    label: 'Platform filter',
-                    child: DropdownButtonFormField<SessionsPlatformFilter>(
-                      key: ValueKey(platformFilter),
-                      initialValue: platformFilter,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Platform',
-                        isDense: true,
-                      ),
-                      items: const [
-                        DropdownMenuItem(
-                          value: SessionsPlatformFilter.both,
-                          child: Text('Both'),
-                        ),
-                        DropdownMenuItem(
-                          value: SessionsPlatformFilter.windows,
-                          child: Text('Windows'),
-                        ),
-                        DropdownMenuItem(
-                          value: SessionsPlatformFilter.wsl,
-                          child: Text('WSL'),
-                        ),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          onPlatformChanged(value);
-                        }
-                      },
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: 140,
-                  child: _FilterSemantics(
-                    label: 'Time range filter',
-                    child: DropdownButtonFormField<SessionsTimeFilter>(
-                      key: ValueKey('time-filter-${timeFilter.name}'),
-                      initialValue: timeFilter,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Time',
-                        isDense: true,
-                      ),
-                      items: [
-                        for (final value in SessionsTimeFilter.values)
-                          DropdownMenuItem(
-                            value: value,
-                            child: Text(value.label),
-                          ),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          onTimeChanged(value);
-                        }
-                      },
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: 150,
-                  child: _FilterSemantics(
-                    label: 'Viewer archive filter',
-                    child: DropdownButtonFormField<SessionsArchivedFilter>(
-                      key: ValueKey(archivedFilter),
-                      initialValue: archivedFilter,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Viewer archive',
-                        isDense: true,
-                      ),
-                      items: const [
-                        DropdownMenuItem(
-                          value: SessionsArchivedFilter.activeOnly,
-                          child: Text('Active only'),
-                        ),
-                        DropdownMenuItem(
-                          value: SessionsArchivedFilter.archivedOnly,
-                          child: Text('Archived only'),
-                        ),
-                        DropdownMenuItem(
-                          value: SessionsArchivedFilter.all,
-                          child: Text('All'),
-                        ),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          onArchivedChanged(value);
-                        }
-                      },
-                    ),
-                  ),
-                ),
-                _NewestPerProjectFilter(
-                  value: newestPerProjectOnly,
-                  onChanged: onNewestPerProjectOnlyChanged,
-                ),
-                _NamedOnlyFilter(
-                  value: namedOnly,
-                  onChanged: onNamedOnlyChanged,
-                ),
-                ElevatedButton.icon(
-                  onPressed: isCancellingRefresh ? null : onRefresh,
-                  icon: AppSvgIcon(
-                    isScanning ? AppIcons.cancel : AppIcons.refresh,
-                  ),
-                  label: Text(refreshLabel),
-                ),
+        ),
+      ),
+    );
+    final time = _FilterSemantics(
+      label: 'Time range filter',
+      child: _FilterMenuButton<SessionsTimeFilter>(
+        key: ValueKey('time-filter-${widget.timeFilter.name}'),
+        label: 'Time',
+        value: widget.timeFilter,
+        isActive: widget.timeFilter != _defaultTimeFilter,
+        options: [
+          for (final value in SessionsTimeFilter.values) (value, value.label),
+        ],
+        onSelected: widget.onTimeChanged,
+      ),
+    );
+    final refresh = ElevatedButton.icon(
+      onPressed: widget.isCancellingRefresh ? null : widget.onRefresh,
+      icon: AppSvgIcon(widget.isScanning ? AppIcons.cancel : AppIcons.refresh),
+      label: Text(refreshLabel),
+    );
+    final facets = Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        _FilterSemantics(
+          label: 'Project filter',
+          child: _FilterMenuButton<String?>(
+            label: 'Project',
+            value: widget.projectFilter,
+            isActive: widget.projectFilter != null,
+            options: [
+              (null, 'All projects'),
+              for (final project in widget.projectOptions) (project, project),
+            ],
+            onSelected: widget.onProjectChanged,
+          ),
+        ),
+        _FilterSemantics(
+          label: 'Model filter',
+          child: _FilterMenuButton<String?>(
+            label: 'Model',
+            value: widget.modelFilter,
+            isActive: widget.modelFilter != null,
+            options: [
+              (null, 'All models'),
+              for (final model in widget.modelOptions) (model, model),
+            ],
+            onSelected: widget.onModelChanged,
+          ),
+        ),
+        if (widget.tagOptions.isNotEmpty || widget.tagFilter != null)
+          _FilterSemantics(
+            label: 'Tag filter',
+            child: _FilterMenuButton<String?>(
+              label: 'Tag',
+              value: widget.tagFilter,
+              isActive: widget.tagFilter != null,
+              options: [
+                (null, 'All tags'),
+                for (final tag in widget.tagOptions) (tag, tag),
               ],
+              onSelected: widget.onTagChanged,
             ),
-            Theme(
-              data: Theme.of(context).copyWith(
-                dividerColor: Colors.transparent,
-                visualDensity: VisualDensity.compact,
+          ),
+        _FilterSemantics(
+          label: 'Platform filter',
+          child: _FilterMenuButton<SessionsPlatformFilter>(
+            key: ValueKey(widget.platformFilter),
+            label: 'Platform',
+            value: widget.platformFilter,
+            isActive: widget.platformFilter != SessionsPlatformFilter.both,
+            options: [
+              for (final value in SessionsPlatformFilter.values)
+                (value, value.label),
+            ],
+            onSelected: widget.onPlatformChanged,
+          ),
+        ),
+        _FilterSemantics(
+          label: 'Origin filter',
+          child: _FilterMenuButton<SessionsOriginFilter>(
+            key: ValueKey('origin-filter-${widget.originFilter.name}'),
+            label: 'Show',
+            value: widget.originFilter,
+            isActive: widget.originFilter != _defaultOriginFilter,
+            tooltip:
+                'Main sessions group their subagents under an expandable row.',
+            options: [
+              for (final value in SessionsOriginFilter.values)
+                (value, value.label),
+            ],
+            onSelected: widget.onOriginChanged,
+          ),
+        ),
+        Semantics(
+          button: true,
+          expanded: showMore,
+          label: hiddenActiveCount == 0
+              ? 'More filters'
+              : 'More filters, $hiddenActiveCount active',
+          child: ExcludeSemantics(
+            child: TextButton.icon(
+              onPressed: () => setState(() => _showMore = !showMore),
+              icon: Icon(
+                showMore ? Icons.expand_less : Icons.expand_more,
+                size: 18,
               ),
-              child: ExpansionTile(
-                tilePadding: EdgeInsets.zero,
-                childrenPadding: const EdgeInsets.only(top: 4, bottom: 2),
-                title: const Text('Advanced filters'),
+              label: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: Wrap(
-                      spacing: 10,
-                      runSpacing: 8,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        SizedBox(
-                          width: 280,
-                          child: Semantics(
-                            label: 'Path filter',
-                            textField: true,
-                            child: TextField(
-                              controller: pathController,
-                              decoration: const InputDecoration(
-                                labelText: 'Path',
-                                isDense: true,
-                              ),
-                            ),
-                          ),
-                        ),
-                        SizedBox(
-                          width: 170,
-                          child: Semantics(
-                            label: 'Thread name filter',
-                            textField: true,
-                            child: TextField(
-                              controller: threadNameController,
-                              decoration: const InputDecoration(
-                                labelText: 'Thread name',
-                                isDense: true,
-                              ),
-                            ),
-                          ),
-                        ),
-                        SizedBox(
-                          width: 150,
-                          child: _staticFilter('Project filter', 'Project'),
-                        ),
-                        SizedBox(
-                          width: 150,
-                          child: _staticFilter('Tags filter', 'Tags'),
-                        ),
-                        SizedBox(
-                          width: 150,
-                          child: _staticFilter('Model filter', 'Model'),
-                        ),
-                        SizedBox(
-                          width: 150,
-                          child: _FilterSemantics(
-                            label: 'Origin filter',
-                            child:
-                                DropdownButtonFormField<SessionsOriginFilter>(
-                                  key: ValueKey(
-                                    'origin-filter-${originFilter.name}',
-                                  ),
-                                  initialValue: originFilter,
-                                  isExpanded: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Origin',
-                                    isDense: true,
-                                  ),
-                                  items: const [
-                                    DropdownMenuItem(
-                                      value: SessionsOriginFilter.all,
-                                      child: Text('All'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: SessionsOriginFilter.user,
-                                      child: Text('User'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: SessionsOriginFilter.subagent,
-                                      child: Text('Subagent'),
-                                    ),
-                                  ],
-                                  onChanged: (value) {
-                                    if (value != null) {
-                                      onOriginChanged(value);
-                                    }
-                                  },
-                                ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  const Text('More filters'),
+                  if (hiddenActiveCount > 0) ...[
+                    const SizedBox(width: 6),
+                    _CountBadge(count: hiddenActiveCount),
+                  ],
                 ],
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: OutlinedButton.icon(
-                onPressed: onClearFilters,
-                icon: const AppSvgIcon(AppIcons.filterClear),
-                label: const Text('Clear filters'),
+          ),
+        ),
+      ],
+    );
+    final moreFilters = Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _FilterSemantics(
+                label: 'Viewer archive filter',
+                child: _FilterMenuButton<SessionsArchivedFilter>(
+                  key: ValueKey(widget.archivedFilter),
+                  label: 'Archived in viewer',
+                  value: widget.archivedFilter,
+                  isActive:
+                      widget.archivedFilter !=
+                      SessionsArchivedFilter.activeOnly,
+                  tooltip:
+                      'Sessions you archived in this viewer. Codex files are not changed.',
+                  options: [
+                    for (final value in SessionsArchivedFilter.values)
+                      (value, value.label),
+                  ],
+                  onSelected: widget.onArchivedChanged,
+                ),
               ),
+              _ToggleFilterChip(
+                semanticsLabel: 'Named sessions only filter',
+                label: 'Named only',
+                tooltip: 'Only sessions that have a thread name',
+                value: widget.namedOnly,
+                onChanged: widget.onNamedOnlyChanged,
+              ),
+              _ToggleFilterChip(
+                semanticsLabel: 'Newest session per project filter',
+                label: 'Newest per project',
+                tooltip: 'Only the most recent session of each project',
+                value: widget.newestPerProjectOnly,
+                onChanged: widget.onNewestPerProjectOnlyChanged,
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: Semantics(
+                  label: 'Path filter',
+                  textField: true,
+                  child: TextField(
+                    controller: widget.pathController,
+                    decoration: const InputDecoration(
+                      labelText: 'Path contains',
+                      hintText: r'e.g. F:\projects\my-app',
+                      isDense: true,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: Semantics(
+                  label: 'Thread name filter',
+                  textField: true,
+                  child: TextField(
+                    controller: widget.threadNameController,
+                    decoration: const InputDecoration(
+                      labelText: 'Thread name contains',
+                      isDense: true,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+    final activeSummary = Semantics(
+      container: true,
+      liveRegion: true,
+      label: summary,
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 4,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          ExcludeSemantics(
+            child: Text(
+              '${formatGroupedInt(widget.visibleCount)} of '
+              '${formatGroupedInt(widget.totalCount)} shown',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          for (final chip in activeChips)
+            InputChip(
+              label: Text(chip.label),
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              labelStyle: theme.textTheme.bodySmall,
+              onDeleted: chip.onRemove,
+              deleteButtonTooltipMessage: 'Remove filter ${chip.label}',
+            ),
+          OutlinedButton.icon(
+            onPressed: widget.onClearFilters,
+            style: OutlinedButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+            ),
+            icon: const AppSvgIcon(AppIcons.filterClear),
+            label: const Text('Clear filters'),
+          ),
+        ],
+      ),
+    );
+
+    return Semantics(
+      container: true,
+      explicitChildNodes: true,
+      child: Material(
+        color: theme.colorScheme.surface,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final narrow = constraints.maxWidth < 620;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(child: search),
+                      if (!narrow) ...[const SizedBox(width: 8), time],
+                      const SizedBox(width: 8),
+                      refresh,
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  if (narrow)
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [time, ...facets.children],
+                    )
+                  else
+                    facets,
+                  if (showMore) moreFilters,
+                  if (activeChips.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    activeSummary,
+                  ],
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  List<_ActiveFilterChip> _activeFilterChips() {
+    final widget = this.widget;
+    final search = widget.searchController.text.trim();
+    final path = widget.pathController.text.trim();
+    final threadName = widget.threadNameController.text.trim();
+    return [
+      if (search.isNotEmpty)
+        _ActiveFilterChip('Search: $search', widget.searchController.clear),
+      if (widget.timeFilter != _defaultTimeFilter)
+        _ActiveFilterChip(
+          'Time: ${widget.timeFilter.label}',
+          () => widget.onTimeChanged(_defaultTimeFilter),
+        ),
+      if (widget.projectFilter != null)
+        _ActiveFilterChip(
+          'Project: ${widget.projectFilter}',
+          () => widget.onProjectChanged(null),
+        ),
+      if (widget.modelFilter != null)
+        _ActiveFilterChip(
+          'Model: ${widget.modelFilter}',
+          () => widget.onModelChanged(null),
+        ),
+      if (widget.tagFilter != null)
+        _ActiveFilterChip(
+          'Tag: ${widget.tagFilter}',
+          () => widget.onTagChanged(null),
+        ),
+      if (widget.platformFilter != SessionsPlatformFilter.both)
+        _ActiveFilterChip(
+          widget.platformFilter.label,
+          () => widget.onPlatformChanged(SessionsPlatformFilter.both),
+        ),
+      if (widget.originFilter != _defaultOriginFilter)
+        _ActiveFilterChip(
+          widget.originFilter.label,
+          () => widget.onOriginChanged(_defaultOriginFilter),
+        ),
+      if (widget.archivedFilter != SessionsArchivedFilter.activeOnly)
+        _ActiveFilterChip(
+          'Archived: ${widget.archivedFilter.label}',
+          () => widget.onArchivedChanged(SessionsArchivedFilter.activeOnly),
+        ),
+      if (widget.namedOnly)
+        _ActiveFilterChip('Named only', () => widget.onNamedOnlyChanged(false)),
+      if (widget.newestPerProjectOnly)
+        _ActiveFilterChip(
+          'Newest per project',
+          () => widget.onNewestPerProjectOnlyChanged(false),
+        ),
+      if (path.isNotEmpty)
+        _ActiveFilterChip('Path: $path', widget.pathController.clear),
+      if (threadName.isNotEmpty)
+        _ActiveFilterChip(
+          'Thread: $threadName',
+          widget.threadNameController.clear,
+        ),
+    ];
+  }
+}
+
+class _CountBadge extends StatelessWidget {
+  const _CountBadge({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        color: scheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        '$count',
+        style: Theme.of(
+          context,
+        ).textTheme.labelSmall?.copyWith(color: scheme.onSecondaryContainer),
+      ),
+    );
+  }
+}
+
+class _ActiveFilterChip {
+  const _ActiveFilterChip(this.label, this.onRemove);
+
+  final String label;
+  final VoidCallback onRemove;
+}
+
+extension on SessionsPlatformFilter {
+  String get label => switch (this) {
+    SessionsPlatformFilter.both => 'Windows and WSL',
+    SessionsPlatformFilter.windows => 'Windows only',
+    SessionsPlatformFilter.wsl => 'WSL only',
+  };
+}
+
+extension on SessionsOriginFilter {
+  String get label => switch (this) {
+    SessionsOriginFilter.user => 'Main sessions',
+    SessionsOriginFilter.all => 'All sessions',
+    SessionsOriginFilter.subagent => 'Subagents only',
+  };
+}
+
+extension on SessionsArchivedFilter {
+  String get label => switch (this) {
+    SessionsArchivedFilter.activeOnly => 'Hidden',
+    SessionsArchivedFilter.archivedOnly => 'Archived only',
+    SessionsArchivedFilter.all => 'Shown',
+  };
+}
+
+/// A compact dropdown that shows its label and current value, and highlights
+/// itself when set to a non-default value.
+class _FilterMenuButton<T> extends StatelessWidget {
+  const _FilterMenuButton({
+    super.key,
+    required this.label,
+    required this.value,
+    required this.options,
+    required this.onSelected,
+    required this.isActive,
+    this.tooltip,
+  });
+
+  final String label;
+  final T value;
+  final List<(T, String)> options;
+  final ValueChanged<T> onSelected;
+  final bool isActive;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    var valueLabel = '$value';
+    for (final option in options) {
+      if (option.$1 == value) {
+        valueLabel = option.$2;
+        break;
+      }
+    }
+    return PopupMenuButton<T>(
+      tooltip: tooltip ?? '$label: $valueLabel',
+      initialValue: value,
+      onSelected: onSelected,
+      constraints: const BoxConstraints(maxHeight: 420, minWidth: 180),
+      itemBuilder: (context) => [
+        for (final option in options)
+          CheckedPopupMenuItem<T>(
+            value: option.$1,
+            checked: option.$1 == value,
+            child: Text(option.$2),
+          ),
+      ],
+      child: Container(
+        height: 32,
+        padding: const EdgeInsets.only(left: 10, right: 4),
+        decoration: BoxDecoration(
+          color: isActive ? scheme.secondaryContainer : null,
+          border: Border.all(
+            color: isActive ? scheme.secondary : scheme.outlineVariant,
+          ),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              '$label: ',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: isActive
+                    ? scheme.onSecondaryContainer
+                    : scheme.onSurfaceVariant,
+              ),
+            ),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 180),
+              child: Text(
+                valueLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  fontWeight: isActive ? FontWeight.w600 : null,
+                  color: isActive ? scheme.onSecondaryContainer : null,
+                ),
+              ),
+            ),
+            Icon(
+              Icons.arrow_drop_down,
+              size: 18,
+              color: isActive
+                  ? scheme.onSecondaryContainer
+                  : scheme.onSurfaceVariant,
             ),
           ],
         ),
       ),
     );
   }
-
-  Widget _staticFilter(String semanticsLabel, String label) {
-    return _FilterSemantics(
-      label: semanticsLabel,
-      child: DropdownButtonFormField<String>(
-        initialValue: 'All',
-        isExpanded: true,
-        decoration: InputDecoration(labelText: label, isDense: true),
-        items: const [DropdownMenuItem(value: 'All', child: Text('All'))],
-        onChanged: null,
-      ),
-    );
-  }
 }
 
-class _NewestPerProjectFilter extends StatelessWidget {
-  const _NewestPerProjectFilter({required this.value, required this.onChanged});
+class _ToggleFilterChip extends StatelessWidget {
+  const _ToggleFilterChip({
+    required this.semanticsLabel,
+    required this.label,
+    required this.tooltip,
+    required this.value,
+    required this.onChanged,
+  });
 
+  final String semanticsLabel;
+  final String label;
+  final String tooltip;
   final bool value;
   final ValueChanged<bool> onChanged;
 
   @override
   Widget build(BuildContext context) {
     return Semantics(
-      label: 'Newest session per project filter',
+      label: semanticsLabel,
       toggled: value,
       container: true,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(6),
-        onTap: () => onChanged(!value),
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(minHeight: 36, maxWidth: 190),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Checkbox(
-                value: value,
-                visualDensity: VisualDensity.compact,
-                semanticLabel: 'Newest session per project filter',
-                onChanged: (checked) => onChanged(checked ?? false),
-              ),
-              const Flexible(
-                child: Text(
-                  'Newest per project',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              const SizedBox(width: 6),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _NamedOnlyFilter extends StatelessWidget {
-  const _NamedOnlyFilter({required this.value, required this.onChanged});
-
-  final bool value;
-  final ValueChanged<bool> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Semantics(
-      label: 'Named sessions only filter',
-      button: true,
-      toggled: value,
-      child: IconButton(
-        tooltip: 'Named sessions only',
-        isSelected: value,
-        onPressed: () => onChanged(!value),
-        style: IconButton.styleFrom(
-          backgroundColor: value ? colorScheme.secondaryContainer : null,
-          foregroundColor: value ? colorScheme.onSecondaryContainer : null,
-          minimumSize: const Size.square(36),
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          visualDensity: VisualDensity.compact,
-        ),
-        icon: const AppSvgIcon(AppIcons.filter),
+      child: FilterChip(
+        label: Text(label),
+        tooltip: tooltip,
+        selected: value,
+        visualDensity: VisualDensity.compact,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        labelStyle: Theme.of(context).textTheme.bodySmall,
+        onSelected: onChanged,
       ),
     );
   }
@@ -3094,6 +3584,7 @@ class _SessionsHeading extends StatelessWidget {
       children: [
         Semantics(
           header: true,
+          container: true,
           label: 'Sessions, $visibleCount visible',
           child: ExcludeSemantics(
             child: Row(
@@ -3111,6 +3602,7 @@ class _SessionsHeading extends StatelessWidget {
           Semantics(
             label: 'Session list actions',
             button: true,
+            container: true,
             child: PopupMenuButton<_SessionListAction>(
               tooltip: 'Session list actions',
               onSelected: onAction,
@@ -4212,9 +4704,43 @@ String? _blankToNull(String value) {
   return trimmed.isEmpty ? null : trimmed;
 }
 
+/// Draggable divider between the session table and the detail pane.
+/// Double-click restores the default split.
+class _SplitHandle extends StatelessWidget {
+  const _SplitHandle({required this.onDrag, required this.onReset});
+
+  final ValueChanged<double> onDrag;
+  final VoidCallback onReset;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.outlineVariant;
+    return ExcludeSemantics(
+      child: MouseRegion(
+        cursor: SystemMouseCursors.resizeColumn,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onHorizontalDragUpdate: (details) => onDrag(details.delta.dx),
+          onDoubleTap: onReset,
+          child: SizedBox(
+            width: 7,
+            child: Center(child: Container(width: 1, color: color)),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _SessionDetailPlaceholder extends StatelessWidget {
   const _SessionDetailPlaceholder({
     required this.row,
+    required this.subagents,
+    required this.parentRow,
+    required this.onOpenSession,
+    required this.detailTab,
+    required this.onDetailTabChanged,
+    required this.onLoadFullConversationMessages,
     required this.visibleCount,
     required this.hasRows,
     required this.hasActiveFilters,
@@ -4232,6 +4758,12 @@ class _SessionDetailPlaceholder extends StatelessWidget {
   });
 
   final SessionRowViewModel? row;
+  final List<SessionRowViewModel> subagents;
+  final SessionRowViewModel? parentRow;
+  final ValueChanged<String> onOpenSession;
+  final SessionDetailTab detailTab;
+  final ValueChanged<SessionDetailTab> onDetailTabChanged;
+  final FullConversationMessagesLoader? onLoadFullConversationMessages;
   final int visibleCount;
   final bool hasRows;
   final bool hasActiveFilters;
@@ -4268,6 +4800,7 @@ class _SessionDetailPlaceholder extends StatelessWidget {
       ),
       layoutBuilder: (currentChild, previousChildren) => Stack(
         alignment: Alignment.topLeft,
+        fit: StackFit.expand,
         children: [
           for (final child in previousChildren)
             IgnorePointer(
@@ -4288,6 +4821,12 @@ class _SessionDetailPlaceholder extends StatelessWidget {
       return SessionDetailPane(
         row: row!,
         settings: settings,
+        subagents: subagents,
+        parentRow: parentRow,
+        onOpenSession: onOpenSession,
+        initialTab: detailTab,
+        onTabChanged: onDetailTabChanged,
+        onLoadFullConversationMessages: onLoadFullConversationMessages,
         onCopyText: onCopyText,
         onSessionAction: onSessionAction,
         onExportMarkdown: onExportMarkdown,

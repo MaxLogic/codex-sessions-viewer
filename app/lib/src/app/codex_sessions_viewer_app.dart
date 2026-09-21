@@ -1243,6 +1243,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onReloadSessionDetailFromSource:
           _controller.reloadSessionDetailFromSource,
       onLoadMessagePage: _controller.loadMessagePage,
+      onLoadAllMessages: _controller.loadAllMessages,
       initialTableState: widget.settings.ui.sessionTable,
       onTableStateChanged: widget.onTableStateChanged,
       openTarget: widget.openTarget,

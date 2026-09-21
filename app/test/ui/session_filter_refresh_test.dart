@@ -393,7 +393,9 @@ void main() {
     );
 
     expect(find.text('Codex archived'), findsOneWidget);
-    expect(find.text('Viewer archive'), findsOneWidget);
+    await tester.tap(find.text('More filters'));
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel('Viewer archive filter'), findsOneWidget);
     expect(
       find.bySemanticsLabel(RegExp('Codex source archived')),
       findsWidgets,
@@ -635,8 +637,10 @@ void main() {
       ),
     );
 
-    await tester.tap(find.text('Advanced filters'));
+    await tester.tap(find.text('More filters'));
     await tester.pumpAndSettle();
+    await tester.enterText(find.bySemanticsLabel('Path filter'), 'viewer');
+    await _pumpFilterDebounce(tester);
 
     final searchLeft = tester
         .getTopLeft(find.bySemanticsLabel('Session search'))
@@ -893,7 +897,7 @@ void main() {
 
     await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Advanced filters'));
+    await tester.tap(find.text('More filters'));
     await tester.pumpAndSettle();
     await _enterThreadNameFilter(tester, 'mk2');
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
@@ -907,8 +911,7 @@ void main() {
     await tester.tap(find.text('dmk2').first);
     await tester.pumpAndSettle();
     expect(find.text('dmk2'), findsWidgets);
-    expect(find.text('Thread dmk2'), findsOneWidget);
-    expect(find.text('Thread name'), findsOneWidget);
+    expect(find.text('Thread name contains'), findsOneWidget);
   });
 
   testWidgets(
@@ -1274,7 +1277,9 @@ void main() {
       ),
     );
 
-    await tester.tap(find.text('Active only').last);
+    await tester.tap(find.text('More filters'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.bySemanticsLabel('Viewer archive filter'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Archived only').last);
     await tester.pumpAndSettle();
@@ -1832,6 +1837,8 @@ void main() {
     expect(find.bySemanticsLabel('Sessions, 4 visible'), findsOneWidget);
     expect(find.text('Older viewer session'), findsWidgets);
 
+    await tester.tap(find.text('More filters'));
+    await tester.pumpAndSettle();
     await tester.tap(
       find.bySemanticsLabel('Newest session per project filter'),
     );
@@ -1915,7 +1922,7 @@ void main() {
     expect(find.text('Session 4999'), findsNothing);
   });
 
-  testWidgets('left panel matches the session table width', (tester) async {
+  testWidgets('left panel leaves room for the detail pane', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1800, 1000));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
@@ -1933,7 +1940,7 @@ void main() {
     // window so the detail pane keeps at least 45%.
     expect(
       tester.getSize(find.byKey(const Key('sessions-left-panel'))).width,
-      1240,
+      closeTo(1800 * 0.55, 1),
     );
   });
 
@@ -2072,15 +2079,15 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.bySemanticsLabel('#4 Assistant, 4 tokens'));
     await tester.pumpAndSettle();
-    expect(find.text('Selected message 4'), findsOneWidget);
+    expect(find.textContaining('Message 4 of '), findsOneWidget);
 
     await tester.tap(find.text('Second session').first);
     await tester.pumpAndSettle();
-    expect(find.text('Selected message 4'), findsNothing);
+    expect(find.textContaining('Message 4 of '), findsNothing);
 
     await tester.tap(find.text('First session').first);
     await tester.pumpAndSettle();
-    expect(find.text('Selected message 4'), findsOneWidget);
+    expect(find.textContaining('Message 4 of '), findsOneWidget);
   });
 
   testWidgets('external open target reveals a filtered session', (
@@ -2128,7 +2135,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Hidden target'), findsWidgets);
-    expect(find.text('Selected message 2'), findsOneWidget);
+    expect(find.textContaining('Message 2 of '), findsOneWidget);
   });
 
   testWidgets('external open target loads an unloaded message body', (
@@ -2194,7 +2201,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(pageRequests, ['target:1']);
-    expect(find.text('Selected message 1'), findsOneWidget);
+    expect(find.textContaining('Message 1 of '), findsOneWidget);
     expect(find.text('Target prompt body from page'), findsOneWidget);
     expect(find.text('Message body not loaded yet.'), findsNothing);
   });
@@ -2278,7 +2285,7 @@ void main() {
     }
 
     expect(find.text('Delayed target'), findsWidgets);
-    expect(find.text('Selected message 1'), findsOneWidget);
+    expect(find.textContaining('Message 1 of '), findsOneWidget);
     expect(pageRequests, ['target:1']);
     expect(find.text('Delayed prompt body from page'), findsOneWidget);
   });
@@ -2356,7 +2363,13 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('Current body'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('message-card-1')),
+        matching: find.text('Current body'),
+      ),
+      findsOneWidget,
+    );
     expect(find.text('Stale body'), findsNothing);
     expect(find.text('Loading conversation messages'), findsNothing);
   });
@@ -2624,6 +2637,8 @@ void main() {
 
     await tester.tap(find.text('Icon detail').first);
     await tester.pumpAndSettle();
+    await tester.tap(find.bySemanticsLabel('Show tool calls and reasoning'));
+    await tester.pumpAndSettle();
 
     expect(find.byKey(const Key('message-index-icon-1')), findsOneWidget);
     expect(find.byKey(const Key('message-index-icon-2')), findsOneWidget);
@@ -2746,12 +2761,18 @@ Future<void> _setOriginFilter(WidgetTester tester, String label) async {
   }
 
   if (originDropdown().evaluate().isEmpty) {
-    await tester.tap(find.text('Advanced filters'));
+    await tester.tap(find.text('More filters'));
     await tester.pumpAndSettle();
   }
   await tester.tap(originDropdown());
   await tester.pumpAndSettle();
-  await tester.tap(find.text(label).last);
+  final menuLabel = switch (label) {
+    'User' => 'Main sessions',
+    'Subagent' => 'Subagents only',
+    'All' => 'All sessions',
+    _ => label,
+  };
+  await tester.tap(find.text(menuLabel).last);
   await tester.pumpAndSettle();
 }
 
