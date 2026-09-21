@@ -201,6 +201,14 @@ void main() {
                 detailLoads++;
                 return row.copyWithConversationMessages([
                   _message(
+                    id: '$id:start',
+                    number: 0,
+                    author: ConversationAuthor.system,
+                    body: '',
+                    preview: 'System instructions.',
+                    isBodyLoaded: false,
+                  ),
+                  _message(
                     id: '$id:first',
                     number: 1,
                     author: ConversationAuthor.user,
@@ -211,8 +219,10 @@ void main() {
                   _message(
                     id: '$id:last',
                     number: 2,
-                    author: ConversationAuthor.assistant,
-                    body: 'The parser now accepts the fixture.',
+                    author: ConversationAuthor.tool,
+                    body:
+                        '{"type":"task_complete","turn_id":"hidden",'
+                        '"last_agent_message":"The parser now accepts the fixture."}',
                   ),
                 ]);
               },
@@ -222,8 +232,12 @@ void main() {
                   _message(
                     id: '$id:first',
                     number: anchor,
-                    author: ConversationAuthor.user,
-                    body: 'Explain the failing parser test in full.',
+                    author: anchor == 0
+                        ? ConversationAuthor.tool
+                        : ConversationAuthor.user,
+                    body: anchor == 0
+                        ? '{"type":"task_started","turn_id":"hidden"}'
+                        : 'Explain the failing parser test in full.',
                   ),
                 ];
               },
@@ -259,10 +273,13 @@ void main() {
 
       expect(detailLoads, 1);
       expect(pageLoads, 1);
-      expect(copied, contains('### First message (User)'));
+      expect(copied, contains('### First message 👤'));
       expect(copied, contains('Explain the failing parser test in full.'));
-      expect(copied, contains('### Last message (Assistant)'));
+      expect(copied, contains('### Last message 🤖'));
       expect(copied, contains('The parser now accepts the fixture.'));
+      expect(copied, isNot(contains('turn_id')));
+      expect(copied, isNot(contains('task_started')));
+      expect(copied, isNot(contains('last_agent_message')));
       expect(
         find.text('Copied 1 visible session as extended Markdown.'),
         findsOneWidget,

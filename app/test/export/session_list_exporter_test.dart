@@ -59,7 +59,8 @@ void main() {
       markdown,
       contains(
         'wsl.exe -d Ubuntu --cd /home/pawel/projects/DelphiAiKit '
-        "bash -lc \"'codex' 'resume' 'session-1'\"",
+        "bash -lc \"'codex' 'resume' 'session-1'\"\n"
+        '```\n\n```bash\ncodex resume session-1\n```',
       ),
     );
   });
@@ -112,9 +113,17 @@ void main() {
       sessionId: 'session-messages',
       workingDirectory: r'F:\projects\MaxLogic\codex-sessions-viewer',
       conversationMessages: [
-        _message(1, ConversationAuthor.user, 'First prompt.'),
+        _message(
+          1,
+          ConversationAuthor.user,
+          ' \r\nFirst prompt.\r\n\r\n \t\r\n  Indented line.\r\n ',
+        ),
         _message(2, ConversationAuthor.tool, 'Intermediate tool output.'),
-        _message(3, ConversationAuthor.assistant, 'Last response.'),
+        _message(
+          3,
+          ConversationAuthor.assistant,
+          '\nLast response.\n\t \n\nDone.\n',
+        ),
       ],
     );
 
@@ -124,16 +133,104 @@ void main() {
       includeLastMessage: true,
     );
 
-    expect(markdown, contains('### First message (User)\n\nFirst prompt.'));
     expect(
       markdown,
-      contains('### Last message (Assistant)\n\nLast response.'),
+      contains('### First message 👤\n\nFirst prompt.\n  Indented line.'),
     );
+    expect(markdown, contains('### Last message 🤖\n\nLast response.\nDone.'));
     expect(markdown, isNot(contains('Intermediate tool output.')));
 
     final firstOnly = exporter.exportMarkdown([row], includeFirstMessage: true);
-    expect(firstOnly, contains('### First message (User)'));
+    expect(firstOnly, contains('### First message 👤'));
     expect(firstOnly, isNot(contains('### Last message')));
+  });
+  test('skips lifecycle noise and unwraps completion text', () {
+    final exporter = SessionListExporter(settings: AppSettings.defaults());
+    final row = _row(
+      id: 'events',
+      sessionId: 'events',
+      workingDirectory: r'F:\projects',
+      conversationMessages: [
+        _message(
+          1,
+          ConversationAuthor.tool,
+          '{"type":"task_started","turn_id":"private-turn","started_at":123}',
+        ),
+        _message(2, ConversationAuthor.user, 'Please prepare the release.'),
+        _message(
+          3,
+          ConversationAuthor.tool,
+          '{"type":"task_complete","turn_id":"private-turn",'
+          '"last_agent_message":"**Release ready.**","duration_ms":456}',
+        ),
+        _message(
+          4,
+          ConversationAuthor.tool,
+          '{"type":"token_count","info":{}}',
+        ),
+      ],
+    );
+    final markdown = exporter.exportMarkdown(
+      [row],
+      includeFirstMessage: true,
+      includeLastMessage: true,
+    );
+    expect(
+      markdown,
+      contains('### First message 👤\n\nPlease prepare the release.'),
+    );
+    expect(markdown, contains('### Last message 🤖\n\n**Release ready.**'));
+    for (final noise in [
+      'task_started',
+      'task_complete',
+      'turn_id',
+      'last_agent_message',
+      'duration_ms',
+      'token_count',
+      '(Tool)',
+    ]) {
+      expect(markdown, isNot(contains(noise)));
+    }
+    expect(
+      markdown,
+      endsWith(
+        '**Legend:** 👤 User · 🤖 Assistant · ⚙ Tool · 💭 Reasoning · ℹ System',
+      ),
+    );
+    expect(exporter.exportMarkdown([row]), isNot(contains('Legend')));
+  });
+  test('first message is the earliest user prompt, or absent without one', () {
+    final exporter = SessionListExporter(settings: AppSettings.defaults());
+    final preamble = [
+      _message(1, ConversationAuthor.system, 'System instructions.'),
+      _message(2, ConversationAuthor.assistant, 'Assistant introduction.'),
+      _message(3, ConversationAuthor.reasoning, 'Internal reasoning.'),
+      _message(4, ConversationAuthor.tool, 'Tool output.'),
+    ];
+    for (final hasUser in [true, false]) {
+      final row = _row(
+        id: 'prompt',
+        sessionId: 'prompt',
+        workingDirectory: r'F:\projects',
+        conversationMessages: [
+          if (hasUser) _message(8, ConversationAuthor.user, 'Later prompt.'),
+          ...preamble,
+          if (hasUser) _message(5, ConversationAuthor.user, 'Original prompt.'),
+        ],
+      );
+      final markdown = exporter.exportMarkdown([
+        row,
+      ], includeFirstMessage: true);
+      if (hasUser) {
+        expect(markdown, contains('### First message 👤\n\nOriginal prompt.'));
+        expect(markdown, isNot(contains('Later prompt.')));
+      } else {
+        expect(markdown, isNot(contains('### First message')));
+      }
+      for (final message in preamble) {
+        expect(markdown, isNot(contains(message.body)));
+      }
+    }
   });
 }
 

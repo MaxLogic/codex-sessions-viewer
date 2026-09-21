@@ -1704,18 +1704,25 @@ class _SessionsScreenState extends State<SessionsScreen> {
   ) async {
     final ordered = [...messages]
       ..sort((left, right) => left.number.compareTo(right.number));
-    final requested = <ConversationMessageViewModel>{
-      if (options.includeFirstMessage) ordered.first,
-      if (options.includeLastMessage) ordered.last,
-    };
     final replacements = <int, ConversationMessageViewModel>{};
-    for (final message in requested) {
-      if (message.isBodyLoaded) {
-        continue;
-      }
-      final page = await widget.onLoadMessagePage!(sessionId, message.number);
-      for (final loaded in page) {
-        replacements[loaded.number] = loaded;
+    for (final candidates in [
+      if (options.includeFirstMessage)
+        ordered.where((message) => message.author == ConversationAuthor.user),
+      if (options.includeLastMessage) ordered.reversed,
+    ]) {
+      for (final candidate in candidates) {
+        var message = replacements[candidate.number] ?? candidate;
+        if (!message.isBodyLoaded) {
+          final page = await widget.onLoadMessagePage!(
+            sessionId,
+            message.number,
+          );
+          for (final loaded in page) {
+            replacements[loaded.number] = loaded;
+          }
+          message = replacements[candidate.number] ?? candidate;
+        }
+        if (SessionListExporter.messageContent(message) != null) break;
       }
     }
     if (replacements.isEmpty) {

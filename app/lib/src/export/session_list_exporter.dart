@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import '../commands/resume_command_generator.dart';
 import '../config/app_settings.dart';
 import '../ui/models/conversation_message_view_model.dart';
@@ -24,7 +26,15 @@ class SessionListExporter {
         ..writeln()
         ..writeln('```powershell')
         ..writeln(_resumeCommand(row))
-        ..writeln('```')
+        ..writeln('```');
+      if (row.platform == SessionRowPlatform.wsl) {
+        buffer
+          ..writeln()
+          ..writeln('```bash')
+          ..writeln(_resumeCommand(row, plain: true))
+          ..writeln('```');
+      }
+      buffer
         ..writeln()
         ..write(_metadata(row));
       _writeRequestedMessages(
@@ -40,6 +50,14 @@ class SessionListExporter {
           ..write('---');
       }
     }
+    if (rows.isNotEmpty && (includeFirstMessage || includeLastMessage)) {
+      buffer
+        ..writeln()
+        ..writeln()
+        ..write(
+          '**Legend:** 👤 User · 🤖 Assistant · ⚙ Tool · 💭 Reasoning · ℹ System',
+        );
+    }
     return buffer.toString();
   }
 
@@ -53,10 +71,19 @@ class SessionListExporter {
         row.conversationMessages.isEmpty) {
       return;
     }
-    final messages = [...row.conversationMessages]
-      ..sort((left, right) => left.number.compareTo(right.number));
+    final messages =
+        row.conversationMessages
+            .where((message) => messageContent(message) != null)
+            .toList()
+          ..sort((left, right) => left.number.compareTo(right.number));
+    if (messages.isEmpty) return;
     if (includeFirstMessage) {
-      _writeMessage(buffer, 'First message', messages.first);
+      for (final message in messages) {
+        if (message.author == ConversationAuthor.user) {
+          _writeMessage(buffer, 'First message', message);
+          break;
+        }
+      }
     }
     if (includeLastMessage) {
       _writeMessage(buffer, 'Last message', messages.last);
@@ -68,15 +95,65 @@ class SessionListExporter {
     String label,
     ConversationMessageViewModel message,
   ) {
-    final body = message.body.trim().isNotEmpty
-        ? message.body.trim()
-        : message.preview.trim();
+    final content = messageContent(message)!;
+    final symbol = switch (content.author) {
+      ConversationAuthor.user => '👤',
+      ConversationAuthor.assistant => '🤖',
+      ConversationAuthor.tool => '⚙',
+      ConversationAuthor.reasoning => '💭',
+      ConversationAuthor.system => 'ℹ',
+    };
     buffer
       ..writeln()
       ..writeln()
-      ..writeln('### $label (${message.authorLabel})')
+      ..writeln('### $label $symbol')
       ..writeln()
-      ..write(body.isEmpty ? '_Empty message._' : body);
+      ..write(
+        const LineSplitter()
+            .convert(content.body)
+            .where((line) => line.trim().isNotEmpty)
+            .join('\n'),
+      );
+  }
+
+  /// Shared by endpoint loading and rendering so skipped events do not leave
+  /// the actual first/last message with only a truncated preview.
+  static ({ConversationAuthor author, String body})? messageContent(
+    ConversationMessageViewModel message,
+  ) {
+    final body =
+        (message.body.trim().isNotEmpty ? message.body : message.preview)
+            .trim();
+    if (body.isEmpty) return null;
+    if (message.author == ConversationAuthor.tool ||
+        message.author == ConversationAuthor.system) {
+      Object? decoded;
+      try {
+        decoded = jsonDecode(body);
+      } on FormatException {
+        // Ordinary tool output is not necessarily JSON.
+      }
+      if (decoded is Map<String, dynamic>) {
+        final type = decoded['type'];
+        if (const {
+          'task_started',
+          'token_count',
+          'thread_settings_applied',
+          'thread_goal_updated',
+          'context_compacted',
+          'model_reroute',
+        }.contains(type)) {
+          return null;
+        }
+        if (type == 'task_complete') {
+          final text = decoded['last_agent_message'];
+          return text is String && text.trim().isNotEmpty
+              ? (author: ConversationAuthor.assistant, body: text.trim())
+              : null;
+        }
+      }
+    }
+    return (author: message.author, body: body);
   }
 
   String exportCsv(List<SessionRowViewModel> rows) {
@@ -150,7 +227,7 @@ class SessionListExporter {
     return parts.join(' — ');
   }
 
-  String _resumeCommand(SessionRowViewModel row) {
+  String _resumeCommand(SessionRowViewModel row, {bool plain = false}) {
     final commandSet = ResumeCommandGenerator(settings: settings).build(
       ResumeCommandSession(
         sessionId: row.sessionId,
@@ -160,7 +237,7 @@ class SessionListExporter {
         workingDirectory: row.workingDirectoryForCommands,
       ),
     );
-    return commandSet.platformResumeCommand ??
+    return (plain ? null : commandSet.platformResumeCommand) ??
         commandSet.plainResumeCommand ??
         'Resume unavailable';
   }
