@@ -81,8 +81,8 @@ class UsageSummaryRepository {
   }
 
   /// Call after branch reconciliation, before the ingestion transaction commits.
-  /// Historical price resolution is a later migration phase; until then these
-  /// rows retain exact tokens and explicitly unknown costs.
+  /// New rows keep exact tokens and start with explicitly unknown costs; the
+  /// reprice queue fills in historical prices afterwards.
   /// During migration, [shadowGenerationId] selects the copied shadow facts
   /// without switching the active generation. The caller commits its cursor
   /// in this same transaction and keeps normal writers gated.

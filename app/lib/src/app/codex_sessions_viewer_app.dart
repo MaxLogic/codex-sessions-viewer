@@ -18,6 +18,7 @@ import '../database/database_migrator.dart';
 import '../database/project_tag_state.dart';
 import '../database/session_eval_state.dart';
 import '../app/runtime_session_controller.dart';
+import 'logs_loader.dart';
 import '../export/eval_dataset_exporter.dart';
 import '../parser/codex_session_parser.dart';
 import '../platform/terminal_launcher.dart';
@@ -26,7 +27,6 @@ import '../search/message_search.dart';
 import '../ui/app_shell.dart';
 import '../ui/screens/context_search_screen.dart';
 import '../ui/screens/evals_screen.dart';
-import '../ui/screens/logs_screen.dart';
 import '../ui/screens/sessions_screen.dart';
 import '../ui/screens/settings_screen.dart';
 import '../ui/screens/usage_screen.dart';
@@ -240,20 +240,53 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
 
   @override
   Widget build(BuildContext context) {
+    final ui = (_settings ?? AppSettings.defaults()).ui;
+    final mode = switch (ui.theme) {
+      AppThemeMode.system => CodexThemeMode.system,
+      AppThemeMode.light => CodexThemeMode.light,
+      AppThemeMode.dark => CodexThemeMode.dark,
+      AppThemeMode.highContrastLight => CodexThemeMode.highContrastLight,
+      AppThemeMode.highContrastDark => CodexThemeMode.highContrastDark,
+    };
+    ThemeData themed(CodexThemeMode themeMode) {
+      final data = CodexAppTheme.themeData(themeMode);
+      return ui.density == UiDensity.compact
+          ? data.copyWith(visualDensity: VisualDensity.compact)
+          : data;
+    }
+
     return MaterialApp(
       navigatorKey: _navigatorKey,
       scaffoldMessengerKey: _scaffoldMessengerKey,
       title: CodexSessionsViewerApp.appTitle,
       debugShowCheckedModeBanner: false,
-      theme: CodexAppTheme.themeData(CodexThemeMode.light),
-      darkTheme: CodexAppTheme.themeData(CodexThemeMode.dark),
-      highContrastTheme: CodexAppTheme.themeData(
-        CodexThemeMode.highContrastLight,
+      theme: themed(
+        mode == CodexThemeMode.highContrastLight
+            ? CodexThemeMode.highContrastLight
+            : CodexThemeMode.light,
       ),
-      highContrastDarkTheme: CodexAppTheme.themeData(
-        CodexThemeMode.highContrastDark,
+      darkTheme: themed(
+        mode == CodexThemeMode.highContrastDark
+            ? CodexThemeMode.highContrastDark
+            : CodexThemeMode.dark,
       ),
-      themeMode: CodexAppTheme.themeMode(CodexThemeMode.system),
+      highContrastTheme: themed(CodexThemeMode.highContrastLight),
+      highContrastDarkTheme: themed(CodexThemeMode.highContrastDark),
+      themeMode: CodexAppTheme.themeMode(mode),
+      // The font size setting scales text on top of the Windows text size.
+      builder: (context, child) {
+        final media = MediaQuery.of(context);
+        final factor = ui.fontSize / AppSettings.defaults().ui.fontSize;
+        if (factor == 1 || child == null) {
+          return child ?? const SizedBox.shrink();
+        }
+        return MediaQuery(
+          data: media.copyWith(
+            textScaler: TextScaler.linear(media.textScaler.scale(1) * factor),
+          ),
+          child: child,
+        );
+      },
       home: FutureBuilder<DatabaseStartupResult>(
         future: widget.databaseStartup,
         builder: (context, snapshot) {
@@ -330,6 +363,10 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                             ConnectionState.done) {
                       _settings = settings;
                       _syncStartupPreferenceLater(settings);
+                      // Apply the theme, density, and font size settings.
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted) setState(() {});
+                      });
                     }
                     _startUsageSummaryLoad(settings);
                     _startMessageSearchBackfill();
@@ -406,7 +443,11 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         onSave: _saveSettings,
                         onReload: _reloadSettings,
                       ),
-                      logsScreen: LogsScreen(),
+                      logsScreen: LogsLoader(
+                        databaseFile: widget.databaseFile,
+                        settings: settings.logging,
+                        writerCoordinator: _writerCoordinator,
+                      ),
                     );
                   }
 
@@ -1239,6 +1280,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onOpenSettings: widget.onOpenSettings,
       onSessionAction: _handleSessionAction,
       onSaveSessionListCsv: widget.onSaveSessionListCsv,
+      onExportMarkdown: widget.onExportMarkdown,
       onLoadSessionDetail: _controller.loadSessionDetail,
       onReloadSessionDetailFromSource:
           _controller.reloadSessionDetailFromSource,
