@@ -8,6 +8,7 @@ import 'package:sqlite3/sqlite3.dart' show OpenMode, sqlite3;
 
 import '../path_mapping/path_mapper.dart';
 import '../scanner/session_scanner.dart';
+import 'database_backup.dart';
 import 'database_connection.dart';
 
 const sessionCacheRepairVersion = 3;
@@ -277,7 +278,11 @@ class SessionCacheRepair {
         await _discardUncommittedBackup(backupFile);
         return cancellationResult(repairAudit);
       }
-      _verifyBackupSnapshot(backupFile, repairAudit);
+      _verifyBackupSnapshot(
+        backupFile,
+        repairAudit,
+        expectedSchemaVersion: _schemaVersion(db),
+      );
     } on Object {
       await _discardUncommittedBackup(createdBackupFile);
       return SessionCacheRepairResult(
@@ -396,58 +401,10 @@ class SessionCacheRepair {
   Future<void> restoreVerifiedBackup({
     required File backupFile,
     required File destinationFile,
-  }) async {
-    if (!await backupFile.exists()) {
-      throw StateError('Repair backup does not exist.');
-    }
-    if (await destinationFile.exists()) {
-      throw StateError('Restore destination already exists.');
-    }
-    await destinationFile.parent.create(recursive: true);
-    final partialFile = File('${destinationFile.path}.partial');
-    if (await partialFile.exists() ||
-        await _hasAnySqliteSidecar(destinationFile)) {
-      throw StateError(
-        'Restore destination has stale partial or sidecar files.',
-      );
-    }
-    final source = sqlite3.open(backupFile.path, mode: OpenMode.readOnly);
-    Database? destination;
-    try {
-      if (!_databaseIsHealthy(source)) {
-        throw StateError('Repair backup failed integrity verification.');
-      }
-      destination = sqlite3.open(partialFile.path);
-      await source.backup(destination, nPage: 256).drain<void>();
-      destination.execute('pragma wal_checkpoint(truncate)');
-      final journalMode = destination
-          .select('pragma journal_mode = delete')
-          .single
-          .values
-          .single;
-      if (journalMode.toString().toLowerCase() != 'delete') {
-        throw StateError('Restored database could not switch to one file.');
-      }
-      destination.close();
-      destination = null;
-      await _deleteSqliteSidecars(partialFile);
-      _verifyDatabaseFile(partialFile);
-      if (await destinationFile.exists() ||
-          await _hasAnySqliteSidecar(destinationFile)) {
-        throw StateError('Restore destination changed before publication.');
-      }
-      await partialFile.rename(destinationFile.path);
-    } on Object {
-      destination?.close();
-      if (await partialFile.exists()) {
-        await partialFile.delete();
-      }
-      await _deleteSqliteSidecars(partialFile);
-      rethrow;
-    } finally {
-      source.close();
-    }
-  }
+  }) => SqliteBackupService().restore(
+    backup: backupFile,
+    destinationFile: destinationFile,
+  );
 }
 
 bool _repairCompleted(Database db) => db.select(
@@ -523,46 +480,12 @@ Future<File> _writeVerifiedBackup({
   required File databaseFile,
   required Directory backupDirectory,
   required String backupName,
-}) async {
-  if (!await databaseFile.exists()) {
-    throw StateError('Repair source database does not exist.');
-  }
-  await backupDirectory.create(recursive: true);
-  final backupFile = File(p.join(backupDirectory.path, backupName));
-  final partialFile = File('${backupFile.path}.partial');
-  if (await backupFile.exists() || await partialFile.exists()) {
-    throw StateError('Repair backup target already exists.');
-  }
-  Database? destination;
-  try {
-    destination = sqlite3.open(partialFile.path);
-    await source.backup(destination, nPage: 256).drain<void>();
-    destination.execute('pragma wal_checkpoint(truncate)');
-    final journalMode = destination
-        .select('pragma journal_mode = delete')
-        .single
-        .values
-        .single;
-    if (journalMode.toString().toLowerCase() != 'delete') {
-      throw StateError('Repair backup could not switch to a single file.');
-    }
-    destination.close();
-    destination = null;
-    await _deleteSqliteSidecars(partialFile);
-    await partialFile.rename(backupFile.path);
-  } on Object {
-    destination?.close();
-    destination = null;
-    if (await partialFile.exists()) {
-      await partialFile.delete();
-    }
-    await _deleteSqliteSidecars(partialFile);
-    rethrow;
-  } finally {
-    destination?.close();
-  }
-  return backupFile;
-}
+}) async => (await SqliteBackupService().create(
+  source: source,
+  databaseFile: databaseFile,
+  backupDirectory: backupDirectory,
+  backupName: backupName,
+)).file;
 
 Future<void> _deleteSqliteSidecars(File database) async {
   for (final suffix in ['-wal', '-shm', '-journal']) {
@@ -573,27 +496,11 @@ Future<void> _deleteSqliteSidecars(File database) async {
   }
 }
 
-Future<bool> _hasAnySqliteSidecar(File database) async {
-  for (final suffix in ['-wal', '-shm', '-journal']) {
-    if (await File('${database.path}$suffix').exists()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void _verifyDatabaseFile(File file) {
-  final verification = sqlite3.open(file.path, mode: OpenMode.readOnly);
-  try {
-    if (!_databaseIsHealthy(verification)) {
-      throw StateError('Repair backup did not pass SQLite integrity checks.');
-    }
-  } finally {
-    verification.close();
-  }
-}
-
-void _verifyBackupSnapshot(File file, SessionCacheRepairAudit repairAudit) {
+void _verifyBackupSnapshot(
+  File file,
+  SessionCacheRepairAudit repairAudit, {
+  required int expectedSchemaVersion,
+}) {
   final verification = sqlite3.open(file.path, mode: OpenMode.readOnly);
   try {
     if (!_databaseIsHealthy(verification)) {
@@ -604,7 +511,7 @@ void _verifyBackupSnapshot(File file, SessionCacheRepairAudit repairAudit) {
           'select coalesce(max(version), 0) as version from schema_version',
         )
         .single['version'];
-    if (schemaVersion != 15) {
+    if (schemaVersion != expectedSchemaVersion) {
       throw StateError(
         'Repair backup schema version is not the expected version.',
       );
@@ -641,6 +548,14 @@ void _verifyBackupSnapshot(File file, SessionCacheRepairAudit repairAudit) {
     verification.close();
   }
 }
+
+int _schemaVersion(Database database) =>
+    database
+            .select('select coalesce(max(version), 0) from schema_version')
+            .single
+            .values
+            .single
+        as int;
 
 List<_RepairEntry> _classifyRows(
   Database db,

@@ -7,20 +7,359 @@ import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
 import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
+import 'package:codex_sessions_viewer/src/database/application_maintenance.dart';
+import 'package:codex_sessions_viewer/src/pricing/pricing_repository.dart';
+import 'package:codex_sessions_viewer/src/database/database_generation.dart';
+import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
+import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/database/session_cache_repair.dart';
+import 'package:codex_sessions_viewer/src/database/usage_path_context_migration.dart';
 import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
+import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
 void main() {
+  test(
+    'concurrent refresh requests keep one scan owner without blocking other writers',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('csv_scan_owner_');
+      final windowsRoot = await Directory('${temp.path}/windows').create();
+      final wslRoot = await Directory('${temp.path}/wsl').create();
+      for (var i = 0; i < 20; i++) {
+        await _writeJsonFixture(windowsRoot, 'owner-$i');
+      }
+      final file = File('${temp.path}/viewer.sqlite');
+      final settingsFile = File('${temp.path}/settings.toml');
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: windowsRoot.path,
+            wslCodexUncPath: wslRoot.path,
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      expect(
+        (await DatabaseMigrator(
+          sqlRoot: Directory('../sql'),
+        ).openAndMigrate(file)).canStartNormalUi,
+        isTrue,
+      );
+      final coordinator = DatabaseMaintenanceCoordinator(file);
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: file,
+        writerCoordinator: coordinator,
+        scanBatchingPolicy: const ScanBatchingPolicy(
+          parsedSessionFlushBatchSize: 1,
+          fullRowSnapshotBatchSize: 1,
+        ),
+      );
+      var overlap = false;
+      void check(SessionsRefreshProgress _) {
+        final db = openFileBackedDatabase(file);
+        try {
+          overlap |=
+              (db
+                      .select(
+                        "select count(*) n from scan_runs where status='running'",
+                      )
+                      .single['n']
+                  as int) >
+              1;
+        } finally {
+          db.close();
+        }
+      }
+
+      final first = controller.startRefreshInBackgroundOperation(
+        onProgress: check,
+      );
+      final second = controller.startRefreshInBackgroundOperation(
+        onProgress: check,
+      );
+      try {
+        final results = await Future.wait([first.result, second.result]);
+        expect(
+          overlap,
+          isFalse,
+          reason:
+              'A second discovery must not apply stale missing-file decisions over the active scan.',
+        );
+        expect(results.map((r) => r.rows.length), [20, 20]);
+      } finally {
+        await first.cancel();
+        await second.cancel();
+        await coordinator.idle;
+        await temp.delete(recursive: true);
+      }
+    },
+  );
+  test(
+    'pricing commits between background scan batches before scan completion',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('csv_scan_prices_');
+      final windowsRoot = await Directory('${temp.path}/windows').create();
+      final wslRoot = await Directory('${temp.path}/wsl').create();
+      for (var i = 0; i < 100; i++) {
+        await _writeJsonFixture(windowsRoot, 'price-scan-$i');
+      }
+      final file = File('${temp.path}/viewer.sqlite');
+      final settingsFile = File('${temp.path}/settings.toml');
+      final settings = AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      );
+      await SettingsRepository(settingsFile).save(settings);
+      expect(
+        (await DatabaseMigrator(
+          sqlRoot: Directory('../sql'),
+        ).openAndMigrate(file)).canStartNormalUi,
+        isTrue,
+      );
+      final coordinator = DatabaseMaintenanceCoordinator(file);
+      final maintenance = ApplicationMaintenance(
+        databaseFile: file,
+        coordinator: coordinator,
+        client: _ScanPricingCatalog(),
+      );
+      await maintenance.configure(settings);
+      Future<bool>? refresh;
+      String? scanStateAtPriceCommit;
+      void captureCommit() {
+        if (maintenance.schedules.any(
+          (s) =>
+              s.jobType == 'openrouter_price_refresh' &&
+              s.lastSuccessAtUtc != null,
+        )) {
+          final db = openFileBackedDatabase(file);
+          try {
+            scanStateAtPriceCommit ??=
+                db
+                        .select(
+                          'select status from scan_runs order by id desc limit 1',
+                        )
+                        .single['status']
+                    as String;
+          } finally {
+            db.close();
+          }
+        }
+      }
+
+      maintenance.addListener(captureCommit);
+      final operation =
+          RuntimeSessionController(
+            settingsFile: settingsFile,
+            databaseFile: file,
+            writerCoordinator: coordinator,
+            scanBatchingPolicy: const ScanBatchingPolicy(
+              parsedSessionFlushBatchSize: 1,
+              fullRowSnapshotBatchSize: 1,
+            ),
+          ).startRefreshInBackgroundOperation(
+            onProgress: (progress) {
+              if ((progress.rows?.isNotEmpty ?? false) && refresh == null) {
+                refresh = maintenance.refreshPrices();
+              }
+            },
+          );
+      try {
+        final result = await operation.result.timeout(
+          const Duration(seconds: 30),
+        );
+        expect(refresh, isNotNull);
+        expect(await refresh!, isTrue);
+        expect(
+          scanStateAtPriceCommit,
+          'running',
+          reason: 'A downloaded catalog must not wait for the entire scan.',
+        );
+        expect(result.rows, hasLength(100));
+        final db = openFileBackedDatabase(file);
+        try {
+          expect(db.select('pragma foreign_key_check'), isEmpty);
+        } finally {
+          db.close();
+        }
+      } finally {
+        await operation.cancel();
+        await maintenance.stop();
+        maintenance.dispose();
+        await coordinator.idle;
+        await temp.delete(recursive: true);
+      }
+    },
+  );
+  test('runtime project edits wait for the application writer queue', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_writer_queue_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(
+      settingsFile,
+    ).save(AppSettings.defaults().copyWith(pricing: _testPricing()));
+    expect(
+      (await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(databaseFile)).canStartNormalUi,
+      isTrue,
+    );
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    db.execute(
+      "insert into projects (id, name, is_active, created_at_utc, updated_at_utc) values (1, 'fixture', 1, '2026-09-07', '2026-09-07')",
+    );
+    final coordinator = DatabaseMaintenanceCoordinator(databaseFile);
+    final release = Completer<void>();
+    final held = coordinator.runWriter(() => release.future);
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      writerCoordinator: coordinator,
+    );
+    final edit = controller.upsertProjectMaskAndRecalculate(
+      projectId: 1,
+      pathMask: 'c:/fixture/*',
+    );
+    try {
+      final earlyResult = await edit.timeout(
+        const Duration(milliseconds: 300),
+        onTimeout: () => -1,
+      );
+      expect(
+        earlyResult,
+        -1,
+        reason: 'no project mutation may bypass the active application writer',
+      );
+      expect(db.select('select * from project_path_masks'), isEmpty);
+      // Read-only detail loading remains usable while a writer is queued.
+      expect(await controller.loadSessionDetail('missing'), isNull);
+    } finally {
+      release.complete();
+      await held;
+      await edit;
+    }
+    expect(
+      db.select('select path_mask from project_path_masks').single['path_mask'],
+      'c:/fixture/*',
+    );
+  });
+
+  test('database migration resumes from its durable checkpoint', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_migration_resume_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+    final seed = openFileBackedDatabase(databaseFile);
+    seed.execute('create table migration_source (value text not null)');
+    seed.execute('''
+      create table migration_destination (
+        source_rowid integer primary key,
+        value text not null
+      )
+      ''');
+    for (var index = 1; index <= 5; index++) {
+      seed.execute('insert into migration_source (value) values (?)', [
+        'row-$index',
+      ]);
+    }
+    seed.close();
+
+    final coordinator = DatabaseMaintenanceCoordinator(
+      databaseFile,
+      leaseDuration: const Duration(seconds: 2),
+    );
+    final first = await coordinator.start(
+      jobType: 'usage_projection_migration',
+      initialPhase: 'copy_probe',
+      worker: _copyMigrationProbeRows,
+      totalUnits: 5,
+      initialStatusMessage: 'Preparing migration test rows.',
+    );
+    var stopRequested = false;
+    final subscription = first.progress.listen((progress) {
+      if (!stopRequested && progress.completedUnits == 2) {
+        stopRequested = true;
+        unawaited(first.requestStop());
+      }
+    });
+    final firstResult = await first.result;
+    await subscription.cancel();
+    expect(firstResult.state, DatabaseMaintenanceState.interrupted);
+
+    final interrupted = openFileBackedDatabase(
+      databaseFile,
+      maintenanceWriter: true,
+    );
+    final durable = MaintenanceJobRepository(
+      interrupted,
+    ).latestForType('usage_projection_migration')!;
+    expect(durable.lastProcessedRowId, 2);
+    expect(durable.completedUnits, 2);
+    interrupted.execute('''
+      create trigger reject_repeated_migration_rows
+      before insert on migration_destination
+      when new.source_rowid <= 2
+      begin
+        select raise(abort, 'committed migration batch repeated');
+      end
+      ''');
+    interrupted.close();
+
+    final resumed = await coordinator.start(
+      jobType: 'usage_projection_migration',
+      initialPhase: 'copy_probe',
+      worker: _copyMigrationProbeRows,
+      totalUnits: 5,
+      initialStatusMessage: 'Resuming migration test rows.',
+    );
+    final resumedResult = await resumed.result;
+    expect(resumedResult.state, DatabaseMaintenanceState.succeeded);
+
+    final verified = openFileBackedDatabase(databaseFile);
+    addTearDown(verified.close);
+    expect(
+      verified
+          .select(
+            'select source_rowid, value from migration_destination order by source_rowid',
+          )
+          .map((row) => (row['source_rowid'], row['value']))
+          .toList(),
+      [(1, 'row-1'), (2, 'row-2'), (3, 'row-3'), (4, 'row-4'), (5, 'row-5')],
+    );
+    expect(
+      MaintenanceJobRepository(
+        verified,
+      ).latestForType('usage_projection_migration')!.attemptCount,
+      2,
+    );
+  });
+
   test(
     'runtime scan loads settings, persists parsed sessions, and returns rows',
     () async {
@@ -175,6 +514,21 @@ void main() {
       settingsFile: settingsFile,
       databaseFile: databaseFile,
     );
+    final contextSetup = openFileBackedDatabase(databaseFile);
+    final contextGenerations = DatabaseGenerationRepository(contextSetup);
+    final contextGeneration = contextGenerations.createBuilding(
+      sourceSchemaVersion: 15,
+      targetSchemaVersion: 16,
+      sourceFingerprint: 'empty fixture',
+    );
+    contextGenerations.markReady(
+      contextGeneration.id,
+      validationReportJson: jsonEncode(
+        UsagePathContextMigration(contextSetup).validateShadowParity(),
+      ),
+    );
+    contextGenerations.activate(contextGeneration.id);
+    contextSetup.close();
     final refresh = await controller.refresh();
     expect(refresh.rows, hasLength(7));
 
@@ -186,6 +540,20 @@ void main() {
         // The success path closes this handle before the parent-late refresh.
       }
     });
+    final contexts = db.select('''
+      select c.*, p.name as detected_name
+      from usage_path_contexts c
+      left join projects p on p.id = c.detected_project_id
+      where c.display_path_key = 'f:/projects/maxlogic/codex-sessions-viewer'
+    ''');
+    expect(
+      contexts,
+      hasLength(1),
+      reason: 'Usage ingestion must deduplicate path contexts.',
+    );
+    expect(contexts.single['detected_name'], 'codex-sessions-viewer');
+    expect(contexts.single['resolution_source'], 'detected');
+    expect(contexts.single['normalization_version'], 1);
     final projectionRows = db.select('''
       select session_id, usage_projection_status
       from sessions
@@ -228,6 +596,16 @@ void main() {
     expect(event['occurred_at_utc'], '2026-06-10T10:00:04.000Z');
     expect(event['model'], 'gpt-5.5-thinking');
     expect(event['input_tokens'], 42);
+    expect(
+      db.select('''
+        select coalesce(sum(d.input_tokens), 0) n from usage_session_daily d
+        join sessions s on s.id = d.session_id
+        where s.session_id = 'aggregate-jsonl-001' and d.branch_scope = 'local'
+      ''').single['n'],
+      42,
+      reason:
+          'Ingestion must persist its daily projection in the same transaction.',
+    );
     expect(event['cached_input_tokens'], 7);
     expect(event['cache_write_input_tokens'], 0);
     expect(event['output_tokens'], 21);
@@ -274,9 +652,9 @@ void main() {
         session_row_id, source_record_ordinal, epoch, input_tokens,
         cached_input_tokens, cache_write_input_tokens, output_tokens,
         reasoning_output_tokens, total_tokens, branch_scope, derivation,
-        event_fingerprint
+        event_fingerprint, path_context_id
       ) values ('aggregate-child-row', 1, 0, 3, 0, 0, 2, 0, 5,
-        'ambiguous', 'cumulative_delta', ?)
+        'ambiguous', 'cumulative_delta', ?, 1)
       ''',
       ['e' * 64],
     );
@@ -448,6 +826,127 @@ void main() {
           .select('select count(*) as count from usage_events')
           .single['count'],
       15,
+    );
+
+    final parentLines = (await parentFile.readAsLines())
+        .where((line) => line.trim().isNotEmpty)
+        .toList();
+    final parentMetadata =
+        jsonDecode(parentLines.first) as Map<String, dynamic>;
+    final parentPayload = parentMetadata['payload'] as Map<String, dynamic>;
+    parentPayload['forked_from_id'] = 'legacy-grandchild';
+    parentLines[0] = jsonEncode(parentMetadata);
+    await parentFile.writeAsString(parentLines.join('\n'), flush: true);
+    await controller.refresh();
+    expect(
+      reconciledDb
+          .select(
+            "select usage_projection_status from sessions where session_id = 'legacy-grandchild'",
+          )
+          .single['usage_projection_status'],
+      'ambiguous',
+      reason:
+          'Changing an ancestor must reconcile every descendant in the cycle.',
+    );
+    expect(
+      reconciledDb.select('''
+      select coalesce(sum(d.total_tokens), 0) n from usage_session_daily d
+      join sessions s on s.id = d.session_id
+      where s.session_id = 'legacy-grandchild' and d.branch_scope = 'local'
+    ''').single['n'],
+      0,
+    );
+    final cycleModifiedAt = (await parentFile.stat()).modified;
+    parentPayload.remove('forked_from_id');
+    parentLines[0] = jsonEncode(parentMetadata);
+    await parentFile.writeAsString(parentLines.join('\n'), flush: true);
+    // Windows stat exposes second-grained timestamps here. Make the smaller
+    // replacement explicitly newer, rather than testing the size tie-breaker.
+    await parentFile.setLastModified(
+      cycleModifiedAt.add(const Duration(seconds: 2)),
+    );
+    await controller.refresh();
+    expect(
+      reconciledDb
+          .select('''
+        select session_id, forked_from_id, usage_projection_status from sessions
+        where session_id in ('legacy-parent', 'legacy-child', 'legacy-grandchild')
+        order by session_id
+      ''')
+          .map(
+            (r) => (
+              r['session_id'],
+              r['forked_from_id'],
+              r['usage_projection_status'],
+            ),
+          )
+          .toList(),
+      [
+        ('legacy-child', 'legacy-parent', 'complete'),
+        ('legacy-grandchild', 'legacy-child', 'complete'),
+        ('legacy-parent', null, 'complete'),
+      ],
+    );
+    expect(
+      reconciledDb.select('''
+      select coalesce(sum(d.total_tokens), 0) n from usage_session_daily d
+      join sessions s on s.id = d.session_id
+      where s.session_id = 'legacy-grandchild' and d.branch_scope = 'local'
+    ''').single['n'],
+      6,
+    );
+    final emptyChild = File(p.join(windowsRoot.path, 'empty-child.jsonl'));
+    await emptyChild.writeAsString(
+      jsonEncode({
+        'type': 'session_meta',
+        'timestamp': '2026-06-11T10:00:00Z',
+        'payload': {
+          'id': 'empty-child',
+          'forked_from_id': 'legacy-parent',
+          'timestamp': '2026-06-11T10:00:00Z',
+        },
+      }),
+    );
+    await controller.refresh();
+    expect(
+      reconciledDb
+          .select(
+            "select usage_projection_status from sessions where session_id = 'empty-child'",
+          )
+          .single['usage_projection_status'],
+      'complete',
+    );
+    parentPayload['forked_from_id'] = 'empty-child';
+    parentLines[0] = jsonEncode(parentMetadata);
+    await parentFile.writeAsString(parentLines.join('\n'), flush: true);
+    await parentFile.setLastModified(
+      cycleModifiedAt.add(const Duration(seconds: 4)),
+    );
+    await controller.refresh();
+    expect(
+      reconciledDb
+          .select(
+            "select usage_projection_status from sessions where session_id = 'empty-child'",
+          )
+          .single['usage_projection_status'],
+      'ambiguous',
+    );
+    parentPayload.remove('forked_from_id');
+    parentLines[0] = jsonEncode(parentMetadata);
+    await parentFile.writeAsString(parentLines.join('\n'), flush: true);
+    await parentFile.setLastModified(
+      cycleModifiedAt.add(const Duration(seconds: 6)),
+    );
+    await controller.refresh();
+    expect(
+      reconciledDb
+          .select(
+            "select usage_projection_status from sessions where session_id = 'empty-child'",
+          )
+          .single['usage_projection_status'],
+      'complete',
+      reason:
+          'A successfully parsed empty descendant must recover without being reparsed.',
     );
   });
 
@@ -1633,6 +2132,14 @@ void main() {
         // The success path closes this setup handle before scanning.
       }
     });
+    final generations = DatabaseGenerationRepository(db);
+    final generation = generations.createBuilding(
+      sourceSchemaVersion: 15,
+      targetSchemaVersion: 16,
+      sourceFingerprint: 'empty identity fixture',
+    );
+    generations.markReady(generation.id, validationReportJson: '{}');
+    generations.activate(generation.id);
     db.execute('drop index idx_sessions_session_id_unique');
     for (final row in [
       (
@@ -1706,9 +2213,9 @@ void main() {
           session_row_id, source_record_ordinal, epoch, input_tokens,
           cached_input_tokens, cache_write_input_tokens, output_tokens,
           reasoning_output_tokens, total_tokens, branch_scope, derivation,
-          event_fingerprint
+          event_fingerprint, path_context_id, occurred_at_utc
         ) values (?, ?, 0, 1, 0, 0, 1, 0, 2, ?,
-          'cumulative_delta', ?)
+          'cumulative_delta', ?, 1, '2026-07-27T14:00:00Z')
         ''',
         [event.session, event.ordinal, event.scope, event.fingerprint],
       );
@@ -1745,6 +2252,13 @@ void main() {
           .map((row) => row['branch_scope'])
           .toList(),
       ['inherited', 'local'],
+    );
+    expect(
+      reconciled.select('''
+      select coalesce(sum(total_tokens), 0) n from usage_session_daily
+      where session_id = 'session:merge-child' and branch_scope = 'local'
+    ''').single['n'],
+      2,
     );
   });
 
@@ -2246,6 +2760,115 @@ void main() {
     );
   });
 
+  test(
+    'message backfill yields its writer slot and cancellation wakes its pause',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'csv_backfill_writer_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final dbFile = await _prepareBackfillDatabase(temp, count: 4);
+      final coordinator = DatabaseMaintenanceCoordinator(dbFile);
+      final controller = RuntimeSessionController(
+        settingsFile: File(p.join(temp.path, 'unused.toml')),
+        databaseFile: dbFile,
+        writerCoordinator: coordinator,
+      );
+      final operation = controller
+          .startMessageSearchBackfillInBackgroundOperation(
+            batchSize: 1,
+            pauseBetweenBatches: const Duration(seconds: 5),
+          );
+      var finished = false;
+      operation.result.then((_) => finished = true);
+      Future<void>? writer;
+      try {
+        final deadline = DateTime.now().add(const Duration(seconds: 3));
+        while (true) {
+          final db = openFileBackedDatabase(dbFile);
+          final MessageSearchBackfillStatus status;
+          try {
+            status = MessageSearchIndex(db).backfillStatus();
+          } finally {
+            db.close();
+          }
+          if (status.indexed >= 1) break;
+          if (DateTime.now().isAfter(deadline)) {
+            fail('No committed backfill batch.');
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        writer = coordinator.runWriter(() async {
+          final renamed = dbFile.renameSync('${dbFile.path}.writer');
+          renamed.renameSync(dbFile.path);
+          final db = openFileBackedDatabase(dbFile);
+          try {
+            expect(MessageSearchIndex(db).backfillStatus().remaining, 3);
+            db.execute(
+              "insert into app_metadata(key,value,updated_at_utc) values('fixture.writer','ran','2026-09-07T00:00:00Z')",
+            );
+          } finally {
+            db.close();
+          }
+        });
+        await writer.timeout(const Duration(seconds: 1));
+        expect(finished, isFalse);
+        await operation.cancel().timeout(const Duration(seconds: 1));
+        expect((await operation.result).cancelled, isTrue);
+      } finally {
+        await operation.cancel();
+        await writer;
+      }
+      final resumed = controller
+          .startMessageSearchBackfillInBackgroundOperation(
+            batchSize: 2,
+            pauseBetweenBatches: Duration.zero,
+          );
+      expect((await resumed.result).complete, isTrue);
+      final db = openFileBackedDatabase(dbFile);
+      try {
+        expect(MessageSearchIndex(db).backfillStatus().indexed, 4);
+        expect(
+          db
+              .select(
+                "select value from app_metadata where key='fixture.writer'",
+              )
+              .single['value'],
+          'ran',
+        );
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  test('queued message backfill cancellation does not index a batch', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_backfill_queued_');
+    addTearDown(() => temp.delete(recursive: true));
+    final dbFile = await _prepareBackfillDatabase(temp, count: 4);
+    final coordinator = DatabaseMaintenanceCoordinator(dbFile);
+    final release = Completer<void>();
+    final writer = coordinator.runWriter(() => release.future);
+    await Future<void>.delayed(Duration.zero);
+    final operation = RuntimeSessionController(
+      settingsFile: File(p.join(temp.path, 'unused.toml')),
+      databaseFile: dbFile,
+      writerCoordinator: coordinator,
+    ).startMessageSearchBackfillInBackgroundOperation(batchSize: 1);
+    final cancelled = operation.cancel();
+    release.complete();
+    await writer;
+    await cancelled;
+    final result = await operation.result;
+    expect(result.cancelled, isTrue);
+    final db = openFileBackedDatabase(dbFile);
+    try {
+      expect(MessageSearchIndex(db).backfillStatus().indexed, 0);
+    } finally {
+      db.close();
+    }
+  });
+
   test('message search backfill does not block startup', () async {
     final tempDir = await Directory.systemTemp.createTemp(
       'csv_runtime_backfill_',
@@ -2739,7 +3362,9 @@ void main() {
       await tester.pump(const Duration(seconds: 2));
       expect(refreshCalls, 0);
 
-      await tester.tap(find.bySemanticsLabel('Settings navigation'));
+      await tester.tap(
+        find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
+      );
       await _pumpFrames(tester);
       await tester.tap(
         find.bySemanticsLabel('Background scan enabled setting'),
@@ -2757,7 +3382,9 @@ void main() {
         isTrue,
       );
 
-      await tester.tap(find.bySemanticsLabel('Sessions navigation'));
+      await tester.tap(
+        find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
+      );
       await tester.pump();
       expect(
         tester
@@ -2771,12 +3398,16 @@ void main() {
       expect(refreshCalls, 1);
 
       storedSettings = disabledSettings;
-      await tester.tap(find.bySemanticsLabel('Settings navigation'));
+      await tester.tap(
+        find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
+      );
       await _pumpFrames(tester);
       await tester.tap(find.text('Reload from file'));
       await _pumpFrames(tester);
 
-      await tester.tap(find.bySemanticsLabel('Sessions navigation'));
+      await tester.tap(
+        find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
+      );
       await tester.pump();
       final callsAfterReload = refreshCalls;
       await tester.pump(const Duration(milliseconds: 1001));
@@ -2845,6 +3476,160 @@ void main() {
     expect(detail?.userMessageTokens, 12);
     expect(detail?.assistantResponseTokens, 28);
     expect(detail?.modelsUsedForDetail, ['gpt-5.5-thinking']);
+  });
+
+  test('persisted cost lookup cannot create a database', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_cost_readonly_');
+    addTearDown(() => temp.delete(recursive: true));
+    final file = File(p.join(temp.path, 'missing.sqlite'));
+    final controller = RuntimeSessionController(
+      settingsFile: File(p.join(temp.path, 'unused.toml')),
+      databaseFile: file,
+    );
+    try {
+      await controller.loadPersistedSessionCosts(['missing']);
+    } on Object {
+      // A missing database may fail, but must never be created by a cost read.
+    }
+    expect(await file.exists(), isFalse);
+  });
+
+  test('cached and detailed sessions use historical local projected costs', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_historical_cost_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+    final windowsRoot = await Directory(p.join(temp.path, 'windows')).create();
+    await _writeAggregateJsonlFixture(windowsRoot);
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: p.join(temp.path, 'missing-wsl'),
+        ),
+        pricing: _testPricing(),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await DatabaseMigrator(
+      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
+    ).openAndMigrate(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    final generations = DatabaseGenerationRepository(db);
+    final generation = generations.createBuilding(
+      sourceSchemaVersion: 15,
+      targetSchemaVersion: 16,
+      sourceFingerprint: 'empty fixture',
+    );
+    generations.markReady(
+      generation.id,
+      validationReportJson: jsonEncode(
+        UsagePathContextMigration(db).validateShadowParity(),
+      ),
+    );
+    generations.activate(generation.id);
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    );
+    final scanned = await controller.refresh();
+    final id = scanned.rows.single.id;
+    expect(
+      db.select(
+        'select parse_status, usage_projection_status, parser_version from sessions where id = ?',
+        [id],
+      ).single,
+      {
+        'parse_status': 'available',
+        'usage_projection_status': 'complete',
+        'parser_version': CodexSessionParser.currentVersion,
+      },
+    );
+    db.execute('''
+      insert into local_price_override_periods (model_id, prompt_price_per_token,
+        settings_fingerprint, valid_from_utc, first_settings_revision, last_seen_settings_revision)
+      values ('gpt-5.5-thinking', '0.01', 'historical fixture', '2026-01-01T00:00:00Z', 1, 1);
+      delete from usage_session_daily;
+      delete from usage_cost_dirty_partitions;
+    ''');
+    final basis = db.lastInsertRowId;
+    for (final (day, scope, cost) in [
+      ('2026-06-01', 'local', '0.10'),
+      ('2026-06-02', 'local', '0.20'),
+      ('2026-06-03', 'inherited', '99'),
+    ]) {
+      db.execute(
+        '''
+        insert into usage_session_daily (session_id, day_utc, model_key, path_context_id,
+          branch_scope, input_tokens, cached_input_tokens, cache_write_input_tokens,
+          output_tokens, reasoning_output_tokens, total_tokens, estimated_cost_text,
+          cost_status, local_override_period_id, pricing_resolution_method,
+          cost_projection_version, updated_at_utc)
+        values (?, ?, 'gpt-5.5-thinking', 1, ?, 10, 0, 0, 0, 0, 10, ?, 'complete', ?, 'local_exact', 1, '2026-06-04')
+      ''',
+        [id, day, scope, cost, basis],
+      );
+    }
+    Future<void> expectCost(String display) async {
+      final cached = await controller.loadCachedRows();
+      expect(cached.rows.single.estimatedCostDisplay, display);
+      final detail = await controller.loadSessionDetail(id);
+      expect(detail?.estimatedCostDisplay, display);
+    }
+
+    await expectCost(r'$0.3');
+    final isolatedCosts = await controller.loadPersistedSessionCosts([
+      id,
+      'missing',
+    ]);
+    expect(isolatedCosts?[id]?.estimatedCostText, '0.3');
+    expect(isolatedCosts?['missing']?.costUnknown, isTrue);
+    final batch = UsageSummaryRepository(db).loadPersistedSessionCosts([
+      for (var i = 0; i < 520; i++) 'missing-$i',
+      id,
+    ], projectionVersion: CodexSessionParser.currentVersion)!;
+    expect(batch, hasLength(521));
+    expect(batch[id]!.estimatedCostText, '0.3');
+    expect(batch['missing-0']!.costUnknown, isTrue);
+    expect(batch['missing-519']!.costUnknown, isTrue);
+    db.execute(
+      '''
+      insert into usage_cost_dirty_partitions (session_id, day_utc, model_key, reason,
+        target_cost_projection_version, created_at_utc, updated_at_utc)
+      values (?, '2026-06-03', 'gpt-5.5-thinking', 'fixture', 1, '2026-06-04', '2026-06-04')
+    ''',
+      [id],
+    );
+    await expectCost(r'$0.3');
+    db.execute("update usage_cost_dirty_partitions set day_utc = '2026-06-01'");
+    await expectCost('Pricing update in progress');
+    db.execute('delete from usage_cost_dirty_partitions');
+    db.execute(
+      "update usage_session_daily set cost_status = 'partial_unsupported_units' where day_utc = '2026-06-02'",
+    );
+    await expectCost(r'$0.3 (partial)');
+    db.execute(
+      "update usage_session_daily set cost_status = 'unknown', estimated_cost_text = null where day_utc = '2026-06-01'",
+    );
+    await expectCost('Cost unknown');
+    db.execute(
+      "update usage_session_daily set estimated_cost_text = '0', cost_status = 'complete'",
+    );
+    await expectCost(r'$0');
+    db.execute(
+      "update sessions set usage_projection_status = 'ambiguous' where id = ?",
+      [id],
+    );
+    await expectCost('Cost unknown');
+    db.execute(
+      "update sessions set usage_projection_status = 'complete', parser_version = 0 where id = ?",
+      [id],
+    );
+    await expectCost('Cost unknown');
   });
 
   test(
@@ -3474,9 +4259,11 @@ void main() {
     ).openAndMigrate(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
+    final coordinator = DatabaseMaintenanceCoordinator(databaseFile);
     final operation = RuntimeSessionController(
       settingsFile: settingsFile,
       databaseFile: databaseFile,
+      writerCoordinator: coordinator,
       scanBatchingPolicy: const ScanBatchingPolicy(
         parsedSessionFlushBatchSize: 1,
         fullRowSnapshotBatchSize: 1,
@@ -3485,6 +4272,7 @@ void main() {
     final cancelAck = operation.cancel();
     final result = await operation.result;
     await cancelAck;
+    await coordinator.idle.timeout(const Duration(seconds: 3));
 
     expect(result.cancelled, isTrue);
     expect(result.statusMessage, contains('cancelled'));
@@ -3561,9 +4349,138 @@ void main() {
 
     final second = await controller.refresh();
     expect(second.rows.single.project, 'Manual Project');
+    expect(
+      db
+          .select(
+            '''
+        select detected.name
+        from sessions s join projects detected on detected.id = s.detected_project_id
+        where s.id = ?
+      ''',
+            [first.rows.single.id],
+          )
+          .map((row) => row['name']),
+      ['codex-sessions-viewer'],
+      reason: 'A manual override must not erase persisted project discovery.',
+    );
   });
 
-  test('project mask changes remap usage events', () async {
+  for (final operation in ['rescan', 'cached load']) {
+    test(
+      'runtime discovery preserves masked and manual projects during $operation',
+      () async {
+        final temp = await Directory.systemTemp.createTemp(
+          'csv_runtime_project_precedence_',
+        );
+        addTearDown(() => temp.delete(recursive: true));
+        final windowsRoot = await Directory(
+          p.join(temp.path, 'windows'),
+        ).create();
+        final wslRoot = await Directory(p.join(temp.path, 'wsl')).create();
+        final fixture = await _copyFixture(
+          'sample_windows_session.json',
+          windowsRoot,
+        );
+        final settingsFile = File(p.join(temp.path, 'settings.toml'));
+        await SettingsRepository(settingsFile).save(
+          AppSettings.defaults().copyWith(
+            paths: PathSettings(
+              windowsCodexPath: windowsRoot.path,
+              wslCodexUncPath: wslRoot.path,
+            ),
+            logging: _testLogging(temp),
+          ),
+        );
+        final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+        final startup = await DatabaseMigrator(
+          sqlRoot: Directory('../sql'),
+        ).openAndMigrate(databaseFile);
+        expect(startup.canStartNormalUi, isTrue);
+        final controller = RuntimeSessionController(
+          settingsFile: settingsFile,
+          databaseFile: databaseFile,
+        );
+        final initial = await controller.refresh();
+        final sessionId = initial.rows.single.id;
+        final db = openFileBackedDatabase(databaseFile);
+        addTearDown(db.close);
+        final store = ProjectTagStateStore(db);
+        final maskedId = store.upsertProject(name: 'Masked Project');
+        final maskId = store.upsertProjectMask(
+          projectId: maskedId,
+          pathMask: '*codex-sessions-viewer*',
+        );
+        store.recalculateSessionProjects();
+        final rulesVersion = db
+            .select('select project_rules_version from database_state')
+            .single
+            .values
+            .single;
+        db.execute(
+          'update sessions set detected_project_id = null where id = ?',
+          [sessionId],
+        );
+        if (operation == 'rescan') {
+          // Changing file size forces the real parse/write path on the next scan.
+          await fixture.writeAsString('${await fixture.readAsString()}\n ');
+        }
+        final refreshed = operation == 'rescan'
+            ? await controller.refresh()
+            : await controller.loadCachedRows();
+        expect(refreshed.rows.single.project, 'Masked Project');
+        expect(
+          db.select(
+            'select detected.name from sessions s join projects detected on detected.id = s.detected_project_id where s.id = ?',
+            [sessionId],
+          ).single['name'],
+          'codex-sessions-viewer',
+        );
+        expect(
+          db
+              .select('select project_name from session_search')
+              .single['project_name'],
+          'Masked Project',
+        );
+        expect(
+          db
+              .select('select project_rules_version from database_state')
+              .single
+              .values
+              .single,
+          rulesVersion,
+        );
+
+        db.execute('delete from project_path_masks where id = ?', [maskId]);
+        store.recalculateSessionProjects();
+        expect(
+          (await controller.loadCachedRows()).rows.single.project,
+          'codex-sessions-viewer',
+        );
+        final manualId = store.upsertProject(name: 'Manual Project');
+        store.setSessionProject(sessionId, manualId);
+        db.execute(
+          'update sessions set detected_project_id = null where id = ?',
+          [sessionId],
+        );
+        final cached = await controller.loadCachedRows();
+        expect(cached.rows.single.project, 'Manual Project');
+        expect(
+          db.select('select detected_project_id from sessions where id = ?', [
+            sessionId,
+          ]).single['detected_project_id'],
+          isNotNull,
+        );
+        expect(
+          db
+              .select('select project_name from session_search')
+              .single['project_name'],
+          'Manual Project',
+        );
+      },
+    );
+  }
+
+  test('project mask changes remap usage contexts', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_usage_project_remap_',
     );
@@ -3702,6 +4619,53 @@ void main() {
       ''',
       [oldAutoId],
     );
+    final generations = DatabaseGenerationRepository(db);
+    final generation = generations.createBuilding(
+      sourceSchemaVersion: 15,
+      targetSchemaVersion: 16,
+      sourceFingerprint: 'fixture',
+    );
+    final jobs = MaintenanceJobRepository(db);
+    final job = jobs.enqueue(
+      jobType: 'usage_projection_migration',
+      phase: 'copy_events',
+      databaseGenerationId: generation.id,
+    );
+    final lease = jobs.claim(
+      jobType: job.jobType,
+      leaseDuration: const Duration(minutes: 1),
+    )!;
+    final migration = UsagePathContextMigration(db);
+    while (migration.copyNextBatch(jobs: jobs, lease: lease) != 0) {}
+    while (migration.resolveNextContextBatch(jobs: jobs, lease: lease) != 0) {}
+    generations.markReady(
+      generation.id,
+      validationReportJson: jsonEncode(migration.validateShadowParity()),
+    );
+    generations.activate(generation.id);
+    jobs.markSucceeded(
+      lease,
+      phase: 'complete',
+      statusMessage: 'Fixture migrated.',
+    );
+    final eventsBefore = db
+        .select(
+          'select * from usage_events order by session_row_id, source_record_ordinal',
+        )
+        .map((row) => Map<String, Object?>.from(row))
+        .toList();
+    for (final table in [
+      'usage_events',
+      'usage_daily',
+      'usage_session_daily',
+    ]) {
+      for (final operation in ['insert', 'update', 'delete']) {
+        db.execute('''
+          create trigger reject_${table}_$operation before $operation on $table
+          begin select raise(abort, 'project remap must not rewrite usage'); end
+        ''');
+      }
+    }
     db.close();
 
     await RuntimeSessionController(
@@ -3718,11 +4682,20 @@ void main() {
     expect(
       remapped
           .select(
-            'select distinct project_id from usage_events order by project_id',
+            'select distinct effective_project_id as project_id from usage_path_contexts where id <> 1 order by project_id',
           )
           .map((row) => row['project_id'])
           .toList(),
       [maskedId],
+    );
+    expect(
+      remapped
+          .select(
+            'select * from usage_events order by session_row_id, source_record_ordinal',
+          )
+          .map((row) => Map<String, Object?>.from(row))
+          .toList(),
+      eventsBefore,
     );
     expect(
       remapped
@@ -3757,7 +4730,7 @@ void main() {
             ),
           )
           .toList(),
-      [(maskedId, 534, '0.539'), (manualId, 15, '0.02')],
+      [(oldAutoId, 999, null)],
     );
 
     final dailyBeforeFailure = remapped
@@ -3765,10 +4738,10 @@ void main() {
         .map((row) => Map<String, Object?>.from(row))
         .toList(growable: false);
     remapped.execute('''
-      create trigger reject_usage_daily_rebuild
-      before insert on usage_daily
+      create trigger reject_context_remap
+      before update on usage_path_contexts
       begin
-        select raise(abort, 'rejected usage daily rebuild');
+        select raise(abort, 'rejected context remap');
       end
       ''');
     await expectLater(
@@ -3793,7 +4766,9 @@ void main() {
     );
     expect(
       remapped
-          .select('select distinct project_id from usage_events')
+          .select(
+            'select distinct effective_project_id as project_id from usage_path_contexts where id <> 1',
+          )
           .single['project_id'],
       maskedId,
     );
@@ -3804,7 +4779,7 @@ void main() {
           .toList(growable: false),
       dailyBeforeFailure,
     );
-    remapped.execute('drop trigger reject_usage_daily_rebuild');
+    remapped.execute('drop trigger reject_context_remap');
   });
 
   test(
@@ -4112,6 +5087,63 @@ void main() {
       expect(openSettingsCalls, 1);
     },
   );
+}
+
+class _ScanPricingCatalog implements OpenRouterModelsClient {
+  @override
+  Future<OpenRouterModelsResponse> fetchModels(
+    OpenRouterModelsRequest request,
+  ) async => OpenRouterModelsResponse.fromJsonText(
+    '{"data":[{"id":"openai/gpt-5","pricing":{"prompt":"0.000001","completion":"0.000002"}}]}',
+  );
+}
+
+Future<DatabaseMaintenanceWorkerOutcome> _copyMigrationProbeRows(
+  DatabaseMaintenanceWorkerContext context,
+) async {
+  while (true) {
+    if (context.stopRequested) {
+      return DatabaseMaintenanceWorkerOutcome.interrupted;
+    }
+    final job = context.jobs.read(context.lease.jobId)!;
+    final rows = context.database.select(
+      '''
+      select rowid, value
+      from migration_source
+      where rowid > ?
+      order by rowid
+      limit 2
+      ''',
+      [job.lastProcessedRowId],
+    );
+    if (rows.isEmpty) {
+      return DatabaseMaintenanceWorkerOutcome.succeeded;
+    }
+    final lastRowId = rows.last['rowid'] as int;
+    final completed = job.completedUnits + rows.length;
+    context.commitBatch(
+      phase: 'copy_probe',
+      currentWork: 'Copied $completed of ${job.totalUnits} migration rows.',
+      unitLabel: 'rows',
+      completedUnits: completed,
+      totalUnits: job.totalUnits,
+      lastProcessedRowId: lastRowId,
+      apply: (transaction) {
+        final insert = transaction.prepare('''
+          insert into migration_destination (source_rowid, value)
+          values (?, ?)
+          ''');
+        try {
+          for (final row in rows) {
+            insert.execute([row['rowid'], row['value']]);
+          }
+        } finally {
+          insert.close();
+        }
+      },
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
 }
 
 Future<void> _pumpFrames(WidgetTester tester, {int count = 5}) async {
@@ -4466,6 +5498,36 @@ Future<File> _writeWslJsonFixture(
 
 String _escapedJsonString(String value) =>
     value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
+
+Future<File> _prepareBackfillDatabase(
+  Directory temp, {
+  required int count,
+}) async {
+  final file = File(p.join(temp.path, 'viewer.sqlite'));
+  final startup = await DatabaseMigrator(
+    sqlRoot: Directory('../sql'),
+  ).openAndMigrate(file);
+  expect(startup.canStartNormalUi, isTrue);
+  final db = openFileBackedDatabase(file);
+  try {
+    _insertBackfillSession(db);
+    for (var index = 0; index < count; index++) {
+      _insertBackfillMessage(db, index);
+    }
+    db.execute(
+      "insert into message_search(message_search) values('delete-all')",
+    );
+    db.execute(
+      "update app_metadata set value='0' where key='message_search.backfill.last_message_rowid'",
+    );
+    db.execute(
+      "update app_metadata set value=(select cast(max(id) as text) from messages) where key='message_search.backfill.target_message_rowid'",
+    );
+  } finally {
+    db.close();
+  }
+  return file;
+}
 
 void _insertBackfillSession(Database db) {
   db.execute('''

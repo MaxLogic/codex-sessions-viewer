@@ -74,7 +74,8 @@ wav = 'assets\voice\database_error.wav'
 [pricing]
 provider = 'openrouter'
 use_external_pricing = true
-cache_pricing_hours = 24
+automatic_refresh_enabled = true
+refresh_interval_hours = 24
 fallback_to_overrides = true
 
 [pricing.openrouter]
@@ -87,6 +88,10 @@ completion = '0'
 input_cache_read = '0'
 input_cache_write = '0'
 internal_reasoning = '0'
+
+[maintenance]
+database_optimize_enabled = true
+database_optimize_interval_days = 7
 
 [logging]
 level = 'info'

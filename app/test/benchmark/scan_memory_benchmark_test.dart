@@ -86,7 +86,7 @@ void main() {
     expect(result['files_parsed'], 1);
     expect(result['files_failed'], 0);
     expect(result['persistence_flush_count'], 1);
-    expect(result['batch_source_bytes'], 512 * 1024 * 1024);
+    expect(result['batch_source_bytes'], 32 * 1024 * 1024);
     expect(result['cache_repair_precompleted'], isTrue);
     final backupDirectory = Directory(p.join(work.path, 'backups'));
     expect(

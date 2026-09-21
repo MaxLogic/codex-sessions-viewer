@@ -12,12 +12,16 @@ class UsageScreen extends StatefulWidget {
     this.announcer,
     this.isRefreshing = false,
     this.refreshFailed = false,
+    this.onPeriodChanged,
+    this.request,
   });
 
   final UsageSummary? summary;
   final ScreenReaderAnnouncer? announcer;
   final bool isRefreshing;
   final bool refreshFailed;
+  final ValueChanged<UsageSummaryRequest>? onPeriodChanged;
+  final UsageSummaryRequest? request;
 
   @override
   State<UsageScreen> createState() => _UsageScreenState();
@@ -26,7 +30,9 @@ class UsageScreen extends StatefulWidget {
 class _UsageScreenState extends State<UsageScreen>
     with SingleTickerProviderStateMixin {
   late final TabController _tabController;
-  UsagePeriod _selectedPeriod = UsagePeriod.last30Days;
+  UsagePeriod _localPeriod = UsagePeriod.last30Days;
+  UsagePeriod get _selectedPeriod => widget.request?.period ?? _localPeriod;
+  DateTimeRange? _customRange;
   String _announcement = '';
 
   UsageSummary get _summary => widget.summary ?? _emptySummary;
@@ -47,10 +53,54 @@ class _UsageScreenState extends State<UsageScreen>
   }
 
   Future<void> _selectPeriod(UsagePeriod period) async {
+    final now = DateTime.now().toUtc();
+    DateTime? customStart;
+    DateTime? customEnd;
+    if (period == UsagePeriod.custom) {
+      final previous = widget.request;
+      final previousRange = previous?.period == UsagePeriod.custom
+          ? previous!.resolve()
+          : null;
+      final range = await showDateRangePicker(
+        context: context,
+        firstDate: DateTime(1),
+        lastDate: DateTime(9999, 12, 31),
+        currentDate: DateTime(now.year, now.month, now.day),
+        initialDateRange: previousRange == null
+            ? _customRange
+            : DateTimeRange(
+                start: previousRange.startUtc,
+                end: previousRange.endExclusiveUtc.subtract(
+                  const Duration(days: 1),
+                ),
+              ),
+        helpText: 'Select usage dates (UTC)',
+      );
+      if (!mounted || range == null) return;
+      _customRange = range;
+      customStart = DateTime.utc(
+        range.start.year,
+        range.start.month,
+        range.start.day,
+      );
+      customEnd = DateTime.utc(
+        range.end.year,
+        range.end.month,
+        range.end.day,
+      ).add(const Duration(days: 1));
+    }
     setState(() {
-      _selectedPeriod = period;
+      _localPeriod = period;
       _announcement = 'Usage period changed to ${period.label}.';
     });
+    widget.onPeriodChanged?.call(
+      UsageSummaryRequest(
+        period: period,
+        nowUtc: now,
+        customStartUtc: customStart,
+        customEndExclusiveUtc: customEnd,
+      ),
+    );
     await widget.announcer?.announce(_announcement);
   }
 
@@ -286,11 +336,26 @@ class _UsageStatus extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Estimated cost at current cached/override rates'),
-              if (!pricing.refreshSucceeded)
+              Text(
+                pricing.usesHistoricalCosts
+                    ? 'Historical estimates at last observed rates'
+                    : 'Estimated cost at current cached/override rates',
+              ),
+              if (pricing.updating)
+                Semantics(
+                  container: true,
+                  liveRegion: true,
+                  child: const Text('Pricing update in progress'),
+                ),
+              if (pricing.partialUnsupportedUnits)
                 const Text(
-                  'Pricing refresh failed; cached/override rates are being '
-                  'shown.',
+                  'Partial estimate: charges for unmeasured units are excluded.',
+                ),
+              if (!pricing.refreshSucceeded)
+                Text(
+                  pricing.usesHistoricalCosts
+                      ? 'Pricing refresh failed; stored price history is unchanged.'
+                      : 'Pricing refresh failed; cached/override rates are being shown.',
                 ),
               if (pricing.openRouterFetchedAtUtc case final fetchedAt?)
                 Text(
@@ -298,7 +363,12 @@ class _UsageStatus extends StatelessWidget {
                   '${_formatUtcMinute(fetchedAt)}',
                 ),
               for (final model in pricing.models.take(8))
-                Text(_pricingModelStatus(model)),
+                Text(
+                  _pricingModelStatus(
+                    model,
+                    historical: pricing.usesHistoricalCosts,
+                  ),
+                ),
               if (pricing.models.length > 8)
                 Text('${pricing.models.length - 8} more pricing models'),
             ],
@@ -813,14 +883,19 @@ String _formatUtcMinute(DateTime value) {
       '${twoDigits(utc.hour)}:${twoDigits(utc.minute)} UTC';
 }
 
-String _pricingModelStatus(UsageModelPricingStatus model) {
+String _pricingModelStatus(
+  UsageModelPricingStatus model, {
+  bool historical = false,
+}) {
   final fetched = model.fetchedAtUtc == null
-      ? 'fetch time unavailable'
-      : 'fetched ${_formatUtcMinute(model.fetchedAtUtc!)}';
+      ? historical
+            ? 'historical coverage unavailable'
+            : 'fetch time unavailable'
+      : '${historical ? 'observed' : 'fetched'} ${_formatUtcMinute(model.fetchedAtUtc!)}';
   return 'Raw: ${model.rawModelId}; '
       'effective: ${model.effectiveModelId}; resolved: '
       '${model.resolvedModelId ?? 'unresolved'}; '
-      '${model.resolutionMethod.name}; ${model.cacheState}; '
+      '${model.resolutionMethod.name}; ${historical ? 'stored basis' : model.cacheState}; '
       '${model.source ?? 'unavailable'}; $fetched';
 }
 

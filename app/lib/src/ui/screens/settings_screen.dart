@@ -3,6 +3,9 @@ import 'package:flutter/material.dart';
 import '../../accessibility/announcement_service.dart';
 import '../../config/app_settings.dart';
 import '../../config/settings_diagnostics.dart';
+import '../../database/maintenance_job.dart';
+import '../../database/database_maintenance.dart';
+import '../motion.dart';
 import '../widgets/svg_icon.dart';
 
 typedef SettingsSaveCallback = Future<void> Function(AppSettings settings);
@@ -17,6 +20,8 @@ class SettingsScreen extends StatefulWidget {
     this.onReload,
     this.announcer,
     this.diagnostics = const DefaultSettingsDiagnostics(),
+    this.maintenanceSchedules = const [],
+    this.maintenanceProgress,
   });
 
   final AppSettings? initialSettings;
@@ -24,6 +29,8 @@ class SettingsScreen extends StatefulWidget {
   final SettingsReloadCallback? onReload;
   final ScreenReaderAnnouncer? announcer;
   final SettingsDiagnostics diagnostics;
+  final List<MaintenanceScheduleRecord> maintenanceSchedules;
+  final DatabaseMaintenanceProgress? maintenanceProgress;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -46,7 +53,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _scanInterval = TextEditingController();
   final _fontSize = TextEditingController();
   final _voiceOverFiles = TextEditingController();
-  final _pricingCacheDuration = TextEditingController();
+  final _pricingRefreshInterval = TextEditingController();
+  final _databaseOptimizeInterval = TextEditingController();
   final _pricingOverrides = TextEditingController();
   final _cacheDatabaseLocation = TextEditingController();
   final _exportFolder = TextEditingController();
@@ -73,7 +81,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _scanInterval,
       _fontSize,
       _voiceOverFiles,
-      _pricingCacheDuration,
+      _pricingRefreshInterval,
+      _databaseOptimizeInterval,
       _pricingOverrides,
       _cacheDatabaseLocation,
       _exportFolder,
@@ -99,13 +108,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _voiceOverFiles.text = settings.voiceOver.events.entries
         .map((entry) => '${entry.key}: ${entry.value.wav}')
         .join('\n');
-    _pricingCacheDuration.text = settings.pricing.cachePricingHours.toString();
+    _pricingRefreshInterval.text = settings.pricing.refreshIntervalHours
+        .toString();
+    _databaseOptimizeInterval.text = settings
+        .maintenance
+        .databaseOptimizeIntervalDays
+        .toString();
     _pricingOverrides.text = settings.pricing.overrides.keys.join('\n');
     _cacheDatabaseLocation.text = 'Default local database';
     _exportFolder.text = 'Default export folder';
   }
 
   Future<void> _save() async {
+    if (!await _validateScheduleInputs()) return;
     final next = _settingsFromControllers();
     await widget.onSave?.call(next);
     setState(() {
@@ -141,6 +156,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _runDiagnostic(SettingsDiagnosticAction action) async {
+    if (!await _validateScheduleInputs()) return;
     final result = await widget.diagnostics.run(
       action,
       _settingsFromControllers(),
@@ -206,19 +222,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
       pricing: PricingSettings(
         provider: _settings.pricing.provider,
         useExternalPricing: _settings.pricing.useExternalPricing,
-        cachePricingHours:
-            int.tryParse(_pricingCacheDuration.text) ??
-            _settings.pricing.cachePricingHours,
+        refreshIntervalHours:
+            int.tryParse(_pricingRefreshInterval.text) ??
+            _settings.pricing.refreshIntervalHours,
+        automaticRefreshEnabled: _settings.pricing.automaticRefreshEnabled,
         fallbackToOverrides: _settings.pricing.fallbackToOverrides,
         openRouter: _settings.pricing.openRouter,
         overrides: _settings.pricing.overrides,
       ),
+      maintenance: _settings.maintenance.copyWith(
+        databaseOptimizeIntervalDays:
+            int.tryParse(_databaseOptimizeInterval.text) ??
+            _settings.maintenance.databaseOptimizeIntervalDays,
+      ),
     );
+  }
+
+  Future<bool> _validateScheduleInputs() async {
+    for (final (controller, label, maximum) in [
+      (_pricingRefreshInterval, 'Price refresh interval (hours)', 720),
+      (_databaseOptimizeInterval, 'Database optimization interval (days)', 365),
+    ]) {
+      final value = int.tryParse(controller.text.trim());
+      if (value == null || value < 1 || value > maximum) {
+        final error = '$label must be an integer from 1 to $maximum.';
+        setState(() => _status = error);
+        await widget.announcer?.announce(error);
+        return false;
+      }
+    }
+    return true;
   }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final progress = widget.maintenanceProgress;
     return Material(
       color: scheme.surface,
       child: Padding(
@@ -262,6 +301,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    if (progress != null &&
+                        progress.state != DatabaseMaintenanceState.succeeded)
+                      _maintenanceProgress(progress),
                     _Section(
                       title: 'Application',
                       children: [
@@ -479,6 +521,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                   useExternalPricing: value,
                                   cachePricingHours:
                                       _settings.pricing.cachePricingHours,
+                                  automaticRefreshEnabled:
+                                      _settings.pricing.automaticRefreshEnabled,
                                   fallbackToOverrides:
                                       _settings.pricing.fallbackToOverrides,
                                   openRouter: _settings.pricing.openRouter,
@@ -488,22 +532,65 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             });
                           },
                         ),
+                        _SwitchSetting(
+                          label: 'Automatic OpenRouter price refresh',
+                          value: _settings.pricing.automaticRefreshEnabled,
+                          onChanged: (value) => setState(() {
+                            final pricing = _settings.pricing;
+                            _settings = _settings.copyWith(
+                              pricing: PricingSettings(
+                                provider: pricing.provider,
+                                useExternalPricing: pricing.useExternalPricing,
+                                automaticRefreshEnabled: value,
+                                refreshIntervalHours:
+                                    pricing.refreshIntervalHours,
+                                fallbackToOverrides:
+                                    pricing.fallbackToOverrides,
+                                openRouter: pricing.openRouter,
+                                overrides: pricing.overrides,
+                              ),
+                            );
+                          }),
+                        ),
                         _TextSetting(
-                          label: 'Pricing cache duration (hours)',
+                          label: 'Price refresh interval (hours)',
                           helperText:
                               'Public model-pricing metadata only; no session content is sent.',
-                          controller: _pricingCacheDuration,
+                          controller: _pricingRefreshInterval,
                         ),
                         _TextSetting(
                           label: 'Pricing overrides',
                           controller: _pricingOverrides,
                           maxLines: 3,
                         ),
+                        _maintenanceStatus(
+                          'openrouter_price_refresh',
+                          'OpenRouter price refresh status',
+                        ),
                       ],
                     ),
                     _Section(
                       title: 'Data and cache',
                       children: [
+                        _SwitchSetting(
+                          label: 'Automatic database optimization',
+                          value: _settings.maintenance.databaseOptimizeEnabled,
+                          onChanged: (value) => setState(() {
+                            _settings = _settings.copyWith(
+                              maintenance: _settings.maintenance.copyWith(
+                                databaseOptimizeEnabled: value,
+                              ),
+                            );
+                          }),
+                        ),
+                        _TextSetting(
+                          label: 'Database optimization interval (days)',
+                          controller: _databaseOptimizeInterval,
+                        ),
+                        _maintenanceStatus(
+                          'database_optimize',
+                          'Database optimization status',
+                        ),
                         _TextSetting(
                           label: 'Cache/database location',
                           controller: _cacheDatabaseLocation,
@@ -553,6 +640,81 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _maintenanceProgress(DatabaseMaintenanceProgress progress) {
+    final running = progress.state == DatabaseMaintenanceState.running;
+    final motion = CodexMotionPolicy.fromContext(
+      context,
+      mode: _settings.ui.motion,
+    );
+    return _Section(
+      title: 'Database maintenance ${progress.state.name}',
+      children: [
+        Semantics(
+          key: const Key('settings-maintenance-announcement'),
+          container: true,
+          liveRegion: true,
+          label: progress.boundedAnnouncement,
+          child: ExcludeSemantics(child: Text(progress.phase)),
+        ),
+        Text(progress.currentWork),
+        if (running) ...[
+          const SizedBox(height: 8),
+          TickerMode(
+            enabled: !motion.isReduced,
+            child: LinearProgressIndicator(
+              value: progress.fraction,
+              semanticsLabel: 'Database maintenance progress',
+              semanticsValue: progress.percentage == null
+                  ? null
+                  : '${progress.percentage}%',
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+        Text(
+          progress.totalUnits == null
+              ? '${progress.completedUnits} ${progress.unitLabel}'
+              : '${progress.completedUnits} of ${progress.totalUnits} ${progress.unitLabel}',
+        ),
+        if (progress.errorMessage != null) Text(progress.errorMessage!),
+      ],
+    );
+  }
+
+  Widget _maintenanceStatus(String jobType, String heading) {
+    MaintenanceScheduleRecord? schedule;
+    for (final row in widget.maintenanceSchedules) {
+      if (row.jobType == jobType) {
+        schedule = row;
+        break;
+      }
+    }
+    String date(DateTime? value, String absent) => value == null
+        ? absent
+        : '${value.toUtc().toIso8601String().substring(0, 19).replaceFirst('T', ' ')} UTC';
+    final nextDue = schedule?.enabled == false
+        ? schedule?.nextDueAtUtc == null
+              ? 'Disabled'
+              : 'Disabled (stored: ${date(schedule!.nextDueAtUtc, 'Not scheduled')})'
+        : date(schedule?.nextDueAtUtc, 'Not scheduled');
+    return _Section(
+      title: heading,
+      children: [
+        Text(
+          'Automatic job: ${schedule == null
+              ? 'Not configured'
+              : schedule.enabled
+              ? 'Enabled'
+              : 'Disabled'}',
+        ),
+        Text('Last attempt: ${date(schedule?.lastAttemptAtUtc, 'Never')}'),
+        Text('Last success: ${date(schedule?.lastSuccessAtUtc, 'Never')}'),
+        Text('Next due: $nextDue'),
+        Text('Last error: ${schedule?.lastError ?? 'None'}'),
+      ],
     );
   }
 

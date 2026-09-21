@@ -6,6 +6,98 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('discloses historical partial costs and pending repricing', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 1200));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final semantics = tester.ensureSemantics();
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: UsageScreen(
+            summary: _summary(
+              pricingStatus: const UsagePricingStatus(
+                openRouterFetchedAtUtc: null,
+                models: [],
+                usesHistoricalCosts: true,
+                updating: true,
+                partialUnsupportedUnits: true,
+              ),
+              costUnknown: true,
+            ),
+          ),
+        ),
+      );
+      expect(
+        find.text('Historical estimates at last observed rates'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Estimated cost at current cached/override rates'),
+        findsNothing,
+      );
+      expect(find.text('Pricing update in progress'), findsOneWidget);
+      expect(
+        find.bySemanticsLabel('Pricing update in progress'),
+        findsOneWidget,
+      );
+      expect(
+        find.text(
+          'Partial estimate: charges for unmeasured units are excluded.',
+        ),
+        findsOneWidget,
+      );
+    } finally {
+      semantics.dispose();
+    }
+  });
+
+  testWidgets('custom period waits for dates and cancel preserves selection', (
+    tester,
+  ) async {
+    final requests = <UsageSummaryRequest>[];
+    await tester.pumpWidget(
+      MaterialApp(home: UsageScreen(onPeriodChanged: requests.add)),
+    );
+    await tester.tap(find.text('Custom range'));
+    await tester.pumpAndSettle();
+    expect(find.byType(DateRangePickerDialog), findsOneWidget);
+    expect(requests, isEmpty);
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
+    expect(requests, isEmpty);
+    final chip = tester.widget<FilterChip>(
+      find.widgetWithText(FilterChip, 'Last 30 days'),
+    );
+    expect(chip.selected, isTrue);
+  });
+
+  testWidgets(
+    'custom dates load an inclusive selection as a half-open UTC range',
+    (tester) async {
+      final requests = <UsageSummaryRequest>[];
+      await tester.pumpWidget(
+        MaterialApp(home: UsageScreen(onPeriodChanged: requests.add)),
+      );
+      await tester.tap(find.text('Custom range'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Switch to input'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).at(0), '09/01/2026');
+      await tester.enterText(find.byType(TextField).at(1), '09/04/2026');
+      await tester.tap(find.text('OK'));
+      await tester.pumpAndSettle();
+      expect(requests, hasLength(1));
+      expect(requests.single.period, UsagePeriod.custom);
+      expect(requests.single.resolve().startUtc, DateTime.utc(2026, 9, 1));
+      expect(
+        requests.single.resolve().endExclusiveUtc,
+        DateTime.utc(2026, 9, 5),
+      );
+    },
+  );
+
   testWidgets('shows branch-aware coverage and current-rate cost status', (
     tester,
   ) async {

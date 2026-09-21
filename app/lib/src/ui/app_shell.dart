@@ -96,21 +96,11 @@ class _CodexAppShellState extends State<CodexAppShell> {
                 destinations: [
                   for (final item in CodexAppSection.values)
                     NavigationRailDestination(
-                      icon: Semantics(
-                        button: true,
-                        label: '${item.label} navigation',
-                        child: Icon(item.icon),
-                      ),
-                      selectedIcon: Semantics(
-                        button: true,
-                        label: '${item.label} navigation',
-                        selected: true,
-                        child: Icon(item.icon),
-                      ),
-                      label: Semantics(
-                        button: true,
-                        label: '${item.label} navigation',
-                        child: Text(item.label),
+                      // Let the rail merge its label, focus, and selected state.
+                      icon: Icon(item.icon),
+                      label: Text(
+                        item.label,
+                        semanticsLabel: '${item.label} navigation',
                       ),
                     ),
                 ],

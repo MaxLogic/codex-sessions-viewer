@@ -1,5 +1,9 @@
 import 'dart:io';
 
+import 'package:codex_sessions_viewer/src/database/database_generation.dart';
+import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
+import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/usage/usage_cost_projection.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
@@ -28,6 +32,631 @@ void main() {
 
   tearDown(() {
     db.close();
+  });
+
+  test('repricing visits dirty partitions in model day session order', () {
+    final day = DateTime.utc(2026, 9, 7);
+    for (final id in ['a', 'b']) {
+      _insertSession(db, id: id, sourceType: 'windows', startedAtUtc: day);
+    }
+    _activatePersistedUsage(db);
+    db.execute('''
+      insert into usage_cost_dirty_partitions (session_id, day_utc, model_key,
+        reason, target_cost_projection_version, created_at_utc, updated_at_utc)
+      values ('a', '2026-09-06', 'z-model', 'fixture', 1, '2026-09-07', '2026-09-07'),
+        ('a', '2026-09-07', 'a-model', 'fixture', 1, '2026-09-07', '2026-09-07'),
+        ('b', '2026-09-06', 'a-model', 'fixture', 1, '2026-09-07', '2026-09-07');
+    ''');
+    final jobs = MaintenanceJobRepository(db);
+    final job = jobs.enqueue(
+      jobType: 'usage_cost_repricing',
+      phase: 'reprice_costs',
+    );
+    final lease = jobs.claim(
+      jobType: job.jobType,
+      leaseDuration: const Duration(minutes: 5),
+    )!;
+    final settings = PricingSettings(
+      provider: 'openrouter',
+      useExternalPricing: false,
+      cachePricingHours: 24,
+      fallbackToOverrides: false,
+      openRouter: const OpenRouterSettings(
+        modelsEndpoint: 'https://openrouter.ai/api/v1/models',
+        apiKey: '',
+      ),
+      overrides: const {},
+    );
+    // Empty partitions still need clearing after source deletion. Their order
+    // deliberately differs from the session-first deduplication key.
+    for (final (session, day, model) in [
+      ('b', '2026-09-06', 'a-model'),
+      ('a', '2026-09-07', 'a-model'),
+      ('a', '2026-09-06', 'z-model'),
+    ]) {
+      expect(
+        UsageCostProjectionRepository(
+          db,
+        ).repriceNextBatch(jobs: jobs, lease: lease, settings: settings),
+        1,
+      );
+      expect(
+        db.select(
+          'select 1 from usage_cost_dirty_partitions where session_id=? and day_utc=? and model_key=?',
+          [session, day, model],
+        ),
+        isEmpty,
+      );
+    }
+    expect(jobs.read(job.id)!.completedUnits, 3);
+  });
+
+  test('reprices dirty usage partitions from events', () {
+    final day = DateTime.utc(2026, 9, 7);
+    for (final id in ['a', 'b']) {
+      _insertSession(db, id: id, sourceType: 'windows', startedAtUtc: day);
+    }
+    for (final (id, ordinal, minute, input, output) in [
+      ('a', 1, 599, 100, 10),
+      ('a', 2, 600, 100, 10),
+      ('b', 1, 600, 1, 1),
+      for (var ordinal = 2; ordinal <= 520; ordinal++)
+        ('b', ordinal, 600, 1, 1),
+    ]) {
+      _insertUsageEvent(
+        db,
+        sessionId: id,
+        ordinal: ordinal,
+        occurredAtUtc: day.add(Duration(minutes: minute)),
+        model: 'provider/model',
+        projectId: null,
+        inputTokens: input,
+        outputTokens: output,
+        totalTokens: input + output,
+      );
+    }
+    _activatePersistedUsage(db);
+    db.execute('pragma foreign_keys = on');
+    db.execute('''
+      insert into price_catalog_snapshots (source, started_at_utc, finished_at_utc,
+        status, completeness_status) values ('openrouter', '2026-09-01T00:00:00.000000Z',
+        '2026-09-01T00:00:00.000000Z', 'succeeded', 'complete_for_updates');
+      insert into model_price_periods (source, model_id, provider,
+        prompt_price_per_token, completion_price_per_token, pricing_fingerprint,
+        raw_pricing_json, valid_from_utc, first_snapshot_id, last_seen_snapshot_id)
+      values ('openrouter', 'provider/model', 'provider', '0.001', '0.002',
+        'fixture', '{}', '2026-09-01T00:00:00.000000Z', 1, 1);
+      insert into provider_price_rules (price_period_id, provider_order,
+        prompt_tokens_min, utc_start_minute, utc_end_minute, prompt_price_per_token,
+        pricing_fingerprint, raw_rule_json)
+      values (1, 0, 99, 600, 720, '0.003', 'rule-fixture', '{}');
+      insert into provider_price_rules (price_period_id, provider_order,
+        completion_price_per_token, pricing_fingerprint, raw_rule_json)
+      values (1, 1, '0.004', 'second-rule-fixture', '{}');
+      begin immediate;
+    ''');
+    repository.replaceDailyProjectionsInCurrentTransaction(['a', 'b']);
+    db.execute('''
+      update usage_session_daily set estimated_cost_text = '99', cost_status = 'complete',
+        provider_price_period_id = 1, pricing_catalog_snapshot_id = 1;
+      update usage_cost_dirty_partitions set reason = 'price_history';
+      commit;
+    ''');
+    final settings = PricingSettings(
+      provider: 'openrouter',
+      useExternalPricing: true,
+      cachePricingHours: 24,
+      fallbackToOverrides: false,
+      openRouter: const OpenRouterSettings(
+        modelsEndpoint: 'https://openrouter.ai/api/v1/models',
+        apiKey: '',
+      ),
+      overrides: const {},
+    );
+    final jobs = MaintenanceJobRepository(db);
+    final job = jobs.enqueue(
+      jobType: 'usage_cost_repricing',
+      phase: 'reprice_costs',
+    );
+    var lease = jobs.claim(
+      jobType: job.jobType,
+      leaseDuration: const Duration(minutes: 5),
+    )!;
+    final before = db.select('select * from usage_session_daily order by id');
+    int reprice() => UsageCostProjectionRepository(
+      db,
+    ).repriceNextBatch(jobs: jobs, lease: lease, settings: settings);
+    db.execute(
+      'update usage_cost_dirty_partitions set target_cost_projection_version = 2',
+    );
+    expect(reprice, throwsStateError);
+    expect(db.select('select * from usage_session_daily order by id'), before);
+    expect(jobs.read(job.id)!.completedUnits, 0);
+    db.execute(
+      'update usage_cost_dirty_partitions set target_cost_projection_version = 1',
+    );
+    db.execute('''
+      create trigger reject_reprice before delete on usage_cost_dirty_partitions
+      begin select raise(abort, 'injected dirty removal failure'); end;
+    ''');
+    expect(reprice, throwsA(isA<SqliteException>()));
+    expect(db.select('select * from usage_session_daily order by id'), before);
+    expect(
+      db.select('select * from usage_cost_dirty_partitions'),
+      hasLength(2),
+    );
+    expect(jobs.read(job.id)!.completedUnits, 0);
+    db.execute('drop trigger reject_reprice');
+    expect(reprice(), 1);
+    final priced = db.select(
+      "select * from usage_session_daily where session_id = 'a' order by estimated_cost_text",
+    );
+    expect(priced.map((row) => row['estimated_cost_text']), ['0.14', '0.34']);
+    // Same last rule, different earlier matches: never merge their audit basis.
+    expect(priced.map((row) => row['provider_rule_ids_json']), [
+      '[2]',
+      '[1,2]',
+    ]);
+    expect(
+      priced.every(
+        (row) =>
+            row['provider_price_period_id'] == 1 &&
+            row['pricing_catalog_snapshot_id'] == 1,
+      ),
+      isTrue,
+    );
+    expect(
+      db
+          .select('select sum(total_tokens) n from usage_session_daily')
+          .single['n'],
+      1260,
+    );
+    expect(
+      db
+          .select('select session_id from usage_cost_dirty_partitions')
+          .single['session_id'],
+      'b',
+    );
+    expect(jobs.read(job.id)!.completedUnits, 1);
+    jobs.markInterrupted(
+      lease,
+      statusMessage: 'Stopped at committed partition.',
+    );
+    lease = MaintenanceJobRepository(
+      db,
+    ).claim(jobType: job.jobType, leaseDuration: const Duration(minutes: 5))!;
+    expect(reprice(), 1);
+    expect(reprice(), 0);
+    expect(
+      db
+          .select(
+            "select estimated_cost_text from usage_session_daily where session_id = 'b'",
+          )
+          .single['estimated_cost_text'],
+      '2.6',
+    );
+    expect(jobs.read(job.id)!.completedUnits, 2);
+    expect(db.select('pragma foreign_key_check'), isEmpty);
+  });
+
+  test(
+    'rejects overlapping token buckets even when their sum would overflow',
+    () {
+      final estimate = estimateUsageCost(
+        inputTokens: 9223372036854775807,
+        cachedInputTokens: 9223372036854775807,
+        cacheWriteInputTokens: 1,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        model: 'overflow-fixture',
+        pricing: const UsagePricingCatalog({
+          'overflow-fixture': UsageModelPricing(
+            promptPricePerToken: '1',
+            completionPricePerToken: '0',
+            cachedInputPricePerToken: '0',
+            cacheWriteInputPricePerToken: '0',
+          ),
+        }),
+      );
+      expect(estimate.costUnknown, isTrue);
+      expect(estimate.estimatedCostText, isNull);
+    },
+  );
+
+  test('repricing preserves unknown costs and rolls back token overflow', () {
+    final day = DateTime.utc(2026, 9, 7);
+    _insertSession(db, id: 's', sourceType: 'windows', startedAtUtc: day);
+    for (var ordinal = 1; ordinal <= 2; ordinal++) {
+      _insertUsageEvent(
+        db,
+        sessionId: 's',
+        ordinal: ordinal,
+        occurredAtUtc: day,
+        model: 'model',
+        projectId: null,
+        inputTokens: 10,
+        outputTokens: 0,
+        cachedInputTokens: ordinal == 2 ? 11 : 0,
+        totalTokens: 10,
+      );
+    }
+    _activatePersistedUsage(db);
+    db.execute('''
+      insert into local_price_override_periods (model_id, prompt_price_per_token,
+        settings_fingerprint, valid_from_utc, first_settings_revision, last_seen_settings_revision)
+      values ('model', '0.01', 'fixture', '2026-01-01T00:00:00.000000Z', 1, 1);
+      begin immediate;
+    ''');
+    repository.replaceDailyProjectionsInCurrentTransaction(['s']);
+    db.execute('commit');
+    final jobs = MaintenanceJobRepository(db);
+    final job = jobs.enqueue(
+      jobType: 'usage_cost_repricing',
+      phase: 'reprice_costs',
+    );
+    var lease = jobs.claim(
+      jobType: job.jobType,
+      leaseDuration: const Duration(minutes: 5),
+    )!;
+    final settings = PricingSettings(
+      provider: 'openrouter',
+      useExternalPricing: false,
+      cachePricingHours: 24,
+      fallbackToOverrides: true,
+      openRouter: const OpenRouterSettings(
+        modelsEndpoint: 'https://openrouter.ai/api/v1/models',
+        apiKey: '',
+      ),
+      overrides: const {},
+    );
+    int reprice() => UsageCostProjectionRepository(
+      db,
+    ).repriceNextBatch(jobs: jobs, lease: lease, settings: settings);
+    expect(reprice(), 1);
+    final unknown = db.select('select * from usage_session_daily').single;
+    expect(unknown['total_tokens'], 20);
+    expect(unknown['cost_status'], 'unknown');
+    expect(unknown['estimated_cost_text'], isNull);
+    expect(unknown['local_override_period_id'], 1);
+    db.execute('''
+      update usage_events set cached_input_tokens = 0,
+        input_tokens = case when source_record_ordinal = 1 then 9223372036854775807 else 1 end,
+        total_tokens = case when source_record_ordinal = 1 then 9223372036854775807 else 1 end;
+      insert into usage_cost_dirty_partitions (session_id, day_utc, model_key, reason,
+        target_cost_projection_version, created_at_utc, updated_at_utc)
+      values ('s', '2026-09-07', 'model', 'fixture', 1, '2026-09-07', '2026-09-07');
+    ''');
+    jobs.markInterrupted(lease, statusMessage: 'Next fixture update.');
+    lease = jobs.claim(
+      jobType: job.jobType,
+      leaseDuration: const Duration(minutes: 5),
+    )!;
+    expect(reprice, throwsA(isA<SqliteException>()));
+    expect(db.select('select * from usage_session_daily').single, unknown);
+    expect(
+      db.select('select * from usage_cost_dirty_partitions'),
+      hasLength(1),
+    );
+    expect(jobs.read(job.id)!.completedUnits, 1);
+    expect(db.select('pragma foreign_key_check'), isEmpty);
+  });
+
+  test('usage ranges reject subday boundaries instead of truncating them', () {
+    _activatePersistedUsage(db);
+    final start = DateTime.utc(2026, 9, 1);
+    final end = DateTime.utc(2026, 9, 5);
+    for (final (from, to) in [
+      (DateTime.utc(2026, 9, 1, 12), end),
+      (start, DateTime.utc(2026, 9, 5, 12)),
+      (start.add(const Duration(microseconds: 1)), end),
+      (start, end.add(const Duration(microseconds: 1))),
+    ]) {
+      final request = UsageSummaryRequest(
+        period: UsagePeriod.custom,
+        nowUtc: end,
+        customStartUtc: from,
+        customEndExclusiveUtc: to,
+      );
+      expect(() => repository.summarize(request), throwsArgumentError);
+      expect(
+        () => repository.explainUsageEventAggregation(request),
+        throwsArgumentError,
+      );
+    }
+    final normalized = UsageSummaryRequest(
+      period: UsagePeriod.custom,
+      nowUtc: end,
+      customStartUtc: DateTime.parse('2026-09-01T02:00:00+02:00'),
+      customEndExclusiveUtc: DateTime.parse('2026-09-05T02:00:00+02:00'),
+    );
+    expect(normalized.resolve().startUtc, start);
+    expect(normalized.resolve().endExclusiveUtc, end);
+    expect(repository.summarize(normalized).totalTokens, 0);
+  });
+
+  test(
+    'active context generation reads persisted daily tokens and unknown costs',
+    () {
+      _insertSession(
+        db,
+        id: 'persisted',
+        sourceType: 'windows',
+        startedAtUtc: DateTime.utc(2026, 6, 12),
+        inputTokens: 10,
+        totalTokens: 10,
+        modelPrimary: 'model',
+      );
+      _activatePersistedUsage(db);
+      db.execute('''
+      insert into usage_session_daily (
+        session_id, day_utc, model_key, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens,
+        reasoning_output_tokens, total_tokens, cost_status, pricing_resolution_method,
+        cost_projection_version, updated_at_utc)
+      values ('persisted', '2026-06-12', 'model', 1, 'local',
+        37, 0, 0, 0, 0, 37, 'unknown', 'unknown', 1, '2026-06-12T00:00:00Z');
+    ''');
+      final summary = repository.summarize(
+        UsageSummaryRequest(
+          period: UsagePeriod.today,
+          nowUtc: DateTime.utc(2026, 6, 12),
+        ),
+        pricing: const UsagePricingCatalog({
+          'model': UsageModelPricing(
+            promptPricePerToken: '1',
+            completionPricePerToken: '1',
+          ),
+        }),
+      );
+      expect(summary.totalTokens, 37);
+      expect(summary.inputTokens, 37);
+      expect(
+        summary.costUnknown,
+        isTrue,
+        reason:
+            'Current catalog must not silently replace persisted historical costs.',
+      );
+      expect(summary.estimatedCostText, isNull);
+    },
+  );
+
+  test(
+    'persisted coverage retains undated and zero-token local event evidence',
+    () {
+      const ids = ['zero', 'inherited', 'dated', 'undated', 'zero-token'];
+      for (final id in ids) {
+        _insertSession(
+          db,
+          id: id,
+          sourceType: 'windows',
+          startedAtUtc: DateTime.utc(2026, 6, 12),
+        );
+        if (id != 'zero') {
+          final tokens = id == 'zero-token' ? 0 : 1;
+          _insertUsageEvent(
+            db,
+            sessionId: id,
+            ordinal: 1,
+            occurredAtUtc: DateTime.utc(2026, 6, 12),
+            model: null,
+            projectId: null,
+            inputTokens: tokens,
+            outputTokens: 0,
+            totalTokens: tokens,
+            branchScope: id == 'inherited' ? 'inherited' : 'local',
+          );
+        }
+      }
+      db.execute('update sessions set parser_version = 3');
+      db.execute(
+        "update usage_events set occurred_at_utc = null where session_row_id = 'undated'",
+      );
+      _activatePersistedUsage(db);
+      db.execute('begin immediate');
+      repository.replaceDailyProjectionsInCurrentTransaction(ids);
+      db.execute('commit');
+      // Production reads must use persisted coverage, not inspect raw events.
+      // Removing this fixture's facts makes accidental raw reads observable.
+      db.execute('delete from usage_events');
+      final summary = repository.summarize(
+        UsageSummaryRequest(
+          period: UsagePeriod.today,
+          nowUtc: DateTime.utc(2026, 6, 12),
+          projectionVersion: 3,
+        ),
+      );
+      expect(summary.projectionCoverage.currentCompleteSessions, 5);
+      expect(summary.projectionCoverage.completeZeroUsageSessions, 2);
+      expect(summary.totalTokens, 1);
+    },
+  );
+
+  test('dirty persisted costs are excluded without recalculating tokens', () {
+    _insertSession(
+      db,
+      id: 'paid',
+      sourceType: 'windows',
+      startedAtUtc: DateTime.utc(2026, 6, 12),
+      inputTokens: 10,
+      totalTokens: 10,
+      modelPrimary: 'gpt-fixture',
+    );
+    _activatePersistedUsage(db);
+    db.execute('begin immediate');
+    repository.replaceDailyProjectionsInCurrentTransaction(['paid']);
+    db.execute('commit');
+    db.execute('''
+      insert into local_price_override_periods (model_id, prompt_price_per_token,
+        settings_fingerprint, valid_from_utc, first_settings_revision, last_seen_settings_revision)
+      values ('openai/gpt-fixture', '0.037', 'fixture', '2026-06-01T00:00:00Z', 1, 1);
+      update usage_session_daily set estimated_cost_text = '0.37', cost_status = 'complete',
+        local_override_period_id = last_insert_rowid(), pricing_resolution_method = 'local_openai_exact';
+      delete from usage_cost_dirty_partitions where session_id = 'paid';
+    ''');
+    final request = UsageSummaryRequest(
+      period: UsagePeriod.today,
+      nowUtc: DateTime.utc(2026, 6, 12),
+    );
+    const catalog = UsagePricingCatalog({
+      'gpt-fixture': UsageModelPricing(
+        promptPricePerToken: '1',
+        completionPricePerToken: '1',
+      ),
+    });
+    final historical = repository.summarize(request, pricing: catalog);
+    expect(historical.estimatedCostText, '0.37');
+    expect(historical.pricingStatus.models.single.source, 'override');
+    expect(historical.pricingStatus.usesHistoricalCosts, isTrue);
+    expect(historical.pricingStatus.updating, isFalse);
+    expect(
+      historical.pricingStatus.models.single.resolvedModelId,
+      'openai/gpt-fixture',
+    );
+    expect(historical.pricingStatus.models.single.rawModelId, 'gpt-fixture');
+    expect(
+      historical.pricingStatus.models.single.resolutionMethod,
+      UsageModelResolutionMethod.openAiExact,
+    );
+    expect(
+      historical.pricingStatus.models.single.fetchedAtUtc,
+      DateTime.utc(2026, 6, 1),
+    );
+    db.execute(
+      "update usage_session_daily set cost_status = 'partial_unsupported_units'",
+    );
+    final partial = repository.summarize(request, pricing: catalog);
+    expect(partial.estimatedCostText, '0.37');
+    expect(partial.pricingStatus.partialUnsupportedUnits, isTrue);
+    db.execute('''
+      insert into usage_cost_dirty_partitions (session_id, day_utc, model_key,
+        reason, target_cost_projection_version, created_at_utc, updated_at_utc)
+      values ('paid', '2026-06-12', 'gpt-fixture', 'price_changed', 2, '2026-06-12', '2026-06-12');
+    ''');
+    final dirty = repository.summarize(request, pricing: catalog);
+    expect(dirty.costUnknown, isTrue);
+    expect(dirty.pricingStatus.updating, isTrue);
+    expect(dirty.estimatedCostText, isNull);
+    expect(dirty.totalTokens, 10);
+    expect(dirty.byModel.single.costUnknown, isTrue);
+    expect(dirty.topSessionsByTokens.single.costUnknown, isTrue);
+    db.execute('delete from usage_cost_dirty_partitions');
+    db.execute('update usage_session_daily set cost_projection_version = 2');
+    final unsupported = repository.summarize(request, pricing: catalog);
+    expect(unsupported.estimatedCostText, isNull);
+    expect(unsupported.pricingStatus.updating, isTrue);
+  });
+
+  test('active16 preserves nonmonetary summaries across periods and filters', () {
+    final automatic = _insertProject(db, 'Automatic');
+    final other = _insertProject(db, 'Other');
+    final manual = _insertProject(db, 'Manual');
+    final sessionIds = [
+      'month-edge',
+      'week-edge',
+      'yesterday',
+      'manual',
+      'zero',
+    ];
+    final starts = [
+      DateTime.utc(2026, 5, 31, 23),
+      DateTime.utc(2026, 6, 7, 23),
+      DateTime.utc(2026, 6, 11, 9),
+      DateTime.utc(2026, 6, 12, 10),
+      DateTime.utc(2026, 6, 12, 11),
+    ];
+    for (var index = 0; index < sessionIds.length; index++) {
+      final tokens = index == 4 ? 0 : index + 1;
+      _insertSession(
+        db,
+        id: sessionIds[index],
+        sourceType: index.isEven ? 'windows' : 'wsl',
+        startedAtUtc: starts[index],
+        title: 'Session $index',
+        messageCount: index + 2,
+        inputTokens: tokens * 10,
+        outputTokens: tokens,
+        cachedInputTokens: tokens,
+        // Cached input is a subset, not an additional total-token bucket.
+        totalTokens: tokens * 12,
+        modelPrimary: index.isEven ? 'gpt-5.5' : 'gpt-5.6-sol',
+        projectId: index == 3 ? manual : automatic,
+        projectName: index == 3 ? 'Manual' : 'Automatic',
+        projectOverride: index == 3,
+        isArchived: index == 1,
+        threadSource: index == 1 ? 'subagent' : 'cli',
+      );
+    }
+    // Activity is selected by event time, not the session's start date or
+    // current automatic project. A manual session override still wins.
+    for (final (id, ordinal, day, project, input, output, scope) in [
+      ('week-edge', 1, 12, other, 5, 2, 'local'),
+      ('manual', 1, 12, other, 100, 50, 'inherited'),
+      ('manual', 2, 13, other, 1000, 500, 'local'),
+    ]) {
+      _insertUsageEvent(
+        db,
+        sessionId: id,
+        ordinal: ordinal,
+        occurredAtUtc: DateTime.utc(2026, 6, day),
+        model: 'gpt-5.6-terra',
+        projectId: project,
+        inputTokens: input,
+        outputTokens: output,
+        totalTokens: input + output,
+        branchScope: scope,
+      );
+    }
+    db.execute(
+      "update usage_events set project_id = ? where session_row_id = 'manual'",
+      [other],
+    );
+    db.execute('update sessions set parser_version = 3');
+    final requests = [
+      for (final period in UsagePeriod.values)
+        UsageSummaryRequest(
+          period: period,
+          nowUtc: DateTime.utc(2026, 6, 12, 15),
+          customStartUtc: DateTime.utc(2026, 5, 31),
+          customEndExclusiveUtc: DateTime.utc(2026, 6, 13),
+          projectionVersion: 3,
+        ),
+    ];
+    final filters = <Set<String>>[
+      {},
+      {'week-edge', 'manual', 'zero'},
+      {'not-present'},
+    ];
+    final legacy = [
+      for (final request in requests)
+        for (final filter in filters)
+          repository.summarize(request, includeSessionIds: filter),
+    ];
+    expect(legacy.first.totalTokens, 51);
+    expect(legacy.first.totalSessions, 2);
+    expect(legacy.first.byProject.map((row) => (row.key, row.totalTokens)), [
+      ('Manual', 44),
+      ('Other', 7),
+      ('Automatic', 0),
+    ]);
+
+    _activatePersistedUsage(db);
+    db.execute('begin immediate');
+    repository.replaceDailyProjectionsInCurrentTransaction(sessionIds);
+    db.execute('commit');
+    // Remove raw facts after initialization to make a raw-reader fallback fail.
+    db.execute('delete from usage_events');
+    var index = 0;
+    for (final request in requests) {
+      for (final filter in filters) {
+        expect(
+          _nonmonetarySummary(
+            repository.summarize(request, includeSessionIds: filter),
+          ),
+          _nonmonetarySummary(legacy[index++]),
+          reason: '${request.period.name}, includeSessionIds: $filter',
+        );
+      }
+    }
   });
 
   test('aggregates period totals, breakdowns, and top sessions', () {
@@ -566,6 +1195,37 @@ void main() {
     expect(sumEstimatedCostTexts(const ['0.1', 'not-a-decimal']), isNull);
   });
 
+  test('preserves provider precision across mixed-scale costs', () {
+    const rate = '0.0000000833333333333333';
+    final estimate = estimateUsageCost(
+      inputTokens: 7,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 7,
+      model: 'provider/precise',
+      pricing: const UsagePricingCatalog({
+        'provider/precise': UsageModelPricing(
+          promptPricePerToken: '0.1',
+          completionPricePerToken: '0.2',
+          cacheWriteInputPricePerToken: rate,
+        ),
+      }),
+    );
+    expect(estimate.estimatedCostText, '0.0000005833333333333331');
+    expect(estimate.costUnknown, isFalse);
+    for (final amounts in [
+      ['1.25', rate, '-0.0000000416666666666667'],
+      [rate, '-0.0000000416666666666667', '1.25'],
+    ]) {
+      expect(sumEstimatedCostTexts(amounts), '1.2500000416666666666666');
+    }
+    expect(sumEstimatedCostTexts([rate, '-$rate']), '0');
+    expect(
+      sumEstimatedCostTexts(['-0.00000000000000000000001']),
+      '-0.00000000000000000000001',
+    );
+  });
+
   test('estimates a single session cost from cached model pricing', () {
     final estimate = estimateUsageCost(
       inputTokens: 24,
@@ -586,14 +1246,14 @@ void main() {
     expect(estimate.estimatedCostDisplay, '\$0.0545');
   });
 
-  test('prices mutually exclusive input buckets exactly once', () {
+  test('prices mutually exclusive input and output buckets exactly once', () {
     const pricing = UsagePricingCatalog({
       'openai/gpt-current': UsageModelPricing(
         promptPricePerToken: '0.01',
         completionPricePerToken: '0.02',
         cachedInputPricePerToken: '0.001',
         cacheWriteInputPricePerToken: '0.02',
-        internalReasoningPricePerToken: '9',
+        internalReasoningPricePerToken: '0.03',
       ),
     });
 
@@ -607,8 +1267,35 @@ void main() {
       pricing: pricing,
     );
 
-    expect(estimate.estimatedCostText, '1.52');
+    // 70*.01 + 20*.001 + 10*.02 + 25*.02 + 5*.03.
+    expect(estimate.estimatedCostText, '1.57');
     expect(estimate.costUnknown, isFalse);
+    for (final (reasoningRate, expected) in [
+      (null, '0.6'),
+      ('0', '0.5'),
+      ('0.03', '0.65'),
+      ('invalid', null),
+    ]) {
+      final cost = estimateUsageCost(
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 30,
+        reasoningOutputTokens: 5,
+        model: 'model',
+        pricing: UsagePricingCatalog({
+          'model': UsageModelPricing(
+            completionPricePerToken: '0.02',
+            internalReasoningPricePerToken: reasoningRate,
+          ),
+        }),
+      );
+      expect(
+        cost.estimatedCostText,
+        expected,
+        reason: 'Reasoning rate $reasoningRate',
+      );
+      expect(cost.costUnknown, expected == null);
+    }
 
     final invalidOverlap = estimateUsageCost(
       inputTokens: 10,
@@ -870,6 +1557,112 @@ void main() {
     expect(plan, contains('sqlite_autoindex_sessions_1'));
     expect(plan, isNot(contains('SCAN usage_events')));
   });
+}
+
+void _activatePersistedUsage(Database db) {
+  db.execute(
+    File(
+      '../sql/migration/016_persisted_usage_pricing_maintenance.sql',
+    ).readAsStringSync(),
+  );
+  // Distinct fixture projects represent distinct path contexts. Migration
+  // identity and conflict resolution have their own database-level tests.
+  db.execute('''
+    insert into usage_path_contexts (
+      display_path_raw, platform_path_raw, unc_path_raw,
+      display_path_key, platform_path_key, unc_path_key,
+      normalization_version, detected_project_id, effective_project_id,
+      resolution_source, project_rules_version, created_at_utc, updated_at_utc)
+    select 'fixture-project-' || project_id, '', '',
+      'fixture-project-' || project_id, '', '',
+      1, project_id, project_id, 'detected', 0,
+      '2026-06-12T00:00:00Z', '2026-06-12T00:00:00Z'
+    from usage_events where project_id is not null group by project_id;
+  ''');
+  db.execute('''
+    insert into usage_events_next (
+      session_row_id, source_record_ordinal, rollout_ordinal, turn_ordinal,
+      epoch, occurred_at_utc, model, path_context_id, input_tokens,
+      cached_input_tokens, cache_write_input_tokens, output_tokens,
+      reasoning_output_tokens, total_tokens, branch_scope, derivation, event_fingerprint)
+    select session_row_id, source_record_ordinal, rollout_ordinal, turn_ordinal,
+      epoch, occurred_at_utc, model,
+      coalesce((select id from usage_path_contexts
+        where effective_project_id = usage_events.project_id), 1),
+      input_tokens, cached_input_tokens,
+      cache_write_input_tokens, output_tokens, reasoning_output_tokens,
+      total_tokens, branch_scope, derivation, event_fingerprint from usage_events;
+  ''');
+  final generations = DatabaseGenerationRepository(db);
+  final generation = generations.createBuilding(
+    sourceSchemaVersion: 15,
+    targetSchemaVersion: 16,
+    sourceFingerprint: 'fixture',
+  );
+  generations.markReady(generation.id, validationReportJson: '{}');
+  generations.activate(generation.id);
+}
+
+Map<String, Object?> _nonmonetarySummary(UsageSummary summary) {
+  List<Object> breakdown(List<UsageBreakdownRow> rows) => [
+    for (final row in rows)
+      (
+        row.key,
+        row.sessionCount,
+        row.messageCount,
+        row.inputTokens,
+        row.outputTokens,
+        row.cachedInputTokens,
+        row.totalTokens,
+      ),
+  ];
+  List<Object> top(List<UsageTopSession> rows) => [
+    for (final row in rows)
+      (
+        row.sessionId,
+        row.title,
+        row.messageCount,
+        row.totalTokens,
+        row.originLabel,
+      ),
+  ];
+  final coverage = summary.projectionCoverage;
+  return {
+    'period': (summary.period.startUtc, summary.period.endExclusiveUtc),
+    'totals': (
+      summary.totalSessions,
+      summary.totalMessages,
+      summary.inputTokens,
+      summary.outputTokens,
+      summary.cachedInputTokens,
+      summary.totalTokens,
+    ),
+    'mostActive': (
+      summary.mostUsedModel,
+      summary.mostActiveProject,
+      summary.mostActivePlatform,
+    ),
+    'coverage': (
+      coverage.projectionVersion,
+      coverage.availableSessions,
+      coverage.currentCompleteSessions,
+      coverage.outdatedProjectionSessions,
+      coverage.legacyPendingSessions,
+      coverage.ambiguousSessions,
+      coverage.missingParentSessions,
+      coverage.completeZeroUsageSessions,
+    ),
+    'day': breakdown(summary.byDay),
+    'week': breakdown(summary.byWeek),
+    'month': breakdown(summary.byMonth),
+    'model': breakdown(summary.byModel),
+    'project': breakdown(summary.byProject),
+    'platform': breakdown(summary.byPlatform),
+    'origin': breakdown(summary.byOrigin),
+    'archive': breakdown(summary.byArchiveState),
+    'topTokens': top(summary.topSessionsByTokens),
+    'topMessages': top(summary.topSessionsByMessageCount),
+  };
 }
 
 void _insertSession(

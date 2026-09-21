@@ -1,10 +1,285 @@
 import 'package:codex_sessions_viewer/src/accessibility/announcement_service.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
+import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('maintenance progress is bounded, accessible and non-modal', (
+    tester,
+  ) async {
+    final semantics = tester.ensureSemantics();
+    var saves = 0;
+    DatabaseMaintenanceProgress progress({
+      int completed = 25,
+      int? total = 100,
+      DatabaseMaintenanceState state = DatabaseMaintenanceState.running,
+    }) => DatabaseMaintenanceProgress(
+      state: state,
+      phase: 'Repricing usage',
+      currentWork: 'Repricing stored daily partitions',
+      unitLabel: 'partitions',
+      completedUnits: completed,
+      totalUnits: total,
+      ratePerSecond: null,
+      elapsed: const Duration(seconds: 5),
+      estimatedRemaining: null,
+      walBytes: 0,
+      errorMessage: state == DatabaseMaintenanceState.failed
+          ? 'Pricing maintenance failed.'
+          : null,
+    );
+    Future<void> show(
+      DatabaseMaintenanceProgress? progress, {
+      bool reduced = false,
+    }) => tester.pumpWidget(
+      MaterialApp(
+        home: MediaQuery(
+          data: MediaQueryData(disableAnimations: reduced),
+          child: SettingsScreen(
+            maintenanceProgress: progress,
+            onSave: (_) async => saves++,
+          ),
+        ),
+      ),
+    );
+    await show(progress());
+    expect(find.text('Repricing usage'), findsOneWidget);
+    expect(find.text('Repricing stored daily partitions'), findsOneWidget);
+    expect(find.text('25 of 100 partitions'), findsOneWidget);
+    final bar = tester.widget<LinearProgressIndicator>(
+      find.byType(LinearProgressIndicator),
+    );
+    expect(bar.value, 0.25);
+    expect(bar.semanticsValue, '25%');
+    final announcement = find.byKey(
+      const Key('settings-maintenance-announcement'),
+    );
+    expect(
+      tester.getSemantics(announcement).label,
+      'Database maintenance running. Repricing usage, 20 percent.',
+    );
+    await show(progress(completed: 26));
+    expect(
+      tester.getSemantics(announcement).label,
+      'Database maintenance running. Repricing usage, 20 percent.',
+    );
+    await tester.tap(find.text('Save settings'));
+    await tester.pump();
+    expect(saves, 1);
+    expect(find.byType(AlertDialog), findsNothing);
+    await show(progress(total: null));
+    expect(
+      tester
+          .widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator))
+          .value,
+      isNull,
+    );
+    await show(progress(total: null), reduced: true);
+    await tester.pump(const Duration(seconds: 1));
+    expect(tester.binding.transientCallbackCount, 0);
+    expect(find.text('25 partitions'), findsOneWidget);
+    for (final state in [
+      DatabaseMaintenanceState.interrupted,
+      DatabaseMaintenanceState.failed,
+    ]) {
+      await show(progress(state: state));
+      expect(find.text('Database maintenance ${state.name}'), findsOneWidget);
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+    }
+    expect(find.text('Pricing maintenance failed.'), findsOneWidget);
+    await show(progress(state: DatabaseMaintenanceState.succeeded));
+    expect(find.text('Repricing usage'), findsNothing);
+    await show(null);
+    expect(find.byType(LinearProgressIndicator), findsNothing);
+    expect(tester.takeException(), isNull);
+    semantics.dispose();
+  });
+
+  testWidgets('shows read-only maintenance history and updates it on rebuild', (
+    tester,
+  ) async {
+    final semantics = tester.ensureSemantics();
+    var saves = 0;
+    Future<void> show(List<MaintenanceScheduleRecord> schedules) =>
+        tester.pumpWidget(
+          MaterialApp(
+            home: SettingsScreen(
+              maintenanceSchedules: schedules,
+              onSave: (_) async => saves++,
+            ),
+          ),
+        );
+    final attempt = DateTime.utc(2026, 9, 7, 12);
+    final success = DateTime.utc(2026, 9, 6, 11);
+    final due = DateTime.utc(2026, 9, 7, 13);
+    await show([
+      MaintenanceScheduleRecord(
+        jobType: 'openrouter_price_refresh',
+        enabled: true,
+        intervalSeconds: 86400,
+        lastAttemptAtUtc: attempt,
+        lastSuccessAtUtc: success,
+        nextDueAtUtc: due,
+        retryCount: 1,
+        lastError: 'OpenRouter price refresh failed.',
+      ),
+      MaintenanceScheduleRecord(
+        jobType: 'database_optimize',
+        enabled: false,
+        intervalSeconds: 604800,
+        nextDueAtUtc: due,
+      ),
+    ]);
+    expect(find.text('OpenRouter price refresh status'), findsOneWidget);
+    expect(find.text('Database optimization status'), findsOneWidget);
+    await tester.ensureVisible(find.text('OpenRouter price refresh status'));
+    expect(find.text('Last attempt: 2026-09-07 12:00:00 UTC'), findsOneWidget);
+    expect(find.text('Last success: 2026-09-06 11:00:00 UTC'), findsOneWidget);
+    expect(find.text('Next due: 2026-09-07 13:00:00 UTC'), findsOneWidget);
+    expect(
+      find.text('Last error: OpenRouter price refresh failed.'),
+      findsOneWidget,
+    );
+    await tester.ensureVisible(find.text('Database optimization status'));
+    expect(find.text('Automatic job: Disabled'), findsOneWidget);
+    expect(
+      find.text('Next due: Disabled (stored: 2026-09-07 13:00:00 UTC)'),
+      findsOneWidget,
+    );
+    expect(find.text('Last attempt: Never'), findsOneWidget);
+    expect(find.text('Last success: Never'), findsOneWidget);
+    expect(find.text('Last error: None'), findsOneWidget);
+    expect(
+      find.bySemanticsLabel('Database optimization status'),
+      findsOneWidget,
+    );
+    await show([
+      MaintenanceScheduleRecord(
+        jobType: 'openrouter_price_refresh',
+        enabled: true,
+        intervalSeconds: 86400,
+        lastAttemptAtUtc: due,
+        lastSuccessAtUtc: due,
+        nextDueAtUtc: DateTime.utc(2026, 9, 8, 13),
+      ),
+    ]);
+    expect(find.text('Last success: 2026-09-07 13:00:00 UTC'), findsOneWidget);
+    expect(
+      find.text('Last error: OpenRouter price refresh failed.'),
+      findsNothing,
+    );
+    expect(find.text('Next due: 2026-09-08 13:00:00 UTC'), findsOneWidget);
+    expect(saves, 0);
+    expect(tester.takeException(), isNull);
+    semantics.dispose();
+  });
+
+  testWidgets(
+    'edits maintenance schedules without losing them on unrelated changes',
+    (tester) async {
+      AppSettings? saved;
+      final initial = AppSettings.defaults();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SettingsScreen(
+            initialSettings: initial,
+            onSave: (settings) async => saved = settings,
+            onReload: () async => initial,
+          ),
+        ),
+      );
+      Future<void> toggle(String label) async {
+        final control = find.bySemanticsLabel('$label setting');
+        await tester.ensureVisible(control);
+        await tester.tap(control);
+        await tester.pump();
+      }
+
+      Future<void> enter(String label, String value) async {
+        final control = find.bySemanticsLabel('$label input');
+        await tester.ensureVisible(control);
+        await tester.enterText(control, value);
+      }
+
+      expect(find.text('Automatic OpenRouter price refresh'), findsOneWidget);
+      expect(find.text('Automatic database optimization'), findsOneWidget);
+      await toggle('Automatic OpenRouter price refresh');
+      await enter('Price refresh interval (hours)', '720');
+      await toggle('OpenRouter pricing enabled');
+      await toggle('Automatic database optimization');
+      await enter('Database optimization interval (days)', '365');
+      await tester.tap(find.text('Save settings'));
+      await tester.pump();
+      expect(saved!.pricing.automaticRefreshEnabled, isFalse);
+      expect(saved!.pricing.useExternalPricing, isFalse);
+      expect(saved!.pricing.refreshIntervalHours, 720);
+      expect(saved!.maintenance.databaseOptimizeEnabled, isFalse);
+      expect(saved!.maintenance.databaseOptimizeIntervalDays, 365);
+      expect(saved!.pricing.openRouter, initial.pricing.openRouter);
+      await enter('Database optimization interval (days)', '1');
+      await tester.tap(find.text('Cancel changes'));
+      await tester.pump();
+      await tester.tap(find.text('Save settings'));
+      await tester.pump();
+      expect(saved!.maintenance.databaseOptimizeIntervalDays, 365);
+      await tester.tap(find.text('Reload from file'));
+      await tester.pump();
+      await tester.tap(find.text('Save settings'));
+      await tester.pump();
+      expect(saved!.pricing.automaticRefreshEnabled, isTrue);
+      expect(saved!.pricing.refreshIntervalHours, 24);
+      expect(saved!.maintenance, const MaintenanceSettings());
+    },
+  );
+
+  testWidgets('invalid maintenance intervals block saving and announce errors', (
+    tester,
+  ) async {
+    final announcer = RecordingScreenReaderAnnouncer();
+    var saves = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          announcer: announcer,
+          onSave: (_) async => saves++,
+        ),
+      ),
+    );
+    for (final (label, values, error) in [
+      (
+        'Price refresh interval (hours)',
+        ['0', '721', 'bad'],
+        'Price refresh interval (hours) must be an integer from 1 to 720.',
+      ),
+      (
+        'Database optimization interval (days)',
+        ['0', '366', '1.5'],
+        'Database optimization interval (days) must be an integer from 1 to 365.',
+      ),
+    ]) {
+      final control = find.bySemanticsLabel('$label input');
+      for (final value in values) {
+        await tester.ensureVisible(control);
+        await tester.enterText(control, value);
+        await tester.tap(find.text('Save settings'));
+        await tester.pump();
+        expect(saves, 0);
+        expect(find.text(error), findsOneWidget);
+        expect(announcer.messages.last, error);
+        expect(tester.takeException(), isNull);
+      }
+      await tester.ensureVisible(control);
+      await tester.enterText(control, '1');
+    }
+    await tester.tap(find.text('Save settings'));
+    await tester.pump();
+    expect(saves, 1);
+    expect(find.text('Settings saved.'), findsOneWidget);
+  });
+
   testWidgets('shows required settings groups and saves explicit changes', (
     tester,
   ) async {
@@ -59,7 +334,7 @@ void main() {
       'Voice-over enabled',
       'Voice-over file paths',
       'OpenRouter pricing enabled',
-      'Pricing cache duration (hours)',
+      'Price refresh interval (hours)',
       'Pricing overrides',
       'Cache/database location',
       'Export folder',

@@ -3,7 +3,8 @@ const defaultScanBatchingPolicy = ScanBatchingPolicy();
 class ScanBatchingPolicy {
   const ScanBatchingPolicy({
     this.parsedSessionFlushBatchSize = 250,
-    this.parsedSessionFlushSourceBytes = 512 * 1024 * 1024,
+    // Bound ordinary writer holds; a single oversized session remains atomic.
+    this.parsedSessionFlushSourceBytes = 32 * 1024 * 1024,
     this.fullRowSnapshotBatchSize = 500,
   }) : assert(parsedSessionFlushBatchSize > 0),
        assert(parsedSessionFlushSourceBytes > 0),

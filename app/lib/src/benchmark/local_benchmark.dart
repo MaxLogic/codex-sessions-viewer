@@ -108,30 +108,20 @@ class LocalBenchmarkRunner {
       final sqlRoot = options.sqlRoot ?? Directory('../sql');
       final db = sqlite3.openInMemory();
       try {
-        db.execute(
-          File(
-            p.join(sqlRoot.path, 'init', '001_initial_schema.sql'),
-          ).readAsStringSync(),
-        );
-        db.execute(
-          File(
-            p.join(sqlRoot.path, 'migration', '002_search_filter_schema.sql'),
-          ).readAsStringSync(),
-        );
-        db.execute(
-          File(
-            p.join(sqlRoot.path, 'migration', '009_message_search.sql'),
-          ).readAsStringSync(),
-        );
-        db.execute(
-          File(
-            p.join(
-              sqlRoot.path,
-              'migration',
-              '012_external_content_search.sql',
-            ),
-          ).readAsStringSync(),
-        );
+        final scripts =
+            [
+              ...Directory(
+                p.join(sqlRoot.path, 'init'),
+              ).listSync().whereType<File>(),
+              ...Directory(
+                p.join(sqlRoot.path, 'migration'),
+              ).listSync().whereType<File>(),
+            ].where((file) => file.path.endsWith('.sql')).toList()..sort(
+              (a, b) => p.basename(a.path).compareTo(p.basename(b.path)),
+            );
+        for (final script in scripts) {
+          db.execute(script.readAsStringSync());
+        }
         final index = SessionSearchIndex(db);
         final documents = scanResult.sessions.isEmpty
             ? [_syntheticDocument()]

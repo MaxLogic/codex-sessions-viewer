@@ -2,6 +2,8 @@ import 'package:sqlite3/sqlite3.dart';
 
 import '../ui/models/session_label_formatter.dart';
 
+const usageCostProjectionVersion = 1;
+
 enum UsagePeriod {
   today,
   yesterday,
@@ -17,6 +19,161 @@ class UsageSummaryRepository {
   const UsageSummaryRepository(this.db);
 
   final Database db;
+
+  /// Null selects legacy pricing. An active projection always returns explicit
+  /// unknown values for missing/ineligible sessions, never a current-rate fallback.
+  Map<String, UsageCostEstimate>? loadPersistedSessionCosts(
+    Iterable<String> sessionIds, {
+    required int projectionVersion,
+  }) {
+    if (!_usesDailyProjection) return null;
+    const unknown = UsageCostEstimate(
+      estimatedCostText: null,
+      costUnknown: true,
+    );
+    final ids = sessionIds.toSet().toList();
+    final result = {for (final id in ids) id: unknown};
+    for (var offset = 0; offset < ids.length; offset += 512) {
+      final batch = ids.skip(offset).take(512).toList();
+      final seen = <String>{};
+      final statement = db.prepare('''
+        select d.session_id, d.estimated_cost_text, d.cost_status,
+          dirty.session_id is not null or d.cost_projection_version <> $usageCostProjectionVersion as cost_updating
+        from usage_session_daily d join sessions s on s.id = d.session_id
+        left join usage_cost_dirty_partitions dirty on dirty.session_id = d.session_id
+          and dirty.day_utc = d.day_utc and dirty.model_key = d.model_key
+        where d.session_id in (${List.filled(batch.length, '?').join(', ')})
+          and d.branch_scope = 'local' and s.parse_status = 'available'
+          and s.usage_projection_status = 'complete' and s.parser_version = ?
+      ''');
+      try {
+        // Stream daily grains: memory grows with the requested session page,
+        // not with its number of days, models, contexts, or price periods.
+        final cursor = statement.iterateWith(
+          StatementParameters([...batch, projectionVersion]),
+        );
+        while (cursor.moveNext()) {
+          final row = cursor.current;
+          final id = row['session_id'] as String;
+          final previous = seen.add(id) ? null : result[id];
+          final updating = row['cost_updating'] == 1;
+          final amount = updating
+              ? null
+              : row['estimated_cost_text'] as String?;
+          final total = previous == null
+              ? sumEstimatedCostTexts([amount])
+              : sumEstimatedCostTexts([previous.estimatedCostText, amount]);
+          result[id] = UsageCostEstimate(
+            estimatedCostText: total,
+            costUnknown: total == null,
+            updating: updating || (previous?.updating ?? false),
+            partialUnsupportedUnits:
+                (!updating &&
+                    row['cost_status'] == 'partial_unsupported_units') ||
+                (previous?.partialUnsupportedUnits ?? false),
+          );
+        }
+      } finally {
+        statement.close();
+      }
+    }
+    return result;
+  }
+
+  /// Call after branch reconciliation, before the ingestion transaction commits.
+  /// Historical price resolution is a later migration phase; until then these
+  /// rows retain exact tokens and explicitly unknown costs.
+  /// During migration, [shadowGenerationId] selects the copied shadow facts
+  /// without switching the active generation. The caller commits its cursor
+  /// in this same transaction and keeps normal writers gated.
+  void replaceDailyProjectionsInCurrentTransaction(
+    Iterable<String> sessionIds, {
+    int? shadowGenerationId,
+  }) {
+    final activeProjection = _usesDailyProjection;
+    if (shadowGenerationId == null && !activeProjection) return;
+    if (db.autocommit) {
+      throw StateError(
+        'Daily projection replacement requires the ingestion transaction.',
+      );
+    }
+    if (shadowGenerationId != null &&
+        (activeProjection ||
+            db
+                .select(
+                  '''
+              select 1 from database_generations
+              where id = ? and state = 'building' and target_schema_version = 16
+            ''',
+                  [shadowGenerationId],
+                )
+                .isEmpty)) {
+      throw StateError(
+        'Shadow projection requires an inactive building generation.',
+      );
+    }
+    final sourceTable = shadowGenerationId == null
+        ? 'usage_events'
+        : 'usage_events_next';
+    final delete = db.prepare(
+      'delete from usage_session_daily where session_id = ?',
+    );
+    final insert = db.prepare('''
+      insert into usage_session_daily (
+        session_id, day_utc, model_key, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens, estimated_cost_text,
+        cost_status, pricing_resolution_method, cost_projection_version, updated_at_utc)
+      select session_row_id, strftime('%Y-%m-%d', occurred_at_utc),
+        coalesce(model, ''), path_context_id, branch_scope,
+        sum(input_tokens), sum(cached_input_tokens), sum(cache_write_input_tokens),
+        sum(output_tokens), sum(reasoning_output_tokens), sum(input_tokens + output_tokens),
+        null, 'unknown', 'pending_history', 1, ?
+      from $sourceTable where session_row_id = ?
+        and strftime('%Y-%m-%d', occurred_at_utc) is not null
+      group by session_row_id, strftime('%Y-%m-%d', occurred_at_utc),
+        coalesce(model, ''), path_context_id, branch_scope
+    ''');
+    final coverage = db.prepare('''
+      update sessions set usage_local_event_count = (
+        select count(*) from $sourceTable
+        where session_row_id = ? and branch_scope = 'local'
+      ) where id = ?
+    ''');
+    final removeObsoleteDirty = db.prepare('''
+      delete from usage_cost_dirty_partitions where session_id = ?
+        and not exists (select 1 from usage_session_daily daily
+          where daily.session_id = usage_cost_dirty_partitions.session_id
+            and daily.day_utc = usage_cost_dirty_partitions.day_utc
+            and daily.model_key = usage_cost_dirty_partitions.model_key)
+    ''');
+    final queueCosts = db.prepare('''
+      insert into usage_cost_dirty_partitions (session_id, day_utc, model_key, reason,
+        target_cost_projection_version, created_at_utc, updated_at_utc)
+      select distinct session_id, day_utc, model_key, 'usage_ingestion', ?, ?, ?
+      from usage_session_daily where session_id = ?
+      on conflict(session_id, day_utc, model_key) do update set
+        target_cost_projection_version = max(usage_cost_dirty_partitions.target_cost_projection_version,
+          excluded.target_cost_projection_version),
+        updated_at_utc = excluded.updated_at_utc
+    ''');
+    try {
+      final now = DateTime.now().toUtc().toIso8601String();
+      for (final id in sessionIds) {
+        delete.execute([id]);
+        insert.execute([now, id]);
+        coverage.execute([id, id]);
+        removeObsoleteDirty.execute([id]);
+        queueCosts.execute([usageCostProjectionVersion, now, now, id]);
+      }
+    } finally {
+      delete.close();
+      insert.close();
+      coverage.close();
+      removeObsoleteDirty.close();
+      queueCosts.close();
+    }
+  }
 
   UsageSummary summarize(
     UsageSummaryRequest request, {
@@ -45,6 +202,7 @@ class UsageSummaryRepository {
       range,
       coverage,
       pricingRefreshSucceeded,
+      _usesDailyProjection,
     );
   }
 
@@ -189,6 +347,16 @@ class UsageSummaryRepository {
     Set<String> includeSessionIds,
     int? projectionVersion,
   ) {
+    if (_usesDailyProjection) {
+      return [
+        for (final row in _dailyUsageRows(
+          range,
+          includeSessionIds,
+          projectionVersion,
+        ))
+          _UsageEventGroup.fromRow(row, persisted: true),
+      ];
+    }
     final where = <String>[
       "s.parse_status = 'available'",
       "s.usage_projection_status = 'complete'",
@@ -219,8 +387,92 @@ class UsageSummaryRepository {
     return rows.map(_UsageEventGroup.fromRow).toList(growable: false);
   }
 
+  bool get _usesDailyProjection {
+    if (db
+        .select(
+          "select 1 from sqlite_schema where type = 'table' and name = 'database_state'",
+        )
+        .isEmpty) {
+      return false;
+    }
+    return db.select('''
+      select g.target_schema_version from database_state s
+      join database_generations g on g.id = s.active_usage_generation_id where s.id = 1
+    ''').single['target_schema_version']
+            as int >=
+        16;
+  }
+
+  ResultSet _dailyUsageRows(
+    UsageDateRange? range,
+    Set<String> includeSessionIds,
+    int? projectionVersion, {
+    bool explain = false,
+  }) {
+    final where = <String>[
+      "d.branch_scope = 'local'",
+      "s.parse_status = 'available'",
+      "s.usage_projection_status = 'complete'",
+    ];
+    final args = <Object?>[];
+    if (range != null) {
+      where.add('d.day_utc >= ? and d.day_utc < ?');
+      args.addAll([_dayKey(range.startUtc), _dayKey(range.endExclusiveUtc)]);
+    }
+    if (includeSessionIds.isNotEmpty) {
+      where.add(
+        'd.session_id in (${List.filled(includeSessionIds.length, '?').join(', ')})',
+      );
+      args.addAll(includeSessionIds);
+    }
+    if (projectionVersion != null) {
+      where.add('s.parser_version = ?');
+      args.add(projectionVersion);
+    }
+    return db.select('''
+      ${explain ? 'explain query plan' : ''}
+      select d.session_id as session_row_id, d.day_utc, nullif(d.model_key, '') as model,
+        case when s.project_override = 1 then s.project_id else c.effective_project_id end as project_id,
+        case when s.project_override = 1 then coalesce(p.name, s.project_name_snapshot)
+          else p.name end as project_name,
+        s.source_type, s.is_archived, s.title, s.message_count, s.thread_source,
+        d.input_tokens, d.cached_input_tokens, d.cache_write_input_tokens,
+        d.output_tokens, d.reasoning_output_tokens, d.total_tokens,
+        0 as invalid_bucket_count,
+        case when dirty.session_id is not null or d.cost_projection_version <> $usageCostProjectionVersion
+          then null else d.estimated_cost_text end as estimated_cost_text,
+        dirty.session_id is not null or d.cost_projection_version <> $usageCostProjectionVersion as cost_updating,
+        d.cost_status,
+        d.pricing_resolution_method,
+        coalesce(provider.model_id, local.model_id) as priced_model_id,
+        case when provider.id is not null then 'openrouter'
+          when local.id is not null then 'override' end as price_source,
+        coalesce(provider.valid_from_utc, local.valid_from_utc) as price_observed_at_utc
+      from usage_session_daily d join sessions s on s.id = d.session_id
+      join usage_path_contexts c on c.id = d.path_context_id
+      left join projects p on p.id = case when s.project_override = 1
+        then s.project_id else c.effective_project_id end
+      left join model_price_periods provider on provider.id = d.provider_price_period_id
+      left join local_price_override_periods local on local.id = d.local_override_period_id
+      left join usage_cost_dirty_partitions dirty on dirty.session_id = d.session_id
+        and dirty.day_utc = d.day_utc and dirty.model_key = d.model_key
+      where ${where.join(' and ')}
+    ''', args);
+  }
+
   List<String> explainUsageEventAggregation(UsageSummaryRequest request) {
     final range = request.resolve();
+    if (_usesDailyProjection) {
+      return [
+        for (final row in _dailyUsageRows(
+          range,
+          const {},
+          request.projectionVersion,
+          explain: true,
+        ))
+          row['detail'] as String,
+      ];
+    }
     final where = <String>[
       "s.parse_status = 'available'",
       "s.usage_projection_status = 'complete'",
@@ -248,6 +500,46 @@ class UsageSummaryRepository {
     Set<String> includeSessionIds,
     int projectionVersion,
   ) {
+    final row = _coverageRows(
+      range,
+      includeSessionIds,
+      projectionVersion,
+    ).single;
+    return UsageProjectionCoverage(
+      projectionVersion: projectionVersion,
+      availableSessions: row['available_sessions'] as int,
+      currentCompleteSessions: row['current_complete_sessions'] as int,
+      outdatedProjectionSessions: row['outdated_projection_sessions'] as int,
+      legacyPendingSessions: row['legacy_pending_sessions'] as int,
+      ambiguousSessions: row['ambiguous_sessions'] as int,
+      missingParentSessions: row['missing_parent_sessions'] as int,
+      completeZeroUsageSessions: row['complete_zero_usage_sessions'] as int,
+    );
+  }
+
+  List<String> explainUsageProjectionCoverage(UsageSummaryRequest request) {
+    final version = request.projectionVersion;
+    if (version == null) return const [];
+    return [
+      for (final row in _coverageRows(
+        request.resolve(),
+        const {},
+        version,
+        explain: true,
+      ))
+        row['detail'] as String,
+    ];
+  }
+
+  ResultSet _coverageRows(
+    UsageDateRange range,
+    Set<String> includeSessionIds,
+    int projectionVersion, {
+    bool explain = false,
+  }) {
+    final zeroUsagePredicate = _usesDailyProjection
+        ? 's.usage_local_event_count = 0'
+        : 'not exists (select 1 from billable_usage_events e where e.session_row_id = s.id)';
     final where = <String>[
       "s.parse_status = 'available'",
       's.started_at_utc is not null',
@@ -267,7 +559,8 @@ class UsageSummaryRepository {
       );
       args.addAll(includeSessionIds);
     }
-    final row = db.select('''
+    return db.select('''
+      ${explain ? 'explain query plan' : ''}
       select
         count(*) as available_sessions,
         coalesce(sum(case
@@ -290,26 +583,12 @@ class UsageSummaryRepository {
         coalesce(sum(case
           when s.parser_version = ?
             and s.usage_projection_status = 'complete'
-            and not exists (
-              select 1
-              from billable_usage_events e
-              where e.session_row_id = s.id
-            )
+            and $zeroUsagePredicate
           then 1 else 0
         end), 0) as complete_zero_usage_sessions
       from sessions s
       where ${where.join(' and ')}
-      ''', args).single;
-    return UsageProjectionCoverage(
-      projectionVersion: projectionVersion,
-      availableSessions: row['available_sessions'] as int,
-      currentCompleteSessions: row['current_complete_sessions'] as int,
-      outdatedProjectionSessions: row['outdated_projection_sessions'] as int,
-      legacyPendingSessions: row['legacy_pending_sessions'] as int,
-      ambiguousSessions: row['ambiguous_sessions'] as int,
-      missingParentSessions: row['missing_parent_sessions'] as int,
-      completeZeroUsageSessions: row['complete_zero_usage_sessions'] as int,
-    );
+      ''', args);
   }
 }
 
@@ -399,7 +678,7 @@ class UsageSummaryRequest {
   UsageDateRange resolve() {
     final now = nowUtc.toUtc();
     final today = DateTime.utc(now.year, now.month, now.day);
-    return switch (period) {
+    final range = switch (period) {
       UsagePeriod.today => UsageDateRange(
         startUtc: today,
         endExclusiveUtc: today.add(const Duration(days: 1)),
@@ -429,6 +708,13 @@ class UsageSummaryRequest {
             today.add(const Duration(days: 1)),
       ),
     };
+    for (final boundary in [range.startUtc, range.endExclusiveUtc]) {
+      if (boundary !=
+          DateTime.utc(boundary.year, boundary.month, boundary.day)) {
+        throw ArgumentError('Usage ranges require whole UTC days.');
+      }
+    }
+    return range;
   }
 }
 
@@ -545,10 +831,14 @@ class UsageCostEstimate {
   const UsageCostEstimate({
     required this.estimatedCostText,
     required this.costUnknown,
+    this.updating = false,
+    this.partialUnsupportedUnits = false,
   });
 
   final String? estimatedCostText;
   final bool costUnknown;
+  final bool updating;
+  final bool partialUnsupportedUnits;
 
   String get estimatedCostDisplay =>
       costUnknown ? 'Cost unknown' : '\$${estimatedCostText ?? '0'}';
@@ -689,16 +979,25 @@ class UsagePricingStatus {
     required this.openRouterFetchedAtUtc,
     required this.models,
     this.refreshSucceeded = true,
+    this.usesHistoricalCosts = false,
+    this.updating = false,
+    this.partialUnsupportedUnits = false,
   });
 
   const UsagePricingStatus.empty()
     : openRouterFetchedAtUtc = null,
       models = const [],
+      usesHistoricalCosts = false,
+      updating = false,
+      partialUnsupportedUnits = false,
       refreshSucceeded = true;
 
   final DateTime? openRouterFetchedAtUtc;
   final List<UsageModelPricingStatus> models;
   final bool refreshSucceeded;
+  final bool usesHistoricalCosts;
+  final bool updating;
+  final bool partialUnsupportedUnits;
 }
 
 class UsageModelPricingStatus {
@@ -776,6 +1075,7 @@ UsageSummary _summarizeSessions(
   UsageDateRange range,
   UsageProjectionCoverage projectionCoverage,
   bool pricingRefreshSucceeded,
+  bool usesHistoricalCosts,
 ) {
   final aggregate = _aggregateUsageGroups(
     usageGroups,
@@ -826,6 +1126,7 @@ UsageSummary _summarizeSessions(
       usageGroups,
       pricing,
       pricingRefreshSucceeded,
+      usesHistoricalCosts,
     ),
     mostUsedModel: _mostActive(byModel),
     mostActiveProject: _mostActive(byProject),
@@ -880,7 +1181,37 @@ UsagePricingStatus _pricingStatus(
   List<_UsageEventGroup> usageGroups,
   UsagePricingCatalog pricing,
   bool refreshSucceeded,
+  bool usesHistoricalCosts,
 ) {
+  if (usesHistoricalCosts) {
+    final models =
+        <
+          (String, String?, String?, DateTime?, UsageModelResolutionMethod),
+          UsageModelPricingStatus
+        >{};
+    for (final group in usageGroups) {
+      final status = group.persistedPricing!;
+      models[(
+            status.rawModelId,
+            status.resolvedModelId,
+            status.source,
+            status.fetchedAtUtc,
+            status.resolutionMethod,
+          )] =
+          status;
+    }
+    return UsagePricingStatus(
+      openRouterFetchedAtUtc: null,
+      refreshSucceeded: refreshSucceeded,
+      usesHistoricalCosts: true,
+      updating: usageGroups.any((group) => group.persistedCost!.updating),
+      partialUnsupportedUnits: usageGroups.any(
+        (group) => group.persistedCost!.partialUnsupportedUnits,
+      ),
+      models: models.values.toList()
+        ..sort((a, b) => a.rawModelId.compareTo(b.rawModelId)),
+    );
+  }
   final models = <String?>{
     for (final group in usageGroups) group.model,
   }.toList()..sort((left, right) => (left ?? '').compareTo(right ?? ''));
@@ -989,7 +1320,12 @@ _UsageAggregate _aggregateUsageGroups(
     outputTokens += group.outputTokens;
     cachedInputTokens += group.cachedInputTokens;
     totalTokens += group.totalTokens;
-    final groupCost = group.invalidBucketCount == 0
+    final stored = group.persistedCost;
+    final groupCost = stored != null
+        ? stored.costUnknown
+              ? null
+              : _DecimalAmount.parse(stored.estimatedCostText!)
+        : group.invalidBucketCount == 0
         ? _costForTokenUsage(
             inputTokens: group.inputTokens,
             outputTokens: group.outputTokens,
@@ -1046,7 +1382,8 @@ _DecimalAmount? _costForTokenUsage({
       cachedInputTokens < 0 ||
       cacheWriteInputTokens < 0 ||
       reasoningOutputTokens < 0 ||
-      cachedInputTokens + cacheWriteInputTokens > inputTokens ||
+      cachedInputTokens > inputTokens ||
+      cacheWriteInputTokens > inputTokens - cachedInputTokens ||
       reasoningOutputTokens > outputTokens) {
     return null;
   }
@@ -1061,8 +1398,12 @@ _DecimalAmount? _costForTokenUsage({
     pricing.promptPricePerToken,
   );
   final completion = _pricedTokens(
-    outputTokens,
+    outputTokens - reasoningOutputTokens,
     pricing.completionPricePerToken,
+  );
+  final reasoning = _pricedTokens(
+    reasoningOutputTokens,
+    pricing.internalReasoningPricePerToken ?? pricing.completionPricePerToken,
   );
   final cached = _pricedTokens(
     cachedInputTokens,
@@ -1074,11 +1415,12 @@ _DecimalAmount? _costForTokenUsage({
   );
   if (prompt == null ||
       completion == null ||
+      reasoning == null ||
       cached == null ||
       cacheWrite == null) {
     return null;
   }
-  return prompt + completion + cached + cacheWrite;
+  return prompt + completion + reasoning + cached + cacheWrite;
 }
 
 _DecimalAmount? _pricedTokens(int tokens, String? pricePerToken) {
@@ -1302,27 +1644,58 @@ class _UsageEventGroup {
     required this.reasoningOutputTokens,
     required this.totalTokens,
     required this.invalidBucketCount,
+    this.persistedCost,
+    this.persistedPricing,
   });
 
-  factory _UsageEventGroup.fromRow(Row row) => _UsageEventGroup(
-    sessionId: row['session_row_id'] as String,
-    dayUtc: row['day_utc'] as String,
-    model: row['model'] as String?,
-    projectId: row['project_id'] as int?,
-    projectName: row['project_name'] as String?,
-    sourceType: row['source_type'] as String,
-    isArchived: _rowInt(row['is_archived']) == 1,
-    title: row['title'] as String? ?? '',
-    messageCount: _rowInt(row['message_count']),
-    threadSource: row['thread_source'] as String?,
-    inputTokens: _rowInt(row['input_tokens']),
-    cachedInputTokens: _rowInt(row['cached_input_tokens']),
-    cacheWriteInputTokens: _rowInt(row['cache_write_input_tokens']),
-    outputTokens: _rowInt(row['output_tokens']),
-    reasoningOutputTokens: _rowInt(row['reasoning_output_tokens']),
-    totalTokens: _rowInt(row['total_tokens']),
-    invalidBucketCount: _rowInt(row['invalid_bucket_count']),
-  );
+  factory _UsageEventGroup.fromRow(Row row, {bool persisted = false}) =>
+      _UsageEventGroup(
+        sessionId: row['session_row_id'] as String,
+        dayUtc: row['day_utc'] as String,
+        model: row['model'] as String?,
+        projectId: row['project_id'] as int?,
+        projectName: row['project_name'] as String?,
+        sourceType: row['source_type'] as String,
+        isArchived: _rowInt(row['is_archived']) == 1,
+        title: row['title'] as String? ?? '',
+        messageCount: _rowInt(row['message_count']),
+        threadSource: row['thread_source'] as String?,
+        inputTokens: _rowInt(row['input_tokens']),
+        cachedInputTokens: _rowInt(row['cached_input_tokens']),
+        cacheWriteInputTokens: _rowInt(row['cache_write_input_tokens']),
+        outputTokens: _rowInt(row['output_tokens']),
+        reasoningOutputTokens: _rowInt(row['reasoning_output_tokens']),
+        totalTokens: _rowInt(row['total_tokens']),
+        invalidBucketCount: _rowInt(row['invalid_bucket_count']),
+        persistedCost: persisted
+            ? UsageCostEstimate(
+                estimatedCostText: row['estimated_cost_text'] as String?,
+                costUnknown: row['estimated_cost_text'] == null,
+                updating: row['cost_updating'] == 1,
+                partialUnsupportedUnits:
+                    row['cost_updating'] != 1 &&
+                    row['cost_status'] == 'partial_unsupported_units',
+              )
+            : null,
+        persistedPricing: persisted
+            ? UsageModelPricingStatus(
+                rawModelId: row['model'] as String? ?? 'Unknown',
+                effectiveModelId: row['model'] as String? ?? 'Unknown',
+                resolvedModelId: row['priced_model_id'] as String?,
+                resolutionMethod: row['priced_model_id'] == null
+                    ? UsageModelResolutionMethod.unknown
+                    : switch (row['pricing_resolution_method']) {
+                        'openrouter_openai_exact' || 'local_openai_exact' =>
+                          UsageModelResolutionMethod.openAiExact,
+                        _ => UsageModelResolutionMethod.exact,
+                      },
+                source: row['price_source'] as String?,
+                fetchedAtUtc: DateTime.tryParse(
+                  row['price_observed_at_utc'] as String? ?? '',
+                ),
+              )
+            : null,
+      );
 
   final String sessionId;
   final String dayUtc;
@@ -1341,6 +1714,8 @@ class _UsageEventGroup {
   final int reasoningOutputTokens;
   final int totalTokens;
   final int invalidBucketCount;
+  final UsageCostEstimate? persistedCost;
+  final UsageModelPricingStatus? persistedPricing;
 
   DateTime get day => DateTime.parse('${dayUtc}T00:00:00Z');
 }
@@ -1450,7 +1825,7 @@ class _DailyUsageKey {
 }
 
 class _DecimalAmount implements Comparable<_DecimalAmount> {
-  const _DecimalAmount._(this.units);
+  const _DecimalAmount._(this.units, this.scaleDigits);
 
   factory _DecimalAmount.parse(String value) {
     final trimmed = value.trim();
@@ -1468,44 +1843,55 @@ class _DecimalAmount implements Comparable<_DecimalAmount> {
       throw FormatException('Invalid decimal value.', value);
     }
     final whole = parts[0].isEmpty ? '0' : parts[0];
-    final fractional = parts.length == 1 ? '' : parts[1];
-    if (fractional.length > _scaleDigits) {
-      throw FormatException(
-        'Decimal value exceeds supported precision.',
-        value,
-      );
-    }
-    final paddedFractional = fractional.padRight(_scaleDigits, '0');
-    final parsed =
-        BigInt.parse(whole) * _scale + BigInt.parse(paddedFractional);
-    return _DecimalAmount._(negative ? -parsed : parsed);
+    final fractional = parts.length == 1
+        ? ''
+        : parts[1].replaceFirst(_trailingZeros, '');
+    final parsed = BigInt.parse('$whole$fractional');
+    return _DecimalAmount._(negative ? -parsed : parsed, fractional.length);
   }
 
   static final _digits = RegExp(r'^[0-9]+$');
-  static final _scale = BigInt.from(10).pow(_scaleDigits);
-  static const _scaleDigits = 18;
-  static final zero = _DecimalAmount._(BigInt.zero);
+  static final _trailingZeros = RegExp(r'0+$');
+  static final zero = _DecimalAmount._(BigInt.zero, 0);
 
   final BigInt units;
+  final int scaleDigits;
 
-  _DecimalAmount operator +(_DecimalAmount other) =>
-      _DecimalAmount._(units + other.units);
+  BigInt _unitsAt(int scale) => scale == scaleDigits
+      ? units
+      : units * BigInt.from(10).pow(scale - scaleDigits);
+
+  _DecimalAmount operator +(_DecimalAmount other) {
+    final scale = scaleDigits > other.scaleDigits
+        ? scaleDigits
+        : other.scaleDigits;
+    return _DecimalAmount._(_unitsAt(scale) + other._unitsAt(scale), scale);
+  }
 
   _DecimalAmount operator *(int multiplier) =>
-      _DecimalAmount._(units * BigInt.from(multiplier));
+      _DecimalAmount._(units * BigInt.from(multiplier), scaleDigits);
 
   @override
-  int compareTo(_DecimalAmount other) => units.compareTo(other.units);
+  int compareTo(_DecimalAmount other) {
+    final scale = scaleDigits > other.scaleDigits
+        ? scaleDigits
+        : other.scaleDigits;
+    return _unitsAt(scale).compareTo(other._unitsAt(scale));
+  }
 
   String toDecimalString() {
     if (units == BigInt.zero) {
       return '0';
     }
+    if (scaleDigits == 0) {
+      return units.toString();
+    }
     final negative = units.isNegative;
-    final absolute = units.abs();
-    final whole = absolute ~/ _scale;
-    final fraction = (absolute % _scale).toString().padLeft(_scaleDigits, '0');
-    final trimmedFraction = fraction.replaceFirst(RegExp(r'0+$'), '');
+    final digits = units.abs().toString().padLeft(scaleDigits + 1, '0');
+    final whole = digits.substring(0, digits.length - scaleDigits);
+    final trimmedFraction = digits
+        .substring(digits.length - scaleDigits)
+        .replaceFirst(_trailingZeros, '');
     final sign = negative ? '-' : '';
     if (trimmedFraction.isEmpty) {
       return '$sign$whole';

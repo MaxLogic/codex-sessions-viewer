@@ -5,11 +5,15 @@ import 'dart:isolate';
 import 'dart:math' as math;
 
 import 'package:path/path.dart' as p;
+import 'package:sqlite3/sqlite3.dart' show sqlite3, OpenMode;
 
 import '../config/app_settings.dart';
 import '../database/database_connection.dart';
+import '../database/database_generation.dart';
+import '../database/database_maintenance.dart';
 import '../database/project_tag_state.dart';
 import '../database/session_cache_repair.dart';
+import '../database/session_list_query.dart';
 import '../logging/structured_logger.dart';
 import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
@@ -35,6 +39,7 @@ class RuntimeSessionController {
     this.scanBatchingPolicy = defaultScanBatchingPolicy,
     this.wslProjectResolver = const ProcessWslProjectResolver(),
     this.parserWorkerCountOverride,
+    this.writerCoordinator,
   }) : assert(
          parserWorkerCountOverride == null || parserWorkerCountOverride > 0,
        );
@@ -44,15 +49,40 @@ class RuntimeSessionController {
   final ScanBatchingPolicy scanBatchingPolicy;
   final WslProjectResolver wslProjectResolver;
   final int? parserWorkerCountOverride;
+  final DatabaseMaintenanceCoordinator? writerCoordinator;
+  SendPort? _backgroundWriterPort;
+
+  Future<T> _runWrite<T>(Future<T> Function() work) =>
+      writerCoordinator?.runWriter(work) ?? work();
+
+  Future<T> _writeScan<T>(Future<T> Function() work) async {
+    final owner = _backgroundWriterPort;
+    if (owner == null) {
+      return writerCoordinator?.runWriter(
+            work,
+            priority: DatabaseWriterPriority.scan,
+          ) ??
+          work();
+    }
+    final granted = ReceivePort();
+    SendPort? release;
+    try {
+      owner.send(_BackgroundScanWriteRequest(granted.sendPort));
+      release = await granted.first as SendPort;
+      return await work();
+    } finally {
+      release?.send(null);
+      granted.close();
+    }
+  }
 
   CancellableSessionScanOperation startRefreshOperation({
     SessionsRefreshProgressCallback? onProgress,
   }) {
     final cancellation = ScanCancellationController();
-    final result = _refresh(
-      onProgress: onProgress,
-      cancellationToken: cancellation.token,
-    );
+    Future<SessionsRefreshResult> work() =>
+        _refresh(onProgress: onProgress, cancellationToken: cancellation.token);
+    final result = writerCoordinator?.runScan(work) ?? work();
     return CancellableSessionScanOperation._(result, cancellation.cancel);
   }
 
@@ -64,24 +94,22 @@ class RuntimeSessionController {
       databaseFile: databaseFile,
       scanBatchingPolicy: scanBatchingPolicy,
       onProgress: onProgress,
+      writerCoordinator: writerCoordinator,
     );
   }
 
-  Future<SessionsRefreshResult> loadCachedRows() {
-    return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
-      final db = openFileBackedDatabase(databaseFile);
+  Future<Map<String, UsageCostEstimate>?> loadPersistedSessionCosts(
+    Iterable<String> sessionIds,
+  ) {
+    final path = databaseFile.path;
+    final ids = sessionIds.toList(growable: false);
+    return Isolate.run(() {
+      final db = sqlite3.open(path, mode: OpenMode.readOnly);
       try {
-        _cleanSessionMetadataPlaceholders(db);
-        await _backfillAutomaticProjects(
-          db,
-          wslProjects: _WslProjectResolutionCache(wslProjectResolver),
-        );
-        final rows = _loadRowsProfiled(db);
-        return SessionsRefreshResult(
-          rows: rows,
-          statusMessage: rows.isEmpty
-              ? ''
-              : 'Loaded ${rows.length} of ${rows.length} sessions from the previous scan.',
+        db.execute('pragma busy_timeout = $defaultSqliteBusyTimeoutMs');
+        return UsageSummaryRepository(db).loadPersistedSessionCosts(
+          ids,
+          projectionVersion: CodexSessionParser.currentVersion,
         );
       } finally {
         db.close();
@@ -89,9 +117,43 @@ class RuntimeSessionController {
     });
   }
 
+  Future<SessionsRefreshResult> loadCachedRows() {
+    return _runWrite(
+      () => Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
+        final db = openFileBackedDatabase(databaseFile);
+        try {
+          _cleanSessionMetadataPlaceholders(db);
+          await _backfillAutomaticProjects(
+            db,
+            wslProjects: _WslProjectResolutionCache(wslProjectResolver),
+          );
+          final rows = _loadRowsProfiled(db);
+          return SessionsRefreshResult(
+            rows: rows,
+            statusMessage: rows.isEmpty
+                ? ''
+                : 'Loaded ${rows.length} of ${rows.length} sessions from the previous scan.',
+          );
+        } finally {
+          db.close();
+        }
+      }),
+    );
+  }
+
   Future<SessionsRefreshResult> loadCachedRowsInBackground({
     SessionsRefreshProgressCallback? onProgress,
     int batchSize = 250,
+  }) => _runWrite(
+    () => _loadCachedRowsInBackground(
+      onProgress: onProgress,
+      batchSize: batchSize,
+    ),
+  );
+
+  Future<SessionsRefreshResult> _loadCachedRowsInBackground({
+    SessionsRefreshProgressCallback? onProgress,
+    required int batchSize,
   }) {
     return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
       final messages = ReceivePort();
@@ -315,12 +377,14 @@ class RuntimeSessionController {
   }
 
   Future<SessionRowViewModel?> reloadSessionDetailFromSource(String sessionId) {
-    return Profiling.spanAsync('scan.runtime.reload_session_detail', () async {
-      return _loadSessionDetailInBackground(
-        sessionId: sessionId,
-        reloadFromSource: true,
-      );
-    }, arguments: {'session_id': sessionId});
+    return _runWrite(
+      () => Profiling.spanAsync('scan.runtime.reload_session_detail', () async {
+        return _loadSessionDetailInBackground(
+          sessionId: sessionId,
+          reloadFromSource: true,
+        );
+      }, arguments: {'session_id': sessionId}),
+    );
   }
 
   static Future<SessionRowViewModel?> _reloadSessionDetailFromSourceOnWorker({
@@ -457,6 +521,7 @@ class RuntimeSessionController {
       databaseFile: databaseFile,
       batchSize: batchSize,
       pauseBetweenBatches: pauseBetweenBatches,
+      writerCoordinator: writerCoordinator,
     );
   }
 
@@ -480,23 +545,44 @@ class RuntimeSessionController {
           parsedSessionFlushSourceBytes:
               scanBatchingPolicy.parsedSessionFlushSourceBytes,
           fullRowSnapshotBatchSize: scanBatchingPolicy.fullRowSnapshotBatchSize,
+          coordinateWrites: writerCoordinator != null,
         ),
         onError: errors.sendPort,
         onExit: exits.sendPort,
       );
 
       final result = Completer<SessionsRefreshResult>();
+      SendPort? activeWriteRelease;
       late StreamSubscription<Object?> messageSubscription;
       late StreamSubscription<Object?> errorSubscription;
       late StreamSubscription<Object?> exitSubscription;
 
       void finishError(Object error, [StackTrace? stackTrace]) {
+        activeWriteRelease?.send(null);
         if (!result.isCompleted) {
           result.completeError(error, stackTrace);
         }
       }
 
       messageSubscription = messages.listen((message) {
+        if (message is _BackgroundScanWriteRequest) {
+          unawaited(
+            writerCoordinator!.runWriter(() async {
+              if (result.isCompleted) return;
+              final released = ReceivePort();
+              try {
+                activeWriteRelease = released.sendPort;
+                message.grant.send(released.sendPort);
+                // An unexpected worker exit must also release its queue slot.
+                await released.first;
+              } finally {
+                activeWriteRelease = null;
+                released.close();
+              }
+            }, priority: DatabaseWriterPriority.scan),
+          );
+          return;
+        }
         if (message is _BackgroundRefreshProgress) {
           onProgress?.call(message.progress);
           return;
@@ -506,6 +592,7 @@ class RuntimeSessionController {
           return;
         }
         if (message is _BackgroundRefreshDone) {
+          activeWriteRelease?.send(null);
           if (!result.isCompleted) {
             result.complete(message.result);
           }
@@ -551,7 +638,7 @@ class RuntimeSessionController {
     required String pathMask,
     int priority = 100,
     bool isActive = true,
-  }) async {
+  }) => _runWrite(() async {
     final settings = await SettingsRepository(settingsFile).loadOrCreate();
     final db = openFileBackedDatabase(databaseFile);
     try {
@@ -567,7 +654,7 @@ class RuntimeSessionController {
     } finally {
       db.close();
     }
-  }
+  });
 
   Future<SessionsRefreshResult> _refresh({
     SessionsRefreshProgressCallback? onProgress,
@@ -580,9 +667,11 @@ class RuntimeSessionController {
       int? scanRunId;
       var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
       try {
-        ToolOutputSearchIndex(
-          db,
-        ).configure(enabled: settings.toolOutput.indexToolOutput);
+        await _writeScan(() async {
+          ToolOutputSearchIndex(
+            db,
+          ).configure(enabled: settings.toolOutput.indexToolOutput);
+        });
         final activeLogger = StructuredLogger(
           db: db,
           settings: settings.logging,
@@ -602,9 +691,11 @@ class RuntimeSessionController {
         final projectResolutionCache = _WslProjectResolutionCache(
           wslProjectResolver,
         );
-        _cleanSessionMetadataPlaceholders(db);
-        scanRunId = _startScanRun(db);
-        final activeScanRunId = scanRunId;
+        final activeScanRunId = await _writeScan(() async {
+          _cleanSessionMetadataPlaceholders(db);
+          return _startScanRun(db);
+        });
+        scanRunId = activeScanRunId;
 
         Future<void> persistParsedBatch(List<ScannedSessionFile> batch) async {
           if (batch.isEmpty) {
@@ -612,13 +703,21 @@ class RuntimeSessionController {
           }
           final currentFlush = persistenceFlushQueue.then((_) {
             return Profiling.spanAsync('scan.runtime.persist_flush', () {
-              return _persistParsedSessions(
-                db,
-                batch,
-                threadNamesBySessionId: threadNamesBySessionId,
-                wslProjects: projectResolutionCache,
-                resolveWslProjects: false,
-              );
+              return _writeScan(() async {
+                await _persistParsedSessions(
+                  db,
+                  batch,
+                  threadNamesBySessionId: threadNamesBySessionId,
+                  wslProjects: projectResolutionCache,
+                  resolveWslProjects: false,
+                );
+                _updateScanRun(
+                  db,
+                  activeScanRunId,
+                  latestProgress,
+                  status: _ScanRunStatus.running,
+                );
+              });
             });
           });
           persistenceFlushQueue = currentFlush;
@@ -687,17 +786,19 @@ class RuntimeSessionController {
           );
         }
 
-        await activeLogger.writeBestEffort(
-          LogEntryDraft(
-            level: LogLevel.info,
-            category: LogCategory.scanner,
-            message: 'Session scan started.',
-            details: {
-              'directory_workers': _defaultDirectoryWorkerCount(),
-              'metadata_workers': _defaultMetadataWorkerCount(),
-              'parser_workers': _defaultParserWorkerCount(),
-              'parser_isolates': true,
-            },
+        await _writeScan(
+          () => activeLogger.writeBestEffort(
+            LogEntryDraft(
+              level: LogLevel.info,
+              category: LogCategory.scanner,
+              message: 'Session scan started.',
+              details: {
+                'directory_workers': _defaultDirectoryWorkerCount(),
+                'metadata_workers': _defaultMetadataWorkerCount(),
+                'parser_workers': _defaultParserWorkerCount(),
+                'parser_isolates': true,
+              },
+            ),
           ),
         );
         final mapper = CodexPathMapper(
@@ -733,12 +834,6 @@ class RuntimeSessionController {
               ? null
               : (progress) {
                   latestProgress = progress;
-                  _updateScanRun(
-                    db,
-                    activeScanRunId,
-                    progress,
-                    status: _ScanRunStatus.running,
-                  );
                   onProgress(
                     SessionsRefreshProgress(
                       statusMessage: _progressStatusMessage(progress),
@@ -786,72 +881,82 @@ class RuntimeSessionController {
                 db,
                 parsedProjectCandidates,
                 wslProjects: projectResolutionCache,
+                write: _writeScan,
               ),
             ),
           );
         });
         await Profiling.spanAsync('scan.runtime.persist_scan', () {
-          return _persistScan(
-            db,
-            result,
-            scanRunId: activeScanRunId,
-            persistSessions: false,
-            threadNamesBySessionId: threadNamesBySessionId,
-            wslProjects: projectResolutionCache,
+          return _writeScan(
+            () => _persistScan(
+              db,
+              result,
+              scanRunId: activeScanRunId,
+              persistSessions: false,
+              threadNamesBySessionId: threadNamesBySessionId,
+              wslProjects: projectResolutionCache,
+            ),
           );
         });
-        _applySessionIndexThreadNames(db, threadNamesBySessionId);
+        await _writeScan(
+          () async => _applySessionIndexThreadNames(db, threadNamesBySessionId),
+        );
         try {
-          final repair = await SessionCacheRepair(databaseFile: databaseFile)
-              .run(
-                db: db,
-                roots: scanRoots,
-                discoveryComplete: result.canRunCacheRepair,
-                isCancellationRequested: () =>
-                    cancellationToken.isCancellationRequested,
-                onProgress: (phase) {
-                  onProgress?.call(
-                    SessionsRefreshProgress(
-                      statusMessage: _cacheRepairProgressMessage(phase),
-                    ),
-                  );
-                },
-              );
-          final audit = repair.audit;
-          await activeLogger.writeBestEffort(
-            LogEntryDraft(
-              level:
-                  repair.status == SessionCacheRepairStatus.postponed &&
-                      repair.reasonCode != 'cancelled'
-                  ? LogLevel.warning
-                  : LogLevel.info,
-              category: LogCategory.database,
-              message: repair.status == SessionCacheRepairStatus.postponed
-                  ? 'Session cache repair postponed.'
-                  : 'Session cache repair checked.',
-              details: {
-                'status': repair.status.name,
-                'reason_code': repair.reasonCode,
-                'deleted_rows': repair.deletedCount,
-                if (audit != null)
-                  for (final entry in audit.categoryCounts.entries)
-                    'category_${entry.key.wireName}': entry.value,
-                if (repair.backupFile != null)
-                  'backup_file': p.basename(repair.backupFile!.path),
+          final repair = await _writeScan(
+            () => SessionCacheRepair(databaseFile: databaseFile).run(
+              db: db,
+              roots: scanRoots,
+              discoveryComplete: result.canRunCacheRepair,
+              isCancellationRequested: () =>
+                  cancellationToken.isCancellationRequested,
+              onProgress: (phase) {
+                onProgress?.call(
+                  SessionsRefreshProgress(
+                    statusMessage: _cacheRepairProgressMessage(phase),
+                  ),
+                );
               },
             ),
           );
+          final audit = repair.audit;
+          await _writeScan(
+            () => activeLogger.writeBestEffort(
+              LogEntryDraft(
+                level:
+                    repair.status == SessionCacheRepairStatus.postponed &&
+                        repair.reasonCode != 'cancelled'
+                    ? LogLevel.warning
+                    : LogLevel.info,
+                category: LogCategory.database,
+                message: repair.status == SessionCacheRepairStatus.postponed
+                    ? 'Session cache repair postponed.'
+                    : 'Session cache repair checked.',
+                details: {
+                  'status': repair.status.name,
+                  'reason_code': repair.reasonCode,
+                  'deleted_rows': repair.deletedCount,
+                  if (audit != null)
+                    for (final entry in audit.categoryCounts.entries)
+                      'category_${entry.key.wireName}': entry.value,
+                  if (repair.backupFile != null)
+                    'backup_file': p.basename(repair.backupFile!.path),
+                },
+              ),
+            ),
+          );
         } on Object catch (error) {
-          await activeLogger.writeBestEffort(
-            LogEntryDraft(
-              level: LogLevel.warning,
-              category: LogCategory.database,
-              message: 'Session cache repair postponed.',
-              details: {
-                'status': 'postponed',
-                'reason_code': 'unexpected_repair_error',
-                'error_type': error.runtimeType.toString(),
-              },
+          await _writeScan(
+            () => activeLogger.writeBestEffort(
+              LogEntryDraft(
+                level: LogLevel.warning,
+                category: LogCategory.database,
+                message: 'Session cache repair postponed.',
+                details: {
+                  'status': 'postponed',
+                  'reason_code': 'unexpected_repair_error',
+                  'error_type': error.runtimeType.toString(),
+                },
+              ),
             ),
           );
         }
@@ -862,21 +967,23 @@ class RuntimeSessionController {
         final refreshCancelled =
             result.cancelled || cancellationToken.isCancellationRequested;
         await Profiling.spanAsync('scan.runtime.write_finish_log', () {
-          return activeLogger.writeBestEffort(
-            LogEntryDraft(
-              level: LogLevel.info,
-              category: LogCategory.scanner,
-              message: refreshCancelled
-                  ? 'Session scan cancelled.'
-                  : 'Session scan finished.',
-              details: {
-                ..._progressLogDetails(result.progress),
-                'cancelled': refreshCancelled,
-                'visible_sessions': rows.length,
-                'directory_workers': directoryWorkerCount,
-                'metadata_workers': metadataWorkerCount,
-                'parser_workers': parserWorkerCount,
-              },
+          return _writeScan(
+            () => activeLogger.writeBestEffort(
+              LogEntryDraft(
+                level: LogLevel.info,
+                category: LogCategory.scanner,
+                message: refreshCancelled
+                    ? 'Session scan cancelled.'
+                    : 'Session scan finished.',
+                details: {
+                  ..._progressLogDetails(result.progress),
+                  'cancelled': refreshCancelled,
+                  'visible_sessions': rows.length,
+                  'directory_workers': directoryWorkerCount,
+                  'metadata_workers': metadataWorkerCount,
+                  'parser_workers': parserWorkerCount,
+                },
+              ),
             ),
           );
         });
@@ -893,27 +1000,32 @@ class RuntimeSessionController {
         );
       } on Object catch (error) {
         final progress = latestProgress.finish();
-        if (scanRunId != null) {
+        final failedScanRunId = scanRunId;
+        if (failedScanRunId != null) {
           try {
-            _updateScanRun(
-              db,
-              scanRunId,
-              progress,
-              status: _ScanRunStatus.failed,
+            await _writeScan(
+              () async => _updateScanRun(
+                db,
+                failedScanRunId,
+                progress,
+                status: _ScanRunStatus.failed,
+              ),
             );
           } on Object {
             // Preserve the scan failure even if failure bookkeeping also fails.
           }
         }
-        await logger?.writeBestEffort(
-          LogEntryDraft(
-            level: LogLevel.error,
-            category: LogCategory.scanner,
-            message: 'Session scan failed.',
-            details: {
-              ..._progressLogDetails(progress),
-              'error_type': error.runtimeType.toString(),
-            },
+        await _writeScan(
+          () async => logger?.writeBestEffort(
+            LogEntryDraft(
+              level: LogLevel.error,
+              category: LogCategory.scanner,
+              message: 'Session scan failed.',
+              details: {
+                ..._progressLogDetails(progress),
+                'error_type': error.runtimeType.toString(),
+              },
+            ),
           ),
         );
         rethrow;
@@ -1018,21 +1130,23 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
   StreamSubscription<Object?>? cancelSubscription;
   try {
     request.sendPort.send(_BackgroundRefreshControl(cancelPort.sendPort));
-    final operation =
-        RuntimeSessionController(
-          settingsFile: File(request.settingsFilePath),
-          databaseFile: File(request.databaseFilePath),
-          scanBatchingPolicy: ScanBatchingPolicy(
-            parsedSessionFlushBatchSize: request.parsedSessionFlushBatchSize,
-            parsedSessionFlushSourceBytes:
-                request.parsedSessionFlushSourceBytes,
-            fullRowSnapshotBatchSize: request.fullRowSnapshotBatchSize,
-          ),
-        ).startRefreshOperation(
-          onProgress: (progress) {
-            request.sendPort.send(_BackgroundRefreshProgress(progress));
-          },
-        );
+    final controller = RuntimeSessionController(
+      settingsFile: File(request.settingsFilePath),
+      databaseFile: File(request.databaseFilePath),
+      scanBatchingPolicy: ScanBatchingPolicy(
+        parsedSessionFlushBatchSize: request.parsedSessionFlushBatchSize,
+        parsedSessionFlushSourceBytes: request.parsedSessionFlushSourceBytes,
+        fullRowSnapshotBatchSize: request.fullRowSnapshotBatchSize,
+      ),
+    );
+    if (request.coordinateWrites) {
+      controller._backgroundWriterPort = request.sendPort;
+    }
+    final operation = controller.startRefreshOperation(
+      onProgress: (progress) {
+        request.sendPort.send(_BackgroundRefreshProgress(progress));
+      },
+    );
     cancelSubscription = cancelPort.listen((message) {
       if (message is _BackgroundRefreshCancel) {
         unawaited(operation.cancel());
@@ -1104,7 +1218,8 @@ Future<void> _backgroundMessageSearchBackfillEntry(
 ) async {
   final cancelPort = ReceivePort();
   StreamSubscription<Object?>? cancelSubscription;
-  var cancelRequested = false;
+  var cancelRequested = request.initiallyCancelled;
+  late Object terminalMessage;
   try {
     request.sendPort.send(_BackgroundRefreshControl(cancelPort.sendPort));
     cancelSubscription = cancelPort.listen((message) {
@@ -1119,7 +1234,7 @@ Future<void> _backgroundMessageSearchBackfillEntry(
       ).backfillStatus().toResult(indexedInBatch: 0, complete: false);
       while (!cancelRequested) {
         result = MessageSearchIndex(db).backfillBatch(limit: request.batchSize);
-        if (result.complete) {
+        if (result.complete || request.singleBatch) {
           break;
         }
         await Future<void>.delayed(request.pauseBetweenBatches);
@@ -1131,18 +1246,22 @@ Future<void> _backgroundMessageSearchBackfillEntry(
           cancelled: true,
         );
       }
-      request.sendPort.send(_BackgroundMessageSearchBackfillDone(result));
+      terminalMessage = _BackgroundMessageSearchBackfillDone(result);
     } finally {
       db.close();
     }
   } on Object catch (error, stackTrace) {
-    request.sendPort.send(
-      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+    terminalMessage = _BackgroundRefreshError(
+      error.toString(),
+      stackTrace.toString(),
     );
   } finally {
     await cancelSubscription?.cancel();
     cancelPort.close();
   }
+  // The parent may dispose the isolate immediately on completion. Publish only
+  // after SQLite and control resources are closed, atomically with isolate exit.
+  Isolate.exit(request.sendPort, terminalMessage);
 }
 
 Future<void> _backgroundSessionDetailEntry(
@@ -1196,6 +1315,7 @@ class _BackgroundRefreshRequest {
     required this.parsedSessionFlushBatchSize,
     required this.parsedSessionFlushSourceBytes,
     required this.fullRowSnapshotBatchSize,
+    required this.coordinateWrites,
   });
 
   final String settingsFilePath;
@@ -1204,6 +1324,12 @@ class _BackgroundRefreshRequest {
   final int parsedSessionFlushBatchSize;
   final int parsedSessionFlushSourceBytes;
   final int fullRowSnapshotBatchSize;
+  final bool coordinateWrites;
+}
+
+class _BackgroundScanWriteRequest {
+  const _BackgroundScanWriteRequest(this.grant);
+  final SendPort grant;
 }
 
 class _BackgroundCachedRowsRequest {
@@ -1224,12 +1350,16 @@ class _BackgroundMessageSearchBackfillRequest {
     required this.sendPort,
     required this.batchSize,
     required this.pauseBetweenBatches,
+    required this.singleBatch,
+    required this.initiallyCancelled,
   });
 
   final String databaseFilePath;
   final SendPort sendPort;
   final int batchSize;
   final Duration pauseBetweenBatches;
+  final bool singleBatch;
+  final bool initiallyCancelled;
 }
 
 class _BackgroundSessionDetailRequest {
@@ -1326,18 +1456,55 @@ class _BackgroundMessageSearchBackfillOperation {
     required File databaseFile,
     required int batchSize,
     required Duration pauseBetweenBatches,
+    DatabaseMaintenanceCoordinator? writerCoordinator,
   }) {
     final cancellationHandle = _BackgroundScanCancellationHandle();
-    final result = _start(
+    Timer? pauseTimer;
+    Completer<void>? paused;
+    void requestCancel() {
+      cancellationHandle.requestCancel();
+      pauseTimer?.cancel();
+      if (paused != null && !paused!.isCompleted) paused!.complete();
+    }
+
+    Future<MessageSearchBackfillResult> work() => _start(
       databaseFile: databaseFile,
       batchSize: batchSize,
       pauseBetweenBatches: pauseBetweenBatches,
       cancellationHandle: cancellationHandle,
+      singleBatch: writerCoordinator != null,
     );
-    return CancellableMessageSearchBackfillOperation._(
-      result,
-      cancellationHandle.requestCancel,
-    );
+    Future<MessageSearchBackfillResult> coordinated() async {
+      while (true) {
+        final result = await writerCoordinator!.runWriter(
+          work,
+          priority: DatabaseWriterPriority.repair,
+        );
+        if (result.complete || result.cancelled) return result;
+        if (!cancellationHandle._cancelRequested) {
+          // Each committed batch has closed SQLite before yielding the writer
+          // slot. The deliberate pause must not retain that slot or a worker.
+          paused = Completer<void>();
+          pauseTimer = Timer(pauseBetweenBatches, paused!.complete);
+          await paused!.future;
+          pauseTimer = null;
+          paused = null;
+        }
+        if (cancellationHandle._cancelRequested) {
+          return MessageSearchBackfillResult(
+            indexed: result.indexed,
+            remaining: result.remaining,
+            lastMessageRowId: result.lastMessageRowId,
+            indexedInBatch: 0,
+            complete: false,
+            cancelled: true,
+          );
+        }
+      }
+    }
+
+    final result = writerCoordinator == null ? work() : coordinated();
+    return CancellableMessageSearchBackfillOperation._(result, requestCancel);
   }
 
   static Future<MessageSearchBackfillResult> _start({
@@ -1345,6 +1512,7 @@ class _BackgroundMessageSearchBackfillOperation {
     required int batchSize,
     required Duration pauseBetweenBatches,
     required _BackgroundScanCancellationHandle cancellationHandle,
+    required bool singleBatch,
   }) async {
     final messages = ReceivePort();
     final errors = ReceivePort();
@@ -1358,6 +1526,8 @@ class _BackgroundMessageSearchBackfillOperation {
           sendPort: messages.sendPort,
           batchSize: batchSize,
           pauseBetweenBatches: pauseBetweenBatches,
+          singleBatch: singleBatch,
+          initiallyCancelled: cancellationHandle._cancelRequested,
         ),
         onError: errors.sendPort,
         onExit: exits.sendPort,
@@ -1427,17 +1597,20 @@ class _BackgroundSessionScanOperation {
     required File databaseFile,
     required ScanBatchingPolicy scanBatchingPolicy,
     SessionsRefreshProgressCallback? onProgress,
+    DatabaseMaintenanceCoordinator? writerCoordinator,
   }) {
     final cancellationHandle = _BackgroundScanCancellationHandle();
     final controller = RuntimeSessionController(
       settingsFile: settingsFile,
       databaseFile: databaseFile,
       scanBatchingPolicy: scanBatchingPolicy,
+      writerCoordinator: writerCoordinator,
     );
-    final result = controller._refreshInBackground(
+    Future<SessionsRefreshResult> work() => controller._refreshInBackground(
       onProgress: onProgress,
       cancellationHandle: cancellationHandle,
     );
+    final result = writerCoordinator?.runScan(work) ?? work();
     return CancellableSessionScanOperation._(
       result,
       cancellationHandle.requestCancel,
@@ -1672,11 +1845,14 @@ void _upsertParsedSession(
   if (!_candidateShouldReplacePersistedSession(db, scannedSession)) {
     if (identityMerge != null) {
       _applyIdentityMerge(db, parsed.internalId, identityMerge);
-      _reconcileAffectedLegacyUsage(
+      final affected = _reconcileAffectedLegacyUsage(
         db,
         replacedSessionRowId: parsed.internalId,
         replacedLogicalSessionId: parsed.sessionId,
       );
+      UsageSummaryRepository(
+        db,
+      ).replaceDailyProjectionsInCurrentTransaction(affected);
     }
     return;
   }
@@ -1704,6 +1880,9 @@ void _upsertParsedSession(
     parsed.workingDirectoryDisplay,
     sourceType: scannedSession.sourceType,
   );
+  final detectedProjectId = autoProject == null
+      ? null
+      : _upsertAutoProject(db, autoProject.name, now);
   final tokenBuckets = _messageTokenBuckets(parsed);
   SessionSearchIndex(db).upsert(
     SessionSearchDocument(
@@ -1769,11 +1948,7 @@ void _upsertParsedSession(
       user_message_tokens = ?,
       assistant_response_tokens = ?,
       tool_call_tokens = ?,
-      project_id = case when project_override = 1 then project_id else ? end,
-      project_name_snapshot = case
-        when project_override = 1 then project_name_snapshot
-        else ?
-      end,
+      detected_project_id = ?,
       last_scanned_utc = ?,
       last_parsed_utc = ?
     where id = ?
@@ -1817,18 +1992,12 @@ void _upsertParsedSession(
       tokenBuckets.user,
       tokenBuckets.assistant,
       tokenBuckets.tool,
-      autoProject == null
-          ? null
-          : _upsertAutoProject(db, autoProject.name, now),
-      autoProject?.name,
+      detectedProjectId,
       now,
       now,
       parsed.internalId,
     ],
   );
-  if (autoProject != null) {
-    _updateSearchProjectIfAutomatic(db, parsed.internalId, autoProject.name);
-  }
   _replaceMessages(db, parsed, now);
   _replaceToolCalls(db, parsed);
   _replaceUsageEvents(
@@ -1841,11 +2010,15 @@ void _upsertParsedSession(
   if (identityMerge != null) {
     _applyIdentityMerge(db, parsed.internalId, identityMerge);
   }
-  _reconcileAffectedLegacyUsage(
+  ProjectTagStateStore(db).refreshSessionProject(parsed.internalId);
+  final affected = _reconcileAffectedLegacyUsage(
     db,
     replacedSessionRowId: parsed.internalId,
     replacedLogicalSessionId: parsed.sessionId,
   );
+  UsageSummaryRepository(
+    db,
+  ).replaceDailyProjectionsInCurrentTransaction(affected);
 }
 
 _IdentityMergeState? _captureIdentityMergeState(
@@ -2576,6 +2749,11 @@ void _replaceUsageEvents(
   }
 
   final projectIdsByName = <String, int>{};
+  final contextIdsByPaths = <(String?, String?), int>{};
+  final projectStore = ProjectTagStateStore(db);
+  final contextBased =
+      DatabaseGenerationRepository(db).activeGeneration().targetSchemaVersion >=
+      16;
   final insert = db.prepare('''
     insert into usage_events (
       session_row_id,
@@ -2585,10 +2763,9 @@ void _replaceUsageEvents(
       epoch,
       occurred_at_utc,
       model,
-      working_directory_display,
-      working_directory_platform,
-      working_directory_unc,
-      project_id,
+      ${contextBased ? 'path_context_id,' : '''
+      working_directory_display, working_directory_platform, working_directory_unc, project_id,
+      '''}
       input_tokens,
       cached_input_tokens,
       cache_write_input_tokens,
@@ -2598,7 +2775,7 @@ void _replaceUsageEvents(
       branch_scope,
       derivation,
       event_fingerprint
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (${List.filled(contextBased ? 17 : 20, '?').join(', ')})
     ''');
   try {
     for (final event in parsed.usageEvents) {
@@ -2613,6 +2790,15 @@ void _replaceUsageEvents(
               () => _upsertAutoProject(db, autoProject.name, now),
             );
       final usage = event.usage;
+      final contextId = contextIdsByPaths.putIfAbsent(
+        (event.workingDirectory, event.workingDirectoryUnc),
+        () => projectStore.resolveUsagePathContext(
+          displayPath: event.workingDirectory,
+          platformPath: event.workingDirectory,
+          uncPath: event.workingDirectoryUnc,
+          detectedProjectId: projectId,
+        ),
+      );
       insert.execute([
         parsed.internalId,
         event.sourceRecordOrdinal,
@@ -2621,10 +2807,14 @@ void _replaceUsageEvents(
         event.counterEpoch,
         event.occurredAtUtc?.toIso8601String(),
         event.model,
-        event.workingDirectory,
-        event.workingDirectory,
-        event.workingDirectoryUnc,
-        projectId,
+        if (contextBased)
+          contextId
+        else ...[
+          event.workingDirectory,
+          event.workingDirectory,
+          event.workingDirectoryUnc,
+          projectId,
+        ],
         usage.inputTokens ?? 0,
         usage.cachedInputTokens ?? 0,
         usage.cacheWriteInputTokens ?? 0,
@@ -2641,7 +2831,7 @@ void _replaceUsageEvents(
   }
 }
 
-void _reconcileAffectedLegacyUsage(
+Set<String> _reconcileAffectedLegacyUsage(
   Database db, {
   required String replacedSessionRowId,
   required String? replacedLogicalSessionId,
@@ -2676,13 +2866,16 @@ void _reconcileAffectedLegacyUsage(
     affected[session.rowId] = session;
   }
   final logicalId = replacedLogicalSessionId?.trim() ?? '';
-  if (logicalId.isNotEmpty) {
+  final pending = <String>[if (logicalId.isNotEmpty) logicalId];
+  final visited = <String>{};
+  while (pending.isNotEmpty) {
+    final parentId = pending.removeLast();
+    if (!visited.add(parentId)) continue;
     for (final row in db.select(
       '''
-      select $legacyColumns
+      select $legacyColumns, ($legacyPredicate) as needs_reconciliation
       from sessions
-      where $legacyPredicate
-        and (
+      where (
           forked_from_id = ?
           or (
             (forked_from_id is null or forked_from_id = '')
@@ -2690,10 +2883,18 @@ void _reconcileAffectedLegacyUsage(
           )
         )
       ''',
-      [logicalId, logicalId],
+      [parentId, parentId],
     )) {
-      final session = _LegacyUsageSession.fromRow(row);
-      affected[session.rowId] = session;
+      // Traverse provenance-known nodes too: their own scopes are authoritative,
+      // but a legacy descendant can still depend on their ancestry/cycle state.
+      if (row['needs_reconciliation'] == 1) {
+        final session = _LegacyUsageSession.fromRow(row);
+        affected[session.rowId] = session;
+      }
+      final descendantId = (row['session_id'] as String?)?.trim() ?? '';
+      if (descendantId.isNotEmpty && !visited.contains(descendantId)) {
+        pending.add(descendantId);
+      }
     }
   }
 
@@ -2761,7 +2962,7 @@ void _reconcileAffectedLegacyUsage(
     }
     final childFingerprints = fingerprintsFor(child.rowId);
     if (childFingerprints.isEmpty) {
-      if (child.projectionStatus == 'complete' && !child.hasAggregateUsage) {
+      if (!child.hasAggregateUsage) {
         _setUsageProjectionStatus(db, child.rowId, 'complete');
       } else {
         _markUsageProjectionAmbiguous(db, child.rowId);
@@ -2838,6 +3039,7 @@ void _reconcileAffectedLegacyUsage(
     }
     _setUsageProjectionStatus(db, child.rowId, 'complete');
   }
+  return {replacedSessionRowId, ...affected.keys};
 }
 
 void _setUsageProjectionStatus(Database db, String rowId, String status) {
@@ -3051,75 +3253,18 @@ List<SessionRowViewModel> _loadRows(
   int offset = 0,
   UsagePricingCatalog pricing = const UsagePricingCatalog({}),
 }) {
-  final filters = [
-    "s.parse_status = 'available'",
-    "s.scan_status = 'available'",
-    "coalesce(s.session_id, '') <> ''",
-    if (sessionId != null) 's.id = ?',
-  ];
-  final limitClause = limit == null ? '' : 'limit ? offset ?';
-  final args = <Object?>[?sessionId];
-  if (limit != null) {
-    args
-      ..add(limit)
-      ..add(offset);
-  }
-  final rows = db.select('''
-    select
-      s.id,
-      s.session_id,
-      s.thread_name,
-      s.thread_source,
-      s.parent_thread_id,
-      s.agent_nickname,
-      s.agent_role,
-      s.subagent_depth,
-      s.source_type,
-      s.source_state,
-      s.source_file_path,
-      s.source_file_unc_path,
-      s.display_path,
-      s.platform_path,
-      s.working_directory_display,
-      s.working_directory_unc,
-      s.started_at_utc,
-      s.last_message_at_utc,
-      nullif(trim(s.title), '') as row_title,
-      s.title,
-      s.summary,
-      s.message_count,
-      s.user_message_count,
-      s.assistant_message_count,
-      s.tool_call_count,
-      s.input_tokens,
-      s.output_tokens,
-      s.cached_input_tokens,
-      s.total_tokens,
-      s.user_message_tokens,
-      s.assistant_response_tokens,
-      s.tool_call_tokens,
-      s.model_primary,
-      s.models_used,
-      s.project_name_snapshot,
-      s.scan_status,
-      s.parse_status,
-      s.is_pinned,
-      s.is_archived,
-      s.has_errors,
-      s.eval_ready,
-      s.eval_status,
-      s.eval_notes,
-      s.eval_expected_output,
-      s.eval_reviewed_at_utc,
-      s.eval_updated_at_utc
-    from sessions s
-    where ${filters.join(' and ')}
-    order by coalesce(s.last_message_at_utc, s.started_at_utc, s.updated_at_utc) desc,
-             s.id asc
-    $limitClause
-    ''', args);
+  final query = sessionListQuery(
+    sessionId: sessionId,
+    limit: limit,
+    offset: offset,
+  );
+  final rows = db.select(query.sql, query.parameters);
   final sessionIds = [for (final row in rows) row['id'] as String];
   final tagsBySessionId = _loadTagsBySessionId(db, sessionIds);
+  final persistedCosts = UsageSummaryRepository(db).loadPersistedSessionCosts(
+    sessionIds,
+    projectionVersion: CodexSessionParser.currentVersion,
+  );
   return [
     for (final row in rows)
       _loadRow(
@@ -3128,6 +3273,7 @@ List<SessionRowViewModel> _loadRows(
         includeMessages: includeMessages,
         pricing: pricing,
         tagsBySessionId: tagsBySessionId,
+        persistedCost: persistedCosts?[row['id']],
       ),
   ];
 }
@@ -3138,7 +3284,7 @@ int _visibleRowCount(Database db) {
     from sessions s
     where s.parse_status = 'available'
       and s.scan_status = 'available'
-      and coalesce(s.session_id, '') <> ''
+      and s.session_id is not null and s.session_id <> ''
     ''').single;
   return row['count'] as int? ?? 0;
 }
@@ -3149,6 +3295,7 @@ SessionRowViewModel _loadRow(
   required bool includeMessages,
   required UsagePricingCatalog pricing,
   required Map<String, List<String>> tagsBySessionId,
+  UsageCostEstimate? persistedCost,
 }) {
   final inputTokens = row['input_tokens'] as int? ?? 0;
   final outputTokens = row['output_tokens'] as int? ?? 0;
@@ -3163,13 +3310,15 @@ SessionRowViewModel _loadRow(
           storedToolCallTokens >
       0;
   final model = row['model_primary'] as String? ?? '';
-  final estimate = estimateUsageCost(
-    inputTokens: inputTokens,
-    outputTokens: outputTokens,
-    cachedInputTokens: cachedInputTokens,
-    model: model.isEmpty ? null : model,
-    pricing: pricing,
-  );
+  final estimate =
+      persistedCost ??
+      estimateUsageCost(
+        inputTokens: inputTokens,
+        outputTokens: outputTokens,
+        cachedInputTokens: cachedInputTokens,
+        model: model.isEmpty ? null : model,
+        pricing: pricing,
+      );
   final sourceType = row['source_type'] as String?;
   final workingDirectoryDisplay = row['working_directory_display'] as String?;
   final openablePath = sourceType == 'wsl'
@@ -3227,6 +3376,8 @@ SessionRowViewModel _loadRow(
     totalTokens: row['total_tokens'] as int? ?? 0,
     estimatedCostText: estimate.estimatedCostText,
     costUnknown: estimate.costUnknown,
+    costUpdating: estimate.updating,
+    costPartialUnsupportedUnits: estimate.partialUnsupportedUnits,
     model: model,
     modelsUsed: _decodeMembership(row['models_used'] as String?),
     tags: tagsBySessionId[row['id'] as String] ?? const [],
@@ -3642,24 +3793,6 @@ void _cleanSessionMetadataPlaceholders(Database db) {
   }
 }
 
-void _updateSearchProjectIfAutomatic(
-  Database db,
-  String sessionId,
-  String projectName,
-) {
-  final rows = db.select(
-    'select rowid, project_override from sessions where id = ?',
-    [sessionId],
-  );
-  if (rows.isEmpty || (rows.single['project_override'] as int? ?? 0) == 1) {
-    return;
-  }
-  db.execute('update session_search set project_name = ? where rowid = ?', [
-    projectName,
-    rows.single['rowid'] as int,
-  ]);
-}
-
 Future<void> _backfillAutomaticProjects(
   Database db, {
   required _WslProjectResolutionCache wslProjects,
@@ -3667,8 +3800,13 @@ Future<void> _backfillAutomaticProjects(
   final rows = db.select('''
     select id, source_type, working_directory_display
     from sessions
-    where coalesce(project_override, 0) = 0
-      and coalesce(trim(project_name_snapshot), '') = ''
+    where (
+        detected_project_id is null
+        or (
+          coalesce(project_override, 0) = 0
+          and coalesce(trim(project_name_snapshot), '') = ''
+        )
+      )
       and coalesce(trim(working_directory_display), '') <> ''
       and parse_status = 'available'
       and scan_status = 'available'
@@ -3721,6 +3859,7 @@ Future<void> _applyResolvedProjectsForParsedCandidates(
   Database db,
   Iterable<_ParsedProjectCandidate> parsedCandidates, {
   required _WslProjectResolutionCache wslProjects,
+  required Future<void> Function(Future<void> Function()) write,
 }) async {
   final sessionIds = parsedCandidates
       .map((candidate) => candidate.sessionId)
@@ -3770,7 +3909,7 @@ Future<void> _applyResolvedProjectsForParsedCandidates(
   if (resolvedRows.isEmpty) {
     return;
   }
-  _applyResolvedProjectRows(db, resolvedRows);
+  await write(() async => _applyResolvedProjectRows(db, resolvedRows));
 }
 
 void _applyResolvedProjectRows(
@@ -3787,15 +3926,13 @@ void _applyResolvedProjectRows(
       db.execute(
         '''
         update sessions
-        set project_id = ?,
-            project_name_snapshot = ?,
+        set detected_project_id = ?,
             updated_at_utc = ?
         where id = ?
-          and coalesce(project_override, 0) = 0
         ''',
-        [projectId, projectName, now, sessionId],
+        [projectId, now, sessionId],
       );
-      _updateSearchProjectIfAutomatic(db, sessionId, projectName);
+      ProjectTagStateStore(db).refreshSessionProject(sessionId);
     }
     db.execute('commit');
   } on Object {

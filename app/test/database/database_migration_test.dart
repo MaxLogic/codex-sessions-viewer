@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
+import 'package:codex_sessions_viewer/src/database/database_maintenance_cancelled.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
@@ -26,12 +27,305 @@ void main() {
     }
   });
 
+  test(
+    'startup can defer schema 16 without rejecting an existing upgrade',
+    () async {
+      final migrator = DatabaseMigrator(sqlRoot: Directory('../sql'));
+      final deferred = await migrator.openAndMigrate(
+        dbFile,
+        deferUsageMigration: true,
+      );
+      expect(deferred.canStartNormalUi, isTrue);
+      expect(deferred.lastAppliedSchemaVersion, 15);
+      final legacy = openFileBackedDatabase(dbFile);
+      try {
+        expect(_tableExists(legacy, 'usage_events_next'), isFalse);
+      } finally {
+        legacy.close();
+      }
+      final oldCompatible = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+        supportedSchemaVersion: 15,
+      ).openAndMigrate(dbFile);
+      expect(oldCompatible.canStartNormalUi, isTrue);
+      expect(
+        (await migrator.openAndMigrate(dbFile)).lastAppliedSchemaVersion,
+        17,
+      );
+      final reopened = await migrator.openAndMigrate(
+        dbFile,
+        deferUsageMigration: true,
+      );
+      expect(reopened.canStartNormalUi, isTrue);
+      expect(reopened.lastAppliedSchemaVersion, 17);
+    },
+  );
+
+  test(
+    'worker migration borrows its connection on success and failure',
+    () async {
+      final borrowed = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(borrowed.close);
+      borrowed.createFunction(
+        functionName: 'bootstrap_connection_marker',
+        argumentCount: const AllowedArgumentCount(0),
+        function: (_) => 73,
+      );
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+        fts5ProbeSql: 'select bootstrap_connection_marker()',
+      ).migrateOpenDatabase(borrowed, dbFile);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.details,
+      );
+      expect(result.lastAppliedSchemaVersion, 17);
+      expect(
+        borrowed
+            .select('select bootstrap_connection_marker()')
+            .single
+            .values
+            .single,
+        73,
+      );
+      final failed = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+        fts5ProbeSql: 'select nonexistent_bootstrap_function()',
+      ).migrateOpenDatabase(borrowed, dbFile);
+      expect(failed.canStartNormalUi, isFalse);
+      expect(
+        borrowed
+            .select('select bootstrap_connection_marker()')
+            .single
+            .values
+            .single,
+        73,
+      );
+      expect(borrowed.autocommit, isTrue);
+    },
+  );
+
+  test(
+    'interrupted schema SQL rolls back before recording recovery metadata',
+    () async {
+      final migrator = DatabaseMigrator(sqlRoot: Directory('../sql'));
+      await migrator.openAndMigrate(dbFile, deferUsageMigration: true);
+      final borrowed = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(borrowed.close);
+      var atomicCalls = 0;
+      final result = await migrator.migrateOpenDatabase(
+        borrowed,
+        dbFile,
+        runAtomic: (action) async {
+          atomicCalls++;
+          expect(borrowed.autocommit, isFalse);
+          action();
+          throw StateError('Injected interruption before schema commit.');
+        },
+      );
+      expect(result.canStartNormalUi, isFalse);
+      expect(atomicCalls, 1);
+      expect(result.lastAppliedSchemaVersion, 15);
+      expect(borrowed.autocommit, isTrue);
+      expect(_tableExists(borrowed, 'usage_events_next'), isFalse);
+      expect(
+        borrowed
+            .select('select success from schema_version where version = 16')
+            .single['success'],
+        0,
+      );
+      final retried = await migrator.migrateOpenDatabase(borrowed, dbFile);
+      expect(
+        retried.canStartNormalUi,
+        isTrue,
+        reason: retried.fatalError?.details,
+      );
+    },
+  );
+
+  test(
+    'schema cancellation rolls back without recording migration failure',
+    () async {
+      final migrator = DatabaseMigrator(sqlRoot: Directory('../sql'));
+      await migrator.openAndMigrate(dbFile, deferUsageMigration: true);
+      final borrowed = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(borrowed.close);
+      Object? caught;
+      try {
+        await migrator.migrateOpenDatabase(
+          borrowed,
+          dbFile,
+          runAtomic: (action) async {
+            expect(borrowed.autocommit, isFalse);
+            action();
+            throw const DatabaseMaintenanceCancelled();
+          },
+        );
+      } on Object catch (error) {
+        caught = error;
+      }
+
+      expect(caught, isA<DatabaseMaintenanceCancelled>());
+      expect(borrowed.autocommit, isTrue);
+      expect(_tableExists(borrowed, 'usage_events_next'), isFalse);
+      expect(
+        borrowed.select(
+          'select success from schema_version where version = 16',
+        ),
+        isEmpty,
+      );
+
+      final retried = await migrator.migrateOpenDatabase(borrowed, dbFile);
+      expect(
+        retried.canStartNormalUi,
+        isTrue,
+        reason: retried.fatalError?.details,
+      );
+      expect(retried.lastAppliedSchemaVersion, 17);
+    },
+  );
+
+  test(
+    'post migration optimize cancellation preserves committed schema',
+    () async {
+      final migrator = DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+        supportedSchemaVersion: 16,
+      );
+      await migrator.openAndMigrate(dbFile, deferUsageMigration: true);
+      final borrowed = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(borrowed.close);
+      var atomicCalls = 0;
+      final result = await migrator.migrateOpenDatabase(
+        borrowed,
+        dbFile,
+        runAtomic: (action) async {
+          atomicCalls++;
+          if (atomicCalls >= 2) {
+            throw StateError('Injected optimization interruption.');
+          }
+          action();
+        },
+      );
+      expect(result.canStartNormalUi, isTrue);
+      expect(atomicCalls, greaterThanOrEqualTo(2));
+      expect(result.lastAppliedSchemaVersion, 16);
+      expect(borrowed.autocommit, isTrue);
+      expect(
+        borrowed
+            .select('select success from schema_version where version = 16')
+            .single['success'],
+        1,
+      );
+      expect(
+        borrowed
+            .select(
+              'select last_optimized_schema_version v from database_state',
+            )
+            .single['v'],
+        0,
+      );
+      expect(
+        borrowed
+            .select(
+              "select last_error from maintenance_schedules where job_type='database_optimize'",
+            )
+            .single['last_error'],
+        'Post-migration optimization failed.',
+      );
+      final retry = await migrator.migrateOpenDatabase(borrowed, dbFile);
+      expect(retry.canStartNormalUi, isTrue);
+      expect(
+        borrowed
+            .select(
+              'select last_optimized_schema_version v from database_state',
+            )
+            .single['v'],
+        16,
+      );
+    },
+  );
+
+  test(
+    'optimize cancellation rolls back without recording schedule failure',
+    () async {
+      final migrator = DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+        supportedSchemaVersion: 16,
+      );
+      await migrator.openAndMigrate(dbFile, deferUsageMigration: true);
+      final borrowed = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(borrowed.close);
+      var atomicCalls = 0;
+      Object? caught;
+      try {
+        await migrator.migrateOpenDatabase(
+          borrowed,
+          dbFile,
+          runAtomic: (action) async {
+            atomicCalls++;
+            action();
+            if (atomicCalls >= 2) {
+              throw const DatabaseMaintenanceCancelled();
+            }
+          },
+        );
+      } on Object catch (error) {
+        caught = error;
+      }
+
+      expect(caught, isA<DatabaseMaintenanceCancelled>());
+      expect(atomicCalls, 2);
+      expect(borrowed.autocommit, isTrue);
+      expect(
+        borrowed
+            .select('select success from schema_version where version = 16')
+            .single['success'],
+        1,
+      );
+      expect(
+        borrowed
+            .select(
+              'select last_optimized_schema_version v from database_state',
+            )
+            .single['v'],
+        0,
+      );
+      expect(
+        borrowed.select(
+          "select * from maintenance_schedules where job_type = 'database_optimize'",
+        ),
+        isEmpty,
+      );
+
+      final retried = await migrator.migrateOpenDatabase(borrowed, dbFile);
+      expect(
+        retried.canStartNormalUi,
+        isTrue,
+        reason: retried.fatalError?.details,
+      );
+      expect(
+        borrowed
+            .select(
+              'select last_optimized_schema_version v from database_state',
+            )
+            .single['v'],
+        16,
+      );
+    },
+  );
+
   test('applies initial SQL schema and records migration metadata', () async {
     final result = await DatabaseMigrator(
       sqlRoot: Directory('../sql'),
     ).openAndMigrate(dbFile);
 
-    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
+    expect(
+      result.canStartNormalUi,
+      isTrue,
+      reason: '${result.fatalError?.summary}: ${result.fatalError?.details}',
+    );
     expect(result.fatalError, isNull);
 
     final db = openFileBackedDatabase(dbFile);
@@ -65,7 +359,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 15);
+    expect(versionRows.length, 17);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -129,6 +423,20 @@ void main() {
     expect(versionRows[14]['filename'], '015_branch_aware_usage.sql');
     expect(versionRows[14]['checksum_length'], greaterThan(20));
     expect(versionRows[14]['success'], 1);
+    expect(versionRows[15]['version'], 16);
+    expect(
+      versionRows[15]['filename'],
+      '016_persisted_usage_pricing_maintenance.sql',
+    );
+    expect(versionRows[15]['checksum_length'], greaterThan(20));
+    expect(versionRows[15]['success'], 1);
+    expect(versionRows[16]['version'], 17);
+    expect(
+      versionRows[16]['filename'],
+      '017_message_delete_foreign_key_index.sql',
+    );
+    expect(versionRows[16]['checksum_length'], greaterThan(20));
+    expect(versionRows[16]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -141,7 +449,7 @@ void main() {
     expect(_columnExists(db, 'sessions', 'eval_notes'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_expected_output'), isTrue);
     expect(_columnExists(db, 'sessions', 'source_state'), isTrue);
-    expect(_indexExists(db, 'idx_sessions_source_state'), isTrue);
+    expect(_indexExists(db, 'idx_sessions_source_state'), isFalse);
     expect(_columnExists(db, 'sessions', 'eval_reviewed_at_utc'), isTrue);
     expect(_columnExists(db, 'sessions', 'eval_updated_at_utc'), isTrue);
     expect(_indexExists(db, 'idx_sessions_session_id'), isTrue);
@@ -150,9 +458,14 @@ void main() {
   test('migration 15 adds branch-aware usage schema', () async {
     final result = await DatabaseMigrator(
       sqlRoot: Directory('../sql'),
+      supportedSchemaVersion: 15,
     ).openAndMigrate(dbFile);
 
-    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
+    expect(
+      result.canStartNormalUi,
+      isTrue,
+      reason: '${result.fatalError?.summary}: ${result.fatalError?.details}',
+    );
     expect(result.lastAppliedSchemaVersion, 15);
 
     final db = openFileBackedDatabase(dbFile);
@@ -280,6 +593,7 @@ void main() {
     );
     final version14 = await DatabaseMigrator(
       sqlRoot: upgradeSqlRoot,
+      supportedSchemaVersion: 14,
     ).openAndMigrate(upgradeDbFile);
     expect(version14.canStartNormalUi, isTrue);
     expect(version14.lastAppliedSchemaVersion, 14);
@@ -301,6 +615,7 @@ void main() {
 
     final upgraded = await DatabaseMigrator(
       sqlRoot: upgradeSqlRoot,
+      supportedSchemaVersion: 15,
     ).openAndMigrate(upgradeDbFile);
     expect(upgraded.canStartNormalUi, isTrue);
     expect(upgraded.lastAppliedSchemaVersion, 15);
@@ -319,6 +634,157 @@ void main() {
           .select('select count(*) as count from usage_events')
           .single['count'],
       0,
+    );
+  });
+
+  test('adds persisted usage pricing and maintenance schema', () async {
+    final freshResult = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+    ).openAndMigrate(dbFile);
+
+    expect(
+      freshResult.canStartNormalUi,
+      isTrue,
+      reason: freshResult.fatalError?.details,
+    );
+    expect(freshResult.lastAppliedSchemaVersion, 17);
+
+    final freshDb = openFileBackedDatabase(dbFile);
+    addTearDown(freshDb.close);
+    _expectPersistedUsageSchema(freshDb);
+
+    final upgradeSqlRoot = await _copySqlRoot(tempDir);
+    final copiedMigration = File(
+      p.join(
+        upgradeSqlRoot.path,
+        'migration',
+        '016_persisted_usage_pricing_maintenance.sql',
+      ),
+    );
+    final migrationBytes = await copiedMigration.readAsBytes();
+    await copiedMigration.delete();
+    final upgradeDbFile = File(p.join(tempDir.path, 'upgrade.sqlite'));
+    final legacyResult = await DatabaseMigrator(
+      sqlRoot: upgradeSqlRoot,
+      supportedSchemaVersion: 15,
+    ).openAndMigrate(upgradeDbFile);
+    expect(legacyResult.canStartNormalUi, isTrue);
+    expect(legacyResult.lastAppliedSchemaVersion, 15);
+    await copiedMigration.writeAsBytes(migrationBytes);
+
+    final upgradedResult = await DatabaseMigrator(
+      sqlRoot: upgradeSqlRoot,
+    ).openAndMigrate(upgradeDbFile);
+    expect(
+      upgradedResult.canStartNormalUi,
+      isTrue,
+      reason: upgradedResult.fatalError?.details,
+    );
+    expect(upgradedResult.lastAppliedSchemaVersion, 17);
+
+    final upgradedDb = openFileBackedDatabase(upgradeDbFile);
+    addTearDown(upgradedDb.close);
+    _expectPersistedUsageSchema(upgradedDb);
+    upgradedDb.execute('drop table usage_path_context_aliases');
+    upgradedDb.close();
+    final missingEvidenceTable = await DatabaseMigrator(
+      sqlRoot: upgradeSqlRoot,
+    ).openAndMigrate(upgradeDbFile);
+    expect(missingEvidenceTable.canStartNormalUi, isFalse);
+    expect(
+      missingEvidenceTable.fatalError?.details,
+      contains('usage_path_context_aliases'),
+    );
+  });
+
+  test('does not apply migrations newer than its supported schema', () async {
+    final result = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+      supportedSchemaVersion: 15,
+    ).openAndMigrate(dbFile);
+
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.details);
+    expect(result.lastAppliedSchemaVersion, 15);
+    final db = openFileBackedDatabase(dbFile);
+    addTearDown(db.close);
+    expect(_tableExists(db, 'database_generations'), isFalse);
+  });
+
+  test('migration drops unused usage model time index', () async {
+    final sqlRoot = await _copySqlRoot(tempDir);
+    final migration = File(
+      p.join(
+        sqlRoot.path,
+        'migration',
+        '016_persisted_usage_pricing_maintenance.sql',
+      ),
+    );
+    final migrationBytes = await migration.readAsBytes();
+    await migration.delete();
+    final legacyResult = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+      supportedSchemaVersion: 15,
+    ).openAndMigrate(dbFile);
+    expect(legacyResult.canStartNormalUi, isTrue);
+    final db = openFileBackedDatabase(dbFile);
+    db.execute(
+      '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        created_at_utc, updated_at_utc
+      ) values ('index-session', 'windows', 'index.jsonl', 'index.jsonl',
+                'index.jsonl', ?, ?)
+      ''',
+      ['2026-09-04T08:00:00Z', '2026-09-04T08:00:00Z'],
+    );
+    db.execute(
+      '''
+      insert into usage_events (
+        session_row_id, source_record_ordinal, epoch, occurred_at_utc, model,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens, branch_scope,
+        derivation, event_fingerprint
+      ) values ('index-session', 1, 0, ?, 'model', 1, 0, 0, 1, 0, 2,
+                'local', 'last_token_usage', ?)
+      ''',
+      ['2026-09-04T08:00:00Z', 'a' * 64],
+    );
+    expect(_indexExists(db, 'idx_usage_events_model_time'), isTrue);
+    expect(
+      db
+          .select('select count(*) as count from billable_usage_events')
+          .single['count'],
+      1,
+    );
+    db.close();
+
+    await migration.writeAsBytes(migrationBytes);
+    final result = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.details);
+    final migrated = openFileBackedDatabase(dbFile);
+    addTearDown(migrated.close);
+    expect(_indexExists(migrated, 'idx_usage_events_model_time'), isFalse);
+    expect(
+      migrated
+          .select('pragma table_info(usage_events)')
+          .where((row) => (row['pk'] as int) > 0)
+          .map((row) => row['name'])
+          .toList(),
+      ['session_row_id', 'source_record_ordinal'],
+    );
+    expect(
+      migrated
+          .select('select count(*) as count from usage_events')
+          .single['count'],
+      1,
+    );
+    expect(
+      migrated
+          .select('select count(*) as count from billable_usage_events')
+          .single['count'],
+      1,
     );
   });
 
@@ -446,7 +912,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.summary,
       );
-      expect(result.lastAppliedSchemaVersion, 15);
+      expect(result.lastAppliedSchemaVersion, 17);
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
       final rows = migrated.select(
@@ -493,7 +959,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.summary,
       );
-      expect(result.lastAppliedSchemaVersion, 15);
+      expect(result.lastAppliedSchemaVersion, 17);
 
       final db = openFileBackedDatabase(dbFile);
       addTearDown(db.close);
@@ -562,7 +1028,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 15);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 17);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -620,6 +1086,7 @@ void main() {
     await copiedBranchUsageMigration.delete();
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
+      supportedSchemaVersion: 10,
     ).openAndMigrate(dbFile);
     expect(
       firstRun.canStartNormalUi,
@@ -770,12 +1237,24 @@ void main() {
 
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
+      supportedSchemaVersion: 15,
     ).openAndMigrate(dbFile);
-    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
+    expect(
+      result.canStartNormalUi,
+      isTrue,
+      reason: '${result.fatalError?.summary}: ${result.fatalError?.details}',
+    );
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
 
+    // The historical migration has passed above. Current search uses the
+    // persisted activity column introduced by the current schema.
+    migrated.execute(
+      File(
+        '../sql/migration/016_persisted_usage_pricing_maintenance.sql',
+      ).readAsStringSync(),
+    );
     MessageSearchIndex(migrated).backfillBatch(limit: 10);
     expect(
       SessionSearchIndex(migrated).search(
@@ -832,6 +1311,7 @@ void main() {
       await copiedBranchUsageMigration.delete();
       final firstRun = await DatabaseMigrator(
         sqlRoot: sqlRoot,
+        supportedSchemaVersion: 10,
       ).openAndMigrate(dbFile);
       expect(
         firstRun.canStartNormalUi,
@@ -912,6 +1392,7 @@ void main() {
 
       final result = await DatabaseMigrator(
         sqlRoot: sqlRoot,
+        supportedSchemaVersion: 15,
       ).openAndMigrate(dbFile);
       expect(
         result.canStartNormalUi,
@@ -928,6 +1409,12 @@ void main() {
         1,
       );
 
+      // Exercise today's project repository after proving the historical upgrade.
+      migrated.execute(
+        File(
+          '../sql/migration/016_persisted_usage_pricing_maintenance.sql',
+        ).readAsStringSync(),
+      );
       ProjectTagStateStore(migrated).recalculateSessionProjects();
 
       final row = migrated.select(
@@ -950,6 +1437,7 @@ void main() {
     }
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
+      supportedSchemaVersion: 15,
     ).openAndMigrate(dbFile);
     expect(
       firstRun.canStartNormalUi,
@@ -1197,6 +1685,7 @@ void main() {
     }
     final firstRun = await DatabaseMigrator(
       sqlRoot: sqlRoot,
+      supportedSchemaVersion: 10,
     ).openAndMigrate(dbFile);
     expect(
       firstRun.canStartNormalUi,
@@ -1247,10 +1736,10 @@ void main() {
     ).copy(branchUsageMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 15);
+    expect(migrator.supportedSchemaVersion, 17);
     final result = await migrator.openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
-    expect(result.lastAppliedSchemaVersion, 15);
+    expect(result.lastAppliedSchemaVersion, 17);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -1367,8 +1856,12 @@ void main() {
       final result = await DatabaseMigrator(
         sqlRoot: sqlRoot,
       ).openAndMigrate(dbFile);
-      expect(result.canStartNormalUi, isTrue);
-      expect(result.lastAppliedSchemaVersion, 15);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: '${result.fatalError?.summary}: ${result.fatalError?.details}',
+      );
+      expect(result.lastAppliedSchemaVersion, 17);
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
@@ -1493,7 +1986,11 @@ void main() {
     final result = await DatabaseMigrator(
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile);
-    expect(result.canStartNormalUi, isTrue);
+    expect(
+      result.canStartNormalUi,
+      isTrue,
+      reason: '${result.fatalError?.summary}: ${result.fatalError?.details}',
+    );
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -1661,6 +2158,750 @@ bool _indexExists(Database db, String indexName) {
   );
   return result.isNotEmpty;
 }
+
+void _expectPersistedUsageSchema(Database db) {
+  const expectedColumns = <String, List<String>>{
+    'database_generations': [
+      'id',
+      'source_schema_version',
+      'target_schema_version',
+      'source_fingerprint',
+      'state',
+      'created_at_utc',
+      'activated_at_utc',
+      'completed_at_utc',
+      'validation_report_json',
+      'error_message',
+    ],
+    'database_state': [
+      'id',
+      'active_usage_generation_id',
+      'last_optimized_schema_version',
+      'project_rules_version',
+      'pricing_settings_revision',
+      'pricing_policy_json',
+      'normal_writes_resumed_at_utc',
+      'updated_at_utc',
+    ],
+    'maintenance_jobs': [
+      'id',
+      'job_type',
+      'database_generation_id',
+      'state',
+      'phase',
+      'completed_units',
+      'total_units',
+      'last_processed_rowid',
+      'status_message',
+      'run_token',
+      'owner_process_id',
+      'heartbeat_at_utc',
+      'lease_expires_at_utc',
+      'attempt_count',
+      'started_at_utc',
+      'updated_at_utc',
+      'finished_at_utc',
+      'error_message',
+      'payload_json',
+      'created_at_utc',
+    ],
+    'maintenance_schedules': [
+      'job_type',
+      'enabled',
+      'interval_seconds',
+      'last_attempt_at_utc',
+      'last_success_at_utc',
+      'next_due_at_utc',
+      'retry_count',
+      'last_error',
+      'updated_at_utc',
+    ],
+    'usage_path_contexts': [
+      'id',
+      'display_path_raw',
+      'platform_path_raw',
+      'unc_path_raw',
+      'display_path_key',
+      'platform_path_key',
+      'unc_path_key',
+      'normalization_version',
+      'detected_project_id',
+      'detected_project_source',
+      'mask_project_id',
+      'effective_project_id',
+      'resolution_source',
+      'project_rules_version',
+      'created_at_utc',
+      'updated_at_utc',
+    ],
+    'usage_events_next': [
+      'session_row_id',
+      'source_record_ordinal',
+      'rollout_ordinal',
+      'turn_ordinal',
+      'epoch',
+      'occurred_at_utc',
+      'model',
+      'path_context_id',
+      'input_tokens',
+      'cached_input_tokens',
+      'cache_write_input_tokens',
+      'output_tokens',
+      'reasoning_output_tokens',
+      'total_tokens',
+      'branch_scope',
+      'derivation',
+      'event_fingerprint',
+    ],
+    'price_catalog_snapshots': [
+      'id',
+      'source',
+      'started_at_utc',
+      'finished_at_utc',
+      'status',
+      'http_status',
+      'model_count',
+      'declared_total_count',
+      'page_count',
+      'completeness_status',
+      'catalog_generation',
+      'payload_sha256',
+      'error_message',
+    ],
+    'model_price_periods': [
+      'id',
+      'source',
+      'model_id',
+      'canonical_slug',
+      'model_name',
+      'provider',
+      'prompt_price_per_token',
+      'completion_price_per_token',
+      'input_cache_read_price_per_token',
+      'input_cache_write_price_per_token',
+      'internal_reasoning_price_per_token',
+      'request_price',
+      'image_price',
+      'web_search_price',
+      'additional_prices_json',
+      'pricing_fingerprint',
+      'raw_pricing_json',
+      'valid_from_utc',
+      'valid_to_utc',
+      'first_snapshot_id',
+      'last_seen_snapshot_id',
+    ],
+    'provider_price_rules': [
+      'id',
+      'price_period_id',
+      'provider_order',
+      'prompt_tokens_min',
+      'utc_start_minute',
+      'utc_end_minute',
+      'utc_weekdays',
+      'prompt_price_per_token',
+      'completion_price_per_token',
+      'input_cache_read_price_per_token',
+      'input_cache_write_price_per_token',
+      'internal_reasoning_price_per_token',
+      'request_price',
+      'image_price',
+      'web_search_price',
+      'additional_prices_json',
+      'pricing_fingerprint',
+      'raw_rule_json',
+    ],
+    'local_price_override_periods': [
+      'id',
+      'model_id',
+      'prompt_price_per_token',
+      'completion_price_per_token',
+      'input_cache_read_price_per_token',
+      'input_cache_write_price_per_token',
+      'internal_reasoning_price_per_token',
+      'request_price',
+      'image_price',
+      'web_search_price',
+      'settings_fingerprint',
+      'valid_from_utc',
+      'valid_to_utc',
+      'first_settings_revision',
+      'last_seen_settings_revision',
+    ],
+    'usage_path_context_aliases': [
+      'path_context_id',
+      'display_path_raw',
+      'platform_path_raw',
+      'unc_path_raw',
+    ],
+    'usage_context_project_candidates': [
+      'generation_id',
+      'path_context_id',
+      'historical_project_id',
+      'project_name_snapshot',
+      'event_count',
+      'malformed_timestamp_count',
+      'latest_event_epoch_us',
+      'latest_event_time_raw',
+      'latest_source_rowid',
+      'latest_session_id_snapshot',
+      'latest_source_record_ordinal',
+    ],
+    'usage_session_daily': [
+      'id',
+      'session_id',
+      'day_utc',
+      'model_key',
+      'path_context_id',
+      'branch_scope',
+      'input_tokens',
+      'cached_input_tokens',
+      'cache_write_input_tokens',
+      'output_tokens',
+      'reasoning_output_tokens',
+      'total_tokens',
+      'estimated_cost_text',
+      'cost_status',
+      'provider_price_period_id',
+      'provider_rule_ids_json',
+      'local_override_period_id',
+      'pricing_resolution_method',
+      'pricing_catalog_snapshot_id',
+      'cost_projection_version',
+      'updated_at_utc',
+    ],
+    'usage_cost_dirty_partitions': [
+      'session_id',
+      'day_utc',
+      'model_key',
+      'reason',
+      'target_cost_projection_version',
+      'created_at_utc',
+      'updated_at_utc',
+    ],
+  };
+  for (final MapEntry(key: table, value: columns) in expectedColumns.entries) {
+    expect(_tableExists(db, table), isTrue, reason: '$table should exist');
+    expect(
+      db.select('pragma table_info($table)').map((row) => row['name']).toList(),
+      columns,
+      reason: '$table columns should match the version-16 contract',
+    );
+  }
+
+  final generation = db.select('''
+        select g.state, s.active_usage_generation_id
+        from database_state s
+        join database_generations g
+          on g.id = s.active_usage_generation_id
+        where s.id = 1
+        ''').single;
+  expect(generation['state'], 'legacy');
+  expect(generation['active_usage_generation_id'], isNotNull);
+
+  for (final index in [
+    'idx_maintenance_jobs_active_type',
+    'idx_maintenance_jobs_running',
+    'idx_usage_path_contexts_identity',
+    'idx_project_path_masks_identity',
+    'idx_usage_session_daily_basis',
+    'idx_usage_session_daily_billable_day',
+    'idx_usage_session_daily_model_day',
+    'idx_model_price_period_current',
+    'idx_model_price_period_start',
+    'idx_provider_price_rules_period_order',
+    'idx_local_price_override_current',
+    'idx_local_price_override_start',
+    'idx_usage_cost_dirty_worker',
+  ]) {
+    expect(_indexExists(db, index), isTrue, reason: '$index should exist');
+  }
+  expect(_indexExists(db, 'idx_usage_session_daily_session'), isFalse);
+  expect(_indexExists(db, 'idx_model_price_period_lookup'), isFalse);
+  for (final obsolete in [
+    'idx_maintenance_jobs_state_updated',
+    'idx_price_catalog_snapshots_source_finished',
+    'idx_session_cache_repair_manifest_category',
+    'idx_messages_session',
+    'idx_sessions_thread_source',
+    'idx_sessions_source_state',
+    'idx_sessions_thread_name',
+  ]) {
+    expect(
+      _indexExists(db, obsolete),
+      isFalse,
+      reason: '$obsolete has no independent production query benefit',
+    );
+  }
+  expect(_columnExists(db, 'sessions', 'detected_project_id'), isTrue);
+  expect(
+    _columnExists(db, 'database_state', 'last_optimized_schema_version'),
+    isTrue,
+  );
+  expect(_columnExists(db, 'database_generations', 'completed_at_utc'), isTrue);
+  expect(_columnExists(db, 'database_generations', 'error_message'), isTrue);
+  expect(
+    _schemaSql(db, 'index', 'idx_maintenance_jobs_active_type'),
+    contains("where state in ('pending', 'running')"),
+  );
+  expect(
+    _schemaSql(db, 'index', 'idx_usage_session_daily_basis'),
+    allOf(
+      contains('ifnull(provider_price_period_id, 0)'),
+      contains('provider_rule_ids_json'),
+      contains('ifnull(local_override_period_id, 0)'),
+    ),
+  );
+  expect(
+    _schemaSql(db, 'index', 'idx_usage_session_daily_billable_day'),
+    contains("where branch_scope = 'local'"),
+  );
+
+  final contextProjectForeignKeys = db
+      .select('pragma foreign_key_list(usage_path_contexts)')
+      .where(
+        (row) => const {
+          'detected_project_id',
+          'mask_project_id',
+          'effective_project_id',
+        }.contains(row['from']),
+      );
+  expect(contextProjectForeignKeys, hasLength(3));
+  expect(
+    contextProjectForeignKeys.every(
+      (row) => (row['on_delete'] as String).toLowerCase() == 'set null',
+    ),
+    isTrue,
+  );
+
+  final sessionForeignKey = db
+      .select('pragma foreign_key_list(usage_session_daily)')
+      .singleWhere((row) => row['from'] == 'session_id');
+  expect((sessionForeignKey['on_delete'] as String).toLowerCase(), 'cascade');
+  final contextForeignKey = db
+      .select('pragma foreign_key_list(usage_events_next)')
+      .singleWhere((row) => row['from'] == 'path_context_id');
+  expect(contextForeignKey['table'], 'usage_path_contexts');
+
+  expect(
+    () => db.execute(
+      '''
+      insert into maintenance_jobs (
+        job_type, state, phase, completed_units, attempt_count,
+        created_at_utc, updated_at_utc
+      ) values ('usage_migration', 'pending', 'preflight', 0, 0, ?, ?)
+      ''',
+      ['2026-09-04T08:00:00Z', '2026-09-04T08:00:00Z'],
+    ),
+    returnsNormally,
+  );
+  expect(
+    () => db.execute(
+      '''
+      insert into maintenance_jobs (
+        job_type, state, phase, completed_units, attempt_count,
+        created_at_utc, updated_at_utc
+      ) values ('usage_migration', 'running', 'copy', 0, 1, ?, ?)
+      ''',
+      ['2026-09-04T08:01:00Z', '2026-09-04T08:01:00Z'],
+    ),
+    throwsA(isA<SqliteException>()),
+  );
+
+  expect(
+    () => db.execute(
+      '''
+      insert into usage_path_contexts (
+        display_path_raw, platform_path_raw, unc_path_raw,
+        display_path_key, platform_path_key, unc_path_key,
+        normalization_version, resolution_source, project_rules_version,
+        created_at_utc, updated_at_utc
+      ) values ('', '', '', '', '', '', 1, 'unassigned', 1, ?, ?)
+      ''',
+      ['2026-09-04T08:00:00Z', '2026-09-04T08:00:00Z'],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'the all-empty sentinel context is inserted by the migration',
+  );
+
+  db.execute(
+    '''
+    insert into price_catalog_snapshots (
+      source, started_at_utc, finished_at_utc, status, model_count,
+      page_count, completeness_status
+    ) values ('openrouter', ?, ?, 'succeeded', 1, 1, 'complete_for_updates')
+    ''',
+    ['2026-09-04T08:00:00Z', '2026-09-04T08:00:01Z'],
+  );
+  final snapshotId = db.lastInsertRowId;
+
+  expect(
+    () => db.execute(
+      '''
+        insert into model_price_periods (
+          source, model_id, provider, pricing_fingerprint, raw_pricing_json,
+          valid_from_utc, valid_to_utc, first_snapshot_id,
+          last_seen_snapshot_id
+        ) values ('openrouter', 'invalid', 'provider', 'hash', '{}',
+                  '2026-09-04T09:00:00Z', '2026-09-04T08:00:00Z', ?, ?)
+        ''',
+      [snapshotId, snapshotId],
+    ),
+    throwsA(isA<SqliteException>()),
+  );
+
+  db.execute(
+    '''
+    insert into model_price_periods (
+      source, model_id, provider, pricing_fingerprint, raw_pricing_json,
+      valid_from_utc, first_snapshot_id, last_seen_snapshot_id
+    ) values ('openrouter', 'model', 'provider', 'provider-hash', '{}', ?, ?, ?)
+    ''',
+    ['2026-09-04T08:00:00Z', snapshotId, snapshotId],
+  );
+  final providerPeriodId = db.lastInsertRowId;
+  expect(
+    () => db.execute(
+      '''
+      insert into model_price_periods (
+        source, model_id, provider, pricing_fingerprint, raw_pricing_json,
+        valid_from_utc, valid_to_utc, first_snapshot_id, last_seen_snapshot_id
+      ) values ('openrouter', 'model', 'provider', 'overlap', '{}', ?, ?, ?, ?)
+      ''',
+      ['2026-09-04T08:30:00Z', '2026-09-04T08:45:00Z', snapshotId, snapshotId],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'provider price periods cannot overlap',
+  );
+  db.execute('update model_price_periods set valid_to_utc = ? where id = ?', [
+    '2026-09-04T09:00:00Z',
+    providerPeriodId,
+  ]);
+  db.execute(
+    '''
+    insert into model_price_periods (
+      source, model_id, provider, pricing_fingerprint, raw_pricing_json,
+      valid_from_utc, first_snapshot_id, last_seen_snapshot_id
+    ) values ('openrouter', 'model', 'provider', 'next-hash', '{}', ?, ?, ?)
+    ''',
+    ['2026-09-04T09:00:00Z', snapshotId, snapshotId],
+  );
+  final nextProviderPeriodId = db.lastInsertRowId;
+  expect(
+    () => db.execute(
+      'update model_price_periods set valid_from_utc = ? where id = ?',
+      ['2026-09-04T08:59:00Z', nextProviderPeriodId],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'provider price period updates cannot create overlaps',
+  );
+  db.execute(
+    '''
+    insert into provider_price_rules (
+      price_period_id, provider_order, pricing_fingerprint, raw_rule_json
+    ) values (?, 0, 'rule-hash', '{}')
+    ''',
+    [providerPeriodId],
+  );
+  final providerRuleId = db.lastInsertRowId;
+  db.execute(
+    '''
+    insert into local_price_override_periods (
+      model_id, prompt_price_per_token, settings_fingerprint,
+      valid_from_utc, first_settings_revision, last_seen_settings_revision
+    ) values ('model', '0.000001', 'local-hash', ?, 1, 1)
+    ''',
+    ['2026-09-04T08:00:00Z'],
+  );
+  final localPeriodId = db.lastInsertRowId;
+  expect(
+    () => db.execute(
+      '''
+      insert into local_price_override_periods (
+        model_id, prompt_price_per_token, settings_fingerprint,
+        valid_from_utc, valid_to_utc,
+        first_settings_revision, last_seen_settings_revision
+      ) values ('model', '0.000002', 'local-overlap', ?, ?, 2, 2)
+      ''',
+      ['2026-09-04T08:30:00Z', '2026-09-04T08:45:00Z'],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'local override periods cannot overlap',
+  );
+  db.execute(
+    'update local_price_override_periods set valid_to_utc = ? where id = ?',
+    ['2026-09-04T09:00:00Z', localPeriodId],
+  );
+  db.execute(
+    '''
+    insert into local_price_override_periods (
+      model_id, prompt_price_per_token, settings_fingerprint,
+      valid_from_utc, first_settings_revision, last_seen_settings_revision
+    ) values ('model', '0.000002', 'local-next', ?, 2, 2)
+    ''',
+    ['2026-09-04T09:00:00Z'],
+  );
+  final nextLocalPeriodId = db.lastInsertRowId;
+  expect(
+    () => db.execute(
+      'update local_price_override_periods set valid_from_utc = ? where id = ?',
+      ['2026-09-04T08:59:00Z', nextLocalPeriodId],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'local override updates cannot create overlaps',
+  );
+
+  db.execute(
+    '''
+    insert into sessions (
+      id, source_type, source_file_path, display_path, platform_path,
+      created_at_utc, updated_at_utc
+    ) values ('projection-session', 'windows', 'projection.jsonl',
+              'projection.jsonl', 'projection.jsonl', ?, ?)
+    ''',
+    ['2026-09-04T08:00:00Z', '2026-09-04T08:00:00Z'],
+  );
+  final sentinelContextId =
+      db.select('''
+        select id from usage_path_contexts
+        where normalization_version = 1
+          and display_path_key = ''
+          and platform_path_key = ''
+          and unc_path_key = ''
+        ''').single['id']
+          as int;
+
+  expect(
+    () => db.execute(
+      '''
+      insert into usage_session_daily (
+        session_id, day_utc, model_key, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens,
+        estimated_cost_text, cost_status, provider_price_period_id,
+        pricing_resolution_method, pricing_catalog_snapshot_id,
+        cost_projection_version, updated_at_utc
+      ) values ('projection-session', '2026-09-04', 'known-basis', ?, 'local',
+                1, 0, 0, 0, 0, 1, null, 'unknown', ?, 'provider', ?, 1, ?)
+      ''',
+      [
+        sentinelContextId,
+        nextProviderPeriodId,
+        snapshotId,
+        '2026-09-04T09:00:00Z',
+      ],
+    ),
+    returnsNormally,
+    reason: 'unknown cost retains its resolved historical price basis',
+  );
+
+  expect(
+    () => db.execute(
+      '''
+      insert into usage_session_daily (
+        session_id, day_utc, model_key, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens,
+        estimated_cost_text, cost_status, provider_price_period_id,
+        provider_rule_ids_json, pricing_resolution_method,
+        pricing_catalog_snapshot_id, cost_projection_version, updated_at_utc
+      ) values ('projection-session', '2026-09-04', 'mismatched-rule', ?,
+                'local', 1, 0, 0, 0, 0, 1, '0.000001', 'complete', ?, ?,
+                'provider_rule', ?, 1, ?)
+      ''',
+      [
+        sentinelContextId,
+        nextProviderPeriodId,
+        '[$providerRuleId]',
+        snapshotId,
+        '2026-09-04T09:00:00Z',
+      ],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'the recorded provider rule must belong to the recorded period',
+  );
+
+  db.execute(
+    '''
+    insert into usage_session_daily (
+      session_id, day_utc, model_key, path_context_id, branch_scope,
+      input_tokens, cached_input_tokens, cache_write_input_tokens,
+      output_tokens, reasoning_output_tokens, total_tokens,
+      estimated_cost_text, cost_status, provider_price_period_id,
+      provider_rule_ids_json, pricing_resolution_method,
+      pricing_catalog_snapshot_id, cost_projection_version, updated_at_utc
+    ) values ('projection-session', '2026-09-04', 'rule-reference', ?,
+              'local', 1, 0, 0, 0, 0, 1, '0.000001', 'complete', ?, ?,
+              'provider_rule', ?, 1, ?)
+    ''',
+    [
+      sentinelContextId,
+      providerPeriodId,
+      '[$providerRuleId]',
+      snapshotId,
+      '2026-09-04T08:30:00Z',
+    ],
+  );
+  expect(
+    () => db.execute(
+      'update provider_price_rules set price_period_id = ? where id = ?',
+      [nextProviderPeriodId, providerRuleId],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'provider price rules are immutable historical basis records',
+  );
+  db.execute(
+    '''
+    insert into provider_price_rules (
+      price_period_id, provider_order, pricing_fingerprint, raw_rule_json
+    ) values (?, 1, 'second-rule', '{}')
+  ''',
+    [providerPeriodId],
+  );
+  final secondRuleId = db.lastInsertRowId;
+  void updateBasis(String basis) => db.execute(
+    '''
+    update usage_session_daily set provider_rule_ids_json = ?
+    where model_key = 'rule-reference'
+  ''',
+    [basis],
+  );
+  for (final invalid in [
+    '[999999]',
+    '[$providerRuleId,$providerRuleId]',
+    '[$secondRuleId,$providerRuleId]',
+    '["$providerRuleId"]',
+    '[$providerRuleId.0]',
+    '[0]',
+    '[-1]',
+    '{}',
+    'null',
+    'not-json',
+    '[$providerRuleId, $secondRuleId]',
+  ]) {
+    expect(
+      () => updateBasis(invalid),
+      throwsA(isA<SqliteException>()),
+      reason:
+          'basis must be a canonical ordered set of valid period rule IDs: $invalid',
+    );
+  }
+  updateBasis('[$providerRuleId,$secondRuleId]');
+  expect(
+    () => db.execute('delete from provider_price_rules where id = ?', [
+      secondRuleId,
+    ]),
+    throwsA(isA<SqliteException>()),
+    reason: 'historical rule evidence cannot be deleted while referenced',
+  );
+  updateBasis('[$providerRuleId]');
+  db.execute('delete from provider_price_rules where id = ?', [secondRuleId]);
+
+  expect(
+    () => db.execute(
+      '''
+      insert into usage_session_daily (
+        session_id, day_utc, model_key, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens,
+        estimated_cost_text, cost_status, pricing_resolution_method,
+        cost_projection_version, updated_at_utc
+      ) values ('projection-session', '2026-09-04', '', ?, 'local',
+                -1, 0, 0, 0, 0, 0, null, 'unknown', 'unknown', 1, ?)
+      ''',
+      [sentinelContextId, '2026-09-04T08:00:00Z'],
+    ),
+    throwsA(isA<SqliteException>()),
+  );
+
+  expect(
+    () => db.execute(
+      '''
+      insert into usage_session_daily (
+        session_id, day_utc, model_key, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens,
+        estimated_cost_text, cost_status, provider_price_period_id,
+        local_override_period_id, pricing_resolution_method,
+        pricing_catalog_snapshot_id, cost_projection_version, updated_at_utc
+      ) values ('projection-session', '2026-09-04', 'model', ?, 'local',
+                1, 0, 0, 0, 0, 1, '0.000001', 'complete', ?, ?,
+                'provider', ?, 1, ?)
+      ''',
+      [
+        sentinelContextId,
+        providerPeriodId,
+        localPeriodId,
+        snapshotId,
+        '2026-09-04T08:00:00Z',
+      ],
+    ),
+    throwsA(isA<SqliteException>()),
+    reason: 'provider and local price bases are mutually exclusive',
+  );
+
+  db.execute(
+    '''
+    insert into usage_session_daily (
+      session_id, day_utc, model_key, path_context_id, branch_scope,
+      input_tokens, cached_input_tokens, cache_write_input_tokens,
+      output_tokens, reasoning_output_tokens, total_tokens,
+      estimated_cost_text, cost_status, pricing_resolution_method,
+      cost_projection_version, updated_at_utc
+    ) values ('projection-session', '2026-09-04', '', ?, 'local',
+              1, 0, 0, 0, 0, 1, null, 'unknown', 'unknown', 1, ?)
+    ''',
+    [sentinelContextId, '2026-09-04T08:00:00Z'],
+  );
+  expect(
+    () => db.execute(
+      '''
+      insert into usage_session_daily (
+        session_id, day_utc, model_key, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens,
+        estimated_cost_text, cost_status, pricing_resolution_method,
+        cost_projection_version, updated_at_utc
+      ) values ('projection-session', '2026-09-04', '', ?, 'local',
+                1, 0, 0, 0, 0, 1, null, 'unknown', 'unknown', 1, ?)
+      ''',
+      [sentinelContextId, '2026-09-04T08:01:00Z'],
+    ),
+    throwsA(isA<SqliteException>()),
+  );
+
+  db.execute(
+    '''
+    insert into usage_cost_dirty_partitions (
+      session_id, day_utc, model_key, reason,
+      target_cost_projection_version, created_at_utc, updated_at_utc
+    ) values ('projection-session', '2026-09-04', '', 'algorithm', 2, ?, ?)
+    ''',
+    ['2026-09-04T08:00:00Z', '2026-09-04T08:00:00Z'],
+  );
+  db.execute("delete from sessions where id = 'projection-session'");
+  expect(
+    db
+        .select('select count(*) as count from usage_session_daily')
+        .single['count'],
+    0,
+  );
+  expect(
+    db
+        .select('select count(*) as count from usage_cost_dirty_partitions')
+        .single['count'],
+    0,
+  );
+}
+
+String _schemaSql(Database db, String type, String name) =>
+    (db.select('select sql from sqlite_master where type = ? and name = ?', [
+              type,
+              name,
+            ]).single['sql']
+            as String)
+        .toLowerCase()
+        .replaceAll(RegExp(r'\s+'), ' ');
 
 Future<Directory> _copySqlRoot(Directory tempDir) async {
   final target = Directory('${tempDir.path}${Platform.pathSeparator}sql');

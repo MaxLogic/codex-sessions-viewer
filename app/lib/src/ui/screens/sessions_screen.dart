@@ -149,6 +149,9 @@ class SessionsScreen extends StatefulWidget {
     this.onTableStateChanged,
     this.initialStatusMessage = '',
     this.autoRefreshToken = 0,
+    this.pricingRevision = 0,
+    this.pricingUpdating = false,
+    this.onLoadPersistedCosts,
     this.openTarget,
     this.openTargetSerial = 0,
     this.now = DateTime.now,
@@ -174,6 +177,10 @@ class SessionsScreen extends StatefulWidget {
   final SessionTableStateChanged? onTableStateChanged;
   final String initialStatusMessage;
   final int autoRefreshToken;
+  final int pricingRevision;
+  final bool pricingUpdating;
+  final Future<Map<String, UsageCostEstimate>?> Function(Iterable<String>)?
+  onLoadPersistedCosts;
   final SessionOpenTarget? openTarget;
   final int openTargetSerial;
   final DateTime Function() now;
@@ -214,6 +221,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _selectedDetailWatchGeneration = 0;
   var _selectedDetailLoadGeneration = 0;
   late List<SessionRowViewModel> _rows;
+  var _pricingLoadGeneration = 0;
+  var _pricingCostsPending = false;
+  var _pricingInvalidated = false;
   late Map<String, double> _columnWidths;
   late List<SessionTableSortSettings> _sorts;
   late int _handledAutoRefreshToken;
@@ -255,11 +265,20 @@ class _SessionsScreenState extends State<SessionsScreen> {
     });
     _configureBackgroundRescanTimer();
     _queueOpenTargetFromWidget();
+    if (widget.pricingRevision > 0) {
+      _pricingInvalidated = true;
+      _queuePersistedCostRefresh();
+    }
   }
 
   @override
   void didUpdateWidget(covariant SessionsScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.pricingRevision != widget.pricingRevision ||
+        oldWidget.pricingUpdating != widget.pricingUpdating) {
+      _pricingInvalidated = true;
+      _queuePersistedCostRefresh();
+    }
     if (!_hasRefreshOwnedRows && oldWidget.initialRows != widget.initialRows) {
       _replaceRows(widget.initialRows);
       _retainSelection();
@@ -681,6 +700,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
       mainCostText,
       ...childCostTexts,
     ]);
+    final subagentCostUpdating = children.any((child) => child.costUpdating);
+    final subagentCostPartial = children.any(
+      (child) => child.costPartialUnsupportedUnits,
+    );
     return parent.copyWithUsageRollup(
       SessionUsageRollup(
         mainTokens: parent.totalTokens,
@@ -692,12 +715,19 @@ class _SessionsScreenState extends State<SessionsScreen> {
         mainCostUnknown: mainCostText == null,
         subagentCostUnknown: subagentCostText == null,
         totalCostUnknown: totalCostText == null,
+        mainCostUpdating: parent.costUpdating,
+        subagentCostUpdating: subagentCostUpdating,
+        totalCostUpdating: parent.costUpdating || subagentCostUpdating,
+        mainCostPartialUnsupportedUnits: parent.costPartialUnsupportedUnits,
+        subagentCostPartialUnsupportedUnits: subagentCostPartial,
+        totalCostPartialUnsupportedUnits:
+            parent.costPartialUnsupportedUnits || subagentCostPartial,
       ),
     );
   }
 
   String? _knownCostText(SessionRowViewModel row) {
-    if (row.costUnknown) {
+    if (row.costUnknown || row.costUpdating) {
       return null;
     }
     return row.estimatedCostText ?? '0';
@@ -781,7 +811,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final parentByKey = <String, SessionRowViewModel>{};
     final parents = <SessionRowViewModel>[];
     final subagents = <SessionRowViewModel>[];
-    for (final row in _rows) {
+    for (final sourceRow in _rows) {
+      final row = _pricingOverlay(sourceRow);
       if (row.isSubagentSession) {
         subagents.add(row);
         continue;
@@ -2016,10 +2047,73 @@ class _SessionsScreenState extends State<SessionsScreen> {
     };
   }
 
+  SessionRowViewModel _pricingOverlay(SessionRowViewModel row) =>
+      widget.pricingUpdating || _pricingCostsPending
+      ? row.copyWithProjectedCost(
+          const UsageCostEstimate(
+            estimatedCostText: null,
+            costUnknown: true,
+            updating: true,
+          ),
+        )
+      : row;
+
+  void _queuePersistedCostRefresh() {
+    final generation = ++_pricingLoadGeneration;
+    if (widget.pricingUpdating) {
+      _pricingCostsPending = false;
+      return;
+    }
+    final loader = widget.onLoadPersistedCosts;
+    if (loader == null) {
+      if (_pricingInvalidated) {
+        _rows = [
+          for (final row in _rows)
+            row.copyWithProjectedCost(
+              const UsageCostEstimate(
+                estimatedCostText: null,
+                costUnknown: true,
+              ),
+            ),
+        ];
+      }
+      _pricingCostsPending = false;
+      return;
+    }
+    _pricingCostsPending = true;
+    scheduleMicrotask(() async {
+      if (!mounted || generation != _pricingLoadGeneration) return;
+      Map<String, UsageCostEstimate>? costs;
+      try {
+        costs = await loader([for (final row in _rows) row.id]);
+      } on Object {
+        // A failed cost lookup must not restore previously invalidated amounts.
+      }
+      if (!mounted ||
+          generation != _pricingLoadGeneration ||
+          widget.pricingUpdating) {
+        return;
+      }
+      setState(() {
+        if (costs != null || _pricingInvalidated) {
+          const unknown = UsageCostEstimate(
+            estimatedCostText: null,
+            costUnknown: true,
+          );
+          _rows = [
+            for (final row in _rows)
+              row.copyWithProjectedCost(costs?[row.id] ?? unknown),
+          ];
+        }
+        _pricingCostsPending = false;
+      });
+    });
+  }
+
   SessionRowViewModel? _rowById(String id) {
     for (final row in _rows) {
       if (row.id == id) {
-        return row;
+        return _pricingOverlay(row);
       }
     }
     return null;
@@ -2031,6 +2125,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
       return;
     }
     _rows[index] = replacement;
+    if (widget.onLoadPersistedCosts != null &&
+        (_pricingInvalidated || _pricingCostsPending)) {
+      _queuePersistedCostRefresh();
+    }
   }
 
   void _replaceRows(List<SessionRowViewModel> rows) {
@@ -2053,6 +2151,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         if (_rowChangedForMotion(previousById[row.id], row)) row.id,
     };
     _rows = nextRows;
+    if (_pricingCostsPending) _queuePersistedCostRefresh();
     _textFilterGeneration++;
     if (_appliedSearch.isNotEmpty ||
         _appliedPath.isNotEmpty ||

@@ -55,20 +55,47 @@ class DefaultSettingsDiagnostics implements SettingsDiagnostics {
     SettingsDiagnosticAction action,
     AppSettings settings,
   ) async {
+    if (action == SettingsDiagnosticAction.testOpenRouterPricingFetch) {
+      return SettingsDiagnosticResult.failure(
+        'Pricing maintenance is not ready.',
+      );
+    }
     return SettingsDiagnosticResult.success('${action.label} is available.');
   }
 }
 
 class DatabaseSettingsDiagnostics implements SettingsDiagnostics {
-  const DatabaseSettingsDiagnostics(this.databaseFile);
+  const DatabaseSettingsDiagnostics(this.databaseFile, {this.refreshPrices});
 
   final File databaseFile;
+  final Future<bool> Function()? refreshPrices;
 
   @override
   Future<SettingsDiagnosticResult> run(
     SettingsDiagnosticAction action,
     AppSettings settings,
   ) async {
+    if (action == SettingsDiagnosticAction.testOpenRouterPricingFetch) {
+      final refresh = refreshPrices;
+      if (refresh == null) {
+        return SettingsDiagnosticResult.failure(
+          'Pricing maintenance is not ready.',
+        );
+      }
+      // The application callback uses saved settings, never this diagnostic draft.
+      try {
+        if (await refresh()) {
+          return SettingsDiagnosticResult.success(
+            'OpenRouter prices refreshed using saved settings.',
+          );
+        }
+      } on Object {
+        // Exceptions may contain credentials or paths; do not display them.
+      }
+      return SettingsDiagnosticResult.failure(
+        'OpenRouter price refresh failed.',
+      );
+    }
     if (action != SettingsDiagnosticAction.messageSearchBackfillStatus) {
       return const DefaultSettingsDiagnostics().run(action, settings);
     }

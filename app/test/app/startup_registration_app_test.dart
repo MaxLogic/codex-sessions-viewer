@@ -48,7 +48,9 @@ void main() {
 
     expect(applied, [false]);
 
-    await tester.tap(find.bySemanticsLabel('Settings navigation'));
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
+    );
     await _pumpFrames(tester);
     await tester.tap(find.bySemanticsLabel('Start with Windows setting'));
     await tester.pump();

@@ -25,6 +25,11 @@ void main() {
       ).readAsStringSync(),
     );
     index = SessionSearchIndex(db);
+    db.execute(
+      File(
+        '../sql/migration/016_persisted_usage_pricing_maintenance.sql',
+      ).readAsStringSync(),
+    );
     store = ProjectTagStateStore(db);
   });
 

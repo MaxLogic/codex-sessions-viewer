@@ -24,10 +24,32 @@ void main() {
       ).readAsStringSync(),
     );
     index = SessionSearchIndex(db);
+    db.execute(
+      File(
+        '../sql/migration/016_persisted_usage_pricing_maintenance.sql',
+      ).readAsStringSync(),
+    );
   });
 
   tearDown(() {
     db.close();
+  });
+
+  test('search order uses source activity rather than metadata edits', () {
+    index.upsert(_document(id: 'older', title: 'Activity target'));
+    index.upsert(_document(id: 'newer', title: 'Activity target'));
+    db.execute(
+      "update sessions set last_message_at_utc=null,started_at_utc=null,updated_at_utc='2026-08-01T00:00:00Z' where id='older'",
+    );
+    db.execute(
+      "update sessions set last_message_at_utc=null,started_at_utc=null,updated_at_utc='2026-09-01T00:00:00Z' where id='newer'",
+    );
+    const query = SessionSearchQuery(text: 'Activity target');
+    expect(index.search(query), ['newer', 'older']);
+    db.execute(
+      "update sessions set is_pinned=1,updated_at_utc='2099-01-01T00:00:00Z' where id='older'",
+    );
+    expect(index.search(query), ['newer', 'older']);
   });
 
   test('indexes default searchable fields with FTS5', () {

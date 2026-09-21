@@ -2,6 +2,26 @@ import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'default batching yields before accumulating 32 MiB of parsed source',
+    () {
+      expect(
+        defaultScanBatchingPolicy.shouldFlushParsedSessions(
+          pendingCount: 1,
+          pendingSourceBytes: 32 * 1024 * 1024 - 1,
+        ),
+        isFalse,
+      );
+      expect(
+        defaultScanBatchingPolicy.shouldFlushParsedSessions(
+          pendingCount: 1,
+          pendingSourceBytes: 32 * 1024 * 1024,
+        ),
+        isTrue,
+      );
+    },
+  );
+
   test('default scan batching is sized for large session sets', () {
     expect(
       defaultScanBatchingPolicy.parsedSessionFlushBatchSize,

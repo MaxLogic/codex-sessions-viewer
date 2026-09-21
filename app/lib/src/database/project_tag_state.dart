@@ -1,11 +1,93 @@
 import 'package:sqlite3/sqlite3.dart';
 
 import '../usage/usage_summary.dart';
+import 'database_generation.dart';
 
 class ProjectTagStateStore {
   const ProjectTagStateStore(this.db);
 
   final Database db;
+
+  /// Called inside the event/session write transaction. Raw aliases remain
+  /// evidence; only the identity keys are normalized.
+  int resolveUsagePathContext({
+    String? displayPath,
+    String? platformPath,
+    String? uncPath,
+    int? detectedProjectId,
+  }) {
+    final rawPaths = [displayPath ?? '', platformPath ?? '', uncPath ?? ''];
+    final keys = rawPaths.map(normalizeProjectPath).toList(growable: false);
+    final existing = db.select('''
+      select id, detected_project_id, detected_project_source from usage_path_contexts
+      where normalization_version = 1
+        and display_path_key = ? and platform_path_key = ? and unc_path_key = ?
+    ''', keys);
+    if (existing.isNotEmpty) {
+      final id = existing.single['id'] as int;
+      if (detectedProjectId != null &&
+          (existing.single['detected_project_id'] != detectedProjectId ||
+              existing.single['detected_project_source'] != 'detected')) {
+        db.execute(
+          '''
+          update usage_path_contexts set detected_project_id = ?,
+            detected_project_source = 'detected',
+            effective_project_id = coalesce(mask_project_id, ?),
+            resolution_source = case when mask_project_id is null then 'detected' else 'mask' end,
+            updated_at_utc = ? where id = ?
+        ''',
+          [detectedProjectId, detectedProjectId, _utcNow(), id],
+        );
+      }
+      _retainContextAliases(id, rawPaths);
+      return id;
+    }
+
+    final match = _bestProjectMatch(
+      keys.where((key) => key.isNotEmpty).toList(growable: false),
+      _activeMasks(),
+    );
+    final now = _utcNow();
+    db.execute(
+      '''
+      insert into usage_path_contexts (
+        display_path_raw, platform_path_raw, unc_path_raw,
+        display_path_key, platform_path_key, unc_path_key, normalization_version,
+        detected_project_id, mask_project_id, effective_project_id,
+        resolution_source, project_rules_version, created_at_utc, updated_at_utc
+      ) values (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?,
+        (select project_rules_version from database_state where id = 1), ?, ?)
+    ''',
+      [
+        ...rawPaths,
+        ...keys,
+        detectedProjectId,
+        match?.projectId,
+        match?.projectId ?? detectedProjectId,
+        match != null
+            ? 'mask'
+            : detectedProjectId != null
+            ? 'detected'
+            : 'unassigned',
+        now,
+        now,
+      ],
+    );
+    final id = db.lastInsertRowId;
+    _retainContextAliases(id, rawPaths);
+    return id;
+  }
+
+  void _retainContextAliases(int contextId, List<String> rawPaths) {
+    db.execute(
+      '''
+      insert or ignore into usage_path_context_aliases (
+        path_context_id, display_path_raw, platform_path_raw, unc_path_raw
+      ) values (?, ?, ?, ?)
+    ''',
+      [contextId, ...rawPaths],
+    );
+  }
 
   int upsertProject({
     required String name,
@@ -37,9 +119,10 @@ class ProjectTagStateStore {
     bool isActive = true,
   }) {
     final now = _utcNow();
+    final normalizedMask = normalizeProjectPath(pathMask);
     final existing = db.select(
-      'select id from project_path_masks where project_id = ? and path_mask = ?',
-      [projectId, pathMask],
+      'select id from project_path_masks where project_id = ? and normalized_mask = ?',
+      [projectId, normalizedMask],
     );
     if (existing.isEmpty) {
       db.execute(
@@ -47,13 +130,22 @@ class ProjectTagStateStore {
         insert into project_path_masks (
           project_id,
           path_mask,
+          normalized_mask,
           priority,
           is_active,
           created_at_utc,
           updated_at_utc
-        ) values (?, ?, ?, ?, ?, ?)
+        ) values (?, ?, ?, ?, ?, ?, ?)
         ''',
-        [projectId, pathMask, priority, isActive ? 1 : 0, now, now],
+        [
+          projectId,
+          pathMask,
+          normalizedMask,
+          priority,
+          isActive ? 1 : 0,
+          now,
+          now,
+        ],
       );
       return db.lastInsertRowId;
     }
@@ -88,11 +180,16 @@ class ProjectTagStateStore {
         isActive: isActive,
       );
       recalculateSessionProjects();
-      _recalculateUsageEventProjects();
-      UsageSummaryRepository(db).rebuildDailyUsageInCurrentTransaction(
-        projectionVersion: projectionVersion,
-        pricing: pricing,
-      );
+      if (DatabaseGenerationRepository(
+            db,
+          ).activeGeneration().targetSchemaVersion <
+          16) {
+        _recalculateUsageEventProjects();
+        UsageSummaryRepository(db).rebuildDailyUsageInCurrentTransaction(
+          projectionVersion: projectionVersion,
+          pricing: pricing,
+        );
+      }
       db.execute('commit');
       return maskId;
     } on Object {
@@ -107,32 +204,133 @@ class ProjectTagStateStore {
 
   void recalculateSessionProjects() {
     final masks = _activeMasks();
-    final sessions = db.select('''
-      select id,
+    db.execute(
+      'update database_state set project_rules_version = project_rules_version + 1 where id = 1',
+    );
+    _recalculateUsagePathContexts(masks);
+    _refreshSessionProjects(masks);
+  }
+
+  /// Reapply assignment after discovery or metadata changes, without changing
+  /// project rules or remapping unrelated contexts. The caller owns the write
+  /// transaction, including the detected_project_id update.
+  void refreshSessionProject(String sessionId) {
+    _refreshSessionProjects(_activeMasks(), sessionId: sessionId);
+  }
+
+  /// Remap one migration checkpoint without loading masks for every session.
+  /// The caller commits these assignments together with its session cursor.
+  void refreshSessionProjectsBatch(List<String> sessionIds) {
+    if (sessionIds.length > 512) {
+      throw ArgumentError.value(sessionIds.length, 'sessionIds', 'Maximum 512');
+    }
+    if (sessionIds.isEmpty) return;
+    _refreshSessionProjects(_activeMasks(), sessionIds: sessionIds);
+  }
+
+  void _refreshSessionProjects(
+    List<_ProjectMask> masks, {
+    String? sessionId,
+    List<String>? sessionIds,
+  }) {
+    String? lastSessionId;
+    final now = _utcNow();
+    while (true) {
+      final sessions = db.select(
+        '''
+      select s.id,
              display_path,
              working_directory_display,
              working_directory_platform,
-             working_directory_unc
-      from sessions
-      where project_override = 0
-      order by id
-      ''');
-    final now = _utcNow();
-    for (final session in sessions) {
-      final sessionId = session['id'] as String;
-      final keys = _projectCandidatePaths(sessionId, session);
-      final match = _bestProjectMatch(keys, masks);
-      db.execute(
-        '''
+             working_directory_unc,
+             s.detected_project_id,
+             detected.name as detected_project_name
+      from sessions s
+      left join projects detected on detected.id = s.detected_project_id
+      where s.project_override = 0
+        ${sessionId == null ? '' : 'and s.id = ?'}
+        ${sessionIds == null ? '' : 'and s.id in (${List.filled(sessionIds.length, '?').join(',')})'}
+        ${lastSessionId == null ? '' : 'and s.id > ?'}
+      order by s.id limit 512
+      ''',
+        [?sessionId, ...?sessionIds, ?lastSessionId],
+      );
+      if (sessions.isEmpty) return;
+      for (final session in sessions) {
+        final currentId = session['id'] as String;
+        final keys = _projectCandidatePaths(currentId, session);
+        final match = _bestProjectMatch(keys, masks);
+        final projectId = match?.projectId ?? session['detected_project_id'];
+        final projectName =
+            match?.projectName ?? session['detected_project_name'] as String?;
+        db.execute(
+          '''
         update sessions
         set project_id = ?,
             project_name_snapshot = ?,
             updated_at_utc = ?
         where id = ?
         ''',
-        [match?.projectId, match?.projectName, now, sessionId],
+          [projectId, projectName, now, currentId],
+        );
+        _updateSearchProject(currentId, projectName ?? '');
+      }
+      if (sessionId != null || sessionIds != null) return;
+      lastSessionId = sessions.last['id'] as String;
+    }
+  }
+
+  void _recalculateUsagePathContexts(List<_ProjectMask> masks) {
+    final version = db
+        .select('select project_rules_version from database_state where id = 1')
+        .single['project_rules_version'];
+    final now = _utcNow();
+    var lastId = 0;
+    while (true) {
+      final contexts = db.select(
+        '''
+        select id, display_path_key, platform_path_key, unc_path_key,
+          detected_project_id, detected_project_source, resolution_source
+        from usage_path_contexts where id > ? order by id limit 512
+      ''',
+        [lastId],
       );
-      _updateSearchProject(sessionId, match?.projectName ?? '');
+      if (contexts.isEmpty) break;
+      for (final context in contexts) {
+        final keys = [
+          context['display_path_key'] as String,
+          context['platform_path_key'] as String,
+          context['unc_path_key'] as String,
+        ].where((key) => key.isNotEmpty).toList(growable: false);
+        final match = _bestProjectMatch(keys, masks);
+        final detectedId = context['detected_project_id'];
+        final detectedSource = context['resolution_source'] == 'legacy_import'
+            ? 'legacy_import'
+            : context['detected_project_source'] as String;
+        final source = match != null
+            ? 'mask'
+            : detectedId == null
+            ? 'unassigned'
+            : detectedSource;
+        db.execute(
+          '''
+          update usage_path_contexts set mask_project_id = ?, effective_project_id = ?,
+            resolution_source = ?, detected_project_source = ?,
+            project_rules_version = ?, updated_at_utc = ?
+          where id = ?
+        ''',
+          [
+            match?.projectId,
+            match?.projectId ?? detectedId,
+            source,
+            detectedSource,
+            version,
+            now,
+            context['id'],
+          ],
+        );
+      }
+      lastId = contexts.last['id'] as int;
     }
   }
 
@@ -175,7 +373,7 @@ class ProjectTagStateStore {
           ]) {
             final value = event[column] as String?;
             if (value != null && value.isNotEmpty) {
-              paths.add(_normalizePath(value));
+              paths.add(normalizeProjectPath(value));
             }
           }
           final projectId = _bestProjectMatch(
@@ -296,7 +494,7 @@ class ProjectTagStateStore {
         _ProjectMask(
           projectId: row['project_id'] as int,
           projectName: row['name'] as String,
-          normalizedMask: _normalizePath(row['path_mask'] as String),
+          normalizedMask: normalizeProjectPath(row['path_mask'] as String),
         ),
     ];
   }
@@ -311,7 +509,7 @@ class ProjectTagStateStore {
     ]) {
       final value = session[column] as String?;
       if (value != null && value.isNotEmpty) {
-        paths.add(_normalizePath(value));
+        paths.add(normalizeProjectPath(value));
       }
     }
     paths.addAll(_pathKeysFor(sessionId));
@@ -323,7 +521,7 @@ class ProjectTagStateStore {
       'select path_key from session_path_keys where session_id = ?',
       [sessionId],
     ))
-      _normalizePath(row['path_key'] as String),
+      normalizeProjectPath(row['path_key'] as String),
   ];
 
   _ProjectMask? _bestProjectMatch(
@@ -331,9 +529,8 @@ class ProjectTagStateStore {
     List<_ProjectMask> masks,
   ) {
     for (final mask in masks) {
-      final regex = _maskRegex(mask.normalizedMask);
       for (final pathKey in pathKeys) {
-        if (regex.hasMatch(pathKey)) {
+        if (mask.matcher.hasMatch(pathKey)) {
           return mask;
         }
       }
@@ -375,20 +572,20 @@ class ProjectTagStateStore {
 }
 
 class _ProjectMask {
-  const _ProjectMask({
+  _ProjectMask({
     required this.projectId,
     required this.projectName,
-    required this.normalizedMask,
-  });
+    required String normalizedMask,
+  }) : matcher = _maskRegex(normalizedMask);
 
   final int projectId;
   final String projectName;
-  final String normalizedMask;
+  final RegExp matcher;
 }
 
 String _utcNow() => DateTime.now().toUtc().toIso8601String();
 
-String _normalizePath(String path) =>
+String normalizeProjectPath(String path) =>
     path.replaceAll(r'\', '/').replaceAll(RegExp('/+'), '/').toLowerCase();
 
 RegExp _maskRegex(String mask) {

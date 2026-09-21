@@ -91,8 +91,14 @@ void main() {
       ),
     );
 
-    expect(find.bySemanticsLabel('Sessions navigation'), findsWidgets);
-    expect(find.bySemanticsLabel('Usage navigation'), findsWidgets);
+    expect(
+      find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
+      findsWidgets,
+    );
+    expect(
+      find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')),
+      findsWidgets,
+    );
 
     await tester.tap(find.text('Usage'));
     await tester.pump();
@@ -101,7 +107,10 @@ void main() {
 
     await tester.pumpAndSettle();
 
-    expect(find.bySemanticsLabel('Usage navigation'), findsWidgets);
+    expect(
+      find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')),
+      findsWidgets,
+    );
     expect(find.text('Usage content'), findsOneWidget);
 
     semantics.dispose();

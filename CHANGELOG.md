@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- Added a visible startup usage migration with a verified pre-upgrade backup, resumable batches, historical pricing, parity checks, and rollback before normal writes resume.
+- Added configurable daily OpenRouter price refresh and weekly database optimization, with saved job status, bounded retries, manual refresh, and accessible progress in Settings. Database writers share a queue; catalog downloads do not hold it.
 - Added explicit active/archived Codex source lifecycle tracking and a one-time, audited legacy-cache repair with verified SQLite backup and fail-closed recovery checks.
 - Added resumable background backfill for historical message search rows plus a Settings diagnostic for indexed and remaining message-search counts.
 - Added a persisted `app.start_with_windows` setting, defaulted on, exposed in Settings under Application, and wired to the current-user Windows Run key.
@@ -19,6 +21,19 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- Let pricing and interactive writes run between session-scan batches while preserving a single scan owner. Distinguish downloaded prices waiting for the database writer from prices being stored.
+- Reduce the parsed-source batch threshold from 512 MiB to 32 MiB to yield the writer more frequently; individual large sessions remain atomic.
+- Index the nullable tool-call message foreign key in schema 17 so replacing messages does not repeatedly scan every unrelated tool call. Preserve cascade behavior and optimize after the migration.
+- Make keyboard-focused navigation announce destination names with tab positions and selection state in screen readers.
+- Keep cached session lists on the existing activity index when status statistics are skewed, avoiding a full-list temporary sort while preserving primary-key detail reads.
+- Preserve provider price precision beyond 18 decimal places in cached-history migration and exact cost arithmetic, including observed 22-place cache-write rates.
+- Persist session activity ordering so metadata edits do not reorder Sessions or search results. Use the measured visible-session index, shrink the billable-day and running-job indexes, and remove unused or redundant indexes.
+- Run SQLite optimization after each committed schema migration and retry failed statistics updates without undoing the migration. Repricing refreshes displayed costs from persisted projections without rescanning sessions.
+- Persisted observed provider and local price history with exact per-event cost bases. Reasoning replaces completion pricing for its subset, and all matching provider rules apply in order. Price, policy, and calculation-version changes invalidate affected costs until atomic repricing completes; Usage and session rows disclose updating, unknown, and partial estimates.
+- Moved post-cutover Usage reads to persisted daily projections, with atomic branch-dependent updates, dirty-cost exclusion, and bounded shadow initialization. Period filters now reload statistics and preserve their selection across navigation; custom dates use whole UTC days.
+- Preserved detected project assignments beneath masks and manual overrides during rescans and migration; post-cutover mask edits remap deduplicated path contexts without rewriting usage events or daily projections.
+- Added durable maintenance checkpoints, verified migration backups and disk-space checks, and a startup progress dialog with safe stop and resume. Atomic SQLite work can be interrupted without advancing its checkpoint.
+- Kept newly opened normal database connections read-only while a usage migration is unfinished, including interrupted or failed attempts; only explicit maintenance connections can write until a successful retry completes.
 - Supervised parser-worker failures and made cache maintenance cancellable, skipping no-op backups and removing backups from failed or cancelled repair attempts.
 - Made packaged startup resolve logs, SQL, settings, and other executable-owned resources from the executable directory even when launched with another working directory.
 - Streamed fixed-snapshot JSONL parsing and serialized persistence in count- and byte-bounded batches, removing redundant full-file hash reads and sharply reducing forced-scan memory use.

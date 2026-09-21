@@ -1,3 +1,4 @@
+import '../../usage/usage_summary.dart';
 import 'conversation_message_view_model.dart';
 import 'session_label_formatter.dart';
 
@@ -43,6 +44,8 @@ class SessionRowViewModel {
     this.toolCallTokens = 0,
     this.estimatedCostText,
     this.costUnknown = true,
+    this.costUpdating = false,
+    this.costPartialUnsupportedUnits = false,
     this.modelsUsed = const [],
     this.conversationMessages = const [],
     this.usageRollup,
@@ -94,6 +97,8 @@ class SessionRowViewModel {
   final int toolCallTokens;
   final String? estimatedCostText;
   final bool costUnknown;
+  final bool costUpdating;
+  final bool costPartialUnsupportedUnits;
   final List<String> modelsUsed;
   final List<ConversationMessageViewModel> conversationMessages;
   final SessionUsageRollup? usageRollup;
@@ -181,8 +186,12 @@ class SessionRowViewModel {
     return label == SessionLabelFormatter.unknown ? const [] : [label];
   }
 
-  String get estimatedCostDisplay =>
-      costUnknown ? 'Cost unknown' : '\$${estimatedCostText ?? '0'}';
+  String get estimatedCostDisplay => _costDisplay(
+    estimatedCostText,
+    costUnknown,
+    costUpdating,
+    costPartialUnsupportedUnits,
+  );
 
   int get displayTotalTokens => usageRollup?.totalTokens ?? totalTokens;
 
@@ -212,6 +221,9 @@ class SessionRowViewModel {
     }
     return '${rounded.toStringAsFixed(1)}%';
   }
+
+  SessionRowViewModel copyWithProjectedCost(UsageCostEstimate cost) =>
+      _copyWithUsage(usageRollup, cost: cost);
 
   SessionRowViewModel copyWithConversationMessages(
     List<ConversationMessageViewModel> messages,
@@ -249,6 +261,8 @@ class SessionRowViewModel {
       toolCallTokens: toolCallTokens,
       estimatedCostText: estimatedCostText,
       costUnknown: costUnknown,
+      costUpdating: costUpdating,
+      costPartialUnsupportedUnits: costPartialUnsupportedUnits,
       totalTokens: totalTokens,
       model: model,
       modelsUsed: modelsUsed,
@@ -269,7 +283,13 @@ class SessionRowViewModel {
     );
   }
 
-  SessionRowViewModel copyWithUsageRollup(SessionUsageRollup? rollup) {
+  SessionRowViewModel copyWithUsageRollup(SessionUsageRollup? rollup) =>
+      _copyWithUsage(rollup);
+
+  SessionRowViewModel _copyWithUsage(
+    SessionUsageRollup? rollup, {
+    UsageCostEstimate? cost,
+  }) {
     return SessionRowViewModel(
       id: id,
       sessionId: sessionId,
@@ -301,8 +321,13 @@ class SessionRowViewModel {
       userMessageTokens: userMessageTokens,
       assistantResponseTokens: assistantResponseTokens,
       toolCallTokens: toolCallTokens,
-      estimatedCostText: estimatedCostText,
-      costUnknown: costUnknown,
+      estimatedCostText: cost == null
+          ? estimatedCostText
+          : cost.estimatedCostText,
+      costUnknown: cost?.costUnknown ?? costUnknown,
+      costUpdating: cost?.updating ?? costUpdating,
+      costPartialUnsupportedUnits:
+          cost?.partialUnsupportedUnits ?? costPartialUnsupportedUnits,
       totalTokens: totalTokens,
       model: model,
       modelsUsed: modelsUsed,
@@ -357,6 +382,8 @@ class SessionRowViewModel {
       toolCallTokens: toolCallTokens,
       estimatedCostText: estimatedCostText,
       costUnknown: costUnknown,
+      costUpdating: costUpdating,
+      costPartialUnsupportedUnits: costPartialUnsupportedUnits,
       totalTokens: totalTokens,
       model: model,
       modelsUsed: modelsUsed,
@@ -405,6 +432,12 @@ class SessionUsageRollup {
     required this.mainCostUnknown,
     required this.subagentCostUnknown,
     required this.totalCostUnknown,
+    this.mainCostUpdating = false,
+    this.subagentCostUpdating = false,
+    this.totalCostUpdating = false,
+    this.mainCostPartialUnsupportedUnits = false,
+    this.subagentCostPartialUnsupportedUnits = false,
+    this.totalCostPartialUnsupportedUnits = false,
   });
 
   final int mainTokens;
@@ -416,16 +449,39 @@ class SessionUsageRollup {
   final bool mainCostUnknown;
   final bool subagentCostUnknown;
   final bool totalCostUnknown;
+  final bool mainCostUpdating;
+  final bool subagentCostUpdating;
+  final bool totalCostUpdating;
+  final bool mainCostPartialUnsupportedUnits;
+  final bool subagentCostPartialUnsupportedUnits;
+  final bool totalCostPartialUnsupportedUnits;
 
-  String get mainEstimatedCostDisplay =>
-      mainCostUnknown ? 'Cost unknown' : '\$${mainEstimatedCostText ?? '0'}';
+  String get mainEstimatedCostDisplay => _costDisplay(
+    mainEstimatedCostText,
+    mainCostUnknown,
+    mainCostUpdating,
+    mainCostPartialUnsupportedUnits,
+  );
 
-  String get subagentEstimatedCostDisplay => subagentCostUnknown
-      ? 'Cost unknown'
-      : '\$${subagentEstimatedCostText ?? '0'}';
+  String get subagentEstimatedCostDisplay => _costDisplay(
+    subagentEstimatedCostText,
+    subagentCostUnknown,
+    subagentCostUpdating,
+    subagentCostPartialUnsupportedUnits,
+  );
 
-  String get totalEstimatedCostDisplay =>
-      totalCostUnknown ? 'Cost unknown' : '\$${totalEstimatedCostText ?? '0'}';
+  String get totalEstimatedCostDisplay => _costDisplay(
+    totalEstimatedCostText,
+    totalCostUnknown,
+    totalCostUpdating,
+    totalCostPartialUnsupportedUnits,
+  );
+}
+
+String _costDisplay(String? amount, bool unknown, bool updating, bool partial) {
+  if (updating) return 'Pricing update in progress';
+  if (unknown) return 'Cost unknown';
+  return '\$${amount ?? '0'}${partial ? ' (partial)' : ''}';
 }
 
 bool _isWindowsOpenablePath(String path) {

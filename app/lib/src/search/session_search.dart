@@ -326,7 +326,7 @@ class SessionSearchIndex {
       from sessions s
       join session_search f on f.rowid = s.rowid
       $whereSql
-      order by coalesce(s.last_message_at_utc, s.started_at_utc, s.updated_at_utc) desc,
+      order by s.activity_at_utc desc,
                s.id asc
       ''', args);
     return [for (final row in rows) row['id'] as String];

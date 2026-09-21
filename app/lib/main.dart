@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 
 import 'src/benchmark/scan_memory_benchmark.dart';
 import 'src/database/database_migrator.dart';
+import 'src/database/database_maintenance.dart';
+import 'src/database/application_maintenance.dart';
 import 'src/app/codex_sessions_viewer_app.dart';
 import 'src/config/app_settings.dart';
 import 'src/platform/application_working_directory.dart';
@@ -39,13 +41,28 @@ Future<void> main(List<String> arguments) async {
   await restoreWindowStateBestEffort(windowStateController.restoreAndTrack);
   final sqlRoot = defaultSqlRoot();
   final startupRegistration = WindowsStartupRegistration();
+  final maintenance = ApplicationMaintenance(
+    databaseFile: databaseFile,
+    coordinator: DatabaseMaintenanceCoordinator(databaseFile),
+  );
+  final settingsStartup = _afterFirstFrame(
+    () => SettingsRepository(defaultSettingsFile()).loadOrCreate(),
+  );
   runApp(
     CodexSessionsViewerApp(
-      settingsStartup: _afterFirstFrame(
-        () => SettingsRepository(defaultSettingsFile()).loadOrCreate(),
-      ),
+      databaseFile: databaseFile,
+      applicationMaintenance: maintenance,
+      settingsStartup: settingsStartup,
       databaseStartup: _afterFirstFrame(
-        () => DatabaseMigrator(sqlRoot: sqlRoot).openAndMigrate(databaseFile),
+        () => DatabaseMigrator(
+          sqlRoot: sqlRoot,
+        ).openAndMigrate(databaseFile, deferUsageMigration: true),
+      ),
+      databaseMaintenanceStartup: () async => startPendingDatabaseMigration(
+        databaseFile,
+        sqlRoot: sqlRoot,
+        pricingSettings: (await settingsStartup).pricing,
+        coordinator: maintenance.coordinator,
       ),
       startupPreferenceApplier: (enabled) =>
           applyWindowsStartupPreferenceBestEffort(startupRegistration, enabled),

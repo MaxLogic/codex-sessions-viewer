@@ -33,19 +33,21 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Injected settings screen'), findsOneWidget);
 
-    await tester.tap(find.bySemanticsLabel('Evals navigation'));
+    await tester.tap(find.bySemanticsLabel(RegExp('^Evals navigation\\nTab ')));
     await tester.pumpAndSettle();
     expect(find.text('Injected evals screen'), findsOneWidget);
 
-    await tester.tap(find.bySemanticsLabel('Context navigation'));
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Context navigation\\nTab ')),
+    );
     await tester.pumpAndSettle();
     expect(find.text('Injected context screen'), findsOneWidget);
 
-    await tester.tap(find.bySemanticsLabel('Usage navigation'));
+    await tester.tap(find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')));
     await tester.pumpAndSettle();
     expect(find.text('Injected usage screen'), findsOneWidget);
 
-    await tester.tap(find.bySemanticsLabel('Logs navigation'));
+    await tester.tap(find.bySemanticsLabel(RegExp('^Logs navigation\\nTab ')));
     await tester.pumpAndSettle();
     expect(find.text('Injected logs screen'), findsOneWidget);
   });

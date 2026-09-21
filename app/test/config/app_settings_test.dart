@@ -4,6 +4,105 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'maintenance schedules migrate legacy keys and round trip new settings',
+    () {
+      final defaults = AppSettings.defaults().toTomlMap();
+      expect(defaults['maintenance'], {
+        'database_optimize_enabled': true,
+        'database_optimize_interval_days': 7,
+      });
+      expect((defaults['pricing'] as Map)['automatic_refresh_enabled'], isTrue);
+      expect((defaults['pricing'] as Map)['refresh_interval_hours'], 24);
+      for (final (input, hours) in [
+        (<String, dynamic>{'cache_pricing_hours': 72}, 72),
+        (
+          <String, dynamic>{
+            'cache_pricing_hours': 72,
+            'refresh_interval_hours': 48,
+          },
+          48,
+        ),
+        (
+          <String, dynamic>{
+            'cache_pricing_hours': 'ignored',
+            'refresh_interval_hours': 1,
+          },
+          1,
+        ),
+        (<String, dynamic>{'refresh_interval_hours': 720}, 720),
+      ]) {
+        final loaded = AppSettings.fromTomlMap({
+          'pricing': {...input, 'automatic_refresh_enabled': false},
+          'maintenance': {
+            'database_optimize_enabled': false,
+            'database_optimize_interval_days': 365,
+          },
+        });
+        final encoded = loaded.copyWith().toTomlMap();
+        expect((encoded['pricing'] as Map)['refresh_interval_hours'], hours);
+        expect(
+          (encoded['pricing'] as Map).containsKey('cache_pricing_hours'),
+          isFalse,
+        );
+        expect(
+          (encoded['pricing'] as Map)['automatic_refresh_enabled'],
+          isFalse,
+        );
+        expect(encoded['maintenance'], {
+          'database_optimize_enabled': false,
+          'database_optimize_interval_days': 365,
+        });
+        expect(AppSettings.fromTomlMap(encoded), loaded);
+      }
+      expect(
+        AppSettings.fromTomlMap({
+          'maintenance': {'database_optimize_interval_days': 1},
+        }).toTomlMap()['maintenance'],
+        {
+          'database_optimize_enabled': true,
+          'database_optimize_interval_days': 1,
+        },
+      );
+    },
+  );
+
+  test(
+    'maintenance schedule ranges reject invalid values even when disabled',
+    () {
+      for (final (group, field, maximum) in [
+        ('pricing', 'refresh_interval_hours', 720),
+        ('pricing', 'cache_pricing_hours', 720),
+        ('maintenance', 'database_optimize_interval_days', 365),
+      ]) {
+        for (final value in <Object>[0, -1, maximum + 1, 1.5, '24', false]) {
+          expect(
+            () => AppSettings.fromTomlMap({
+              group: {
+                field: value,
+                if (group == 'pricing') 'automatic_refresh_enabled': false,
+                if (group == 'maintenance') 'database_optimize_enabled': false,
+              },
+            }),
+            throwsA(isA<SettingsValidationException>()),
+            reason: '$group.$field=$value',
+          );
+        }
+      }
+      for (final (group, field) in [
+        ('pricing', 'automatic_refresh_enabled'),
+        ('maintenance', 'database_optimize_enabled'),
+      ]) {
+        expect(
+          () => AppSettings.fromTomlMap({
+            group: {field: 'true'},
+          }),
+          throwsA(isA<SettingsValidationException>()),
+        );
+      }
+    },
+  );
+
   late Directory tempDir;
   late File settingsFile;
 

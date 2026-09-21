@@ -3,9 +3,11 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
+import 'package:sqlite3/sqlite3.dart' show sqlite3;
 
 import '../platform/application_working_directory.dart';
 import 'database_connection.dart';
+import 'database_maintenance_cancelled.dart';
 
 File defaultDatabaseFile() {
   final appData = Platform.environment['APPDATA'];
@@ -31,7 +33,7 @@ Directory defaultSqlRoot() {
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 15,
+    this.supportedSchemaVersion = 17,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
@@ -39,11 +41,53 @@ class DatabaseMigrator {
   final int supportedSchemaVersion;
   final String fts5ProbeSql;
 
-  Future<DatabaseStartupResult> openAndMigrate(File databaseFile) async {
+  Future<DatabaseStartupResult> openAndMigrate(
+    File databaseFile, {
+    bool deferUsageMigration = false,
+  }) async {
     Database? db;
     try {
       await databaseFile.parent.create(recursive: true);
-      db = openFileBackedDatabase(databaseFile);
+      // Startup owns schema and scan-recovery housekeeping before normal
+      // application writers are constructed, including migration resumption.
+      db = openFileBackedDatabase(databaseFile, maintenanceWriter: true);
+      return await migrateOpenDatabase(
+        db,
+        databaseFile,
+        deferUsageMigration: deferUsageMigration,
+      );
+    } on DatabaseMaintenanceCancelled {
+      rethrow;
+    } on Object catch (error) {
+      return DatabaseStartupResult.blocked(
+        DatabaseFatalError(
+          summary: 'SQLite database startup failed.',
+          databasePath: databaseFile.path,
+          lastAppliedSchemaVersion: db == null
+              ? 0
+              : _safeLastAppliedVersion(db),
+          details: error.toString(),
+        ),
+      );
+    } finally {
+      db?.close();
+    }
+  }
+
+  /// Uses the startup worker's connection without closing or replacing it.
+  /// The caller excludes normal application access for the entire operation.
+  Future<DatabaseStartupResult> migrateOpenDatabase(
+    Database db,
+    File databaseFile, {
+    bool deferUsageMigration = false,
+    Future<void> Function(void Function())? runAtomic,
+  }) async {
+    try {
+      if (sqlite3.version.versionNumber < 3046000) {
+        throw StateError(
+          'SQLite 3.46 or newer is required for bounded database optimization.',
+        );
+      }
       final ftsResult = _verifyFts5(db, databaseFile.path);
       if (ftsResult != null) {
         return DatabaseStartupResult.blocked(ftsResult);
@@ -65,18 +109,30 @@ class DatabaseMigrator {
         return DatabaseStartupResult.blocked(versionError);
       }
 
+      final deferPendingUsage =
+          deferUsageMigration && _lastAppliedVersion(db) < 16;
       for (final migration in migrations) {
+        if (migration.version > supportedSchemaVersion ||
+            (deferPendingUsage && migration.version >= 16)) {
+          continue;
+        }
         if (_isApplied(db, migration.version)) {
           continue;
         }
-        final migrationError = _applyMigration(
+        final migrationError = await _applyMigration(
           db,
           migration,
           databaseFile.path,
+          runAtomic: runAtomic,
         );
         if (migrationError != null) {
           return DatabaseStartupResult.blocked(migrationError);
         }
+        await _optimizeAfterMigration(
+          db,
+          migration.version,
+          runAtomic: runAtomic,
+        );
       }
 
       final schemaError = _validateSchema(db, databaseFile.path);
@@ -84,24 +140,122 @@ class DatabaseMigrator {
         return DatabaseStartupResult.blocked(schemaError);
       }
 
+      if (_lastAppliedVersion(db) >= 16 &&
+          (db
+                      .select(
+                        'select last_optimized_schema_version v from database_state where id = 1',
+                      )
+                      .single['v']
+                  as int) <
+              _lastAppliedVersion(db)) {
+        await _optimizeAfterMigration(
+          db,
+          _lastAppliedVersion(db),
+          runAtomic: runAtomic,
+        );
+      }
+      db.execute(
+        '''
+        insert into app_metadata (key, value, updated_at_utc)
+        values ('sqlite_version', ?, ?)
+        on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc
+      ''',
+        [sqlite3.version.libVersion, DateTime.now().toUtc().toIso8601String()],
+      );
+
       _recoverInterruptedScanRuns(db);
 
       return DatabaseStartupResult.ready(
         lastAppliedSchemaVersion: _lastAppliedVersion(db),
       );
+    } on DatabaseMaintenanceCancelled {
+      rethrow;
     } on Object catch (error) {
       return DatabaseStartupResult.blocked(
         DatabaseFatalError(
           summary: 'SQLite database startup failed.',
           databasePath: databaseFile.path,
-          lastAppliedSchemaVersion: db == null
-              ? 0
-              : _safeLastAppliedVersion(db),
+          lastAppliedSchemaVersion: _safeLastAppliedVersion(db),
           details: error.toString(),
         ),
       );
-    } finally {
-      db?.close();
+    }
+  }
+
+  Future<void> _optimizeAfterMigration(
+    Database db,
+    int schemaVersion, {
+    Future<void> Function(void Function())? runAtomic,
+  }) async {
+    final now = DateTime.now().toUtc();
+    final stamp = now.toIso8601String();
+    final hasMaintenance = schemaVersion >= 16;
+    try {
+      db.execute('begin immediate');
+      // Use the schema-changing connection so SQLite retains its planner hints.
+      if (runAtomic == null) {
+        db.execute('pragma optimize');
+      } else {
+        await runAtomic(() => db.execute('pragma optimize'));
+      }
+      if (hasMaintenance) {
+        db.execute(
+          '''
+          update database_state set last_optimized_schema_version = ?, updated_at_utc = ? where id = 1
+        ''',
+          [schemaVersion, stamp],
+        );
+        db.execute(
+          '''
+          insert into maintenance_schedules (job_type, enabled, interval_seconds,
+            last_attempt_at_utc, last_success_at_utc, next_due_at_utc, updated_at_utc)
+          values ('database_optimize', 1, 604800, ?, ?, ?, ?)
+          on conflict(job_type) do update set
+            last_attempt_at_utc = excluded.last_attempt_at_utc,
+            last_success_at_utc = excluded.last_success_at_utc,
+            next_due_at_utc = strftime('%Y-%m-%dT%H:%M:%fZ', ?, '+' || interval_seconds || ' seconds'),
+            retry_count = 0, last_error = null, updated_at_utc = excluded.updated_at_utc
+        ''',
+          [
+            stamp,
+            stamp,
+            now.add(const Duration(days: 7)).toIso8601String(),
+            stamp,
+            stamp,
+          ],
+        );
+      }
+      db.execute('commit');
+    } on DatabaseMaintenanceCancelled {
+      try {
+        if (!db.autocommit) db.execute('rollback');
+      } on Object {
+        // Preserve cancellation if SQLite already rolled back.
+      }
+      rethrow;
+    } on Object {
+      if (!db.autocommit) db.execute('rollback');
+      // A committed schema remains successful even when statistics maintenance
+      // fails. A lagging watermark retries this step on the next startup.
+      if (hasMaintenance) {
+        db.execute(
+          '''
+          insert into maintenance_schedules (job_type, enabled, interval_seconds,
+            last_attempt_at_utc, next_due_at_utc, retry_count, last_error, updated_at_utc)
+          values ('database_optimize', 1, 604800, ?, ?, 1, 'Post-migration optimization failed.', ?)
+          on conflict(job_type) do update set
+            last_attempt_at_utc = excluded.last_attempt_at_utc,
+            next_due_at_utc = excluded.next_due_at_utc,
+            retry_count = maintenance_schedules.retry_count + 1,
+            last_error = excluded.last_error, updated_at_utc = excluded.updated_at_utc
+        ''',
+          [
+            stamp,
+            now.add(const Duration(minutes: 15)).toIso8601String(),
+            stamp,
+          ],
+        );
+      }
     }
   }
 
@@ -250,19 +404,34 @@ class DatabaseMigrator {
     return rows.isNotEmpty;
   }
 
-  DatabaseFatalError? _applyMigration(
+  Future<DatabaseFatalError?> _applyMigration(
     Database db,
     SqlMigration migration,
-    String databasePath,
-  ) {
+    String databasePath, {
+    Future<void> Function(void Function())? runAtomic,
+  }) async {
     try {
       db.execute('begin immediate');
-      db.execute(migration.sql);
+      db.execute('pragma defer_foreign_keys = on');
+      if (runAtomic == null) {
+        db.execute(migration.sql);
+      } else {
+        // Only native schema work is interruptible. The worker disarms its
+        // interrupt timer before commit, rollback, or failure-record SQL.
+        await runAtomic(() => db.execute(migration.sql));
+      }
       db.execute(
         '''
         insert into schema_version
           (version, filename, checksum, applied_at_utc, success, error_message)
         values (?, ?, ?, ?, 1, null)
+        on conflict(version) do update set
+          filename = excluded.filename,
+          checksum = excluded.checksum,
+          applied_at_utc = excluded.applied_at_utc,
+          success = 1,
+          error_message = null
+        where schema_version.success = 0
         ''',
         [
           migration.version,
@@ -273,6 +442,13 @@ class DatabaseMigrator {
       );
       db.execute('commit');
       return null;
+    } on DatabaseMaintenanceCancelled {
+      try {
+        db.execute('rollback');
+      } on Object {
+        // Preserve cancellation if SQLite already rolled back.
+      }
+      rethrow;
     } on Object catch (error) {
       try {
         db.execute('rollback');
@@ -307,11 +483,27 @@ class DatabaseMigrator {
     final lastAppliedVersion = _lastAppliedVersion(db);
     final requiredTables = [
       ..._requiredTables,
+      if (lastAppliedVersion >= 9) 'message_search',
       if (lastAppliedVersion >= 12) 'tool_output_search',
       if (lastAppliedVersion >= 14) 'session_cache_repair_manifest',
       if (lastAppliedVersion >= 15) ...[
         'usage_events',
         'billable_usage_events',
+      ],
+      if (lastAppliedVersion >= 16) ...[
+        'database_generations',
+        'database_state',
+        'maintenance_jobs',
+        'maintenance_schedules',
+        'usage_path_contexts',
+        'usage_path_context_aliases',
+        'usage_context_project_candidates',
+        'price_catalog_snapshots',
+        'model_price_periods',
+        'provider_price_rules',
+        'local_price_override_periods',
+        'usage_session_daily',
+        'usage_cost_dirty_partitions',
       ],
     ];
     for (final table in requiredTables) {
@@ -325,6 +517,63 @@ class DatabaseMigrator {
           databasePath: databasePath,
           lastAppliedSchemaVersion: _lastAppliedVersion(db),
           details: 'Required table is missing: $table.',
+        );
+      }
+    }
+    if (lastAppliedVersion >= 16) {
+      DatabaseFatalError generationError(String details) => DatabaseFatalError(
+        summary: 'SQLite usage generation validation failed.',
+        databasePath: databasePath,
+        lastAppliedSchemaVersion: lastAppliedVersion,
+        details: details,
+      );
+      final active = db.select('''
+        select g.target_schema_version, g.state from database_state s
+        join database_generations g on g.id = s.active_usage_generation_id
+        where s.id = 1
+      ''');
+      if (active.length != 1 ||
+          !{'legacy', 'active', 'complete'}.contains(active.single['state'])) {
+        return generationError(
+          'The active usage generation is missing or not readable.',
+        );
+      }
+      final contextBased =
+          (active.single['target_schema_version'] as int) >= 16;
+      final hasShadow = db
+          .select(
+            "select 1 from sqlite_master where type = 'table' and name = 'usage_events_next'",
+          )
+          .isNotEmpty;
+      if (hasShadow == contextBased) {
+        return generationError(
+          contextBased
+              ? 'An active context generation still has an unswapped usage_events_next table.'
+              : 'Required table is missing: usage_events_next.',
+        );
+      }
+      final columns = db
+          .select("pragma table_info('usage_events')")
+          .map((row) => row['name'])
+          .toSet();
+      final viewColumns = db
+          .select("pragma table_info('billable_usage_events')")
+          .map((row) => row['name'])
+          .toSet();
+      final requiredEventColumns = contextBased
+          ? {'path_context_id'}
+          : {
+              'project_id',
+              'working_directory_display',
+              'working_directory_platform',
+              'working_directory_unc',
+            };
+      if (!columns.containsAll(requiredEventColumns) ||
+          (contextBased && columns.contains('project_id')) ||
+          !viewColumns.contains('project_id') ||
+          (contextBased && !viewColumns.contains('path_context_id'))) {
+        return generationError(
+          'Usage table or billable view does not match the active generation.',
         );
       }
     }
@@ -442,5 +691,4 @@ const _requiredTables = [
   'model_pricing_cache',
   'logs',
   'session_search',
-  'message_search',
 ];

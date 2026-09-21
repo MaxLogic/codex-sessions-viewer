@@ -132,6 +132,7 @@ class AppSettings {
     required this.voiceOver,
     required this.pricing,
     required this.logging,
+    this.maintenance = const MaintenanceSettings(),
   });
 
   final GeneralAppSettings app;
@@ -144,6 +145,7 @@ class AppSettings {
   final VoiceOverSettings voiceOver;
   final PricingSettings pricing;
   final LoggingSettings logging;
+  final MaintenanceSettings maintenance;
 
   factory AppSettings.defaults() => const AppSettings(
     app: GeneralAppSettings(firstRun: false, startWithWindows: true),
@@ -290,6 +292,7 @@ class AppSettings {
         _table(map, 'pricing'),
         defaults.pricing,
       ),
+      maintenance: MaintenanceSettings.fromMap(_table(map, 'maintenance')),
       logging: LoggingSettings.fromMap(
         _table(map, 'logging'),
         defaults.logging,
@@ -308,6 +311,7 @@ class AppSettings {
     VoiceOverSettings? voiceOver,
     PricingSettings? pricing,
     LoggingSettings? logging,
+    MaintenanceSettings? maintenance,
   }) => AppSettings(
     app: app ?? this.app,
     paths: paths ?? this.paths,
@@ -319,6 +323,7 @@ class AppSettings {
     voiceOver: voiceOver ?? this.voiceOver,
     pricing: pricing ?? this.pricing,
     logging: logging ?? this.logging,
+    maintenance: maintenance ?? this.maintenance,
   );
 
   Map<String, Object?> toTomlMap() => {
@@ -332,6 +337,7 @@ class AppSettings {
     'voice_over': voiceOver.toTomlMap(),
     'pricing': pricing.toTomlMap(),
     'logging': logging.toTomlMap(),
+    'maintenance': maintenance.toTomlMap(),
   };
 
   @override
@@ -346,6 +352,7 @@ class AppSettings {
       toolOutput == other.toolOutput &&
       voiceOver == other.voiceOver &&
       pricing == other.pricing &&
+      maintenance == other.maintenance &&
       logging == other.logging;
 
   @override
@@ -358,6 +365,7 @@ class AppSettings {
     terminal,
     toolOutput,
     voiceOver,
+    maintenance,
     pricing,
     logging,
   );
@@ -1090,19 +1098,76 @@ class VoiceOverEventSettings {
   int get hashCode => Object.hash(text, wav);
 }
 
+class MaintenanceSettings {
+  const MaintenanceSettings({
+    this.databaseOptimizeEnabled = true,
+    this.databaseOptimizeIntervalDays = 7,
+  });
+
+  final bool databaseOptimizeEnabled;
+  final int databaseOptimizeIntervalDays;
+
+  factory MaintenanceSettings.fromMap(Map<String, dynamic> map) =>
+      MaintenanceSettings(
+        databaseOptimizeEnabled: _bool(
+          map,
+          'database_optimize_enabled',
+          true,
+          'maintenance.database_optimize_enabled',
+        ),
+        databaseOptimizeIntervalDays: _boundedPositiveInt(
+          map,
+          'database_optimize_interval_days',
+          7,
+          'maintenance.database_optimize_interval_days',
+          365,
+        ),
+      );
+
+  MaintenanceSettings copyWith({
+    bool? databaseOptimizeEnabled,
+    int? databaseOptimizeIntervalDays,
+  }) => MaintenanceSettings(
+    databaseOptimizeEnabled:
+        databaseOptimizeEnabled ?? this.databaseOptimizeEnabled,
+    databaseOptimizeIntervalDays:
+        databaseOptimizeIntervalDays ?? this.databaseOptimizeIntervalDays,
+  );
+
+  Map<String, Object?> toTomlMap() => {
+    'database_optimize_enabled': databaseOptimizeEnabled,
+    'database_optimize_interval_days': databaseOptimizeIntervalDays,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is MaintenanceSettings &&
+      databaseOptimizeEnabled == other.databaseOptimizeEnabled &&
+      databaseOptimizeIntervalDays == other.databaseOptimizeIntervalDays;
+
+  @override
+  int get hashCode =>
+      Object.hash(databaseOptimizeEnabled, databaseOptimizeIntervalDays);
+}
+
 class PricingSettings {
   const PricingSettings({
     required this.provider,
     required this.useExternalPricing,
-    required this.cachePricingHours,
+    int? cachePricingHours,
+    int? refreshIntervalHours,
+    this.automaticRefreshEnabled = true,
     required this.fallbackToOverrides,
     required this.openRouter,
     required this.overrides,
-  });
+  }) : refreshIntervalHours = refreshIntervalHours ?? cachePricingHours ?? 24;
 
   final String provider;
   final bool useExternalPricing;
-  final int cachePricingHours;
+  final int refreshIntervalHours;
+  final bool automaticRefreshEnabled;
+  // Legacy callers share the canonical refresh interval; TOML writes only the new key.
+  int get cachePricingHours => refreshIntervalHours;
   final bool fallbackToOverrides;
   final OpenRouterSettings openRouter;
   final Map<String, PricingOverrideSettings> overrides;
@@ -1138,11 +1203,22 @@ class PricingSettings {
         defaults.useExternalPricing,
         'pricing.use_external_pricing',
       ),
-      cachePricingHours: _positiveInt(
+      automaticRefreshEnabled: _bool(
         map,
-        'cache_pricing_hours',
-        defaults.cachePricingHours,
-        'pricing.cache_pricing_hours',
+        'automatic_refresh_enabled',
+        defaults.automaticRefreshEnabled,
+        'pricing.automatic_refresh_enabled',
+      ),
+      refreshIntervalHours: _boundedPositiveInt(
+        map,
+        map.containsKey('refresh_interval_hours')
+            ? 'refresh_interval_hours'
+            : 'cache_pricing_hours',
+        defaults.refreshIntervalHours,
+        map.containsKey('refresh_interval_hours')
+            ? 'pricing.refresh_interval_hours'
+            : 'pricing.cache_pricing_hours',
+        720,
       ),
       fallbackToOverrides: _bool(
         map,
@@ -1161,7 +1237,8 @@ class PricingSettings {
   Map<String, Object?> toTomlMap() => {
     'provider': provider,
     'use_external_pricing': useExternalPricing,
-    'cache_pricing_hours': cachePricingHours,
+    'refresh_interval_hours': refreshIntervalHours,
+    'automatic_refresh_enabled': automaticRefreshEnabled,
     'fallback_to_overrides': fallbackToOverrides,
     'openrouter': openRouter.toTomlMap(),
     'overrides': {
@@ -1175,6 +1252,7 @@ class PricingSettings {
       provider == other.provider &&
       useExternalPricing == other.useExternalPricing &&
       cachePricingHours == other.cachePricingHours &&
+      automaticRefreshEnabled == other.automaticRefreshEnabled &&
       fallbackToOverrides == other.fallbackToOverrides &&
       openRouter == other.openRouter &&
       _mapEquals(overrides, other.overrides);
@@ -1184,6 +1262,7 @@ class PricingSettings {
     provider,
     useExternalPricing,
     cachePricingHours,
+    automaticRefreshEnabled,
     fallbackToOverrides,
     openRouter,
     _mapHash(overrides),
@@ -1415,6 +1494,21 @@ int _positiveInt(
     return value;
   }
   throw SettingsValidationException(field, 'Expected a positive integer.');
+}
+
+int _boundedPositiveInt(
+  Map<String, dynamic> map,
+  String key,
+  int defaultValue,
+  String field,
+  int maximum,
+) {
+  final value = _positiveInt(map, key, defaultValue, field);
+  if (value <= maximum) return value;
+  throw SettingsValidationException(
+    field,
+    'Expected an integer from 1 to $maximum.',
+  );
 }
 
 double _number(Map<String, dynamic> map, String key, String field) {

@@ -297,8 +297,11 @@ void main() {
       ),
     );
 
-    expect(find.bySemanticsLabel('Evals navigation'), findsOneWidget);
-    await tester.tap(find.bySemanticsLabel('Evals navigation'));
+    expect(
+      find.bySemanticsLabel(RegExp('^Evals navigation\\nTab ')),
+      findsOneWidget,
+    );
+    await tester.tap(find.bySemanticsLabel(RegExp('^Evals navigation\\nTab ')));
     await tester.pumpAndSettle();
 
     for (final label in [

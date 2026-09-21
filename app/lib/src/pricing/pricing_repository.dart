@@ -1,15 +1,286 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
 
 import '../config/app_settings.dart';
+import '../database/maintenance_job.dart';
 import '../usage/usage_summary.dart';
+import 'openrouter_price_rules.dart';
 
 class PricingRepository {
   const PricingRepository(this.db);
 
   final Database db;
+
+  int migrateCachedHistoryNextBatch({
+    required MaintenanceJobRepository jobs,
+    required MaintenanceJobLease lease,
+    required PricingSettings settings,
+    required DateTime migrationTimeUtc,
+  }) {
+    final job = jobs.read(lease.jobId)!;
+    final payload = job.payloadJson == null
+        ? <String, dynamic>{}
+        : jsonDecode(job.payloadJson!) as Map<String, dynamic>;
+    if (!identical(jobs.db, db) ||
+        job.jobType != 'usage_projection_migration' ||
+        job.phase != 'initialize_prices' ||
+        payload['backup'] is! Map ||
+        db
+            .select(
+              '''
+          select 1 from database_generations building
+          where building.id = ? and building.state = 'building'
+            and building.target_schema_version = 16 and exists (
+              select 1 from database_state state join database_generations active
+                on active.id = state.active_usage_generation_id
+              where active.target_schema_version < 16)
+        ''',
+              [job.databaseGenerationId],
+            )
+            .isEmpty) {
+      throw StateError(
+        'Price migration requires its verified inactive-generation owner.',
+      );
+    }
+    final cursor = payload['price_model_cursor'] as String?;
+    final rows = db.select(
+      '''
+      select * from model_pricing_cache where source = 'openrouter'
+        ${cursor == null ? '' : 'and model_id > ?'}
+      order by model_id limit 512
+    ''',
+      [?cursor],
+    );
+    final localInitialized = payload['local_prices_initialized'] == true;
+    if (rows.isEmpty && localInitialized) return 0;
+    payload['price_migration_observed_at_utc'] ??= _priceTimestamp(
+      migrationTimeUtc,
+    );
+    final initialTime = DateTime.parse(
+      payload['price_migration_observed_at_utc'] as String,
+    );
+    final prior = payload['migrated_price_count'] as int? ?? 0;
+    final total =
+        payload['cached_price_count'] as int? ??
+        db
+                .select(
+                  "select count(*) n from model_pricing_cache where source = 'openrouter'",
+                )
+                .single['n']
+            as int;
+    payload['cached_price_count'] = total;
+    payload['migrated_price_count'] = prior + rows.length;
+    payload['local_prices_initialized'] = true;
+    if (rows.isNotEmpty) payload['price_model_cursor'] = rows.last['model_id'];
+    jobs.commitBatch(
+      lease: lease,
+      phase: 'initialize_prices',
+      completedUnits: job.completedUnits + rows.length,
+      totalUnits: job.completedUnits - prior + total,
+      lastProcessedRowId: job.lastProcessedRowId,
+      statusMessage:
+          'Preserving observed prices ${prior + rows.length} of $total.',
+      payloadJson: jsonEncode(payload),
+      apply: (_) {
+        if (!localInitialized) {
+          _recordLocalOverrideHistory(
+            settings,
+            initialTime,
+            ownsTransaction: false,
+          );
+        }
+        for (final row in rows) {
+          final observed = _dateTimeUtc(row['fetched_at_utc']);
+          if (observed == null) {
+            throw const PricingFetchException(
+              'Cached pricing observation time is invalid.',
+            );
+          }
+          final raw = row['raw_pricing_json'] as String?;
+          OpenRouterModelPricing? evidence;
+          if (raw != null) {
+            final parsed = jsonDecode(raw);
+            if (parsed is Map && parsed['pricing'] is Map) {
+              evidence = OpenRouterModelPricing.fromJson(parsed);
+              if (evidence.modelId != row['model_id']) {
+                throw const PricingFetchException(
+                  'Cached pricing identity is inconsistent.',
+                );
+              }
+            }
+          }
+          final model = OpenRouterModelPricing(
+            modelId: row['model_id'] as String,
+            modelName: row['model_name'] as String?,
+            provider: row['provider'] as String,
+            promptPricePerToken: _stringOrNumber(row['prompt_price_per_token']),
+            completionPricePerToken: _stringOrNumber(
+              row['completion_price_per_token'],
+            ),
+            inputCacheReadPricePerToken: _stringOrNumber(
+              row['input_cache_read_price_per_token'],
+            ),
+            inputCacheWritePricePerToken: _stringOrNumber(
+              row['input_cache_write_price_per_token'],
+            ),
+            internalReasoningPricePerToken: _stringOrNumber(
+              row['internal_reasoning_price_per_token'],
+            ),
+            requestPrice: _stringOrNumber(row['request_price']),
+            imagePrice: evidence?.imagePrice,
+            webSearchPrice: evidence?.webSearchPrice,
+            canonicalSlug: evidence?.canonicalSlug,
+            additionalRates: evidence?.additionalRates ?? const {},
+            rules: evidence?.rules ?? const [],
+            rawPricingJson: raw,
+          );
+          _recordCatalogHistory(
+            OpenRouterModelsResponse([model]),
+            started: observed,
+            observed: observed,
+          );
+        }
+      },
+    );
+    return rows.length;
+  }
+
+  HistoricalUsageCost resolveHistoricalUsageCost({
+    required PricingSettings settings,
+    required DateTime occurredAtUtc,
+    required String? model,
+    required int inputTokens,
+    required int cachedInputTokens,
+    required int cacheWriteInputTokens,
+    required int outputTokens,
+    required int reasoningOutputTokens,
+  }) {
+    if (model == null || model.isEmpty) return const HistoricalUsageCost();
+    final at = occurredAtUtc.toUtc();
+    final keys = [
+      model,
+      if (model.startsWith('gpt-') && !model.contains('/')) 'openai/$model',
+    ];
+    Row? period;
+    var provider = false;
+    var method = 'unknown';
+    for (final useProvider in [true, false]) {
+      if (useProvider && !settings.useExternalPricing) continue;
+      if (!useProvider &&
+          settings.useExternalPricing &&
+          !settings.fallbackToOverrides) {
+        continue;
+      }
+      for (final key in keys) {
+        final rows = db.select(
+          '''
+          select * from ${useProvider ? 'model_price_periods' : 'local_price_override_periods'}
+          where ${useProvider ? "source = 'openrouter' and" : ''}
+            model_id = ? and valid_from_utc <= ?
+          order by valid_from_utc desc limit 1
+        ''',
+          [key, _priceTimestamp(at)],
+        );
+        if (rows.isEmpty) continue;
+        final row = rows.single;
+        final end = _dateTimeUtc(row['valid_to_utc']);
+        if (end != null && !at.isBefore(end)) continue;
+        period = row;
+        provider = useProvider;
+        method =
+            '${useProvider ? 'openrouter' : 'local'}_${key == model ? 'exact' : 'openai_exact'}';
+        break;
+      }
+      if (period != null) break;
+    }
+    if (period == null) return const HistoricalUsageCost();
+    final rates = <String, String?>{
+      for (final entry in _priceColumns.entries)
+        entry.key: period[entry.value] as String?,
+    };
+    final additional = provider
+        ? (jsonDecode(period['additional_prices_json'] as String) as Map)
+              .cast<String, String>()
+        : <String, String>{};
+    final ruleIds = <int>[];
+    if (provider) {
+      final rules = db.select(
+        '''
+        select * from provider_price_rules where price_period_id = ?
+        order by provider_order
+      ''',
+        [period['id']],
+      );
+      for (final row in rules) {
+        final rule = OpenRouterPriceRule(
+          providerOrder: row['provider_order'] as int,
+          minPromptTokens: row['prompt_tokens_min'] as int?,
+          utcStartMinute: row['utc_start_minute'] as int?,
+          utcEndMinute: row['utc_end_minute'] as int?,
+          utcWeekdays: row['utc_weekdays'] == null
+              ? null
+              : (jsonDecode(row['utc_weekdays'] as String) as List)
+                    .cast<int>()
+                    .toSet(),
+          rateOverrides: const {},
+          rawRuleJson: row['raw_rule_json'] as String,
+        );
+        if (!rule.matches(promptTokens: inputTokens, occurredAtUtc: at)) {
+          continue;
+        }
+        ruleIds.add(row['id'] as int);
+        for (final entry in _priceColumns.entries) {
+          final override = row[entry.value] as String?;
+          if (override != null) rates[entry.key] = override;
+        }
+        additional.addAll(
+          (jsonDecode(row['additional_prices_json'] as String) as Map)
+              .cast<String, String>(),
+        );
+      }
+    }
+    final estimate = estimateUsageCost(
+      inputTokens: inputTokens,
+      cachedInputTokens: cachedInputTokens,
+      cacheWriteInputTokens: cacheWriteInputTokens,
+      outputTokens: outputTokens,
+      reasoningOutputTokens: reasoningOutputTokens,
+      model: model,
+      pricing: UsagePricingCatalog({
+        model: UsageModelPricing(
+          promptPricePerToken: rates['prompt'],
+          completionPricePerToken: rates['completion'],
+          cachedInputPricePerToken: rates['input_cache_read'],
+          cacheWriteInputPricePerToken: rates['input_cache_write'],
+          internalReasoningPricePerToken: rates['internal_reasoning'],
+        ),
+      }),
+    );
+    final excluded = [
+      rates['request'],
+      rates['image'],
+      rates['web_search'],
+      ...additional.values,
+    ].any((rate) => rate != null && rate != '0');
+    return HistoricalUsageCost(
+      estimatedCostText: estimate.estimatedCostText,
+      costStatus: estimate.costUnknown
+          ? 'unknown'
+          : excluded
+          ? 'partial_unsupported_units'
+          : 'complete',
+      providerPricePeriodId: provider ? period['id'] as int : null,
+      providerRuleIds: List.unmodifiable(ruleIds),
+      localOverridePeriodId: provider ? null : period['id'] as int,
+      catalogSnapshotId: provider ? period['first_snapshot_id'] as int : null,
+      resolutionMethod: method,
+    );
+  }
 
   Future<PricingLoadResult> load(
     PricingSettings settings, {
@@ -36,6 +307,7 @@ class PricingRepository {
         settings,
         client ?? const OpenRouterHttpClient(),
         now,
+        observationTimeOverride: nowUtc,
       );
       return PricingLoadResult.success(_loadCatalog(settings, cutoff: cutoff));
     } on Object catch (error) {
@@ -46,7 +318,7 @@ class PricingRepository {
           includeOpenRouter: settings.useExternalPricing,
           staleOpenRouterOverrideCutoff: cutoff,
         ),
-        errorMessage: error.toString(),
+        errorMessage: _safePricingError(error),
       );
     }
   }
@@ -71,6 +343,7 @@ class PricingRepository {
         settings,
         client ?? const OpenRouterHttpClient(),
         now,
+        observationTimeOverride: nowUtc,
       );
       return PricingLoadResult.success(_loadCatalog(settings, cutoff: cutoff));
     } on Object catch (error) {
@@ -81,7 +354,7 @@ class PricingRepository {
           includeOpenRouter: settings.useExternalPricing,
           staleOpenRouterOverrideCutoff: cutoff,
         ),
-        errorMessage: error.toString(),
+        errorMessage: _safePricingError(error),
       );
     }
   }
@@ -94,33 +367,350 @@ class PricingRepository {
     return _loadCatalog(settings, cutoff: _openRouterCutoff(settings, now));
   }
 
-  Future<void> _fetchAndCache(
-    PricingSettings settings,
-    OpenRouterModelsClient client,
-    DateTime now,
-  ) async {
-    final endpoint = Uri.parse(settings.openRouter.modelsEndpoint);
-    _validateOpenRouterCatalogEndpoint(endpoint);
-    final response = await client.fetchModels(
-      OpenRouterModelsRequest(
-        endpoint: endpoint,
-        apiKey: settings.openRouter.apiKey,
-      ),
-    );
+  /// Synchronize local history and cost policy without making a network request.
+  void synchronizeSettings(PricingSettings settings, {DateTime? nowUtc}) =>
+      _upsertOverrides(settings, (nowUtc ?? DateTime.now()).toUtc());
+
+  /// Apply a fully downloaded catalog while the application owns the writer.
+  void applyCatalog(
+    OpenRouterModelsResponse response, {
+    required DateTime startedAtUtc,
+    required DateTime observedAtUtc,
+  }) {
+    response.validateComplete();
     db.execute('begin immediate');
     try {
-      db.execute("delete from model_pricing_cache where source = 'openrouter'");
+      if (_hasPriceHistory) {
+        _recordCatalogHistory(
+          response,
+          started: startedAtUtc.toUtc(),
+          observed: observedAtUtc.toUtc(),
+        );
+      } else {
+        db.execute(
+          "delete from model_pricing_cache where source = 'openrouter'",
+        );
+      }
       for (final model in response.models) {
-        _upsertOpenRouterModel(model, now);
+        _upsertOpenRouterModel(model, observedAtUtc.toUtc());
       }
       db.execute('commit');
     } on Object {
+      if (!db.autocommit) db.execute('rollback');
+      rethrow;
+    }
+  }
+
+  void recordCatalogFailure({
+    required DateTime startedAtUtc,
+    DateTime? nowUtc,
+  }) {
+    if (!_hasPriceHistory) return;
+    db.execute(
+      '''
+      insert into price_catalog_snapshots (
+        source, started_at_utc, finished_at_utc, status,
+        completeness_status, error_message)
+      values ('openrouter', ?, ?, 'failed', 'failed', 'Catalog refresh failed.')
+    ''',
+      [
+        startedAtUtc.toUtc().toIso8601String(),
+        (nowUtc ?? DateTime.now()).toUtc().toIso8601String(),
+      ],
+    );
+  }
+
+  Future<void> _fetchAndCache(
+    PricingSettings settings,
+    OpenRouterModelsClient client,
+    DateTime now, {
+    DateTime? observationTimeOverride,
+  }) async {
+    final endpoint = Uri.parse(settings.openRouter.modelsEndpoint);
+    _validateOpenRouterCatalogEndpoint(endpoint);
+    try {
+      final response = await client.fetchModels(
+        OpenRouterModelsRequest(
+          endpoint: endpoint,
+          apiKey: settings.openRouter.apiKey,
+        ),
+      );
+      final observed = (observationTimeOverride ?? DateTime.now()).toUtc();
+      applyCatalog(response, startedAtUtc: now, observedAtUtc: observed);
+    } on Object {
       try {
-        db.execute('rollback');
+        recordCatalogFailure(
+          startedAtUtc: now,
+          nowUtc: observationTimeOverride,
+        );
       } on Object {
-        // Keep the original failure if SQLite already rolled back.
+        // Preserve the original failure when the diagnostic write also fails.
       }
       rethrow;
+    }
+  }
+
+  bool get _hasPriceHistory => db
+      .select(
+        "select 1 from sqlite_schema where type = 'table' and name = 'model_price_periods'",
+      )
+      .isNotEmpty;
+
+  void _recordCatalogHistory(
+    OpenRouterModelsResponse response, {
+    required DateTime started,
+    required DateTime observed,
+  }) {
+    final stamp = _priceTimestamp(observed);
+    db.execute(
+      '''
+      insert into price_catalog_snapshots (
+        source, started_at_utc, finished_at_utc, status, model_count,
+        page_count, completeness_status, declared_total_count, payload_sha256)
+      values ('openrouter', ?, ?, 'succeeded', ?, ?, ?, ?, ?)
+    ''',
+      [
+        started.toIso8601String(),
+        stamp,
+        response.models.length,
+        response.pageCount,
+        response.declaredTotalCount == null
+            ? 'complete_for_updates'
+            : 'complete_for_removals',
+        response.declaredTotalCount,
+        response.payloadSha256,
+      ],
+    );
+    final snapshotId = db.lastInsertRowId;
+    // Reuse SQLite's monotonic snapshot identity instead of scanning all prior
+    // catalog generations for every imported cache observation.
+    db.execute(
+      'update price_catalog_snapshots set catalog_generation = id where id = ?',
+      [snapshotId],
+    );
+    for (final model in response.models) {
+      final prices =
+          [
+                model.promptPricePerToken,
+                model.completionPricePerToken,
+                model.inputCacheReadPricePerToken,
+                model.inputCacheWritePricePerToken,
+                model.internalReasoningPricePerToken,
+                model.requestPrice,
+                model.imagePrice,
+                model.webSearchPrice,
+              ]
+              .map((value) {
+                if (value == null) return null;
+                // Reuse the existing BigInt decimal normalization; no floating point.
+                final normalized = sumEstimatedCostTexts([value]);
+                if (normalized == null || normalized.startsWith('-')) {
+                  throw const PricingFetchException(
+                    'Catalog contains an invalid decimal price.',
+                  );
+                }
+                return normalized;
+              })
+              .toList(growable: false);
+      final fingerprint = sha256
+          .convert(
+            utf8.encode(
+              jsonEncode([
+                prices,
+                model.canonicalSlug,
+                {
+                  for (final key in model.additionalRates.keys.toList()..sort())
+                    key: model.additionalRates[key],
+                },
+                model.rules.map(_normalizedRule).toList(growable: false),
+              ]),
+            ),
+          )
+          .toString();
+      final current = db.select(
+        '''
+        select id, pricing_fingerprint from model_price_periods
+        where source = 'openrouter' and model_id = ? and valid_to_utc is null
+      ''',
+        [model.modelId],
+      );
+      if (current.isNotEmpty &&
+          current.single['pricing_fingerprint'] == fingerprint) {
+        db.execute(
+          'update model_price_periods set last_seen_snapshot_id = ? where id = ?',
+          [snapshotId, current.single['id']],
+        );
+        continue;
+      }
+      if (current.isNotEmpty) {
+        db.execute(
+          'update model_price_periods set valid_to_utc = ? where id = ?',
+          [stamp, current.single['id']],
+        );
+      }
+      db.execute(
+        '''
+        insert into model_price_periods (
+          source, model_id, model_name, provider, prompt_price_per_token,
+          completion_price_per_token, input_cache_read_price_per_token,
+          input_cache_write_price_per_token, internal_reasoning_price_per_token,
+          request_price, image_price, web_search_price, canonical_slug, additional_prices_json,
+          pricing_fingerprint, raw_pricing_json, valid_from_utc,
+          first_snapshot_id, last_seen_snapshot_id)
+        values ('openrouter', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ''',
+        [
+          model.modelId,
+          model.modelName,
+          model.provider,
+          ...prices,
+          model.canonicalSlug,
+          jsonEncode(model.additionalRates),
+          fingerprint,
+          model.rawPricingJson ??
+              jsonEncode({'id': model.modelId, 'prices': prices}),
+          stamp,
+          snapshotId,
+          snapshotId,
+        ],
+      );
+      final periodId = db.lastInsertRowId;
+      for (final rule in model.rules) {
+        db.execute(
+          '''
+          insert into provider_price_rules (
+            price_period_id, provider_order, prompt_tokens_min,
+            utc_start_minute, utc_end_minute, utc_weekdays,
+            prompt_price_per_token, completion_price_per_token,
+            input_cache_read_price_per_token, input_cache_write_price_per_token,
+            internal_reasoning_price_per_token, request_price,
+            image_price, web_search_price, additional_prices_json, pricing_fingerprint, raw_rule_json)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+          [
+            periodId,
+            rule.providerOrder,
+            rule.minPromptTokens,
+            rule.utcStartMinute,
+            rule.utcEndMinute,
+            rule.utcWeekdays == null
+                ? null
+                : jsonEncode(rule.utcWeekdays!.toList()..sort()),
+            for (final key in _storedPriceKeys) rule.rateOverrides[key],
+            jsonEncode({
+              for (final entry in rule.rateOverrides.entries)
+                if (!_storedPriceKeys.contains(entry.key))
+                  entry.key: entry.value,
+            }),
+            sha256
+                .convert(utf8.encode(jsonEncode(_normalizedRule(rule))))
+                .toString(),
+            rule.rawRuleJson,
+          ],
+        );
+      }
+      _markModelCostsDirty(model.modelId, observed);
+    }
+    if (response.declaredTotalCount != null) {
+      var cursor = 0;
+      while (true) {
+        final absent = db.select(
+          '''
+          select id, model_id from model_price_periods
+          where source = 'openrouter' and valid_to_utc is null
+            and last_seen_snapshot_id <> ? and id > ?
+          order by id limit 512
+        ''',
+          [snapshotId, cursor],
+        );
+        if (absent.isEmpty) break;
+        for (final row in absent) {
+          db.execute(
+            'update model_price_periods set valid_to_utc = ? where id = ?',
+            [stamp, row['id']],
+          );
+          db.execute(
+            "delete from model_pricing_cache where source = 'openrouter' and model_id = ?",
+            [row['model_id']],
+          );
+          _markModelCostsDirty(row['model_id'] as String, observed);
+        }
+        cursor = absent.last['id'] as int;
+      }
+    }
+  }
+
+  void _markModelCostsDirty(String modelId, DateTime observed) {
+    final keys = [
+      modelId,
+      if (modelId.startsWith('openai/gpt-')) modelId.substring(7),
+    ];
+    final stamp = _priceTimestamp(observed);
+    var cursor = 0;
+    while (true) {
+      final partitions = db.select(
+        '''
+        select id, session_id, day_utc, model_key from usage_session_daily
+        where id > ? and day_utc >= ?
+          and model_key in (${List.filled(keys.length, '?').join(', ')})
+        order by id limit 512
+      ''',
+        [cursor, stamp.substring(0, 10), ...keys],
+      );
+      if (partitions.isEmpty) return;
+      for (final partition in partitions) {
+        if (!_partitionHasEventAtOrAfter(partition, observed)) continue;
+        db.execute(
+          '''
+          insert into usage_cost_dirty_partitions (
+            session_id, day_utc, model_key, reason, target_cost_projection_version,
+            created_at_utc, updated_at_utc)
+          values (?, ?, ?, 'price_history', $usageCostProjectionVersion, ?, ?)
+          on conflict(session_id, day_utc, model_key) do update set
+            target_cost_projection_version = max(usage_cost_dirty_partitions.target_cost_projection_version,
+              excluded.target_cost_projection_version),
+            updated_at_utc = excluded.updated_at_utc
+        ''',
+          [
+            partition['session_id'],
+            partition['day_utc'],
+            partition['model_key'],
+            stamp,
+            stamp,
+          ],
+        );
+      }
+      cursor = partitions.last['id'] as int;
+    }
+  }
+
+  bool _partitionHasEventAtOrAfter(Row partition, DateTime observed) {
+    var ordinal = -1;
+    while (true) {
+      final events = db.select(
+        '''
+        select source_record_ordinal, occurred_at_utc from usage_events
+        where session_row_id = ? and source_record_ordinal > ?
+          and coalesce(model, '') = ?
+          and strftime('%Y-%m-%d', occurred_at_utc) = ?
+        order by source_record_ordinal limit 512
+      ''',
+        [
+          partition['session_id'],
+          ordinal,
+          partition['model_key'],
+          partition['day_utc'],
+        ],
+      );
+      if (events.isEmpty) return false;
+      for (final event in events) {
+        // SQLite Julian-day comparisons lose sub-millisecond precision. Keep
+        // exact UTC ordering, including imported offset timestamps, in Dart.
+        final raw = event['occurred_at_utc'] as String?;
+        final at = raw == null ? null : DateTime.tryParse(raw)?.toUtc();
+        if (at != null && !at.isBefore(observed)) return true;
+      }
+      ordinal = events.last['source_record_ordinal'] as int;
     }
   }
 
@@ -143,16 +733,7 @@ class PricingRepository {
       now.subtract(Duration(hours: settings.cachePricingHours));
 
   void _validateOpenRouterCatalogEndpoint(Uri endpoint) {
-    if (endpoint.scheme != 'https' ||
-        endpoint.host != 'openrouter.ai' ||
-        endpoint.path != '/api/v1/models' ||
-        endpoint.hasQuery ||
-        endpoint.hasFragment ||
-        endpoint.userInfo.isNotEmpty) {
-      throw const PricingFetchException(
-        'OpenRouter catalog endpoint must be https://openrouter.ai/api/v1/models.',
-      );
-    }
+    _validateCatalogUri(endpoint, continuation: false);
   }
 
   void _upsertOpenRouterModel(OpenRouterModelPricing model, DateTime now) {
@@ -198,6 +779,10 @@ class PricingRepository {
   }
 
   void _upsertOverrides(PricingSettings settings, DateTime now) {
+    if (_hasPriceHistory) {
+      _recordLocalOverrideHistory(settings, now);
+      return;
+    }
     if (!settings.fallbackToOverrides) {
       return;
     }
@@ -301,6 +886,141 @@ class PricingRepository {
     }
   }
 
+  void _recordLocalOverrideHistory(
+    PricingSettings settings,
+    DateTime observed, {
+    bool ownsTransaction = true,
+  }) {
+    final stamp = _priceTimestamp(observed);
+    if (ownsTransaction) {
+      db.execute('begin immediate');
+    } else if (db.autocommit) {
+      throw StateError('Price history requires the caller transaction.');
+    }
+    try {
+      final policy = jsonEncode([
+        usageCostProjectionVersion,
+        settings.useExternalPricing,
+        settings.fallbackToOverrides,
+      ]);
+      final previousPolicy = db
+          .select('select pricing_policy_json from database_state where id = 1')
+          .single['pricing_policy_json'];
+      if (previousPolicy != policy) {
+        // Native INSERT SELECT keeps invalidation out of Dart memory. Policy
+        // and algorithm changes invalidate all bases in this same transaction.
+        db.execute(
+          '''
+          insert into usage_cost_dirty_partitions (session_id, day_utc, model_key,
+            reason, target_cost_projection_version, created_at_utc, updated_at_utc)
+          select session_id, day_utc, model_key, 'pricing_policy',
+            max(cost_projection_version, $usageCostProjectionVersion), ?, ?
+          from usage_session_daily where true
+          on conflict(session_id, day_utc, model_key) do update set
+            target_cost_projection_version = max(usage_cost_dirty_partitions.target_cost_projection_version,
+              excluded.target_cost_projection_version),
+            reason = excluded.reason, updated_at_utc = excluded.updated_at_utc
+        ''',
+          [stamp, stamp],
+        );
+        db.execute(
+          'update database_state set pricing_policy_json = ? where id = 1',
+          [policy],
+        );
+      }
+      final revision =
+          db.select('''
+        update database_state set pricing_settings_revision = pricing_settings_revision + 1
+        where id = 1 returning pricing_settings_revision
+      ''').single['pricing_settings_revision']
+              as int;
+      for (final entry in settings.overrides.entries) {
+        final override = entry.value;
+        final rates =
+            [
+                  override.prompt,
+                  override.completion,
+                  override.inputCacheRead,
+                  override.inputCacheWrite,
+                  override.internalReasoning,
+                ]
+                .map((value) {
+                  final normalized = sumEstimatedCostTexts([value]);
+                  if (normalized == null || normalized.startsWith('-')) {
+                    throw const PricingFetchException(
+                      'Local override decimal price is invalid.',
+                    );
+                  }
+                  return normalized;
+                })
+                .toList(growable: false);
+        final fingerprint = sha256
+            .convert(utf8.encode(jsonEncode(rates)))
+            .toString();
+        final current = db.select(
+          '''
+          select id, settings_fingerprint from local_price_override_periods
+          where model_id = ? and valid_to_utc is null
+        ''',
+          [entry.key],
+        );
+        if (current.isNotEmpty &&
+            current.single['settings_fingerprint'] == fingerprint) {
+          db.execute(
+            'update local_price_override_periods set last_seen_settings_revision = ? where id = ?',
+            [revision, current.single['id']],
+          );
+          continue;
+        }
+        if (current.isNotEmpty) {
+          db.execute(
+            'update local_price_override_periods set valid_to_utc = ? where id = ?',
+            [stamp, current.single['id']],
+          );
+        }
+        db.execute(
+          '''
+          insert into local_price_override_periods (model_id, prompt_price_per_token,
+            completion_price_per_token, input_cache_read_price_per_token,
+            input_cache_write_price_per_token, internal_reasoning_price_per_token,
+            settings_fingerprint, valid_from_utc, first_settings_revision,
+            last_seen_settings_revision)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+          [entry.key, ...rates, fingerprint, stamp, revision, revision],
+        );
+        _markModelCostsDirty(entry.key, observed);
+      }
+      var cursor = 0;
+      while (true) {
+        final removed = db.select(
+          '''
+          select id, model_id from local_price_override_periods
+          where valid_to_utc is null and last_seen_settings_revision <> ? and id > ?
+          order by id limit 512
+        ''',
+          [revision, cursor],
+        );
+        if (removed.isEmpty) break;
+        for (final row in removed) {
+          db.execute(
+            '''
+            update local_price_override_periods
+            set valid_to_utc = ?, last_seen_settings_revision = ? where id = ?
+          ''',
+            [stamp, revision, row['id']],
+          );
+          _markModelCostsDirty(row['model_id'] as String, observed);
+        }
+        cursor = removed.last['id'] as int;
+      }
+      if (ownsTransaction) db.execute('commit');
+    } on Object {
+      if (ownsTransaction && !db.autocommit) db.execute('rollback');
+      rethrow;
+    }
+  }
+
   UsagePricingCatalog _loadCatalog(
     PricingSettings settings, {
     bool includeOpenRouter = true,
@@ -387,13 +1107,33 @@ class PricingRepository {
         insert into logs (time_utc, level, category, message, details)
         values (?, 'error', 'pricing', 'Pricing fetch failed.', ?)
         ''',
-        [DateTime.now().toUtc().toIso8601String(), error.toString()],
+        [DateTime.now().toUtc().toIso8601String(), _safePricingError(error)],
       );
     } on Object {
       // Pricing failures are recoverable even when another process owns the
       // SQLite writer slot and the diagnostic row cannot be persisted.
     }
   }
+}
+
+class HistoricalUsageCost {
+  const HistoricalUsageCost({
+    this.estimatedCostText,
+    this.costStatus = 'unknown',
+    this.providerPricePeriodId,
+    this.providerRuleIds = const [],
+    this.localOverridePeriodId,
+    this.catalogSnapshotId,
+    this.resolutionMethod = 'unknown',
+  });
+
+  final String? estimatedCostText;
+  final String costStatus;
+  final int? providerPricePeriodId;
+  final List<int> providerRuleIds;
+  final int? localOverridePeriodId;
+  final int? catalogSnapshotId;
+  final String resolutionMethod;
 }
 
 class PricingLoadResult {
@@ -425,11 +1165,13 @@ class OpenRouterModelsRequest {
     required this.endpoint,
     required this.apiKey,
     this.body,
+    this.cancellation,
   });
 
   final Uri endpoint;
   final String apiKey;
   final String? body;
+  final Future<void>? cancellation;
 }
 
 abstract interface class OpenRouterModelsClient {
@@ -437,41 +1179,235 @@ abstract interface class OpenRouterModelsClient {
 }
 
 class OpenRouterHttpClient implements OpenRouterModelsClient {
-  const OpenRouterHttpClient();
+  const OpenRouterHttpClient({this.clock});
+
+  final DateTime Function()? clock;
 
   @override
   Future<OpenRouterModelsResponse> fetchModels(
     OpenRouterModelsRequest request,
   ) async {
-    final httpClient = HttpClient();
+    _validateCatalogUri(request.endpoint, continuation: false);
+    if (request.body != null) {
+      throw const PricingFetchException(
+        'Catalog requests must not have a body.',
+      );
+    }
+    final httpClient = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    var cancelled = false;
+    final cancellation = Completer<OpenRouterModelsResponse>();
+    void cancel() {
+      cancelled = true;
+      if (!cancellation.isCompleted) {
+        cancellation.completeError(
+          const PricingFetchException('OpenRouter catalog request cancelled.'),
+        );
+      }
+      httpClient.close(force: true);
+    }
+
+    final cancellationSubscription = request.cancellation?.asStream().listen(
+      (_) => cancel(),
+      onError: (Object _) => cancel(),
+    );
     try {
-      final httpRequest = await httpClient.getUrl(request.endpoint);
-      httpRequest.headers.set(HttpHeaders.acceptHeader, 'application/json');
-      if (request.apiKey.trim().isNotEmpty) {
-        httpRequest.headers.set(
-          HttpHeaders.authorizationHeader,
-          'Bearer ${request.apiKey}',
+      final fetch = () async {
+        final models = <OpenRouterModelPricing>[];
+        final ids = <String>{};
+        final visited = <Uri>{};
+        final digest = _CatalogDigest();
+        final hash = sha256.startChunkedConversion(digest);
+        var endpoint = request.endpoint;
+        var totalBytes = 0;
+        int? total;
+        while (true) {
+          if (cancelled) {
+            throw const PricingFetchException(
+              'OpenRouter catalog request cancelled.',
+            );
+          }
+          _validateCatalogUri(endpoint, continuation: visited.isNotEmpty);
+          if (!visited.add(endpoint) || visited.length > 100) {
+            throw const PricingFetchException(
+              'OpenRouter pagination limit or cycle.',
+            );
+          }
+          final bytes = await _readPage(
+            httpClient,
+            endpoint,
+            request.apiKey,
+          ).timeout(const Duration(seconds: 30));
+          if (cancelled) {
+            throw const PricingFetchException(
+              'OpenRouter catalog request cancelled.',
+            );
+          }
+          totalBytes += bytes.length;
+          if (totalBytes > 50 * 1024 * 1024) {
+            throw const PricingFetchException(
+              'OpenRouter catalog exceeds its size limit.',
+            );
+          }
+          hash.add(bytes);
+          final page = OpenRouterModelsResponse.fromJsonText(
+            utf8.decode(bytes),
+          );
+          final declared = page.declaredTotalCount;
+          if (declared != null) {
+            if (declared > 100000 || (total != null && total != declared)) {
+              throw const PricingFetchException(
+                'OpenRouter page totals are inconsistent.',
+              );
+            }
+            total = declared;
+          }
+          for (final model in page.models) {
+            if (!ids.add(model.modelId) || ids.length > 100000) {
+              throw const PricingFetchException(
+                'OpenRouter model IDs are repeated or exceed the limit.',
+              );
+            }
+            models.add(model);
+          }
+          if (page.nextPage == null) break;
+          endpoint = endpoint.resolve(page.nextPage!);
+        }
+        hash.close();
+        final catalog = OpenRouterModelsResponse(
+          List.unmodifiable(models),
+          declaredTotalCount: total,
+          pageCount: visited.length,
+          payloadSha256: digest.value!.toString(),
         );
-      }
-      final response = await httpRequest.close();
-      final text = await utf8.decoder.bind(response).join();
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw PricingFetchException(
-          'OpenRouter returned HTTP ${response.statusCode}.',
-        );
-      }
-      return OpenRouterModelsResponse.fromJsonText(text);
+        catalog.validateComplete();
+        return catalog;
+      }();
+      return await Future.any([fetch, cancellation.future]);
+    } on TimeoutException {
+      throw const PricingFetchException(
+        'OpenRouter catalog request timed out.',
+      );
+    } on FormatException {
+      throw const PricingFetchException(
+        'OpenRouter catalog encoding or continuation is invalid.',
+      );
+    } on SocketException {
+      throw const PricingFetchException(
+        'OpenRouter catalog connection failed.',
+      );
+    } on HttpException {
+      throw const PricingFetchException('OpenRouter catalog transport failed.');
+    } on HandshakeException {
+      throw const PricingFetchException(
+        'OpenRouter catalog secure connection failed.',
+      );
     } finally {
       httpClient.close(force: true);
+      await cancellationSubscription?.cancel();
+    }
+  }
+
+  Future<Uint8List> _readPage(
+    HttpClient client,
+    Uri endpoint,
+    String apiKey,
+  ) async {
+    final request = await client.getUrl(endpoint);
+    request.followRedirects = false;
+    request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    if (apiKey.trim().isNotEmpty) {
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $apiKey');
+    }
+    final response = await request.close();
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw PricingFetchException(
+        'OpenRouter returned HTTP ${response.statusCode}.',
+        statusCode: response.statusCode,
+        retryAfter: _retryAfter(response.headers[HttpHeaders.retryAfterHeader]),
+      );
+    }
+    // HttpClient decompresses automatically. Bound decoded bytes, not the
+    // advertised compressed Content-Length, before UTF-8/JSON allocation.
+    final bytes = BytesBuilder(copy: false);
+    await for (final chunk in response) {
+      if (bytes.length + chunk.length > 5 * 1024 * 1024) {
+        throw const PricingFetchException(
+          'OpenRouter page exceeds its size limit.',
+        );
+      }
+      bytes.add(chunk);
+    }
+    return bytes.takeBytes();
+  }
+
+  Duration? _retryAfter(List<String>? values) {
+    if (values == null || values.length != 1) return null;
+    final value = values.single.trim();
+    const cap = Duration(hours: 24);
+    if (RegExp(r'^[0-9]+$').hasMatch(value)) {
+      final seconds = BigInt.parse(value);
+      return seconds >= BigInt.from(cap.inSeconds)
+          ? cap
+          : Duration(seconds: seconds.toInt());
+    }
+    try {
+      final until = HttpDate.parse(value);
+      final now = (clock?.call() ?? DateTime.now()).toUtc();
+      final delay = until.difference(now);
+      return delay.isNegative
+          ? Duration.zero
+          : delay > cap
+          ? cap
+          : delay;
+    } on HttpException {
+      // Invalid header diagnostics contain the raw value; discard them.
+      return null;
     }
   }
 }
 
+class _CatalogDigest implements Sink<Digest> {
+  Digest? value;
+  @override
+  void add(Digest data) {
+    value = data;
+  }
+
+  @override
+  void close() {}
+}
+
+void _validateCatalogUri(Uri endpoint, {required bool continuation}) {
+  if (endpoint.scheme != 'https' ||
+      endpoint.host != 'openrouter.ai' ||
+      endpoint.port != 443 ||
+      endpoint.path != '/api/v1/models' ||
+      (!continuation && endpoint.hasQuery) ||
+      endpoint.hasFragment ||
+      endpoint.userInfo.isNotEmpty) {
+    throw const PricingFetchException(
+      'OpenRouter catalog endpoint must be https://openrouter.ai/api/v1/models.',
+    );
+  }
+}
+
 class OpenRouterModelsResponse {
-  const OpenRouterModelsResponse(this.models);
+  const OpenRouterModelsResponse(
+    this.models, {
+    this.declaredTotalCount,
+    this.nextPage,
+    this.pageCount = 1,
+    this.payloadSha256,
+  });
 
   factory OpenRouterModelsResponse.fromJsonText(String text) {
-    final decoded = jsonDecode(text);
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(text);
+    } on FormatException {
+      throw const PricingFetchException('OpenRouter catalog JSON is invalid.');
+    }
     if (decoded is! Map) {
       throw const PricingFetchException('OpenRouter catalog root is invalid.');
     }
@@ -479,16 +1415,51 @@ class OpenRouterModelsResponse {
     if (data is! List) {
       throw const PricingFetchException('OpenRouter catalog data is invalid.');
     }
+    final total = decoded['total_count'];
+    final links = decoded['links'];
+    if ((total != null && (total is! int || total < 0)) ||
+        (links != null && links is! Map)) {
+      throw const PricingFetchException(
+        'OpenRouter catalog metadata is invalid.',
+      );
+    }
+    final next = links is Map ? links['next'] : null;
+    if (next != null && (next is! String || next.trim().isEmpty)) {
+      throw const PricingFetchException('OpenRouter continuation is invalid.');
+    }
+    final models = <OpenRouterModelPricing>[];
+    for (final model in data) {
+      if (model is! Map) {
+        throw const PricingFetchException('OpenRouter model entry is invalid.');
+      }
+      models.add(OpenRouterModelPricing.fromJson(model));
+    }
     return OpenRouterModelsResponse(
-      data
-          .whereType<Map>()
-          .map((model) => OpenRouterModelPricing.fromJson(model))
-          .whereType<OpenRouterModelPricing>()
-          .toList(growable: false),
+      List.unmodifiable(models),
+      declaredTotalCount: total as int?,
+      nextPage: next as String?,
+      payloadSha256: sha256.convert(utf8.encode(text)).toString(),
     );
   }
 
   final List<OpenRouterModelPricing> models;
+  final int? declaredTotalCount;
+  final String? nextPage;
+  final int pageCount;
+  final String? payloadSha256;
+
+  void validateComplete() {
+    if (nextPage != null ||
+        pageCount < 1 ||
+        pageCount > 100 ||
+        models.length > 100000 ||
+        (declaredTotalCount != null && declaredTotalCount != models.length) ||
+        models.map((model) => model.modelId).toSet().length != models.length) {
+      throw const PricingFetchException(
+        'OpenRouter catalog is incomplete or inconsistent.',
+      );
+    }
+  }
 }
 
 class OpenRouterModelPricing {
@@ -502,6 +1473,11 @@ class OpenRouterModelPricing {
     this.inputCacheWritePricePerToken,
     this.internalReasoningPricePerToken,
     this.requestPrice,
+    this.imagePrice,
+    this.webSearchPrice,
+    this.canonicalSlug,
+    this.additionalRates = const {},
+    this.rules = const [],
     this.rawPricingJson,
   });
 
@@ -510,9 +1486,29 @@ class OpenRouterModelPricing {
     if (id == null || id.isEmpty) {
       throw const PricingFetchException('OpenRouter model id is missing.');
     }
-    final pricing = json['pricing'] is Map
-        ? (json['pricing'] as Map).cast<Object?, Object?>()
-        : const <Object?, Object?>{};
+    if (json['pricing'] is! Map) {
+      throw const PricingFetchException('OpenRouter model pricing is invalid.');
+    }
+    final pricing = (json['pricing'] as Map).cast<Object?, Object?>();
+    final List<OpenRouterPriceRule> rules;
+    try {
+      rules = parseOpenRouterPriceRules(pricing['overrides']);
+    } on FormatException {
+      throw const PricingFetchException(
+        'OpenRouter conditional pricing is invalid or unsupported.',
+      );
+    }
+    final additional = <String, String>{};
+    for (final entry in pricing.entries) {
+      if (_storedPriceKeys.contains(entry.key) || entry.key == 'overrides') {
+        continue;
+      }
+      if (entry.key is! String) {
+        throw const PricingFetchException('OpenRouter price field is invalid.');
+      }
+      final rate = _stringOrNumber(entry.value);
+      if (rate != null) additional[entry.key as String] = rate;
+    }
     return OpenRouterModelPricing(
       modelId: id,
       modelName: _string(json['name']),
@@ -527,6 +1523,11 @@ class OpenRouterModelPricing {
         pricing['internal_reasoning'],
       ),
       requestPrice: _stringOrNumber(pricing['request']),
+      imagePrice: _stringOrNumber(pricing['image']),
+      webSearchPrice: _stringOrNumber(pricing['web_search']),
+      canonicalSlug: _string(json['canonical_slug']),
+      additionalRates: Map.unmodifiable(additional),
+      rules: rules,
       rawPricingJson: jsonEncode(json),
     );
   }
@@ -540,13 +1541,54 @@ class OpenRouterModelPricing {
   final String? inputCacheWritePricePerToken;
   final String? internalReasoningPricePerToken;
   final String? requestPrice;
+  final String? imagePrice;
+  final String? webSearchPrice;
+  final String? canonicalSlug;
+  final Map<String, String> additionalRates;
+  final List<OpenRouterPriceRule> rules;
   final String? rawPricingJson;
 }
 
+const _storedPriceKeys = [
+  'prompt',
+  'completion',
+  'input_cache_read',
+  'input_cache_write',
+  'internal_reasoning',
+  'request',
+  'image',
+  'web_search',
+];
+
+const _priceColumns = {
+  'prompt': 'prompt_price_per_token',
+  'completion': 'completion_price_per_token',
+  'input_cache_read': 'input_cache_read_price_per_token',
+  'input_cache_write': 'input_cache_write_price_per_token',
+  'internal_reasoning': 'internal_reasoning_price_per_token',
+  'request': 'request_price',
+  'image': 'image_price',
+  'web_search': 'web_search_price',
+};
+
+Map<String, Object?> _normalizedRule(OpenRouterPriceRule rule) => {
+  'order': rule.providerOrder,
+  'minimum': rule.minPromptTokens,
+  'start': rule.utcStartMinute,
+  'end': rule.utcEndMinute,
+  'days': rule.utcWeekdays?.toList()?..sort(),
+  'rates': {
+    for (final key in rule.rateOverrides.keys.toList()..sort())
+      key: rule.rateOverrides[key],
+  },
+};
+
 class PricingFetchException implements Exception {
-  const PricingFetchException(this.message);
+  const PricingFetchException(this.message, {this.statusCode, this.retryAfter});
 
   final String message;
+  final int? statusCode;
+  final Duration? retryAfter;
 
   @override
   String toString() => message;
@@ -560,14 +1602,33 @@ String _providerFromModel(String modelId) {
 String? _string(Object? value) => value is String ? value : null;
 
 String? _stringOrNumber(Object? value) {
-  if (value is String) {
-    return value;
+  if (value == null) return null;
+  // Provider rates are decimal strings. Reject binary floats and malformed
+  // values instead of silently converting an invalid rate into missing data.
+  final normalized = value is String ? sumEstimatedCostTexts([value]) : null;
+  // Observed routing models use -1 where a fixed rate is unavailable. Retain
+  // the original JSON but never turn that sentinel into a negative charge.
+  if (normalized == '-1') return null;
+  if (normalized == null || normalized.startsWith('-')) {
+    throw const PricingFetchException('OpenRouter decimal price is invalid.');
   }
-  if (value is num) {
-    return value.toString();
-  }
-  return null;
+  return normalized;
 }
 
 DateTime? _dateTimeUtc(Object? value) =>
     value is String ? DateTime.tryParse(value)?.toUtc() : null;
+
+String _priceTimestamp(DateTime value) {
+  final utc = value.toUtc();
+  final text = utc.toIso8601String();
+  // SQLite's indexed lexical order requires one fractional width. Dart omits
+  // the final three digits when microsecond == 0, which otherwise misorders
+  // .000Z and .000001Z at a price change inside the same millisecond.
+  return utc.microsecond == 0
+      ? '${text.substring(0, text.length - 1)}000Z'
+      : text;
+}
+
+String _safePricingError(Object error) => error is SqliteException
+    ? 'Pricing database update failed.'
+    : 'Pricing fetch failed.';

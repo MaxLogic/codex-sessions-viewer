@@ -1,8 +1,10 @@
 import 'dart:async';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
+import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,6 +13,306 @@ import 'package:flutter_test/flutter_test.dart';
 import '../helpers/test_sessions_screen.dart';
 
 void main() {
+  testWidgets(
+    'pricing revisions update row and detail costs without source refresh',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final messages = _messages('retained', count: 2);
+      final rows = [
+        _row(
+          id: 'priced',
+          title: 'Priced session',
+          project: 'Viewer',
+          estimatedCostText: '1.00',
+          costUnknown: false,
+          messages: messages,
+        ),
+      ];
+      var scans = 0;
+      final loads = <Completer<Map<String, UsageCostEstimate>?>>[];
+      Future<void> show(int revision, bool updating, {bool available = true}) =>
+          tester.pumpWidget(
+            MaterialApp(
+              home: SessionsScreen(
+                initialRows: rows,
+                now: fixedSessionsNow,
+                pricingRevision: revision,
+                pricingUpdating: updating,
+                onRefresh: () async {
+                  scans++;
+                  return rows;
+                },
+                onLoadPersistedCosts: !available
+                    ? null
+                    : (ids) {
+                        expect(ids, ['priced']);
+                        final result =
+                            Completer<Map<String, UsageCostEstimate>?>();
+                        loads.add(result);
+                        return result.future;
+                      },
+              ),
+            ),
+          );
+      SessionRowViewModel detail() =>
+          tester.widget<SessionDetailPane>(find.byType(SessionDetailPane)).row;
+      await show(0, false);
+      await tester.tap(find.text('Priced session').first);
+      await tester.pumpAndSettle();
+      expect(detail().estimatedCostDisplay, r'$1.00');
+      await show(1, true);
+      expect(detail().estimatedCostDisplay, 'Pricing update in progress');
+      expect(find.text(r'$1.00'), findsNothing);
+      expect(loads, isEmpty);
+      await show(2, false);
+      await tester.pump();
+      loads.single.complete({
+        'priced': const UsageCostEstimate(
+          estimatedCostText: '2.00',
+          costUnknown: false,
+        ),
+      });
+      await tester.pumpAndSettle();
+      expect(detail().estimatedCostDisplay, r'$2.00');
+      expect(identical(detail().conversationMessages, messages), isTrue);
+      await show(3, false);
+      await tester.pump();
+      final stale = loads.last;
+      await show(4, false);
+      await tester.pump();
+      loads.last.complete({
+        'priced': const UsageCostEstimate(
+          estimatedCostText: '4.00',
+          costUnknown: false,
+        ),
+      });
+      await tester.pumpAndSettle();
+      stale.complete({
+        'priced': const UsageCostEstimate(
+          estimatedCostText: '3.00',
+          costUnknown: false,
+        ),
+      });
+      await tester.pumpAndSettle();
+      expect(detail().estimatedCostDisplay, r'$4.00');
+      expect(detail().id, 'priced');
+      expect(identical(detail().conversationMessages, messages), isTrue);
+      expect(scans, 0);
+      // Incoming scan rows are also hidden during repricing, without losing detail.
+      await show(5, true);
+      await tester.tap(find.text('Refresh'));
+      await tester.pumpAndSettle();
+      expect(scans, 1);
+      expect(detail().estimatedCostDisplay, 'Pricing update in progress');
+      expect(find.text(r'$1.00'), findsNothing);
+      await show(6, false);
+      await tester.pump();
+      final beforeNewRows = loads.last;
+      await tester.tap(find.text('Refresh'));
+      await tester.pumpAndSettle();
+      expect(scans, 2);
+      expect(loads.last, isNot(same(beforeNewRows)));
+      loads.last.complete({
+        'priced': const UsageCostEstimate(
+          estimatedCostText: '7.00',
+          costUnknown: false,
+        ),
+      });
+      await tester.pumpAndSettle();
+      beforeNewRows.complete({
+        'priced': const UsageCostEstimate(
+          estimatedCostText: '6.00',
+          costUnknown: false,
+        ),
+      });
+      await tester.pumpAndSettle();
+      expect(detail().estimatedCostDisplay, r'$7.00');
+      expect(detail().id, 'priced');
+      expect(identical(detail().conversationMessages, messages), isTrue);
+      expect(
+        scans,
+        2,
+        reason: 'Only the two explicit Refresh actions scan sources.',
+      );
+      await show(7, true, available: false);
+      await show(8, false, available: false);
+      expect(detail().estimatedCostDisplay, 'Cost unknown');
+    },
+  );
+
+  test('projected cost copies preserve session content and metadata', () {
+    final row = _row(
+      id: 'cost',
+      title: 'Preserve',
+      project: 'Viewer',
+      messages: _messages('copy', count: 2),
+      estimatedCostText: '1',
+      costUnknown: false,
+    );
+    final changed = row.copyWithProjectedCost(
+      const UsageCostEstimate(
+        estimatedCostText: '2',
+        costUnknown: false,
+        partialUnsupportedUnits: true,
+      ),
+    );
+    expect(changed.estimatedCostDisplay, r'$2 (partial)');
+    expect(changed.id, row.id);
+    expect(changed.title, row.title);
+    expect(changed.tags, same(row.tags));
+    expect(changed.conversationMessages, same(row.conversationMessages));
+  });
+
+  test(
+    'session cost labels preserve updating and partial states through copies',
+    () {
+      for (final state in [
+        (
+          updating: true,
+          partial: true,
+          unknown: false,
+          label: 'Pricing update in progress',
+        ),
+        (
+          updating: false,
+          partial: true,
+          unknown: false,
+          label: r'$0.10 (partial)',
+        ),
+        (updating: false, partial: true, unknown: true, label: 'Cost unknown'),
+      ]) {
+        final row = _row(
+          id: 'cost',
+          title: 'Cost states',
+          project: 'Viewer',
+          estimatedCostText: '0.10',
+          costUnknown: state.unknown,
+          costUpdating: state.updating,
+          costPartialUnsupportedUnits: state.partial,
+        );
+        for (final copy in [
+          row,
+          row.copyWithConversationMessages(const []),
+          row.copyWithUsageRollup(null),
+          row.copyWithEvalMetadata(const SessionEvalMetadata(evalReady: true)),
+        ]) {
+          expect(copy.estimatedCostDisplay, state.label);
+          expect(copy.costUpdating, state.updating);
+          expect(copy.costPartialUnsupportedUnits, state.partial);
+        }
+      }
+    },
+  );
+
+  testWidgets('parent cost rollups disclose partial and updating children', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    for (final state in [
+      (
+        parentUpdating: false,
+        childUpdating: false,
+        parentPartial: false,
+        childPartial: true,
+        childUnknown: false,
+        main: r'$0.10',
+        child: r'$0.2 (partial)',
+        total: r'$0.3 (partial)',
+      ),
+      (
+        parentUpdating: false,
+        childUpdating: true,
+        parentPartial: false,
+        childPartial: true,
+        childUnknown: false,
+        main: r'$0.10',
+        child: 'Pricing update in progress',
+        total: 'Pricing update in progress',
+      ),
+      (
+        parentUpdating: true,
+        childUpdating: false,
+        parentPartial: true,
+        childPartial: false,
+        childUnknown: false,
+        main: 'Pricing update in progress',
+        child: r'$0.2',
+        total: 'Pricing update in progress',
+      ),
+      (
+        parentUpdating: false,
+        childUpdating: false,
+        parentPartial: true,
+        childPartial: false,
+        childUnknown: false,
+        main: r'$0.10 (partial)',
+        child: r'$0.2',
+        total: r'$0.3 (partial)',
+      ),
+      (
+        parentUpdating: false,
+        childUpdating: false,
+        parentPartial: true,
+        childPartial: false,
+        childUnknown: true,
+        main: r'$0.10 (partial)',
+        child: 'Cost unknown',
+        total: 'Cost unknown',
+      ),
+    ]) {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TestSessionsScreen(
+            key: UniqueKey(),
+            initialRows: [
+              _row(
+                id: 'parent',
+                sessionId: 'thread-parent',
+                title: 'Main user session',
+                project: 'Viewer',
+                estimatedCostText: '0.10',
+                costUnknown: false,
+                costUpdating: state.parentUpdating,
+                costPartialUnsupportedUnits: state.parentPartial,
+              ),
+              _row(
+                id: 'child',
+                sessionId: 'thread-child',
+                title: 'Child subagent',
+                project: 'Viewer',
+                threadSource: 'subagent',
+                parentThreadId: 'thread-parent',
+                agentNickname: 'Singer',
+                estimatedCostText: '0.20',
+                costUnknown: state.childUnknown,
+                costUpdating: state.childUpdating,
+                costPartialUnsupportedUnits: state.childPartial,
+              ),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Main user session').first);
+      await tester.pumpAndSettle();
+      final parent = tester
+          .widget<SessionDetailPane>(find.byType(SessionDetailPane))
+          .row;
+      final rollup = parent.usageRollup!;
+      expect(rollup.mainEstimatedCostDisplay, state.main);
+      expect(rollup.subagentEstimatedCostDisplay, state.child);
+      expect(parent.displayEstimatedCost, state.total);
+      expect(find.text(state.total), findsWidgets);
+      if (state.parentUpdating || state.childUpdating || state.childUnknown) {
+        expect(rollup.totalEstimatedCostText, isNull);
+      } else {
+        expect(rollup.totalEstimatedCostText, '0.3');
+      }
+    }
+  });
+
   testWidgets('defaults to active sessions and preserves filters on refresh', (
     tester,
   ) async {
@@ -1627,6 +1929,8 @@ void main() {
       ),
     );
 
+    // The table is 1240 wide; the default split caps it at 55% of the
+    // window so the detail pane keeps at least 45%.
     expect(
       tester.getSize(find.byKey(const Key('sessions-left-panel'))).width,
       1240,
@@ -2380,6 +2684,8 @@ SessionRowViewModel _row({
   String? summary,
   String? estimatedCostText,
   bool costUnknown = true,
+  bool costUpdating = false,
+  bool costPartialUnsupportedUnits = false,
 }) {
   return SessionRowViewModel(
     id: id,
@@ -2400,6 +2706,8 @@ SessionRowViewModel _row({
     model: model,
     estimatedCostText: estimatedCostText,
     costUnknown: costUnknown,
+    costUpdating: costUpdating,
+    costPartialUnsupportedUnits: costPartialUnsupportedUnits,
     tags: const ['ui'],
     status: 'Available',
     isArchived: isArchived,
