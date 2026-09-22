@@ -140,6 +140,7 @@ Future<void> _pump(
   _FakeRepository repository, {
   ProjectsViewState? viewState,
   String? openProjectName,
+  void Function(String)? onShowSessions,
 }) async {
   await tester.binding.setSurfaceSize(const Size(1400, 900));
   addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -150,6 +151,7 @@ Future<void> _pump(
           repository: repository,
           viewState: viewState ?? ProjectsViewState(),
           openProjectName: openProjectName,
+          onShowSessions: onShowSessions,
           now: () => DateTime.utc(2026, 9, 22, 12),
         ),
       ),
@@ -288,6 +290,21 @@ void main() {
     expect(repository.calls, ['merge 2 -> viewer']);
     expect(_listedNames(tester), ['viewer', 'alpha']);
     expect(find.text(r'F:\projects'), findsOneWidget);
+  });
+
+  testWidgets('a project can show its sessions', (tester) async {
+    final shown = <String>[];
+    await _pump(
+      tester,
+      _repository(),
+      openProjectName: 'viewer',
+      onShowSessions: shown.add,
+    );
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Show sessions'));
+    await tester.pumpAndSettle();
+
+    expect(shown, ['viewer']);
   });
 
   testWidgets('sessions set by hand can be reset', (tester) async {

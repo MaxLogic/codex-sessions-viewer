@@ -27,6 +27,8 @@ class TestSessionsScreen extends SessionsScreen {
     super.autoRefreshToken,
     super.openTarget,
     super.openTargetSerial,
+    super.projectFilterRequest,
+    super.projectFilterSerial,
     super.now = fixedSessionsNow,
   });
 }

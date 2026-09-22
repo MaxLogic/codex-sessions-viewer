@@ -27,6 +27,7 @@ class ProjectsScreen extends StatefulWidget {
     this.openProjectName,
     this.openProjectSerial = 0,
     this.onProjectsChanged,
+    this.onShowSessions,
     this.pickDirectory,
     this.now = DateTime.now,
   });
@@ -40,6 +41,9 @@ class ProjectsScreen extends StatefulWidget {
 
   /// Called after folder rules or project assignments change.
   final VoidCallback? onProjectsChanged;
+
+  /// Shows this project's sessions on the Sessions screen.
+  final void Function(String projectName)? onShowSessions;
   final Future<String?> Function()? pickDirectory;
   final DateTime Function() now;
 
@@ -651,6 +655,12 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
                       icon: const Icon(Icons.merge),
                       label: const Text('Merge into…'),
                     ),
+                    if (widget.onShowSessions case final showSessions?)
+                      AppButton.outlined(
+                        onPressed: () => showSessions(project.name),
+                        icon: const Icon(Icons.history),
+                        label: const Text('Show sessions'),
+                      ),
                   ],
                 ),
                 const SizedBox(height: 24),

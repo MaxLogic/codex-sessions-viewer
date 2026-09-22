@@ -406,6 +406,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                             },
                             openTarget: _sessionOpenTarget,
                             openTargetSerial: _sessionOpenTargetSerial,
+                            projectFilterRequest: _sessionsProjectFilter,
+                            projectFilterSerial: _sessionsProjectFilterSerial,
                             now: widget.now,
                           ),
                       projectsScreen: ProjectsScreen(
@@ -418,6 +420,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         openProjectName: _projectsOpenName,
                         openProjectSerial: _projectsOpenSerial,
                         onProjectsChanged: _projectsChanged,
+                        onShowSessions: _showProjectSessions,
                         now: widget.now,
                       ),
                       evalsScreen: _EvalsScreenLoader(
@@ -920,6 +923,25 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     });
   }
 
+  String? _sessionsProjectFilter;
+  var _sessionsProjectFilterSerial = 0;
+
+  /// Shows the Sessions screen filtered to one project. The request is
+  /// cleared once the screen has it, so later visits keep their filters.
+  void _showProjectSessions(String projectName) {
+    setState(() {
+      _sessionsProjectFilter = projectName;
+      _sessionsProjectFilterSerial++;
+      _requestedSection = CodexAppSection.sessions;
+      _sectionRequestSerial++;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _sessionsProjectFilter != null) {
+        setState(() => _sessionsProjectFilter = null);
+      }
+    });
+  }
+
   /// Project changes regroup usage, so Usage reloads when next shown.
   void _projectsChanged() {
     if (!mounted) {
@@ -1313,6 +1335,8 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.onTableStateChanged,
     required this.openTarget,
     required this.openTargetSerial,
+    required this.projectFilterRequest,
+    required this.projectFilterSerial,
     required this.now,
   });
 
@@ -1334,6 +1358,8 @@ class _SessionsScreenLoader extends StatefulWidget {
   final SessionTableStateChanged onTableStateChanged;
   final SessionOpenTarget? openTarget;
   final int openTargetSerial;
+  final String? projectFilterRequest;
+  final int projectFilterSerial;
   final DateTime Function() now;
 
   @override
@@ -1438,6 +1464,8 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onTableStateChanged: widget.onTableStateChanged,
       openTarget: widget.openTarget,
       openTargetSerial: widget.openTargetSerial,
+      projectFilterRequest: widget.projectFilterRequest,
+      projectFilterSerial: widget.projectFilterSerial,
       now: widget.now,
     );
   }

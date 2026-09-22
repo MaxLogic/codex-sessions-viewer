@@ -162,6 +162,8 @@ class SessionsScreen extends StatefulWidget {
     this.onLoadPersistedCosts,
     this.openTarget,
     this.openTargetSerial = 0,
+    this.projectFilterRequest,
+    this.projectFilterSerial = 0,
     this.now = DateTime.now,
   });
 
@@ -197,6 +199,11 @@ class SessionsScreen extends StatefulWidget {
   onLoadPersistedCosts;
   final SessionOpenTarget? openTarget;
   final int openTargetSerial;
+
+  /// Shows only this project, replacing the current filters. It applies on
+  /// the first build and whenever [projectFilterSerial] changes.
+  final String? projectFilterRequest;
+  final int projectFilterSerial;
   final DateTime Function() now;
 
   @override
@@ -242,6 +249,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _newestPerProjectOnly = false;
   var _namedOnly = false;
   String? _projectFilter;
+  var _handledProjectFilterSerial = 0;
   String? _modelFilter;
   String? _tagFilter;
   var _isScanning = false;
@@ -309,6 +317,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
     });
     _configureBackgroundRescanTimer();
     _queueOpenTargetFromWidget();
+    _handledProjectFilterSerial = widget.projectFilterSerial;
+    if (widget.projectFilterRequest case final project?) {
+      _applyProjectFilter(project, notify: false);
+    }
     if (widget.pricingRevision > 0) {
       _pricingInvalidated = true;
       _queuePersistedCostRefresh();
@@ -331,6 +343,12 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (!_isScanning &&
         oldWidget.initialStatusMessage != widget.initialStatusMessage) {
       _scanAnnouncement = widget.initialStatusMessage;
+    }
+    if (widget.projectFilterSerial != _handledProjectFilterSerial) {
+      _handledProjectFilterSerial = widget.projectFilterSerial;
+      if (widget.projectFilterRequest case final project?) {
+        _applyProjectFilter(project, notify: true);
+      }
     }
     if (widget.autoRefreshToken != _handledAutoRefreshToken) {
       _handledAutoRefreshToken = widget.autoRefreshToken;
@@ -1785,6 +1803,45 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _rows.where((row) => row.isSubagentSession).length,
       SessionsOriginFilter.all => _rows.length,
     };
+  }
+
+  /// Replaces the filters with "this project only", so a project opened
+  /// from the Projects screen shows all of its sessions.
+  void _applyProjectFilter(String project, {required bool notify}) {
+    void apply() {
+      _searchController.clear();
+      _pathController.clear();
+      _threadNameController.clear();
+      _applyClearedTextFilters();
+      _platformFilter = SessionsPlatformFilter.both;
+      _timeFilter = SessionsTimeFilter.allTime;
+      _archivedFilter = SessionsArchivedFilter.all;
+      _originFilter = SessionsOriginFilter.all;
+      _newestPerProjectOnly = false;
+      _namedOnly = false;
+      _projectFilter = project;
+      _modelFilter = null;
+      _tagFilter = null;
+    }
+
+    if (!notify) {
+      apply();
+      return;
+    }
+    _searchController.removeListener(_filtersChanged);
+    _pathController.removeListener(_filtersChanged);
+    _threadNameController.removeListener(_filtersChanged);
+    try {
+      setState(() {
+        apply();
+        _retainSelection();
+        _markVisibleRowsForMotion();
+      });
+    } finally {
+      _searchController.addListener(_filtersChanged);
+      _pathController.addListener(_filtersChanged);
+      _threadNameController.addListener(_filtersChanged);
+    }
   }
 
   void _updateFilter(VoidCallback change) {
