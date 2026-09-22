@@ -12,6 +12,7 @@ import 'conversation_view.dart';
 import 'focus_reader_view.dart';
 import 'session_stats_view.dart';
 import 'svg_icon.dart';
+import 'app_button.dart';
 
 typedef DetailCopyCallback = Future<void> Function(String text);
 typedef DetailMarkdownExportCallback =
@@ -858,7 +859,7 @@ class _ActionArea extends StatelessWidget {
               : commandSet.terminalDisabledReason ??
                     commandSet.disabledReason ??
                     'Terminal resume is not available.',
-          child: FilledButton.icon(
+          child: AppButton.filled(
             onPressed: canRunTerminal
                 ? () => onSessionAction!(SessionDetailAction.openTerminalResume)
                 : null,
@@ -866,7 +867,7 @@ class _ActionArea extends StatelessWidget {
             label: const Text('Resume in terminal'),
           ),
         ),
-        OutlinedButton.icon(
+        AppButton.outlined(
           onPressed: resumeCommand == null
               ? null
               : () => _copyWithFeedback(
@@ -1109,7 +1110,7 @@ class _ActionArea extends StatelessWidget {
       child: ExcludeSemantics(
         child: Tooltip(
           message: label,
-          child: OutlinedButton.icon(
+          child: AppButton.outlined(
             onPressed: onPressed,
             icon: AppSvgIcon(iconAsset),
             label: Text(shortLabel),
@@ -1204,14 +1205,14 @@ class _CommandActionPanel extends StatelessWidget {
           commandSet.terminalLaunchCommand,
           enabled: terminalEnabled,
         ),
-        OutlinedButton.icon(
+        AppButton.outlined(
           onPressed: terminalEnabled
               ? () => _runTerminalCommand(context)
               : null,
           icon: const AppSvgIcon(AppIcons.play),
           label: const Text('Run'),
         ),
-        OutlinedButton.icon(
+        AppButton.outlined(
           onPressed: terminalEnabled
               ? () => _editTerminalCommand(
                   context,
@@ -1222,7 +1223,7 @@ class _CommandActionPanel extends StatelessWidget {
           icon: const AppSvgIcon(AppIcons.edit),
           label: const Text('Edit and run'),
         ),
-        OutlinedButton.icon(
+        AppButton.outlined(
           onPressed: terminalForkEnabled && onSessionAction != null
               ? () => onSessionAction!(SessionDetailAction.openTerminalFork)
               : null,
@@ -1239,7 +1240,7 @@ class _CommandActionPanel extends StatelessWidget {
     String? text, {
     bool enabled = true,
   }) {
-    return OutlinedButton.icon(
+    return AppButton.outlined(
       onPressed: enabled && text != null
           ? () => _copyWithFeedback(
               context,
@@ -1312,7 +1313,7 @@ Future<void> _editTerminalCommand(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
-        FilledButton.icon(
+        AppButton.filled(
           onPressed: () => Navigator.of(context).pop(controller.text),
           icon: const AppSvgIcon(AppIcons.play),
           label: const Text('Run'),

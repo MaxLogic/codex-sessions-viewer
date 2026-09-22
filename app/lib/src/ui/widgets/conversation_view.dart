@@ -9,6 +9,7 @@ import '../../config/app_settings.dart';
 import '../models/conversation_message_view_model.dart';
 import '../motion.dart';
 import 'svg_icon.dart';
+import 'app_button.dart';
 
 typedef CopyTextCallback = Future<void> Function(String text);
 typedef ConversationPositionChanged =
@@ -418,7 +419,7 @@ class _ConversationViewState extends State<ConversationView> {
         Semantics(
           label: 'Jump to newest message',
           button: true,
-          child: FilledButton.icon(
+          child: AppButton.filled(
             onPressed: _jumpToNewest,
             icon: const Icon(Icons.keyboard_arrow_down),
             label: const Text('Jump to newest'),
@@ -428,7 +429,7 @@ class _ConversationViewState extends State<ConversationView> {
         Semantics(
           label: 'Load older conversation messages',
           button: true,
-          child: OutlinedButton.icon(
+          child: AppButton.outlined(
             onPressed: _loadingOlderMessages ? null : _loadOlderMessages,
             icon: const Icon(Icons.keyboard_arrow_up),
             label: Text(_loadingOlderMessages ? 'Loading older' : 'Load older'),
@@ -1320,7 +1321,7 @@ class _ConversationMessageCard extends StatelessWidget {
                           label: 'Copy message ${message.number} as Markdown',
                           button: true,
                           child: ExcludeSemantics(
-                            child: TextButton.icon(
+                            child: AppButton.text(
                               style: TextButton.styleFrom(
                                 visualDensity: VisualDensity.compact,
                               ),
@@ -1378,7 +1379,7 @@ class _ConversationMessageCard extends StatelessWidget {
                   if (bodyLoaded &&
                       (message.isLong || message.hasToolOutput)) ...[
                     const SizedBox(height: 4),
-                    TextButton.icon(
+                    AppButton.text(
                       style: TextButton.styleFrom(
                         visualDensity: VisualDensity.compact,
                       ),

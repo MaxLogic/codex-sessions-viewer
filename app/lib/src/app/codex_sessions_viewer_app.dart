@@ -31,6 +31,7 @@ import '../ui/screens/sessions_screen.dart';
 import '../ui/screens/settings_screen.dart';
 import '../ui/screens/usage_screen.dart';
 import '../ui/themes.dart';
+import '../ui/widgets/app_button.dart';
 import '../ui/widgets/database_migration_progress.dart';
 import '../usage/usage_summary.dart';
 import '../voice_over/voice_over_service.dart';
@@ -275,18 +276,24 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       highContrastTheme: themed(CodexThemeMode.highContrastLight),
       highContrastDarkTheme: themed(CodexThemeMode.highContrastDark),
       themeMode: CodexAppTheme.themeMode(mode),
-      // The font size setting scales text on top of the Windows text size.
+      // The font size setting scales text on top of the Windows text size;
+      // the button settings reach every AppButton.
       builder: (context, child) {
         final media = MediaQuery.of(context);
         final factor = ui.fontSize / AppSettings.defaults().ui.fontSize;
-        if (factor == 1 || child == null) {
-          return child ?? const SizedBox.shrink();
-        }
-        return MediaQuery(
-          data: media.copyWith(
-            textScaler: TextScaler.linear(media.textScaler.scale(1) * factor),
+        return ButtonAppearance(
+          showIcons: ui.showIcons,
+          showText: ui.showTextOnButtons,
+          child: MediaQuery(
+            data: factor == 1
+                ? media
+                : media.copyWith(
+                    textScaler: TextScaler.linear(
+                      media.textScaler.scale(1) * factor,
+                    ),
+                  ),
+            child: child ?? const SizedBox.shrink(),
           ),
-          child: child,
         );
       },
       home: FutureBuilder<DatabaseStartupResult>(

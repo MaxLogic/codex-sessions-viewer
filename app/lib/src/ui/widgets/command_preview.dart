@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../../commands/resume_command_generator.dart';
 import 'svg_icon.dart';
+import 'app_button.dart';
 
 typedef TerminalCommandCallback = Future<void> Function(String command);
 
@@ -179,7 +180,7 @@ class _CommandBlock extends StatelessWidget {
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('Cancel'),
           ),
-          FilledButton.icon(
+          AppButton.filled(
             onPressed: () => Navigator.of(context).pop(controller.text),
             icon: const AppSvgIcon(AppIcons.play),
             label: const Text('Run'),
@@ -223,7 +224,7 @@ class _LabeledCommandButton extends StatelessWidget {
       child: Semantics(
         label: label,
         button: true,
-        child: OutlinedButton.icon(
+        child: AppButton.outlined(
           onPressed: onPressed,
           icon: AppSvgIcon(iconAsset),
           label: Text(text),

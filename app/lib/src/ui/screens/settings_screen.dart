@@ -7,6 +7,7 @@ import '../../database/maintenance_job.dart';
 import '../../database/database_maintenance.dart';
 import '../motion.dart';
 import '../widgets/svg_icon.dart';
+import '../widgets/app_button.dart';
 
 typedef SettingsSaveCallback = Future<void> Function(AppSettings settings);
 typedef SettingsReloadCallback = Future<AppSettings> Function();
@@ -271,17 +272,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               spacing: 8,
               runSpacing: 8,
               children: [
-                FilledButton.icon(
+                AppButton.filled(
                   onPressed: _save,
                   icon: const AppSvgIcon(AppIcons.save),
                   label: const Text('Save settings'),
                 ),
-                OutlinedButton.icon(
+                AppButton.outlined(
                   onPressed: _cancel,
                   icon: const AppSvgIcon(AppIcons.cancel),
                   label: const Text('Cancel changes'),
                 ),
-                OutlinedButton.icon(
+                AppButton.outlined(
                   onPressed: _reload,
                   icon: const AppSvgIcon(AppIcons.refresh),
                   label: const Text('Reload from file'),

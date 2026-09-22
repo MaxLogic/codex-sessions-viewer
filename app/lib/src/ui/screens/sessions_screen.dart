@@ -19,6 +19,7 @@ import '../widgets/command_preview.dart';
 import '../widgets/conversation_view.dart';
 import '../widgets/session_detail_pane.dart';
 import '../widgets/svg_icon.dart';
+import '../widgets/app_button.dart';
 
 export '../models/session_row_view_model.dart';
 
@@ -3031,14 +3032,14 @@ class _SessionsEmptyState extends StatelessWidget {
                   ),
                 ] else if (hasRowsHiddenByDefaultOrigin) ...[
                   const SizedBox(height: 12),
-                  OutlinedButton.icon(
+                  AppButton.outlined(
                     onPressed: onShowAllOrigins,
                     icon: const AppSvgIcon(AppIcons.filter),
                     label: const Text('Show all origins'),
                   ),
                 ] else if (hasRows && hasActiveFilters) ...[
                   const SizedBox(height: 12),
-                  OutlinedButton.icon(
+                  AppButton.outlined(
                     onPressed: onClearFilters,
                     icon: const AppSvgIcon(AppIcons.filterClear),
                     label: const Text('Clear filters'),
@@ -3048,7 +3049,7 @@ class _SessionsEmptyState extends StatelessWidget {
                   Wrap(
                     spacing: 8,
                     children: [
-                      OutlinedButton.icon(
+                      AppButton.outlined(
                         onPressed: onOpenSettings,
                         icon: const AppSvgIcon(AppIcons.settings),
                         label: const Text('Open Settings'),
@@ -3112,12 +3113,12 @@ class _UnreachableRecoveryActions extends StatelessWidget {
       spacing: 8,
       runSpacing: 8,
       children: [
-        OutlinedButton.icon(
+        AppButton.outlined(
           onPressed: onTestWslPath,
           icon: const AppSvgIcon(AppIcons.terminal),
           label: const Text('Retry scan'),
         ),
-        OutlinedButton.icon(
+        AppButton.outlined(
           onPressed: onOpenSettings,
           icon: const AppSvgIcon(AppIcons.settings),
           label: const Text('Open Settings'),
@@ -3299,7 +3300,7 @@ class _FilterBarState extends State<_FilterBar> {
         onSelected: widget.onTimeChanged,
       ),
     );
-    final refresh = ElevatedButton.icon(
+    final refresh = AppButton.elevated(
       onPressed: widget.isCancellingRefresh ? null : widget.onRefresh,
       icon: AppSvgIcon(widget.isScanning ? AppIcons.cancel : AppIcons.refresh),
       label: Text(refreshLabel),
@@ -3386,7 +3387,7 @@ class _FilterBarState extends State<_FilterBar> {
               ? 'More filters'
               : 'More filters, $hiddenActiveCount active',
           child: ExcludeSemantics(
-            child: TextButton.icon(
+            child: AppButton.text(
               onPressed: () => setState(() => _showMore = !showMore),
               icon: Icon(
                 showMore ? Icons.expand_less : Icons.expand_more,
@@ -3516,7 +3517,7 @@ class _FilterBarState extends State<_FilterBar> {
               onDeleted: chip.onRemove,
               deleteButtonTooltipMessage: 'Remove filter ${chip.label}',
             ),
-          OutlinedButton.icon(
+          AppButton.outlined(
             onPressed: widget.onClearFilters,
             style: OutlinedButton.styleFrom(
               visualDensity: VisualDensity.compact,
@@ -5201,22 +5202,22 @@ class _SortOptionsDialogState extends State<_SortOptionsDialog> {
         ),
       ),
       actions: [
-        TextButton.icon(
+        AppButton.text(
           onPressed: () => Navigator.of(context).pop(_defaultSorts),
           icon: const AppSvgIcon(AppIcons.refresh),
           label: const Text('Default'),
         ),
-        TextButton.icon(
+        AppButton.text(
           onPressed: () => Navigator.of(context).pop(_defaultSorts),
           icon: const AppSvgIcon(AppIcons.filterClear),
           label: const Text('Clear'),
         ),
-        TextButton.icon(
+        AppButton.text(
           onPressed: () => Navigator.of(context).pop(),
           icon: const AppSvgIcon(AppIcons.cancel),
           label: const Text('Cancel'),
         ),
-        FilledButton.icon(
+        AppButton.filled(
           onPressed: () => Navigator.of(context).pop(_sorts),
           icon: const AppSvgIcon(AppIcons.check),
           label: const Text('Apply'),

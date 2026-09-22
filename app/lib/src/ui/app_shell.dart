@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../config/app_settings.dart';
 import 'dialogs/keyboard_shortcuts_dialog.dart';
 import 'motion.dart';
+import 'widgets/app_button.dart';
 
 typedef SessionsScreenBuilder =
     Widget Function(BuildContext context, VoidCallback onOpenSettings);
@@ -129,7 +130,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
                   padding: const EdgeInsets.only(top: 16),
                   child: Tooltip(
                     message: 'Keyboard shortcuts (F1)',
-                    child: TextButton.icon(
+                    child: AppButton.text(
                       onPressed: _showShortcuts,
                       icon: const Icon(Icons.keyboard_outlined),
                       label: const Text('Shortcuts'),

@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../../search/message_search.dart';
 import '../models/session_label_formatter.dart';
 import '../models/session_row_view_model.dart';
+import '../widgets/app_button.dart';
 
 typedef ContextMessageSearchCallback =
     Future<List<MessageSearchResult>> Function(MessageSearchQuery query);
@@ -153,7 +154,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
           label: 'Search context',
           button: true,
           enabled: !_isSearching,
-          child: FilledButton.icon(
+          child: AppButton.filled(
             onPressed: _isSearching ? null : _search,
             icon: const Icon(Icons.search),
             label: Text(_isSearching ? 'Searching' : 'Search'),
@@ -163,7 +164,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
           label: 'Copy selected context results',
           button: true,
           enabled: hasSelected,
-          child: OutlinedButton.icon(
+          child: AppButton.outlined(
             onPressed: hasSelected ? _copySelected : null,
             icon: const Icon(Icons.copy),
             label: const Text('Copy selected'),
@@ -540,7 +541,7 @@ class _OpenButton extends StatelessWidget {
       button: true,
       onTap: onOpen,
       child: ExcludeSemantics(
-        child: OutlinedButton.icon(
+        child: AppButton.outlined(
           onPressed: onOpen,
           icon: const Icon(Icons.open_in_new),
           label: const Text('Open'),
