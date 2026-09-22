@@ -86,7 +86,6 @@ class CodexSessionsViewerApp extends StatefulWidget {
            ).loadOrCreate();
 
   static const appTitle = 'Codex Session Viewer';
-  static const nativeTitleBarEnabled = true;
 
   final Future<DatabaseStartupResult> databaseStartup;
   final Future<AppSettings> settingsStartup;

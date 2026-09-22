@@ -213,7 +213,6 @@ class AppSettings {
       motion: AppMotionMode.system,
       showTextOnButtons: true,
       showIcons: true,
-      nativeTitleBar: true,
       window: null,
       sessionTable: SessionTableSettings(
         columnWidths: {},
@@ -595,7 +594,6 @@ class UiSettings {
     required this.density,
     required this.showTextOnButtons,
     required this.showIcons,
-    required this.nativeTitleBar,
     required this.window,
     required this.sessionTable,
     this.motion = AppMotionMode.system,
@@ -608,7 +606,6 @@ class UiSettings {
   final AppMotionMode motion;
   final bool showTextOnButtons;
   final bool showIcons;
-  final bool nativeTitleBar;
   final WindowPlacementSettings? window;
   final SessionTableSettings sessionTable;
 
@@ -620,7 +617,6 @@ class UiSettings {
     AppMotionMode? motion,
     bool? showTextOnButtons,
     bool? showIcons,
-    bool? nativeTitleBar,
     Object? window = _sentinel,
     SessionTableSettings? sessionTable,
   }) => UiSettings(
@@ -631,7 +627,6 @@ class UiSettings {
     motion: motion ?? this.motion,
     showTextOnButtons: showTextOnButtons ?? this.showTextOnButtons,
     showIcons: showIcons ?? this.showIcons,
-    nativeTitleBar: nativeTitleBar ?? this.nativeTitleBar,
     window: window == _sentinel
         ? this.window
         : window as WindowPlacementSettings?,
@@ -667,12 +662,6 @@ class UiSettings {
       'ui.show_text_on_buttons',
     ),
     showIcons: _bool(map, 'show_icons', defaults.showIcons, 'ui.show_icons'),
-    nativeTitleBar: _bool(
-      map,
-      'native_title_bar',
-      defaults.nativeTitleBar,
-      'ui.native_title_bar',
-    ),
     window: WindowPlacementSettings.fromMap(_table(map, 'window')),
     sessionTable: SessionTableSettings.fromMap(
       _table(map, 'session_table'),
@@ -688,7 +677,6 @@ class UiSettings {
     'motion': motion.tomlValue,
     'show_text_on_buttons': showTextOnButtons,
     'show_icons': showIcons,
-    'native_title_bar': nativeTitleBar,
     if (window != null) 'window': window!.toTomlMap(),
     'session_table': sessionTable.toTomlMap(),
   };
@@ -703,7 +691,6 @@ class UiSettings {
       motion == other.motion &&
       showTextOnButtons == other.showTextOnButtons &&
       showIcons == other.showIcons &&
-      nativeTitleBar == other.nativeTitleBar &&
       window == other.window &&
       sessionTable == other.sessionTable;
 
@@ -716,7 +703,6 @@ class UiSettings {
     motion,
     showTextOnButtons,
     showIcons,
-    nativeTitleBar,
     window,
     sessionTable,
   );

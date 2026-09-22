@@ -198,7 +198,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         motion: _settings.ui.motion,
         showTextOnButtons: _settings.ui.showTextOnButtons,
         showIcons: _settings.ui.showIcons,
-        nativeTitleBar: _settings.ui.nativeTitleBar,
         window: _settings.ui.window,
         sessionTable: _settings.ui.sessionTable,
       ),
@@ -471,12 +470,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           onChanged: (value) =>
                               _replaceUi(showTextOnButtons: value),
                         ),
-                        _SwitchSetting(
-                          label: 'Native title bar',
-                          value: _settings.ui.nativeTitleBar,
-                          onChanged: (value) =>
-                              _replaceUi(nativeTitleBar: value),
-                        ),
                       ],
                     ),
                     _Section(
@@ -719,11 +712,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  void _replaceUi({
-    bool? showIcons,
-    bool? showTextOnButtons,
-    bool? nativeTitleBar,
-  }) {
+  void _replaceUi({bool? showIcons, bool? showTextOnButtons}) {
     setState(() {
       final ui = _settings.ui;
       _settings = _settings.copyWith(
@@ -735,7 +724,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           motion: ui.motion,
           showTextOnButtons: showTextOnButtons ?? ui.showTextOnButtons,
           showIcons: showIcons ?? ui.showIcons,
-          nativeTitleBar: nativeTitleBar ?? ui.nativeTitleBar,
           window: ui.window,
           sessionTable: ui.sessionTable,
         ),

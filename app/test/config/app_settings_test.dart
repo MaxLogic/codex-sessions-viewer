@@ -128,7 +128,6 @@ void main() {
     expect(settings.paths.windowsCodexPath, r'C:\Users\pawel\.codex');
     expect(settings.wsl.distro, 'Ubuntu');
     expect(settings.app.startWithWindows, isTrue);
-    expect(settings.ui.nativeTitleBar, isTrue);
 
     final tomlText = await settingsFile.readAsString();
     for (final header in [
@@ -177,7 +176,6 @@ void main() {
         density: UiDensity.compact,
         showTextOnButtons: false,
         showIcons: true,
-        nativeTitleBar: true,
         window: WindowPlacementSettings(
           x: 20,
           y: 30,

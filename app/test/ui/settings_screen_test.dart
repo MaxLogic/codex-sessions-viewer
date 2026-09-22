@@ -330,7 +330,6 @@ void main() {
       'UI density',
       'Show icons',
       'Show text on buttons',
-      'Native title bar',
       'Voice-over enabled',
       'Voice-over file paths',
       'OpenRouter pricing enabled',

@@ -12,7 +12,6 @@ void main() {
     await tester.pump();
 
     expect(find.text(CodexSessionsViewerApp.appTitle), findsOneWidget);
-    expect(CodexSessionsViewerApp.nativeTitleBarEnabled, isTrue);
   });
 
   testWidgets('defers cached session loading until after first shell frame', (
