@@ -25,6 +25,7 @@ import '../search/message_search.dart';
 import '../search/session_search.dart';
 import '../usage/usage_summary.dart';
 import '../ui/models/conversation_message_view_model.dart';
+import '../ui/models/session_project_change.dart';
 import '../ui/screens/sessions_screen.dart';
 import '../utils/injected_context_filter.dart';
 import '../utils/profiling.dart';
@@ -710,6 +711,52 @@ class RuntimeSessionController {
         projectionVersion: CodexSessionParser.currentVersion,
         pricing: pricing,
       );
+    } finally {
+      db.close();
+    }
+  });
+
+  Future<SessionProjectAssignment> loadSessionProjectAssignment(
+    String sessionId,
+  ) async {
+    final db = openFileBackedDatabase(databaseFile);
+    try {
+      return ProjectTagStateStore(db).loadSessionProjectAssignment(sessionId);
+    } finally {
+      db.close();
+    }
+  }
+
+  /// Applies a "Move to project" choice for [sessionId].
+  Future<void> changeSessionProject(
+    String sessionId,
+    SessionProjectChange change,
+  ) => _runWrite(() async {
+    final settings = await SettingsRepository(settingsFile).loadOrCreate();
+    final db = openFileBackedDatabase(databaseFile);
+    try {
+      final store = ProjectTagStateStore(db);
+      final pricing = PricingRepository(db).loadCached(settings.pricing);
+      switch (change) {
+        case MoveSessionToProject(:final projectName):
+          store.assignSessionProject(sessionId, projectName);
+        case MoveFolderToProject(:final folder, :final projectName):
+          store.assignFolderToProject(
+            folder: folder,
+            projectName: projectName,
+            sessionId: sessionId,
+            projectionVersion: CodexSessionParser.currentVersion,
+            pricing: pricing,
+          );
+        case ResetSessionProject():
+          store.resetSessionProject(sessionId);
+        case RemoveFolderRule(:final folder):
+          store.removeFolderRule(
+            folder: folder,
+            projectionVersion: CodexSessionParser.currentVersion,
+            pricing: pricing,
+          );
+      }
     } finally {
       db.close();
     }

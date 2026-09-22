@@ -65,6 +65,7 @@ enum SessionRowAction {
   openTerminalFork,
   copyTerminalCommand,
   editTags,
+  moveToProject,
   togglePin,
   toggleArchive,
   updateEvalMetadata,
@@ -2227,6 +2228,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
       SessionDetailAction.editTags => SessionActionRequest(
         row: row,
         action: SessionRowAction.editTags,
+      ),
+      SessionDetailAction.moveToProject => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.moveToProject,
       ),
       SessionDetailAction.exportMarkdown ||
       SessionDetailAction.addToEvals ||
@@ -4845,6 +4850,11 @@ class _ActionsMenu extends StatelessWidget {
                 iconAsset: AppIcons.tag,
               ),
               _item(
+                SessionRowAction.moveToProject,
+                'Move to project…',
+                iconAsset: AppIcons.folderOpen,
+              ),
+              _item(
                 SessionRowAction.togglePin,
                 row.isPinned ? 'Unpin session' : 'Pin session',
                 iconAsset: AppIcons.pin,
@@ -4925,7 +4935,7 @@ class _ActionsMenu extends StatelessWidget {
       SessionRowAction.openTerminalResume => commandSet.terminalLaunchCommand,
       SessionRowAction.openTerminalFork => commandSet.terminalForkCommand,
       SessionRowAction.copyTerminalCommand => commandSet.terminalLaunchCommand,
-      SessionRowAction.editTags => null,
+      SessionRowAction.editTags || SessionRowAction.moveToProject => null,
       SessionRowAction.togglePin ||
       SessionRowAction.toggleArchive ||
       SessionRowAction.updateEvalMetadata ||
@@ -4960,6 +4970,7 @@ extension on SessionRowAction {
       SessionRowAction.openTerminalFork => 'Open terminal and fork',
       SessionRowAction.copyTerminalCommand => 'Copy terminal command',
       SessionRowAction.editTags => 'Add or remove tags',
+      SessionRowAction.moveToProject => 'Move to project',
       SessionRowAction.togglePin => 'Pin or unpin session',
       SessionRowAction.toggleArchive => 'Archive or unarchive session',
       SessionRowAction.updateEvalMetadata => 'Update eval metadata',

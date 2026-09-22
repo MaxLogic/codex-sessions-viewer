@@ -33,6 +33,7 @@ enum SessionDetailAction {
   togglePin,
   toggleArchive,
   editTags,
+  moveToProject,
   addToEvals,
   removeFromEvals,
   editEvalMetadata,
@@ -959,6 +960,7 @@ class _ActionArea extends StatelessWidget {
             ),
             const PopupMenuDivider(),
             _moreItem('edit-tags', 'Add/remove tags', AppIcons.tag),
+            _moreItem('move-project', 'Move to project…', AppIcons.folderOpen),
             _moreItem(
               'toggle-eval',
               row.evalReady ? 'Remove from Evals' : 'Add to Evals',
@@ -1080,6 +1082,8 @@ class _ActionArea extends StatelessWidget {
         }
       case 'edit-tags':
         await _invokeAction(SessionDetailAction.editTags);
+      case 'move-project':
+        await _invokeAction(SessionDetailAction.moveToProject);
       case 'toggle-eval':
         await _invokeAction(
           row.evalReady

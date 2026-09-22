@@ -25,6 +25,8 @@ import '../platform/terminal_launcher.dart';
 import '../pricing/pricing_repository.dart';
 import '../search/message_search.dart';
 import '../ui/app_shell.dart';
+import '../ui/dialogs/move_to_project_dialog.dart';
+import '../ui/models/session_project_change.dart';
 import '../ui/screens/context_search_screen.dart';
 import '../ui/screens/evals_screen.dart';
 import '../ui/screens/sessions_screen.dart';
@@ -829,6 +831,9 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       case SessionRowAction.editTags:
         await _editSessionTags(request.row);
         return;
+      case SessionRowAction.moveToProject:
+        await _moveSessionToProject(request.row);
+        return;
       case SessionRowAction.openPath:
         await _openPath(payload ?? request.row.sourcePathForDisplay);
         return;
@@ -883,10 +888,50 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     });
   }
 
+  Future<void> _moveSessionToProject(SessionRowViewModel row) async {
+    final dialogContext = _navigatorKey.currentContext;
+    if (dialogContext == null) {
+      return;
+    }
+    final controller = RuntimeSessionController(
+      settingsFile: widget.settingsFile,
+      databaseFile: widget.databaseFile,
+      writerCoordinator: _writerCoordinator,
+    );
+    final assignment = await controller.loadSessionProjectAssignment(row.id);
+    if (!mounted || !dialogContext.mounted) {
+      return;
+    }
+    final change = await showMoveToProjectDialog(
+      dialogContext,
+      assignment: assignment,
+    );
+    if (change == null) {
+      return;
+    }
+    await controller.changeSessionProject(row.id, change);
+    final message = switch (change) {
+      MoveSessionToProject(:final projectName) =>
+        'Moved the session to "$projectName".',
+      MoveFolderToProject(:final folder, :final projectName) =>
+        'Sessions from $folder now belong to "$projectName".',
+      ResetSessionProject() => 'The session follows its folder again.',
+      RemoveFolderRule(:final folder) => 'Removed the folder rule for $folder.',
+    };
+    _scaffoldMessengerKey.currentState
+      ?..removeCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
   Future<void> _editSessionTags(SessionRowViewModel row) async {
+    // The app state sits above the Navigator, so dialogs use its context.
+    final dialogContext = _navigatorKey.currentContext;
+    if (dialogContext == null) {
+      return;
+    }
     final controller = TextEditingController(text: row.tags.join(', '));
     final tags = await showDialog<List<String>>(
-      context: context,
+      context: dialogContext,
       builder: (context) => AlertDialog(
         title: const Text('Edit tags'),
         content: TextField(
@@ -912,7 +957,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         ],
       ),
     );
-    controller.dispose();
+    // The controller is left to the garbage collector: the closing dialog
+    // still renders its field while it animates out.
     if (tags == null) {
       return;
     }
@@ -927,9 +973,9 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     if (!mounted) {
       return;
     }
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Session tags updated.')));
+    _scaffoldMessengerKey.currentState
+      ?..removeCurrentSnackBar()
+      ..showSnackBar(const SnackBar(content: Text('Session tags updated.')));
   }
 
   Future<void> _openPath(String path) async {
@@ -1349,7 +1395,9 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
 
   Future<void> _handleSessionAction(SessionActionRequest request) async {
     await widget.onSessionAction(request);
-    if (!mounted || request.action != SessionRowAction.editTags) {
+    if (!mounted ||
+        (request.action != SessionRowAction.editTags &&
+            request.action != SessionRowAction.moveToProject)) {
       return;
     }
     _startCachedLoad();

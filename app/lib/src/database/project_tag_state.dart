@@ -171,27 +171,183 @@ class ProjectTagStateStore {
     required int projectionVersion,
     UsagePricingCatalog pricing = const UsagePricingCatalog({}),
   }) {
-    db.execute('begin immediate');
-    try {
+    return _inTransaction(() {
       final maskId = upsertProjectMask(
         projectId: projectId,
         pathMask: pathMask,
         priority: priority,
         isActive: isActive,
       );
-      recalculateSessionProjects();
-      if (DatabaseGenerationRepository(
-            db,
-          ).activeGeneration().targetSchemaVersion <
-          16) {
-        _recalculateUsageEventProjects();
-        UsageSummaryRepository(db).rebuildDailyUsageInCurrentTransaction(
-          projectionVersion: projectionVersion,
-          pricing: pricing,
+      _recalculateAfterRuleChange(projectionVersion, pricing);
+      return maskId;
+    });
+  }
+
+  /// What the "Move to project" dialog needs to know about a session.
+  SessionProjectAssignment loadSessionProjectAssignment(String sessionId) {
+    final session = db
+        .select(
+          '''
+      select s.id,
+             display_path,
+             working_directory_display,
+             working_directory_platform,
+             working_directory_unc,
+             s.project_name_snapshot,
+             s.project_override,
+             detected.name as detected_project_name
+      from sessions s
+      left join projects detected on detected.id = s.detected_project_id
+      where s.id = ?
+      ''',
+          [sessionId],
+        )
+        .single;
+    final match = _bestProjectMatch(
+      _projectCandidatePaths(sessionId, session),
+      _activeMasks(),
+    );
+    final workingDirectory =
+        (session['working_directory_display'] as String?)?.trim() ?? '';
+    return SessionProjectAssignment(
+      projectName: session['project_name_snapshot'] as String?,
+      isManual: session['project_override'] == 1,
+      detectedProjectName: session['detected_project_name'] as String?,
+      workingDirectory: workingDirectory.isEmpty ? null : workingDirectory,
+      folderRule: match == null
+          ? null
+          : ProjectFolderRule(
+              folder: projectRuleFolder(match.pathMask),
+              projectName: match.projectName,
+            ),
+      projectNames: [
+        for (final row in db.select(
+          'select name from projects where is_active = 1 '
+          'order by name collate nocase',
+        ))
+          row['name'] as String,
+      ],
+    );
+  }
+
+  /// Moves one session to [projectName], creating the project if needed.
+  /// The session keeps this project until it is reset.
+  void assignSessionProject(String sessionId, String projectName) {
+    _inTransaction(() {
+      setSessionProject(sessionId, _ensureProject(projectName));
+    });
+  }
+
+  /// Returns [sessionId] to automatic assignment: folder rules, then the
+  /// project detected from its working directory.
+  void resetSessionProject(String sessionId) {
+    _inTransaction(() {
+      db.execute(
+        'update sessions set project_override = 0, updated_at_utc = ? '
+        'where id = ?',
+        [_utcNow(), sessionId],
+      );
+      refreshSessionProject(sessionId);
+    });
+  }
+
+  /// Adds a folder rule: sessions from [folder] and its subfolders belong to
+  /// [projectName]. It replaces any rule for the same folder. When
+  /// [sessionId] is given, that session drops its manual project so the
+  /// rule applies to it too.
+  void assignFolderToProject({
+    required String folder,
+    required String projectName,
+    String? sessionId,
+    required int projectionVersion,
+    UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+  }) {
+    final base = _trimFolder(folder);
+    if (base.isEmpty) {
+      throw ArgumentError.value(folder, 'folder', 'Must not be empty');
+    }
+    _inTransaction(() {
+      final projectId = _ensureProject(projectName);
+      _deleteFolderMasks(base);
+      final separator = base.contains(r'\') ? r'\' : '/';
+      for (final mask in [base, '$base$separator*']) {
+        upsertProjectMask(projectId: projectId, pathMask: mask, priority: 10);
+      }
+      if (sessionId != null) {
+        db.execute('update sessions set project_override = 0 where id = ?', [
+          sessionId,
+        ]);
+      }
+      _recalculateAfterRuleChange(projectionVersion, pricing);
+    });
+  }
+
+  /// Removes the folder rule for [folder]; its sessions fall back to their
+  /// detected projects.
+  void removeFolderRule({
+    required String folder,
+    required int projectionVersion,
+    UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+  }) {
+    _inTransaction(() {
+      _deleteFolderMasks(_trimFolder(folder));
+      _recalculateAfterRuleChange(projectionVersion, pricing);
+    });
+  }
+
+  void _deleteFolderMasks(String base) {
+    final normalized = normalizeProjectPath(base);
+    db.execute(
+      'delete from project_path_masks where normalized_mask in (?, ?, ?)',
+      [normalized, '$normalized/*', '$normalized*'],
+    );
+  }
+
+  int _ensureProject(String name) {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) {
+      throw ArgumentError.value(name, 'name', 'Must not be empty');
+    }
+    final existing = db.select(
+      'select id, is_active from projects where name = ?',
+      [trimmed],
+    );
+    if (existing.isNotEmpty) {
+      final row = existing.single;
+      if (row['is_active'] != 1) {
+        db.execute(
+          'update projects set is_active = 1, updated_at_utc = ? where id = ?',
+          [_utcNow(), row['id']],
         );
       }
+      return row['id'] as int;
+    }
+    return upsertProject(name: trimmed);
+  }
+
+  void _recalculateAfterRuleChange(
+    int projectionVersion,
+    UsagePricingCatalog pricing,
+  ) {
+    recalculateSessionProjects();
+    if (DatabaseGenerationRepository(
+          db,
+        ).activeGeneration().targetSchemaVersion <
+        16) {
+      _recalculateUsageEventProjects();
+      UsageSummaryRepository(db).rebuildDailyUsageInCurrentTransaction(
+        projectionVersion: projectionVersion,
+        pricing: pricing,
+      );
+    }
+  }
+
+  T _inTransaction<T>(T Function() work) {
+    db.execute('begin immediate');
+    try {
+      final result = work();
       db.execute('commit');
-      return maskId;
+      return result;
     } on Object {
       try {
         db.execute('rollback');
@@ -494,6 +650,7 @@ class ProjectTagStateStore {
         _ProjectMask(
           projectId: row['project_id'] as int,
           projectName: row['name'] as String,
+          pathMask: row['path_mask'] as String,
           normalizedMask: normalizeProjectPath(row['path_mask'] as String),
         ),
     ];
@@ -575,12 +732,66 @@ class _ProjectMask {
   _ProjectMask({
     required this.projectId,
     required this.projectName,
+    required this.pathMask,
     required String normalizedMask,
   }) : matcher = _maskRegex(normalizedMask);
 
   final int projectId;
   final String projectName;
+  final String pathMask;
   final RegExp matcher;
+}
+
+/// A folder rule as the user sees it: sessions from [folder] and its
+/// subfolders belong to [projectName].
+class ProjectFolderRule {
+  const ProjectFolderRule({required this.folder, required this.projectName});
+
+  final String folder;
+  final String projectName;
+}
+
+class SessionProjectAssignment {
+  const SessionProjectAssignment({
+    required this.projectName,
+    required this.isManual,
+    required this.detectedProjectName,
+    required this.workingDirectory,
+    required this.folderRule,
+    required this.projectNames,
+  });
+
+  final String? projectName;
+
+  /// The project was set by hand for this session.
+  final bool isManual;
+  final String? detectedProjectName;
+  final String? workingDirectory;
+
+  /// The folder rule matching this session; it applies unless [isManual].
+  final ProjectFolderRule? folderRule;
+
+  /// Active project names, sorted.
+  final List<String> projectNames;
+}
+
+/// The folder a path mask covers, without a trailing `*` or separator.
+String projectRuleFolder(String pathMask) {
+  var folder = pathMask.trim();
+  if (folder.endsWith('*')) {
+    folder = folder.substring(0, folder.length - 1);
+  }
+  return _trimFolder(folder);
+}
+
+String _trimFolder(String folder) {
+  var trimmed = folder.trim();
+  while (trimmed.length > 1 &&
+      (trimmed.endsWith('/') || trimmed.endsWith(r'\')) &&
+      !RegExp(r'^[A-Za-z]:[\\/]$').hasMatch(trimmed)) {
+    trimmed = trimmed.substring(0, trimmed.length - 1);
+  }
+  return trimmed;
 }
 
 String _utcNow() => DateTime.now().toUtc().toIso8601String();

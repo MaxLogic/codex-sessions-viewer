@@ -761,6 +761,118 @@ void main() {
       containsPair('is_archived', 0),
     );
   });
+
+  group('moving sessions between projects', () {
+    late int mainProject;
+
+    void addSession(String id, String workingDirectory, int? detected) {
+      searchIndex.upsert(_document(id: id, displayPath: '$id.jsonl'));
+      db.execute(
+        'update sessions set working_directory_display = ?, '
+        'detected_project_id = ?, project_id = ? where id = ?',
+        [workingDirectory, detected, detected, id],
+      );
+      store.refreshSessionProject(id);
+    }
+
+    setUp(() {
+      // A migrated database: usage follows path contexts, not usage_events.
+      db.execute('update database_generations set target_schema_version = 16');
+      mainProject = store.upsertProject(name: 'viewer');
+      final worktree = store.upsertProject(name: 'viewer-wt');
+      addSession('main', r'F:\projects\viewer', mainProject);
+      addSession('wt-root', r'F:\projects\viewer-wt', worktree);
+      addSession('wt-sub', r'F:\projects\viewer-wt\app', worktree);
+      addSession('wt-sibling', r'F:\projects\viewer-wt2', worktree);
+    });
+
+    test('a folder rule merges a worktree and its subfolders', () {
+      store.assignFolderToProject(
+        folder: r'F:\projects\viewer-wt\',
+        projectName: 'viewer',
+        projectionVersion: 1,
+      );
+
+      expect(_sessionProject(db, 'wt-root'), 'viewer');
+      expect(_sessionProject(db, 'wt-sub'), 'viewer');
+      expect(_sessionProject(db, 'wt-sibling'), 'viewer-wt');
+      final assignment = store.loadSessionProjectAssignment('wt-sub');
+      expect(assignment.folderRule?.folder, r'F:\projects\viewer-wt');
+      expect(assignment.folderRule?.projectName, 'viewer');
+      expect(assignment.isManual, isFalse);
+      expect(assignment.detectedProjectName, 'viewer-wt');
+    });
+
+    test('a new folder rule replaces the old rule for that folder', () {
+      store.assignFolderToProject(
+        folder: r'F:\projects\viewer-wt',
+        projectName: 'viewer',
+        projectionVersion: 1,
+      );
+      store.assignFolderToProject(
+        folder: 'f:/projects/viewer-wt',
+        projectName: 'Other',
+        projectionVersion: 1,
+      );
+
+      expect(_sessionProject(db, 'wt-sub'), 'Other');
+      expect(
+        db.select('select count(*) as n from project_path_masks').single['n'],
+        2,
+      );
+    });
+
+    test('removing the folder rule restores detected projects', () {
+      store.assignFolderToProject(
+        folder: r'F:\projects\viewer-wt',
+        projectName: 'viewer',
+        projectionVersion: 1,
+      );
+      store.removeFolderRule(
+        folder: r'F:\projects\viewer-wt',
+        projectionVersion: 1,
+      );
+
+      expect(_sessionProject(db, 'wt-root'), 'viewer-wt');
+      expect(_sessionProject(db, 'wt-sub'), 'viewer-wt');
+      expect(store.loadSessionProjectAssignment('wt-root').folderRule, isNull);
+    });
+
+    test('one session can move to a new project and back', () {
+      store.assignSessionProject('wt-root', '  Side quest ');
+
+      expect(_sessionProject(db, 'wt-root'), 'Side quest');
+      expect(_sessionProject(db, 'wt-sub'), 'viewer-wt');
+      final assignment = store.loadSessionProjectAssignment('wt-root');
+      expect(assignment.isManual, isTrue);
+      expect(assignment.projectNames, ['Side quest', 'viewer', 'viewer-wt']);
+
+      store.resetSessionProject('wt-root');
+
+      expect(_sessionProject(db, 'wt-root'), 'viewer-wt');
+      expect(store.loadSessionProjectAssignment('wt-root').isManual, isFalse);
+    });
+
+    test('a folder rule from a manual session makes it follow the rule', () {
+      store.assignSessionProject('wt-root', 'Side quest');
+      store.assignFolderToProject(
+        folder: r'F:\projects\viewer-wt',
+        projectName: 'viewer',
+        sessionId: 'wt-root',
+        projectionVersion: 1,
+      );
+
+      expect(_sessionProject(db, 'wt-root'), 'viewer');
+      expect(store.loadSessionProjectAssignment('wt-root').isManual, isFalse);
+    });
+
+    test('rule folders drop the trailing wildcard and separator', () {
+      expect(projectRuleFolder(r'F:\work\wt\*'), r'F:\work\wt');
+      expect(projectRuleFolder('/home/me/wt/*'), '/home/me/wt');
+      expect(projectRuleFolder('/home/me/wt'), '/home/me/wt');
+      expect(projectRuleFolder(r'C:\*'), r'C:\');
+    });
+  });
 }
 
 String? _sessionProject(Database db, String sessionId) {
