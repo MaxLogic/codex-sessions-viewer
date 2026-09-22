@@ -91,6 +91,72 @@ void main() {
     },
   );
 
+  test(
+    'first maximize saves a centered normal size, not the full screen',
+    () async {
+      final store = _MemoryWindowStateStore(null);
+      final manager = _FakeWindowManager()
+        ..position = const Offset(-8, -8)
+        ..size = const Size(1936, 1096)
+        ..maximized = true;
+      final controller = AppWindowStateController(
+        store: store,
+        manager: manager,
+        displayProvider: const _FakeDisplayProvider([
+          Rect.fromLTWH(0, 0, 1920, 1080),
+        ]),
+      );
+
+      controller.onWindowMaximize();
+      await _flushMicrotasks();
+
+      expect(
+        store.saved.single,
+        const PersistedWindowState(
+          x: 192,
+          y: 108,
+          width: 1536,
+          height: 864,
+          isMaximized: true,
+        ),
+      );
+    },
+  );
+
+  test('concurrent settings updates keep every change', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_settings_');
+    addTearDown(() => temp.delete(recursive: true));
+    final file = File('${temp.path}/settings.toml');
+    final windowStore = WindowStateStore(SettingsRepository(file));
+    await SettingsRepository(file).save(AppSettings.defaults());
+
+    const table = SessionTableSettings(
+      columnWidths: {'project': 200},
+      newestPerProjectOnly: true,
+      sorts: [SessionTableSortSettings(column: 'project', ascending: true)],
+    );
+    await Future.wait([
+      windowStore.save(
+        const PersistedWindowState(
+          x: 1,
+          y: 2,
+          width: 1000,
+          height: 700,
+          isMaximized: true,
+        ),
+      ),
+      SettingsRepository(file).update(
+        (settings) =>
+            settings.copyWith(ui: settings.ui.copyWith(sessionTable: table)),
+      ),
+    ]);
+
+    final saved = await SettingsRepository(file).loadOrCreate();
+    expect(saved.ui.window?.isMaximized, isTrue);
+    expect(saved.ui.sessionTable.newestPerProjectOnly, isTrue);
+    expect(File('${file.path}.tmp').existsSync(), isFalse);
+  });
+
   test('normal state saves current restored bounds', () async {
     final store = _MemoryWindowStateStore(null);
     final manager = _FakeWindowManager()

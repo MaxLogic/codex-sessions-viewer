@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -95,10 +96,45 @@ class SettingsRepository {
 
   final File file;
 
-  Future<AppSettings> loadOrCreate() async {
+  /// Pending operations per settings file. Window placement, table layout,
+  /// and the Settings screen all write the same file; each load-modify-save
+  /// runs alone so one writer cannot drop another's change.
+  static final _queues = <String, Future<void>>{};
+
+  Future<T> _serialized<T>(Future<T> Function() action) {
+    final key = file.absolute.path.toLowerCase();
+    final previous = _queues[key] ?? Future<void>.value();
+    final result = previous.then((_) => action());
+    final done = result.then<void>((_) {}, onError: (Object _) {});
+    _queues[key] = done;
+    unawaited(
+      done.whenComplete(() {
+        if (identical(_queues[key], done)) {
+          _queues.remove(key);
+        }
+      }),
+    );
+    return result;
+  }
+
+  Future<AppSettings> loadOrCreate() => _serialized(_loadOrCreate);
+
+  Future<void> save(AppSettings settings) => _serialized(() => _save(settings));
+
+  /// Loads the current file, applies [change], and saves the result as one
+  /// step. Returns the saved settings.
+  Future<AppSettings> update(AppSettings Function(AppSettings current) change) {
+    return _serialized(() async {
+      final next = change(await _loadOrCreate());
+      await _save(next);
+      return next;
+    });
+  }
+
+  Future<AppSettings> _loadOrCreate() async {
     if (!await file.exists()) {
       final settings = AppSettings.defaults();
-      await save(settings);
+      await _save(settings);
       return settings;
     }
 
@@ -107,9 +143,16 @@ class SettingsRepository {
     return AppSettings.fromTomlMap(map);
   }
 
-  Future<void> save(AppSettings settings) async {
+  /// Writes a temporary file and renames it over the settings file, so a
+  /// reader never sees a truncated file.
+  Future<void> _save(AppSettings settings) async {
     await file.parent.create(recursive: true);
-    await file.writeAsString(_encodeToml(settings.toTomlMap()));
+    final temporary = File('${file.path}.tmp');
+    await temporary.writeAsString(
+      _encodeToml(settings.toTomlMap()),
+      flush: true,
+    );
+    await temporary.rename(file.path);
   }
 
   String _encodeToml(Map<String, Object?> map) {

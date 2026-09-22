@@ -61,9 +61,8 @@ class WindowStateStore implements WindowStatePersistence {
 
   @override
   Future<void> save(PersistedWindowState state) async {
-    final settings = await repository.loadOrCreate();
-    await repository.save(
-      settings.copyWith(
+    await repository.update(
+      (settings) => settings.copyWith(
         ui: settings.ui.copyWith(
           window: WindowPlacementSettings(
             x: state.x,
@@ -180,24 +179,43 @@ class AppWindowStateController with wm.WindowListener {
 
   @override
   void onWindowMoved() {
-    unawaited(_saveCurrent(preserveBoundsWhenMaximized: true));
+    unawaited(_saveBestEffort(preserveBoundsWhenMaximized: true));
   }
 
   @override
   void onWindowResized() {
-    unawaited(_saveCurrent(preserveBoundsWhenMaximized: true));
+    unawaited(_saveBestEffort(preserveBoundsWhenMaximized: true));
   }
 
   @override
   void onWindowMaximize() {
     unawaited(
-      _saveCurrent(maximizedOverride: true, preserveBoundsWhenMaximized: true),
+      _saveBestEffort(
+        maximizedOverride: true,
+        preserveBoundsWhenMaximized: true,
+      ),
     );
   }
 
   @override
   void onWindowUnmaximize() {
-    unawaited(_saveCurrent(maximizedOverride: false));
+    unawaited(_saveBestEffort(maximizedOverride: false));
+  }
+
+  /// Window events fire during drags and resizes; a failed save must not
+  /// surface as an unhandled error.
+  Future<void> _saveBestEffort({
+    bool? maximizedOverride,
+    bool preserveBoundsWhenMaximized = false,
+  }) async {
+    try {
+      await _saveCurrent(
+        maximizedOverride: maximizedOverride,
+        preserveBoundsWhenMaximized: preserveBoundsWhenMaximized,
+      );
+    } on Object {
+      // The next move or resize saves again.
+    }
   }
 
   Future<void> _saveCurrent({
@@ -206,7 +224,10 @@ class AppWindowStateController with wm.WindowListener {
   }) async {
     final isMaximized = maximizedOverride ?? await windowManager.isMaximized();
     if (isMaximized && preserveBoundsWhenMaximized) {
-      final previous = await store.load();
+      // Keep the restored (normal) bounds so un-maximizing after a restart
+      // returns to them. Without earlier bounds, use a centered default
+      // rather than the maximized size.
+      final previous = await store.load() ?? await _defaultNormalPlacement();
       if (previous != null) {
         await store.save(
           PersistedWindowState(
@@ -230,6 +251,23 @@ class AppWindowStateController with wm.WindowListener {
         height: size.height,
         isMaximized: isMaximized,
       ),
+    );
+  }
+
+  Future<PersistedWindowState?> _defaultNormalPlacement() async {
+    final frames = await displayProvider.visibleFrames();
+    if (frames.isEmpty) {
+      return null;
+    }
+    final frame = frames.first;
+    final width = (frame.width * 0.8).roundToDouble();
+    final height = (frame.height * 0.8).roundToDouble();
+    return PersistedWindowState(
+      x: (frame.left + (frame.width - width) / 2).roundToDouble(),
+      y: (frame.top + (frame.height - height) / 2).roundToDouble(),
+      width: width,
+      height: height,
+      isMaximized: false,
     );
   }
 

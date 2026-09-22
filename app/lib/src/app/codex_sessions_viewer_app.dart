@@ -641,7 +641,16 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   Future<void> _saveSettings(AppSettings settings) async {
     final save = widget.settingsSave;
     if (save == null) {
-      await SettingsRepository(widget.settingsFile).save(settings);
+      // The window placement and table layout are saved as they change; keep
+      // the file's current values instead of the ones loaded at startup.
+      settings = await SettingsRepository(widget.settingsFile).update(
+        (current) => settings.copyWith(
+          ui: settings.ui.copyWith(
+            window: current.ui.window,
+            sessionTable: current.ui.sessionTable,
+          ),
+        ),
+      );
     } else {
       await save(settings);
     }
@@ -1130,12 +1139,10 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   }
 
   Future<void> _saveSessionTableState(SessionTableSettings tableState) async {
-    final repository = SettingsRepository(widget.settingsFile);
-    final settings = await repository.loadOrCreate();
-    final next = settings.copyWith(
-      ui: settings.ui.copyWith(sessionTable: tableState),
+    final next = await SettingsRepository(widget.settingsFile).update(
+      (settings) =>
+          settings.copyWith(ui: settings.ui.copyWith(sessionTable: tableState)),
     );
-    await repository.save(next);
     if (!mounted) {
       return;
     }
