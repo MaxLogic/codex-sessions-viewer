@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import '../../accessibility/announcement_service.dart';
 import '../../config/app_settings.dart';
+import '../copy_shortcut.dart';
 import '../models/conversation_message_view_model.dart';
 import '../motion.dart';
 import 'svg_icon.dart';
@@ -82,6 +83,10 @@ class _ConversationViewState extends State<ConversationView> {
   var _listGeneration = 0;
   final _findController = TextEditingController();
   final _findFocusNode = FocusNode(debugLabel: 'Find in conversation');
+  final _viewFocusNode = FocusNode(debugLabel: 'Conversation');
+
+  /// Whether text inside a message is selected; Ctrl+C then copies it.
+  var _textSelected = false;
   final _cardContexts = <int, BuildContext>{};
   final _currentMatchKey = GlobalKey(debugLabel: 'current-find-match');
   var _selectedNumber = 1;
@@ -168,6 +173,7 @@ class _ConversationViewState extends State<ConversationView> {
     _messageListController.dispose();
     _findController.dispose();
     _findFocusNode.dispose();
+    _viewFocusNode.dispose();
     super.dispose();
   }
 
@@ -187,7 +193,7 @@ class _ConversationViewState extends State<ConversationView> {
     final current = _currentMatch >= 0 && _currentMatch < matches.length
         ? matches[_currentMatch]
         : null;
-    return CallbackShortcuts(
+    final view = CallbackShortcuts(
       bindings: {
         const SingleActivator(LogicalKeyboardKey.keyF, control: true):
             _focusFind,
@@ -251,6 +257,42 @@ class _ConversationViewState extends State<ConversationView> {
         ),
       ),
     );
+    // Ctrl+C copies the selected message unless its text is selected.
+    return CopyShortcut(
+      focusNode: _viewFocusNode,
+      onCopy: _copySelectedMessage,
+      child: view,
+    );
+  }
+
+  bool _copySelectedMessage() {
+    if (focusedTextOwnsCopy(textSelected: _textSelected)) {
+      return false;
+    }
+    final message = _mergedMessages()
+        .where((message) => message.number == _selectedNumber)
+        .firstOrNull;
+    if (message == null || !message.isBodyLoaded) {
+      return false;
+    }
+    unawaited(() async {
+      final text = conversationMessageMarkdown(message);
+      final callback = widget.onCopyMessageMarkdown;
+      if (callback != null) {
+        await callback(text);
+      } else {
+        await Clipboard.setData(ClipboardData(text: text));
+      }
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.maybeOf(context)
+        ?..removeCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text('Message ${message.number} copied.')),
+        );
+    }());
+    return true;
   }
 
   Widget _buildEmpty(BuildContext context) {
@@ -505,7 +547,15 @@ class _ConversationViewState extends State<ConversationView> {
                   : null,
               currentMatchKey: _currentMatchKey,
               onCopyMarkdown: widget.onCopyMessageMarkdown,
-              onSelect: () => _selectMessage(message.number, scroll: false),
+              onSelect: () {
+                // Focus moves here so Ctrl+C copies this message, but not
+                // away from text selected inside the conversation.
+                if (!_viewFocusNode.hasFocus) {
+                  _viewFocusNode.requestFocus();
+                }
+                _selectMessage(message.number, scroll: false);
+              },
+              onTextSelectionChanged: (selected) => _textSelected = selected,
               onToggleExpanded: () {
                 final willExpand = !_isExpanded(message);
                 setState(() {
@@ -1203,6 +1253,7 @@ class _ConversationMessageCard extends StatelessWidget {
     required this.currentMatchKey,
     required this.onCopyMarkdown,
     required this.onSelect,
+    required this.onTextSelectionChanged,
     required this.onToggleExpanded,
   });
 
@@ -1216,6 +1267,7 @@ class _ConversationMessageCard extends StatelessWidget {
   final GlobalKey currentMatchKey;
   final CopyTextCallback? onCopyMarkdown;
   final VoidCallback onSelect;
+  final ValueChanged<bool> onTextSelectionChanged;
   final VoidCallback onToggleExpanded;
 
   bool get _isChatAuthor =>
@@ -1365,6 +1417,10 @@ class _ConversationMessageCard extends StatelessWidget {
                         readOnly: true,
                         child: ExcludeSemantics(
                           child: SelectionArea(
+                            onSelectionChanged: (content) =>
+                                onTextSelectionChanged(
+                                  content?.plainText.isNotEmpty ?? false,
+                                ),
                             child: _HighlightedText(
                               text: body,
                               query: findQuery,
@@ -1408,7 +1464,7 @@ class _ConversationMessageCard extends StatelessWidget {
 
   Future<void> _copyMarkdown(BuildContext context) async {
     final callback = onCopyMarkdown;
-    final text = _messageMarkdown(message);
+    final text = conversationMessageMarkdown(message);
     if (callback != null) {
       await callback(text);
     } else {
@@ -1420,15 +1476,6 @@ class _ConversationMessageCard extends StatelessWidget {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Message Markdown copied.')));
-  }
-
-  String _messageMarkdown(ConversationMessageViewModel message) {
-    return [
-      '### Message ${message.number} - ${message.authorLabel}',
-      '',
-      message.body,
-      '',
-    ].join('\n');
   }
 
   String _messageSemanticsLabel(
@@ -1564,4 +1611,15 @@ extension on DateTime {
     String two(int value) => value.toString().padLeft(2, '0');
     return '${two(local.hour)}:${two(local.minute)}';
   }
+}
+
+/// One message as Markdown, as the Copy button and Ctrl+C put it on the
+/// clipboard.
+String conversationMessageMarkdown(ConversationMessageViewModel message) {
+  return [
+    '### Message ${message.number} - ${message.authorLabel}',
+    '',
+    message.body,
+    '',
+  ].join('\n');
 }

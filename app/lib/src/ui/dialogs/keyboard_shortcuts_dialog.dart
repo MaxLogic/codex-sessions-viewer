@@ -34,6 +34,7 @@ const keyboardShortcutGroups = [
     KeyboardShortcut(['Ctrl', 'F'], 'Search sessions'),
     KeyboardShortcut(['Ctrl', 'L'], 'Go to the session filters'),
     KeyboardShortcut(['Ctrl', 'E'], 'Export the selected session as Markdown'),
+    KeyboardShortcut(['Ctrl', 'C'], "Copy the selected session's path"),
     KeyboardShortcut(['F5'], 'Refresh sessions from disk'),
     KeyboardShortcut(['Click column'], 'Sort by that column'),
     KeyboardShortcut(['Shift', 'Click column'], 'Add a secondary sort'),
@@ -46,13 +47,19 @@ const keyboardShortcutGroups = [
     'Conversation',
     [
       KeyboardShortcut(['Ctrl', 'F'], 'Find in the conversation'),
+      KeyboardShortcut([
+        'Ctrl',
+        'C',
+      ], 'Copy the selected message as Markdown, or the selected text'),
       KeyboardShortcut(['Enter'], 'Next match (in the find box)'),
       KeyboardShortcut(['Shift', 'Enter'], 'Previous match (in the find box)'),
       KeyboardShortcut(['F3'], 'Next match'),
       KeyboardShortcut(['Shift', 'F3'], 'Previous match'),
       KeyboardShortcut(['Escape'], 'Clear the find box, then leave it'),
     ],
-    note: 'Ctrl+F finds in the conversation when focus is inside it.',
+    note:
+        'Ctrl+F and Ctrl+C act on the conversation when focus is inside it. '
+        'In a command preview, Ctrl+C copies the whole command.',
   ),
   KeyboardShortcutGroup('Focus reader', [
     KeyboardShortcut(['N'], 'Next message'),

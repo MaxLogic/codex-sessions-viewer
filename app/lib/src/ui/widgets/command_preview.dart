@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../../commands/resume_command_generator.dart';
 import 'svg_icon.dart';
 import 'app_button.dart';
+import '../copy_shortcut.dart';
 
 typedef TerminalCommandCallback = Future<void> Function(String command);
 
@@ -98,7 +99,12 @@ class _CommandBlock extends StatelessWidget {
         children: [
           Text(label),
           const SizedBox(height: 4),
-          SelectableText(command ?? 'Unavailable'),
+          _CommandText(
+            command: command,
+            onCopy: copyEnabled && command != null
+                ? () => _copyCommand(context, command!)
+                : null,
+          ),
           const SizedBox(height: 4),
           if (showInlineActions)
             Wrap(
@@ -229,6 +235,41 @@ class _LabeledCommandButton extends StatelessWidget {
           icon: AppSvgIcon(iconAsset),
           label: Text(text),
         ),
+      ),
+    );
+  }
+}
+
+/// The command as selectable text. Ctrl+C with nothing selected copies the
+/// whole command.
+class _CommandText extends StatefulWidget {
+  const _CommandText({required this.command, required this.onCopy});
+
+  final String? command;
+  final VoidCallback? onCopy;
+
+  @override
+  State<_CommandText> createState() => _CommandTextState();
+}
+
+class _CommandTextState extends State<_CommandText> {
+  var _hasSelection = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return CopyShortcut(
+      onCopy: () {
+        final copy = widget.onCopy;
+        if (_hasSelection || copy == null) {
+          return false;
+        }
+        copy();
+        return true;
+      },
+      child: SelectableText(
+        widget.command ?? 'Unavailable',
+        onSelectionChanged: (selection, _) =>
+            _hasSelection = !selection.isCollapsed,
       ),
     );
   }

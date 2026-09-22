@@ -10,6 +10,7 @@ import '../../commands/windows_command_line.dart';
 import '../../config/app_settings.dart';
 import '../../export/session_list_exporter.dart';
 import '../../voice_over/voice_over_service.dart';
+import '../copy_shortcut.dart';
 import '../../usage/usage_summary.dart';
 import '../motion.dart';
 import '../models/conversation_message_view_model.dart';
@@ -210,6 +211,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
 
   final _searchController = TextEditingController();
   final _searchFocusNode = FocusNode(debugLabel: 'Session search');
+  final _screenFocusNode = FocusNode(debugLabel: 'Sessions screen');
   final _filterAreaFocusNode = FocusNode(
     debugLabel: 'Session filters',
     skipTraversal: true,
@@ -364,6 +366,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _relativeDateTimer?.cancel();
     _stopSelectedSessionFileWatch();
     _searchFocusNode.dispose();
+    _screenFocusNode.dispose();
     _filterAreaFocusNode.dispose();
     super.dispose();
   }
@@ -433,10 +436,11 @@ class _SessionsScreenState extends State<SessionsScreen> {
               unawaited(_exportSelectedSession()),
         },
         // Holds focus at startup so Ctrl+F and F5 work before anything else
-        // is focused.
-        child: Focus(
+        // is focused; Ctrl+C here copies the selected session's path.
+        child: CopyShortcut(
+          focusNode: _screenFocusNode,
           autofocus: true,
-          skipTraversal: true,
+          onCopy: _copySelectedSessionPath,
           child: FocusTraversalGroup(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -547,7 +551,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                 : _SessionsTable(
                                     rows: visibleDisplayRows,
                                     selectedId: _selectedId,
-                                    onSelect: _select,
+                                    onSelect: _selectFromList,
                                     onToggleSubagents: _toggleSubagents,
                                     onAction: _handleSessionAction,
                                     settings:
@@ -1398,6 +1402,41 @@ class _SessionsScreenState extends State<SessionsScreen> {
       }
     }
     return null;
+  }
+
+  /// Selects a session from a click: focus returns to the screen, so Ctrl+C
+  /// copies this session's path.
+  void _selectFromList(String id) {
+    _screenFocusNode.requestFocus();
+    _select(id);
+  }
+
+  /// Ctrl+C with nothing more specific focused.
+  bool _copySelectedSessionPath() {
+    if (focusedTextOwnsCopy()) {
+      return false;
+    }
+    final row = _selectedRow(_visibleRows);
+    if (row == null || row.path.isEmpty) {
+      return false;
+    }
+    unawaited(
+      _handleSessionAction(
+        SessionActionRequest(
+          row: row,
+          action: SessionRowAction.copyPath,
+          payload: row.path,
+        ),
+      ).then((_) {
+        if (!mounted || widget.onSessionAction == null) {
+          return;
+        }
+        ScaffoldMessenger.maybeOf(context)
+          ?..removeCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('Copied session path.')));
+      }),
+    );
+    return true;
   }
 
   void _select(String id) {
