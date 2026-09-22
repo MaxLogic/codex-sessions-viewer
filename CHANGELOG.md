@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Added
+- Added Move to project… to the session More menu and row menu. It moves one session, or every session from a folder and its subfolders, to an existing or new project; use the folder choice to merge a worktree back into its main project. The dialog says how the session got its project and can undo a manual move or remove the folder rule.
+- Added context-aware Ctrl+C: it copies the selected message in the conversation, the whole command in a command preview, or the selected session's path, and leaves text fields and selected text to the normal copy.
+- Added voice-over sounds (a warm, cheerful ElevenLabs Bella voice) for scan started, scan finished, copied, export finished, parse errors, and database errors, with a screen reader announcement when a sound cannot play.
 - Added a keyboard shortcuts dialog (F1 or the Shortcuts button in the navigation rail) and the documented Ctrl+L (go to filters) and Ctrl+E (export the selected session) shortcuts.
 - Wired the Logs screen to the stored log entries, with copy, open log file, open logs folder, and clear entries older than 7 days.
 - Added a session Stats tab: active time split into model work, tool execution, and subagent waits; token split by agent, token type, and message kind; per-tool calls, failures, and time; models with reasoning effort; and a subagent table with kind (preconfigured role or generic), model, tokens and share, tool calls, active time, and cost. Timing is read on demand from the local session files.
@@ -27,6 +30,8 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- The Show icons and Show text on buttons settings now apply to the app's buttons; an icon-only button keeps its label as tooltip and accessible name.
+- Add/remove tags works again; its dialog was opened from above the navigator and failed.
 - Apply the theme, UI density, and font size settings; they were saved but ignored.
 - Show pin and archive changes immediately, and say when an archived session is hidden by the current filter.
 - Re-parse this session now re-reads only that session file and refreshes its row, instead of running an incremental scan of everything.
@@ -68,3 +73,6 @@
 - Backfilled auto-detected project names for older cached sessions, removed placeholder values from Sessions table cells, animated active load/scan status, and started a scan automatically after cached startup rows finish loading.
 - Removed the Sessions title column, stopped deriving JSONL titles from first user messages, hid empty title headers in session details, and cleaned placeholder `auto` summaries plus AGENTS-instruction titles from cached metadata.
 - Added a Sessions table filter that shows only the newest session per project while leaving sessions with no project ungrouped.
+
+### Removed
+- Removed the Native title bar setting; the app always uses the Windows title bar.
