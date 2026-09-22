@@ -23,6 +23,7 @@ void main() {
           usageScreen: const Text('Injected usage screen'),
           settingsScreen: const Text('Injected settings screen'),
           logsScreen: const Text('Injected logs screen'),
+          projectsScreen: const Text('Projects content'),
         ),
       ),
     );

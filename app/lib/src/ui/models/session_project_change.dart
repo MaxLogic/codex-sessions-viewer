@@ -24,6 +24,13 @@ class ResetSessionProject extends SessionProjectChange {
   const ResetSessionProject();
 }
 
+/// Opens the Projects screen at [projectName] instead of changing anything.
+class ManageProjectRules extends SessionProjectChange {
+  const ManageProjectRules(this.projectName);
+
+  final String? projectName;
+}
+
 /// Deletes the folder rule for [folder].
 class RemoveFolderRule extends SessionProjectChange {
   const RemoveFolderRule(this.folder);

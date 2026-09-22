@@ -298,6 +298,7 @@ void main() {
           usageScreen: const Text('Usage screen'),
           settingsScreen: const Text('Settings screen'),
           logsScreen: const Text('Logs screen'),
+          projectsScreen: const Text('Projects content'),
         ),
       ),
     );

@@ -25,6 +25,7 @@ import '../search/message_search.dart';
 import '../search/session_search.dart';
 import '../usage/usage_summary.dart';
 import '../ui/models/conversation_message_view_model.dart';
+import '../ui/models/projects_repository.dart';
 import '../ui/models/session_project_change.dart';
 import '../ui/screens/sessions_screen.dart';
 import '../utils/injected_context_filter.dart';
@@ -33,7 +34,7 @@ import '../utils/profiling.dart';
 const _conversationTailBodyPageSize = 50;
 const _conversationMessagePageRadius = 25;
 
-class RuntimeSessionController {
+class RuntimeSessionController implements ProjectsRepository {
   RuntimeSessionController({
     required this.settingsFile,
     required this.databaseFile,
@@ -756,7 +757,116 @@ class RuntimeSessionController {
             projectionVersion: CodexSessionParser.currentVersion,
             pricing: pricing,
           );
+        case ManageProjectRules():
+          break;
       }
+    } finally {
+      db.close();
+    }
+  });
+
+  @override
+  Future<List<ProjectSummary>> loadProjects() async =>
+      (await _readProjectsInBackground(databaseFile.path, null))
+          as List<ProjectSummary>;
+
+  @override
+  Future<ProjectDetail> loadProjectDetail(int projectId) async =>
+      (await _readProjectsInBackground(databaseFile.path, projectId))
+          as ProjectDetail;
+
+  @override
+  Future<ProjectRulesSnapshot> addFolderRule({
+    required String folder,
+    required String projectName,
+  }) => _editProjects(
+    (store, version, pricing) => store.assignFolderToProject(
+      folder: folder,
+      projectName: projectName,
+      projectionVersion: version,
+      pricing: pricing,
+    ),
+  );
+
+  @override
+  Future<ProjectRulesSnapshot> changeFolderRule({
+    required String oldFolder,
+    required String newFolder,
+    required String projectName,
+  }) => _editProjects(
+    (store, version, pricing) => store.changeFolderRule(
+      oldFolder: oldFolder,
+      newFolder: newFolder,
+      projectName: projectName,
+      projectionVersion: version,
+      pricing: pricing,
+    ),
+  );
+
+  @override
+  Future<ProjectRulesSnapshot> moveFolderRule({
+    required String folder,
+    required String projectName,
+  }) => addFolderRule(folder: folder, projectName: projectName);
+
+  @override
+  Future<ProjectRulesSnapshot> removeFolderRule(String folder) => _editProjects(
+    (store, version, pricing) => store.removeFolderRule(
+      folder: folder,
+      projectionVersion: version,
+      pricing: pricing,
+    ),
+  );
+
+  @override
+  Future<ProjectRulesSnapshot> mergeProject({
+    required int sourceProjectId,
+    required String targetName,
+  }) => _editProjects(
+    (store, version, pricing) => store.mergeProject(
+      sourceProjectId: sourceProjectId,
+      targetName: targetName,
+      projectionVersion: version,
+      pricing: pricing,
+    ),
+  );
+
+  @override
+  Future<ProjectRulesSnapshot> resetManualSessions(int projectId) =>
+      _editProjects(
+        (store, version, pricing) =>
+            store.resetManualSessions(projectId: projectId),
+      );
+
+  @override
+  Future<void> restore(ProjectRulesSnapshot snapshot) => _editProjects(
+    (store, version, pricing) => store.restoreProjectRules(
+      snapshot,
+      projectionVersion: version,
+      pricing: pricing,
+    ),
+  );
+
+  /// Runs [edit] in the writer queue and returns the rules from before it.
+  Future<ProjectRulesSnapshot> _editProjects(
+    void Function(
+      ProjectTagStateStore store,
+      int projectionVersion,
+      UsagePricingCatalog pricing,
+    )
+    edit,
+  ) => _runWrite(() async {
+    final settings = await SettingsRepository(settingsFile).loadOrCreate();
+    final db = openFileBackedDatabase(databaseFile);
+    try {
+      final store = ProjectTagStateStore(db);
+      final before = store.snapshotProjectRules();
+      edit(
+        store,
+        CodexSessionParser.currentVersion,
+        PricingRepository(db).loadCached(settings.pricing),
+      );
+      return before;
     } finally {
       db.close();
     }
@@ -1231,6 +1341,22 @@ Map<String, String> _parseWslProjectResolutionOutput(
     }
   }
   return resolved;
+}
+
+/// Reads the project list (null [projectId]) or one project's detail on a
+/// background isolate; detail counts walk every session.
+Future<Object> _readProjectsInBackground(String databasePath, int? projectId) {
+  return Isolate.run(() {
+    final db = openFileBackedDatabase(File(databasePath));
+    try {
+      final store = ProjectTagStateStore(db);
+      return projectId == null
+          ? store.listProjects()
+          : store.loadProjectDetail(projectId);
+    } finally {
+      db.close();
+    }
+  });
 }
 
 Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {

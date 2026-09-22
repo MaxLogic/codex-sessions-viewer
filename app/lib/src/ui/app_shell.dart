@@ -13,6 +13,7 @@ typedef SessionsScreenBuilder =
 
 enum CodexAppSection {
   sessions('Sessions', Icons.history),
+  projects('Projects', Icons.folder_copy_outlined),
   evals('Evals', Icons.fact_check),
   context('Context', Icons.manage_search),
   usage('Usage', Icons.query_stats),
@@ -30,6 +31,7 @@ class CodexAppShell extends StatefulWidget {
     super.key,
     this.title = 'Codex Session Viewer',
     required this.sessionsScreenBuilder,
+    required this.projectsScreen,
     required this.evalsScreen,
     required this.contextScreen,
     required this.usageScreen,
@@ -42,6 +44,7 @@ class CodexAppShell extends StatefulWidget {
 
   final String title;
   final SessionsScreenBuilder sessionsScreenBuilder;
+  final Widget projectsScreen;
   final Widget evalsScreen;
   final Widget contextScreen;
   final Widget usageScreen;
@@ -165,6 +168,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
               child: _SectionContent(
                 section: section,
                 sessionsScreenBuilder: widget.sessionsScreenBuilder,
+                projectsScreen: widget.projectsScreen,
                 evalsScreen: widget.evalsScreen,
                 contextScreen: widget.contextScreen,
                 usageScreen: widget.usageScreen,
@@ -191,6 +195,7 @@ class _SectionContent extends StatelessWidget {
   const _SectionContent({
     required this.section,
     required this.sessionsScreenBuilder,
+    required this.projectsScreen,
     required this.evalsScreen,
     required this.contextScreen,
     required this.usageScreen,
@@ -203,6 +208,7 @@ class _SectionContent extends StatelessWidget {
 
   final CodexAppSection section;
   final SessionsScreenBuilder sessionsScreenBuilder;
+  final Widget projectsScreen;
   final Widget evalsScreen;
   final Widget contextScreen;
   final Widget usageScreen;
@@ -249,6 +255,9 @@ class _SectionContent extends StatelessWidget {
   Widget _buildSection(BuildContext context) {
     if (section == CodexAppSection.sessions) {
       return sessionsScreenBuilder(context, onOpenSettings);
+    }
+    if (section == CodexAppSection.projects) {
+      return projectsScreen;
     }
     if (section == CodexAppSection.evals) {
       return evalsScreen;

@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- Added a Projects screen: a searchable project list sorted by name or last activity in either direction, and for the selected project its folder rules (with how many sessions each places and which more specific rules take sessions from it), the folders it was detected from, and its sessions moved by hand. Add, change, move, or remove folder rules, merge a detected folder or a whole project into another project, or reset manual moves; every change offers Undo. Open it from the rail, from a session's menus, or from Manage folder rules… in the Move to project dialog.
+- Folder rules now prefer the more specific folder, so a rule for a worktree wins over an older rule for its parent folder.
 - Added Move to project… to the session More menu and row menu. It moves one session, or every session from a folder and its subfolders, to an existing or new project; use the folder choice to merge a worktree back into its main project. The dialog says how the session got its project and can undo a manual move or remove the folder rule.
 - Added context-aware Ctrl+C: it copies the selected message in the conversation, the whole command in a command preview, or the selected session's path, and leaves text fields and selected text to the normal copy.
 - Added voice-over sounds (a warm, cheerful ElevenLabs Bella voice) for scan started, scan finished, copied, export finished, parse errors, and database errors, with a screen reader announcement when a sound cannot play.

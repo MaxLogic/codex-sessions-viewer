@@ -17,6 +17,7 @@ Widget _shell() {
       usageScreen: const Text('Usage content'),
       settingsScreen: const Text('Settings content'),
       logsScreen: const Text('Logs content'),
+      projectsScreen: const Text('Projects content'),
     ),
   );
 }
@@ -31,9 +32,33 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Keyboard shortcuts'), findsOneWidget);
+    // The list is virtualized; later groups appear as it scrolls.
     for (final group in keyboardShortcutGroups) {
+      await tester.scrollUntilVisible(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.text(group.title),
+        ),
+        200,
+        scrollable: find
+            .descendant(
+              of: find.byType(Dialog),
+              matching: find.byType(Scrollable),
+            )
+            .first,
+      );
       expect(find.text(group.title), findsWidgets);
     }
+    await tester.scrollUntilVisible(
+      find.bySemanticsLabel('Ctrl+F: Find in the conversation'),
+      -200,
+      scrollable: find
+          .descendant(
+            of: find.byType(Dialog),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
     expect(
       find.bySemanticsLabel('Ctrl+F: Find in the conversation'),
       findsOneWidget,

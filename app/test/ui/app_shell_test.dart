@@ -54,6 +54,7 @@ void main() {
             usageScreen: const Text('Usage content'),
             settingsScreen: const Text('Settings content'),
             logsScreen: const Text('Logs content'),
+            projectsScreen: const Text('Projects content'),
           ),
         ),
       );
@@ -68,7 +69,10 @@ void main() {
         expect(focused, hasLength(1));
         final data = focused.single.getSemanticsData();
         expect(data.label, contains(area.label));
-        expect(data.label, contains('Tab ${area.index + 1} of 6'));
+        expect(
+          data.label,
+          contains('Tab ${area.index + 1} of ${CodexAppSection.values.length}'),
+        );
         expect(data.hasAction(SemanticsAction.tap), isTrue);
         expect(data.flagsCollection.isFocused, Tristate.isTrue);
         await tester.sendKeyEvent(LogicalKeyboardKey.enter);

@@ -866,6 +866,166 @@ void main() {
       expect(store.loadSessionProjectAssignment('wt-root').isManual, isFalse);
     });
 
+    test('the more specific folder rule wins over an older broad one', () {
+      store.assignFolderToProject(
+        folder: r'F:\projects',
+        projectName: 'Everything',
+        projectionVersion: 1,
+      );
+      store.assignFolderToProject(
+        folder: r'F:\projects\viewer-wt',
+        projectName: 'viewer',
+        projectionVersion: 1,
+      );
+
+      expect(_sessionProject(db, 'wt-sub'), 'viewer');
+      expect(_sessionProject(db, 'main'), 'Everything');
+      final everything = store.listProjects().firstWhere(
+        (project) => project.name == 'Everything',
+      );
+      final rule = store.loadProjectDetail(everything.id).rules.single;
+      expect(rule.folder, r'F:\projects');
+      expect(rule.sessionCount, 2);
+      expect(rule.overriddenBy, {
+        const ProjectFolderRule(
+          folder: r'F:\projects\viewer-wt',
+          projectName: 'viewer',
+        ): 2,
+      });
+    });
+
+    test('lists projects with sessions or rules and their counts', () {
+      db.execute(
+        "update sessions set last_message_at_utc = '2026-09-20T10:00:00Z' "
+        "where id = 'wt-sub'",
+      );
+      store.upsertProject(name: 'Empty');
+      store.assignSessionProject('wt-root', 'viewer');
+      store.assignFolderToProject(
+        folder: r'D:\elsewhere',
+        projectName: 'Rules only',
+        projectionVersion: 1,
+      );
+
+      final projects = {
+        for (final project in store.listProjects()) project.name: project,
+      };
+
+      expect(
+        projects.keys,
+        unorderedEquals(['viewer', 'viewer-wt', 'Rules only']),
+      );
+      expect(projects['viewer']!.sessionCount, 2);
+      expect(projects['viewer']!.manualSessionCount, 1);
+      expect(projects['viewer-wt']!.sessionCount, 2);
+      expect(
+        projects['viewer-wt']!.lastActivityUtc,
+        DateTime.utc(2026, 9, 20, 10),
+      );
+      expect(projects['Rules only']!.folderRuleCount, 1);
+      expect(projects['Rules only']!.sessionCount, 0);
+    });
+
+    test('project detail lists the folders it was detected from', () {
+      final worktree = store.listProjects().firstWhere(
+        (project) => project.name == 'viewer-wt',
+      );
+
+      final detail = store.loadProjectDetail(worktree.id);
+
+      expect(detail.rules, isEmpty);
+      expect(detail.detectedFolders, [
+        (folder: r'F:\projects\viewer-wt', sessionCount: 2),
+        (folder: r'F:\projects\viewer-wt2', sessionCount: 1),
+      ]);
+    });
+
+    test('merging a project moves its folders and manual sessions', () {
+      final worktree = store.listProjects().firstWhere(
+        (project) => project.name == 'viewer-wt',
+      );
+      store.assignSessionProject('main', 'viewer-wt');
+      final before = store.snapshotProjectRules();
+
+      store.mergeProject(
+        sourceProjectId: worktree.id,
+        targetName: 'viewer',
+        projectionVersion: 1,
+      );
+
+      for (final id in ['main', 'wt-root', 'wt-sub', 'wt-sibling']) {
+        expect(_sessionProject(db, id), 'viewer', reason: id);
+      }
+      expect(store.listProjects().map((project) => project.name), ['viewer']);
+      final viewer = store.listProjects().single;
+      expect(
+        store.loadProjectDetail(viewer.id).rules.map((rule) => rule.folder),
+        [r'F:\projects\viewer-wt', r'F:\projects\viewer-wt2'],
+      );
+
+      store.restoreProjectRules(before, projectionVersion: 1);
+
+      expect(_sessionProject(db, 'main'), 'viewer-wt');
+      expect(_sessionProject(db, 'wt-sub'), 'viewer-wt');
+      expect(
+        db.select('select count(*) as n from project_path_masks').single['n'],
+        0,
+      );
+    });
+
+    test('merging into the same project is refused', () {
+      final viewer = store.listProjects().firstWhere(
+        (project) => project.name == 'viewer',
+      );
+      expect(
+        () => store.mergeProject(
+          sourceProjectId: viewer.id,
+          targetName: 'viewer',
+          projectionVersion: 1,
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('changing and resetting keep sessions consistent', () {
+      store.assignFolderToProject(
+        folder: r'F:\projects\viewer-wt',
+        projectName: 'viewer',
+        projectionVersion: 1,
+      );
+      store.changeFolderRule(
+        oldFolder: r'F:\projects\viewer-wt',
+        newFolder: r'F:\projects\viewer-wt2',
+        projectName: 'viewer',
+        projectionVersion: 1,
+      );
+      expect(_sessionProject(db, 'wt-sub'), 'viewer-wt');
+      expect(_sessionProject(db, 'wt-sibling'), 'viewer');
+
+      store.assignSessionProject('wt-root', 'viewer');
+      store.assignSessionProject('wt-sub', 'viewer');
+      final viewer = store.listProjects().firstWhere(
+        (project) => project.name == 'viewer',
+      );
+      store.resetManualSessions(projectId: viewer.id);
+
+      expect(_sessionProject(db, 'wt-root'), 'viewer-wt');
+      expect(_sessionProject(db, 'wt-sub'), 'viewer-wt');
+      expect(store.loadProjectDetail(viewer.id).manualSessionCount, 0);
+    });
+
+    test('project roots come from the segment named like the project', () {
+      expect(
+        projectRootFolder(r'F:\projects\viewer-wt\app\src', 'viewer-wt'),
+        r'F:\projects\viewer-wt',
+      );
+      expect(
+        projectRootFolder('/home/me/Viewer/app', 'viewer'),
+        '/home/me/Viewer',
+      );
+      expect(projectRootFolder(r'F:\other\', 'viewer'), r'F:\other');
+    });
+
     test('rule folders drop the trailing wildcard and separator', () {
       expect(projectRuleFolder(r'F:\work\wt\*'), r'F:\work\wt');
       expect(projectRuleFolder('/home/me/wt/*'), '/home/me/wt');

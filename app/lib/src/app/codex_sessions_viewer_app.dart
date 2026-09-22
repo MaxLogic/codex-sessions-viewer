@@ -29,6 +29,7 @@ import '../ui/dialogs/move_to_project_dialog.dart';
 import '../ui/models/session_project_change.dart';
 import '../ui/screens/context_search_screen.dart';
 import '../ui/screens/evals_screen.dart';
+import '../ui/screens/projects_screen.dart';
 import '../ui/screens/sessions_screen.dart';
 import '../ui/screens/settings_screen.dart';
 import '../ui/screens/usage_screen.dart';
@@ -407,6 +408,18 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                             openTargetSerial: _sessionOpenTargetSerial,
                             now: widget.now,
                           ),
+                      projectsScreen: ProjectsScreen(
+                        repository: RuntimeSessionController(
+                          settingsFile: widget.settingsFile,
+                          databaseFile: widget.databaseFile,
+                          writerCoordinator: _writerCoordinator,
+                        ),
+                        viewState: _projectsViewState,
+                        openProjectName: _projectsOpenName,
+                        openProjectSerial: _projectsOpenSerial,
+                        onProjectsChanged: _projectsChanged,
+                        now: widget.now,
+                      ),
                       evalsScreen: _EvalsScreenLoader(
                         settingsFile: widget.settingsFile,
                         databaseFile: widget.databaseFile,
@@ -834,6 +847,9 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       case SessionRowAction.moveToProject:
         await _moveSessionToProject(request.row);
         return;
+      case SessionRowAction.openInProjects:
+        _openProjects(request.row.project);
+        return;
       case SessionRowAction.openPath:
         await _openPath(payload ?? request.row.sourcePathForDisplay);
         return;
@@ -888,6 +904,33 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     });
   }
 
+  final _projectsViewState = ProjectsViewState();
+  String? _projectsOpenName;
+  var _projectsOpenSerial = 0;
+
+  /// Shows the Projects screen, selecting [projectName] when given.
+  void _openProjects(String? projectName) {
+    setState(() {
+      _projectsOpenName = projectName == null || projectName.isEmpty
+          ? null
+          : projectName;
+      _projectsOpenSerial++;
+      _requestedSection = CodexAppSection.projects;
+      _sectionRequestSerial++;
+    });
+  }
+
+  /// Project changes regroup usage, so Usage reloads when next shown.
+  void _projectsChanged() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _usageSummary = null;
+      _usageLoadGeneration++;
+    });
+  }
+
   Future<void> _moveSessionToProject(SessionRowViewModel row) async {
     final dialogContext = _navigatorKey.currentContext;
     if (dialogContext == null) {
@@ -909,13 +952,19 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     if (change == null) {
       return;
     }
+    if (change is ManageProjectRules) {
+      _openProjects(change.projectName);
+      return;
+    }
     await controller.changeSessionProject(row.id, change);
+    _projectsChanged();
     final message = switch (change) {
       MoveSessionToProject(:final projectName) =>
         'Moved the session to "$projectName".',
       MoveFolderToProject(:final folder, :final projectName) =>
         'Sessions from $folder now belong to "$projectName".',
       ResetSessionProject() => 'The session follows its folder again.',
+      ManageProjectRules() => '',
       RemoveFolderRule(:final folder) => 'Removed the folder rule for $folder.',
     };
     _scaffoldMessengerKey.currentState

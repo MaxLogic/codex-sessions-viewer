@@ -163,6 +163,7 @@ Widget _shellHost({
       usageScreen: usage,
       settingsScreen: settings,
       logsScreen: logs,
+      projectsScreen: const Text('Projects content'),
     ),
   );
 }

@@ -159,6 +159,12 @@ class _MoveToProjectDialogState extends State<MoveToProjectDialog> {
       ),
       actions: [
         TextButton(
+          onPressed: () => Navigator.of(
+            context,
+          ).pop(ManageProjectRules(_assignment.projectName)),
+          child: const Text('Manage folder rules…'),
+        ),
+        TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),

@@ -43,6 +43,14 @@ const keyboardShortcutGroups = [
       'Click column',
     ], 'Remove that column from sorting'),
   ]),
+  KeyboardShortcutGroup('Projects', [
+    KeyboardShortcut(['Ctrl', 'F'], 'Search projects'),
+    KeyboardShortcut([
+      'Ctrl',
+      'N',
+    ], 'Add a folder rule to the selected project'),
+    KeyboardShortcut(['Delete'], 'Remove the focused folder rule'),
+  ], note: 'Every change shows Undo for a few seconds.'),
   KeyboardShortcutGroup(
     'Conversation',
     [

@@ -67,6 +67,7 @@ enum SessionRowAction {
   copyTerminalCommand,
   editTags,
   moveToProject,
+  openInProjects,
   togglePin,
   toggleArchive,
   updateEvalMetadata,
@@ -2271,6 +2272,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
       SessionDetailAction.moveToProject => SessionActionRequest(
         row: row,
         action: SessionRowAction.moveToProject,
+      ),
+      SessionDetailAction.openInProjects => SessionActionRequest(
+        row: row,
+        action: SessionRowAction.openInProjects,
       ),
       SessionDetailAction.exportMarkdown ||
       SessionDetailAction.addToEvals ||
@@ -4894,6 +4899,12 @@ class _ActionsMenu extends StatelessWidget {
                 iconAsset: AppIcons.folderOpen,
               ),
               _item(
+                SessionRowAction.openInProjects,
+                'Open project in Projects',
+                enabled: row.project.isNotEmpty,
+                disabledReason: 'This session has no project.',
+              ),
+              _item(
                 SessionRowAction.togglePin,
                 row.isPinned ? 'Unpin session' : 'Pin session',
                 iconAsset: AppIcons.pin,
@@ -4974,7 +4985,9 @@ class _ActionsMenu extends StatelessWidget {
       SessionRowAction.openTerminalResume => commandSet.terminalLaunchCommand,
       SessionRowAction.openTerminalFork => commandSet.terminalForkCommand,
       SessionRowAction.copyTerminalCommand => commandSet.terminalLaunchCommand,
-      SessionRowAction.editTags || SessionRowAction.moveToProject => null,
+      SessionRowAction.editTags ||
+      SessionRowAction.moveToProject ||
+      SessionRowAction.openInProjects => null,
       SessionRowAction.togglePin ||
       SessionRowAction.toggleArchive ||
       SessionRowAction.updateEvalMetadata ||
@@ -5010,6 +5023,7 @@ extension on SessionRowAction {
       SessionRowAction.copyTerminalCommand => 'Copy terminal command',
       SessionRowAction.editTags => 'Add or remove tags',
       SessionRowAction.moveToProject => 'Move to project',
+      SessionRowAction.openInProjects => 'Open project in Projects',
       SessionRowAction.togglePin => 'Pin or unpin session',
       SessionRowAction.toggleArchive => 'Archive or unarchive session',
       SessionRowAction.updateEvalMetadata => 'Update eval metadata',

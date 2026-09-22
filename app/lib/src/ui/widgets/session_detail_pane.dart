@@ -34,6 +34,7 @@ enum SessionDetailAction {
   toggleArchive,
   editTags,
   moveToProject,
+  openInProjects,
   addToEvals,
   removeFromEvals,
   editEvalMetadata,
@@ -962,6 +963,12 @@ class _ActionArea extends StatelessWidget {
             _moreItem('edit-tags', 'Add/remove tags', AppIcons.tag),
             _moreItem('move-project', 'Move to project…', AppIcons.folderOpen),
             _moreItem(
+              'open-project',
+              'Open project in Projects',
+              null,
+              enabled: row.project.isNotEmpty,
+            ),
+            _moreItem(
               'toggle-eval',
               row.evalReady ? 'Remove from Evals' : 'Add to Evals',
               null,
@@ -1084,6 +1091,8 @@ class _ActionArea extends StatelessWidget {
         await _invokeAction(SessionDetailAction.editTags);
       case 'move-project':
         await _invokeAction(SessionDetailAction.moveToProject);
+      case 'open-project':
+        await _invokeAction(SessionDetailAction.openInProjects);
       case 'toggle-eval':
         await _invokeAction(
           row.evalReady

@@ -262,17 +262,8 @@ class ProjectTagStateStore {
     required int projectionVersion,
     UsagePricingCatalog pricing = const UsagePricingCatalog({}),
   }) {
-    final base = _trimFolder(folder);
-    if (base.isEmpty) {
-      throw ArgumentError.value(folder, 'folder', 'Must not be empty');
-    }
     _inTransaction(() {
-      final projectId = _ensureProject(projectName);
-      _deleteFolderMasks(base);
-      final separator = base.contains(r'\') ? r'\' : '/';
-      for (final mask in [base, '$base$separator*']) {
-        upsertProjectMask(projectId: projectId, pathMask: mask, priority: 10);
-      }
+      _putFolderRule(folder, _ensureProject(projectName));
       if (sessionId != null) {
         db.execute('update sessions set project_override = 0 where id = ?', [
           sessionId,
@@ -293,6 +284,332 @@ class ProjectTagStateStore {
       _deleteFolderMasks(_trimFolder(folder));
       _recalculateAfterRuleChange(projectionVersion, pricing);
     });
+  }
+
+  /// Points the rule for [oldFolder] at [newFolder], keeping its project.
+  void changeFolderRule({
+    required String oldFolder,
+    required String newFolder,
+    required String projectName,
+    required int projectionVersion,
+    UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+  }) {
+    _inTransaction(() {
+      _deleteFolderMasks(_trimFolder(oldFolder));
+      _putFolderRule(newFolder, _ensureProject(projectName));
+      _recalculateAfterRuleChange(projectionVersion, pricing);
+    });
+  }
+
+  /// Merges project [sourceProjectId] into [targetName]: every folder its
+  /// sessions were detected from and every folder rule of it now point at
+  /// the target, and sessions moved to it by hand move too.
+  void mergeProject({
+    required int sourceProjectId,
+    required String targetName,
+    required int projectionVersion,
+    UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+  }) {
+    _inTransaction(() {
+      final targetId = _ensureProject(targetName);
+      if (targetId == sourceProjectId) {
+        throw ArgumentError.value(targetName, 'targetName', 'Same project');
+      }
+      final folders = {
+        for (final folder in _detectedFolders(sourceProjectId).keys)
+          normalizeProjectPath(folder): folder,
+        for (final folder in _ruleFolders(sourceProjectId))
+          normalizeProjectPath(folder): folder,
+      };
+      for (final folder in folders.values) {
+        _putFolderRule(folder, targetId);
+      }
+      for (final row in db.select(
+        'select id from sessions where project_id = ? and project_override = 1',
+        [sourceProjectId],
+      )) {
+        setSessionProject(row['id'] as String, targetId);
+      }
+      _recalculateAfterRuleChange(projectionVersion, pricing);
+    });
+  }
+
+  /// Returns the sessions of [projectId] that were moved there by hand to
+  /// automatic assignment.
+  void resetManualSessions({required int projectId}) {
+    _inTransaction(() {
+      final ids = [
+        for (final row in db.select(
+          'select id from sessions where project_id = ? and project_override = 1',
+          [projectId],
+        ))
+          row['id'] as String,
+      ];
+      db.execute(
+        'update sessions set project_override = 0, updated_at_utc = ? '
+        'where project_id = ? and project_override = 1',
+        [_utcNow(), projectId],
+      );
+      for (var start = 0; start < ids.length; start += 512) {
+        refreshSessionProjectsBatch(
+          ids.sublist(start, (start + 512).clamp(0, ids.length)),
+        );
+      }
+    });
+  }
+
+  /// Every folder rule and manual session project, for undo.
+  ProjectRulesSnapshot snapshotProjectRules() {
+    return ProjectRulesSnapshot(
+      masks: [
+        for (final row in db.select('''
+          select p.name, m.path_mask, m.priority, m.is_active
+          from project_path_masks m
+          join projects p on p.id = m.project_id
+          order by m.id
+          '''))
+          (
+            projectName: row['name'] as String,
+            pathMask: row['path_mask'] as String,
+            priority: row['priority'] as int,
+            isActive: row['is_active'] == 1,
+          ),
+      ],
+      manualSessions: {
+        for (final row in db.select(
+          'select id, project_name_snapshot from sessions '
+          'where project_override = 1',
+        ))
+          row['id'] as String: row['project_name_snapshot'] as String?,
+      },
+    );
+  }
+
+  /// Puts folder rules and manual session projects back as [snapshot] had
+  /// them.
+  void restoreProjectRules(
+    ProjectRulesSnapshot snapshot, {
+    required int projectionVersion,
+    UsagePricingCatalog pricing = const UsagePricingCatalog({}),
+  }) {
+    _inTransaction(() {
+      db.execute('delete from project_path_masks');
+      for (final mask in snapshot.masks) {
+        upsertProjectMask(
+          projectId: _ensureProject(mask.projectName),
+          pathMask: mask.pathMask,
+          priority: mask.priority,
+          isActive: mask.isActive,
+        );
+      }
+      final now = _utcNow();
+      for (final row in db.select(
+        'select id from sessions where project_override = 1',
+      )) {
+        final id = row['id'] as String;
+        if (!snapshot.manualSessions.containsKey(id)) {
+          db.execute(
+            'update sessions set project_override = 0, updated_at_utc = ? '
+            'where id = ?',
+            [now, id],
+          );
+        }
+      }
+      for (final entry in snapshot.manualSessions.entries) {
+        final name = entry.value;
+        setSessionProject(
+          entry.key,
+          name == null ? null : _ensureProject(name),
+        );
+      }
+      _recalculateAfterRuleChange(projectionVersion, pricing);
+    });
+  }
+
+  /// Projects that have sessions or folder rules, with their counts.
+  List<ProjectSummary> listProjects() {
+    final stats = {
+      for (final row in db.select('''
+        select project_id,
+               count(*) as session_count,
+               sum(project_override) as manual_count,
+               max(coalesce(last_message_at_utc, started_at_utc)) as last_activity
+        from sessions
+        where project_id is not null
+        group by project_id
+        '''))
+        row['project_id'] as int: row,
+    };
+    final ruleFolders = <int, Set<String>>{};
+    for (final row in db.select(
+      'select project_id, path_mask from project_path_masks where is_active = 1',
+    )) {
+      ruleFolders
+          .putIfAbsent(row['project_id'] as int, () => {})
+          .add(
+            normalizeProjectPath(projectRuleFolder(row['path_mask'] as String)),
+          );
+    }
+    return [
+      for (final row in db.select(
+        'select id, name from projects where is_active = 1',
+      ))
+        if (stats.containsKey(row['id']) || ruleFolders.containsKey(row['id']))
+          ProjectSummary(
+            id: row['id'] as int,
+            name: row['name'] as String,
+            sessionCount: stats[row['id']]?['session_count'] as int? ?? 0,
+            manualSessionCount: stats[row['id']]?['manual_count'] as int? ?? 0,
+            folderRuleCount: ruleFolders[row['id']]?.length ?? 0,
+            lastActivityUtc: DateTime.tryParse(
+              stats[row['id']]?['last_activity'] as String? ?? '',
+            )?.toUtc(),
+          ),
+    ];
+  }
+
+  /// The folder rules of [projectId] with how many sessions each places, the
+  /// folders its sessions were detected from, and its manual sessions.
+  ProjectDetail loadProjectDetail(int projectId) {
+    final masks = _activeMasks();
+    final ruleMasks = masks.where((mask) => mask.projectId == projectId);
+    final rules = <String, _RuleUsageBuilder>{};
+    for (final mask in ruleMasks) {
+      final folder = projectRuleFolder(mask.pathMask);
+      rules
+          .putIfAbsent(
+            normalizeProjectPath(folder),
+            () => _RuleUsageBuilder(folder),
+          )
+          .masks
+          .add(mask);
+    }
+    if (rules.isNotEmpty) {
+      final pathKeys = <String, List<String>>{};
+      for (final row in db.select(
+        'select session_id, path_key from session_path_keys',
+      )) {
+        pathKeys
+            .putIfAbsent(row['session_id'] as String, () => [])
+            .add(normalizeProjectPath(row['path_key'] as String));
+      }
+      for (final session in db.select('''
+        select id, display_path, working_directory_display,
+               working_directory_platform, working_directory_unc
+        from sessions where project_override = 0
+        ''')) {
+        final keys = {
+          for (final column in [
+            'working_directory_display',
+            'working_directory_platform',
+            'working_directory_unc',
+            'display_path',
+          ])
+            if ((session[column] as String?)?.isNotEmpty ?? false)
+              normalizeProjectPath(session[column] as String),
+          ...?pathKeys[session['id']],
+        }.toList(growable: false);
+        final best = _bestProjectMatch(keys, masks);
+        if (best == null) {
+          continue;
+        }
+        for (final rule in rules.values) {
+          if (rule.masks.contains(best)) {
+            rule.sessionCount++;
+          } else if (rule.masks.any(
+            (mask) => keys.any(mask.matcher.hasMatch),
+          )) {
+            final winner = ProjectFolderRule(
+              folder: projectRuleFolder(best.pathMask),
+              projectName: best.projectName,
+            );
+            rule.overriddenBy[winner] = (rule.overriddenBy[winner] ?? 0) + 1;
+          }
+        }
+      }
+    }
+    final manual =
+        db.select(
+              'select count(*) as n from sessions '
+              'where project_id = ? and project_override = 1',
+              [projectId],
+            ).single['n']
+            as int;
+    final detected = _detectedFolders(projectId);
+    return ProjectDetail(
+      projectId: projectId,
+      rules: [
+        for (final rule
+            in rules.values.toList()..sort(
+              (a, b) =>
+                  a.folder.toLowerCase().compareTo(b.folder.toLowerCase()),
+            ))
+          rule.build(),
+      ],
+      detectedFolders: [
+        for (final entry
+            in detected.entries.toList()
+              ..sort((a, b) => b.value.compareTo(a.value)))
+          (folder: entry.key, sessionCount: entry.value),
+      ],
+      manualSessionCount: manual,
+    );
+  }
+
+  /// Folders that sessions detected as [projectId] came from, with session
+  /// counts. The folder is the project root: the part of the working
+  /// directory up to the segment named like the project.
+  Map<String, int> _detectedFolders(int projectId) {
+    final name =
+        db.select('select name from projects where id = ?', [
+              projectId,
+            ]).single['name']
+            as String;
+    final byKey = <String, ({String folder, int count})>{};
+    for (final row in db.select(
+      'select working_directory_display from sessions '
+      'where detected_project_id = ?',
+      [projectId],
+    )) {
+      final directory = (row['working_directory_display'] as String?)?.trim();
+      if (directory == null || directory.isEmpty) {
+        continue;
+      }
+      final folder = projectRootFolder(directory, name);
+      final key = normalizeProjectPath(folder);
+      final current = byKey[key];
+      byKey[key] = (
+        folder: current?.folder ?? folder,
+        count: (current?.count ?? 0) + 1,
+      );
+    }
+    return {for (final value in byKey.values) value.folder: value.count};
+  }
+
+  List<String> _ruleFolders(int projectId) {
+    final byKey = <String, String>{};
+    for (final row in db.select(
+      'select path_mask from project_path_masks where project_id = ?',
+      [projectId],
+    )) {
+      final folder = projectRuleFolder(row['path_mask'] as String);
+      byKey.putIfAbsent(normalizeProjectPath(folder), () => folder);
+    }
+    return byKey.values.toList(growable: false);
+  }
+
+  /// Replaces any rule for [folder] with one that sends it and its
+  /// subfolders to [projectId]. The caller owns the transaction.
+  void _putFolderRule(String folder, int projectId) {
+    final base = _trimFolder(folder);
+    if (base.isEmpty) {
+      throw ArgumentError.value(folder, 'folder', 'Must not be empty');
+    }
+    _deleteFolderMasks(base);
+    final separator = base.contains(r'\') ? r'\' : '/';
+    for (final mask in [base, '$base$separator*']) {
+      upsertProjectMask(projectId: projectId, pathMask: mask, priority: 10);
+    }
   }
 
   void _deleteFolderMasks(String base) {
@@ -645,7 +962,7 @@ class ProjectTagStateStore {
       where ppm.is_active = 1 and p.is_active = 1
       order by ppm.priority asc, ppm.id asc
       ''');
-    return [
+    final masks = [
       for (final row in rows)
         _ProjectMask(
           projectId: row['project_id'] as int,
@@ -654,6 +971,15 @@ class ProjectTagStateStore {
           normalizedMask: normalizeProjectPath(row['path_mask'] as String),
         ),
     ];
+    // The more specific folder wins: a rule for F:\worktrees\viewer-wt beats
+    // one for F:\worktrees. Priority, then age, break ties (stable sort).
+    final order = {for (final (index, mask) in masks.indexed) mask: index};
+    return masks..sort((a, b) {
+      final bySpecificity = b.specificity.compareTo(a.specificity);
+      return bySpecificity != 0
+          ? bySpecificity
+          : order[a]!.compareTo(order[b]!);
+    });
   }
 
   List<String> _projectCandidatePaths(String sessionId, Row session) {
@@ -740,6 +1066,13 @@ class _ProjectMask {
   final String projectName;
   final String pathMask;
   final RegExp matcher;
+
+  /// Length of the literal folder before the first wildcard.
+  int get specificity {
+    final normalized = normalizeProjectPath(pathMask);
+    final star = normalized.indexOf('*');
+    return star < 0 ? normalized.length : star;
+  }
 }
 
 /// A folder rule as the user sees it: sessions from [folder] and its
@@ -749,6 +1082,114 @@ class ProjectFolderRule {
 
   final String folder;
   final String projectName;
+
+  @override
+  bool operator ==(Object other) =>
+      other is ProjectFolderRule &&
+      normalizeProjectPath(other.folder) == normalizeProjectPath(folder) &&
+      other.projectName == projectName;
+
+  @override
+  int get hashCode => Object.hash(normalizeProjectPath(folder), projectName);
+}
+
+/// A project in the Projects list.
+class ProjectSummary {
+  const ProjectSummary({
+    required this.id,
+    required this.name,
+    required this.sessionCount,
+    required this.manualSessionCount,
+    required this.folderRuleCount,
+    required this.lastActivityUtc,
+  });
+
+  final int id;
+  final String name;
+  final int sessionCount;
+
+  /// Sessions moved to this project by hand.
+  final int manualSessionCount;
+  final int folderRuleCount;
+  final DateTime? lastActivityUtc;
+}
+
+/// A folder rule of a project and what it currently does.
+class ProjectRuleUsage {
+  const ProjectRuleUsage({
+    required this.folder,
+    required this.sessionCount,
+    required this.overriddenBy,
+  });
+
+  final String folder;
+
+  /// Sessions this rule places in its project.
+  final int sessionCount;
+
+  /// More specific rules that take sessions from this folder, with how many.
+  final Map<ProjectFolderRule, int> overriddenBy;
+}
+
+class ProjectDetail {
+  const ProjectDetail({
+    required this.projectId,
+    required this.rules,
+    required this.detectedFolders,
+    required this.manualSessionCount,
+  });
+
+  final int projectId;
+  final List<ProjectRuleUsage> rules;
+
+  /// Folders this project was detected from, most sessions first.
+  final List<({String folder, int sessionCount})> detectedFolders;
+  final int manualSessionCount;
+}
+
+/// Folder rules and manual session projects at one moment, for undo.
+class ProjectRulesSnapshot {
+  const ProjectRulesSnapshot({
+    required this.masks,
+    required this.manualSessions,
+  });
+
+  final List<
+    ({String projectName, String pathMask, int priority, bool isActive})
+  >
+  masks;
+
+  /// Session id to its manually set project name (null: no project).
+  final Map<String, String?> manualSessions;
+}
+
+class _RuleUsageBuilder {
+  _RuleUsageBuilder(this.folder);
+
+  final String folder;
+  final masks = <_ProjectMask>[];
+  var sessionCount = 0;
+  final overriddenBy = <ProjectFolderRule, int>{};
+
+  ProjectRuleUsage build() => ProjectRuleUsage(
+    folder: folder,
+    sessionCount: sessionCount,
+    overriddenBy: overriddenBy,
+  );
+}
+
+/// The project root inside [workingDirectory]: the path up to the last
+/// segment named [projectName], or the whole directory when none is.
+String projectRootFolder(String workingDirectory, String projectName) {
+  final separator = workingDirectory.contains(r'\') ? r'\' : '/';
+  final segments = workingDirectory.split(RegExp(r'[\\/]'));
+  final wanted = projectName.toLowerCase();
+  for (var index = segments.length - 1; index >= 0; index--) {
+    if (segments[index].toLowerCase() == wanted) {
+      return segments.sublist(0, index + 1).join(separator);
+    }
+  }
+  return _trimFolder(workingDirectory);
 }
 
 class SessionProjectAssignment {
