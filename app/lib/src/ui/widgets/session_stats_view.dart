@@ -383,7 +383,7 @@ class _StatsContent extends StatelessWidget {
                           : formatGroupedInt(tool.failedCount),
                       _humanDuration(tool.totalTime),
                       tool.isAgentCoordination
-                          ? '–'
+                          ? '–'
                           : _percent(
                               tool.totalTime.inMilliseconds,
                               toolTimeTotal.inMilliseconds,
