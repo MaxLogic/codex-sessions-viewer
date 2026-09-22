@@ -4185,7 +4185,11 @@ String _statusMessage(
   if (result.progress.filesFound == 0 && visibleSessionCount == 0) {
     return 'Scan finished. No supported files found.';
   }
-  return 'Scan finished. $available available. $parsed parsed.';
+  final failed = result.progress.filesFailed;
+  final failures = failed == 0
+      ? ''
+      : ' ${_plural(failed, 'file')} could not be parsed.';
+  return 'Scan finished. $available available. $parsed parsed.$failures';
 }
 
 String _cacheRepairProgressMessage(SessionCacheRepairPhase phase) {

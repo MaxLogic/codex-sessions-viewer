@@ -33,6 +33,8 @@ import '../ui/screens/usage_screen.dart';
 import '../ui/themes.dart';
 import '../ui/widgets/database_migration_progress.dart';
 import '../usage/usage_summary.dart';
+import '../voice_over/voice_over_service.dart';
+import '../voice_over/windows_voice_over.dart';
 
 typedef SessionCachedRowsLoader =
     Future<SessionsRefreshResult> Function(
@@ -291,9 +293,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         future: widget.databaseStartup,
         builder: (context, snapshot) {
           if (snapshot.hasError) {
-            return FatalDatabaseScreen(
-              error: _fatalErrorFromSnapshot(snapshot),
-            );
+            return _fatalScreen(error: _fatalErrorFromSnapshot(snapshot));
           }
           if (!snapshot.hasData) {
             return const Scaffold(
@@ -302,7 +302,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           }
           final result = snapshot.requireData;
           if (!result.canStartNormalUi) {
-            return FatalDatabaseScreen(error: result.fatalError!);
+            return _fatalScreen(error: result.fatalError!);
           }
           return FutureBuilder<DatabaseMaintenanceResult?>(
             future: widget.databaseMaintenanceStartup == null
@@ -310,7 +310,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                 : _ensureDatabaseMaintenanceStarted(),
             builder: (context, maintenanceSnapshot) {
               if (maintenanceSnapshot.hasError) {
-                return FatalDatabaseScreen(
+                return _fatalScreen(
                   error: DatabaseFatalError(
                     summary: 'Database maintenance startup failed.',
                     databasePath: widget.databaseFile.path,
@@ -343,7 +343,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                 initialData: AppSettings.defaults(),
                 builder: (context, settingsSnapshot) {
                   if (settingsSnapshot.hasError) {
-                    return FatalDatabaseScreen(
+                    return _fatalScreen(
                       error: DatabaseFatalError(
                         summary: 'Settings startup failed.',
                         databasePath: widget.settingsFile.path,
@@ -390,6 +390,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                                 _handleSessionAction(request),
                             onExportMarkdown: _exportConversationMarkdown,
                             onSaveSessionListCsv: _saveSessionListCsv,
+                            onCopyText: _copyText,
+                            onVoiceEvent: _playVoiceEvent,
                             onTableStateChanged: (state) {
                               unawaited(_saveSessionTableState(state));
                             },
@@ -468,7 +470,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                     future: _scheduleStartup,
                     builder: (context, scheduleSnapshot) {
                       if (scheduleSnapshot.hasError) {
-                        return FatalDatabaseScreen(
+                        return _fatalScreen(
                           error: DatabaseFatalError(
                             summary:
                                 'Database maintenance configuration failed.',
@@ -815,7 +817,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       case SessionRowAction.copyPlatformResumeCommand:
       case SessionRowAction.copyTerminalCommand:
         if (payload != null) {
-          await Clipboard.setData(ClipboardData(text: payload));
+          await _copyText(payload);
         }
         return;
       case SessionRowAction.editTags:
@@ -937,6 +939,37 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     await Process.start('explorer.exe', ['/select,', trimmed]);
   }
 
+  var _databaseErrorAnnounced = false;
+
+  /// Shows a fatal database error and plays its voice-over event once.
+  Widget _fatalScreen({required DatabaseFatalError error}) {
+    if (!_databaseErrorAnnounced) {
+      _databaseErrorAnnounced = true;
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _playVoiceEvent(VoiceOverStaticEvent.databaseError),
+      );
+    }
+    return FatalDatabaseScreen(error: error);
+  }
+
+  VoiceOverService? _voiceOver;
+  VoiceOverSettings? _voiceOverSettings;
+
+  /// Plays the WAV for [event], or announces its text when no WAV plays.
+  void _playVoiceEvent(VoiceOverStaticEvent event) {
+    final settings = (_settings ?? AppSettings.defaults()).voiceOver;
+    if (!identical(settings, _voiceOverSettings)) {
+      _voiceOverSettings = settings;
+      _voiceOver = createVoiceOverService(settings);
+    }
+    unawaited(_voiceOver!.staticEvent(event).catchError((Object _) {}));
+  }
+
+  Future<void> _copyText(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    _playVoiceEvent(VoiceOverStaticEvent.copied);
+  }
+
   Future<void> _exportConversationMarkdown(
     SessionRowViewModel row,
     String markdown,
@@ -952,6 +985,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       return;
     }
     await File(destination.path).writeAsString(markdown);
+    _playVoiceEvent(VoiceOverStaticEvent.exportFinished);
   }
 
   Future<void> _saveSessionListCsv(String csv) async {
@@ -1173,6 +1207,8 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.onSessionAction,
     required this.onExportMarkdown,
     required this.onSaveSessionListCsv,
+    required this.onCopyText,
+    required this.onVoiceEvent,
     required this.onTableStateChanged,
     required this.openTarget,
     required this.openTargetSerial,
@@ -1192,6 +1228,8 @@ class _SessionsScreenLoader extends StatefulWidget {
   final SessionActionCallback onSessionAction;
   final SessionMarkdownExportCallback onExportMarkdown;
   final SessionListCsvExportCallback onSaveSessionListCsv;
+  final Future<void> Function(String text) onCopyText;
+  final void Function(VoiceOverStaticEvent event) onVoiceEvent;
   final SessionTableStateChanged onTableStateChanged;
   final SessionOpenTarget? openTarget;
   final int openTargetSerial;
@@ -1288,6 +1326,8 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onSessionAction: _handleSessionAction,
       onSaveSessionListCsv: widget.onSaveSessionListCsv,
       onExportMarkdown: widget.onExportMarkdown,
+      onCopyText: widget.onCopyText,
+      onVoiceEvent: widget.onVoiceEvent,
       onLoadSessionDetail: _controller.loadSessionDetail,
       onReloadSessionDetailFromSource:
           _controller.reloadSessionDetailFromSource,

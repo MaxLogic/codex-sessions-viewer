@@ -9,6 +9,7 @@ import '../../commands/resume_command_generator.dart';
 import '../../commands/windows_command_line.dart';
 import '../../config/app_settings.dart';
 import '../../export/session_list_exporter.dart';
+import '../../voice_over/voice_over_service.dart';
 import '../../usage/usage_summary.dart';
 import '../motion.dart';
 import '../models/conversation_message_view_model.dart';
@@ -145,6 +146,7 @@ class SessionsScreen extends StatefulWidget {
     this.onReloadSessionDetailFromSource,
     this.onLoadMessagePage,
     this.onLoadAllMessages,
+    this.onVoiceEvent,
     this.watchSessionFile = _watchSessionFile,
     this.settings,
     this.initialTableState,
@@ -175,6 +177,10 @@ class SessionsScreen extends StatefulWidget {
   final SessionMessagePageLoader? onLoadMessagePage;
   final Future<List<ConversationMessageViewModel>> Function(String sessionId)?
   onLoadAllMessages;
+
+  /// Plays a voice-over event (scan started or finished, parse errors) for
+  /// scans the user started.
+  final void Function(VoiceOverStaticEvent event)? onVoiceEvent;
   final SessionFileWatcher watchSessionFile;
   final AppSettings? settings;
   final SessionTableSettings? initialTableState;
@@ -413,7 +419,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
           },
           const SingleActivator(LogicalKeyboardKey.f5): () {
             if (!_isScanning) {
-              unawaited(_refresh());
+              unawaited(_refresh(userInitiated: true));
             }
           },
           const SingleActivator(LogicalKeyboardKey.keyL, control: true): () {
@@ -516,7 +522,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
                               });
                             },
                             onClearFilters: _clearFilters,
-                            onRefresh: _refresh,
+                            onRefresh: () =>
+                                unawaited(_refresh(userInitiated: true)),
                           ),
                           Expanded(
                             child: visibleDisplayRows.isEmpty
@@ -1754,10 +1761,15 @@ class _SessionsScreenState extends State<SessionsScreen> {
     });
   }
 
-  Future<void> _refresh() async {
+  /// Starts a scan; [userInitiated] scans (Refresh button, F5) also play
+  /// voice-over events, background rescans stay quiet.
+  Future<void> _refresh({bool userInitiated = false}) async {
     if (_isScanning) {
       _requestRefreshCancel();
       return;
+    }
+    if (userInitiated) {
+      widget.onVoiceEvent?.call(VoiceOverStaticEvent.scanStarted);
     }
     setState(() {
       _isScanning = true;
@@ -1780,6 +1792,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _retainSelection();
       });
       _tryApplyPendingOpenTarget();
+      if (userInitiated) {
+        widget.onVoiceEvent?.call(
+          refreshResult.statusMessage.contains('could not be parsed')
+              ? VoiceOverStaticEvent.parseError
+              : VoiceOverStaticEvent.scanFinished,
+        );
+      }
     } on Object catch (error) {
       if (!mounted) {
         return;

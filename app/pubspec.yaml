@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   toml: ^0.18.0
   sqlite3: ^3.3.2
+  ffi: ^2.2.0
   sqlite3_flutter_libs: ^0.6.0+eol
   path: ^1.9.1
   crypto: ^3.0.7
