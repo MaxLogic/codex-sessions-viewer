@@ -320,7 +320,7 @@ fn claude_and_codex_sessions_with_the_same_id_do_not_collide() {
             &env.db,
             "select count(*) from messages where session_id = 'session:parity-rich-001'"
         ),
-        13
+        12
     );
 }
 

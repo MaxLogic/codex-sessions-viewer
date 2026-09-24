@@ -92,6 +92,7 @@ fn parity_view(path: &str) -> Value {
         "model_ids": session.model_ids,
         "usage": usage_view(&session.usage),
         "last_turn_usage": usage_view(&session.last_turn_usage),
+        "extra": session.extra,
         "messages": session.messages.iter().map(|message| json!({
             "index": message.index,
             "author_type": message.author_type.name(),
@@ -348,7 +349,7 @@ fn separate_process_scan_ingests_codex_history_with_the_viewer_closed() {
             &conn,
             "select count(*) from messages where session_id = 'session:parity-rich-001'"
         ),
-        13
+        12
     );
     assert_eq!(
         count(
@@ -565,7 +566,7 @@ fn deleted_rollouts_become_missing_but_keep_their_history() {
         (scan_status.as_str(), source_state.as_str()),
         ("missing", "missing")
     );
-    assert_eq!(count(&conn, "select count(*) from messages"), 13);
+    assert_eq!(count(&conn, "select count(*) from messages"), 12);
 }
 
 #[test]
@@ -717,7 +718,7 @@ fn a_busy_database_fails_the_batch_cleanly_and_the_rerun_completes() {
     drop(holder);
     assert_eq!(count(&open(&db), "select count(*) from messages"), 0);
     assert!(support::scan(&db, &home, &[]).status.success());
-    assert_eq!(count(&open(&db), "select count(*) from messages"), 13);
+    assert_eq!(count(&open(&db), "select count(*) from messages"), 12);
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,7 +1100,7 @@ fn parse_emits_contract_records_that_apply_like_a_scan() {
     assert!(child.wait().unwrap().success());
     // Project names are resolved after the scan; statuses come from scan outcomes.
     let conn = open(&applied_db);
-    assert_eq!(count(&conn, "select count(*) from messages"), 13);
+    assert_eq!(count(&conn, "select count(*) from messages"), 12);
     support::assert_same(
         &support::content_snapshot_without_projects(&scanned),
         &support::content_snapshot_without_projects(&applied_db),

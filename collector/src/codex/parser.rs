@@ -5,7 +5,7 @@
 //! and the collector write the same rows. Keep the two in lockstep; the parity
 //! fixtures under `samples/collector-parity/` fail when they drift.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -18,7 +18,12 @@ use crate::dart::{
     truncate_utf16,
 };
 
-pub const PARSER_VERSION: i64 = 4;
+/// Bump when stored rows change; every Codex session is reparsed on the next
+/// scan. 5: protocol events that repeat stored content are no longer messages.
+pub const PARSER_VERSION: i64 = 5;
+/// Changed file paths kept in a session's source extras; the total is kept
+/// alongside when a session changed more.
+pub const MAX_FILES_CHANGED: usize = 500;
 pub const DEFAULT_MAX_TOOL_OUTPUT_PREVIEW_CHARS: usize = 2000;
 pub const DEFAULT_MAX_MESSAGE_CONTENT_CHARS: usize = 12000;
 const MAX_LEGACY_JSON_BYTES: u64 = 8 * 1024 * 1024;
@@ -61,7 +66,9 @@ impl AuthorType {
         match value {
             Some("user") => Self::User,
             Some("assistant") => Self::Assistant,
-            Some("system") => Self::System,
+            // Codex injects its own context (permissions, mode switches) as
+            // developer messages.
+            Some("system" | "developer") => Self::System,
             Some("tool" | "tool_call") => Self::Tool,
             _ => Self::Unknown,
         }
@@ -367,6 +374,8 @@ pub struct ParsedSession {
     pub warnings: Vec<ParseWarning>,
     pub usage: Usage,
     pub last_turn_usage: Usage,
+    /// Source evidence kept outside the messages (`files_changed`, `goal`).
+    pub extra: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -729,19 +738,77 @@ fn is_echo_record(message: &ParsedMessage) -> bool {
     )
 }
 
+/// The readable summary when there is one: Codex encrypts the full reasoning
+/// but writes its summary in the clear (the legacy `agent_reasoning` events
+/// repeat it and are not stored).
 fn reasoning_content(payload: &Map<String, Value>) -> String {
+    let summary = reasoning_summary(payload.get("summary"));
+    let summary = trim(&summary);
+    if !summary.is_empty() {
+        return summary.to_owned();
+    }
     if let Some(encrypted) = string(payload, "encrypted_content")
         && !trim(encrypted).is_empty()
     {
         return "Reasoning content is encrypted and cannot be displayed.".to_owned();
     }
-    let summary = reasoning_summary(payload.get("summary"));
-    let summary = trim(&summary);
-    if summary.is_empty() {
-        "Reasoning content is unavailable.".to_owned()
-    } else {
-        summary.to_owned()
+    "Reasoning content is unavailable.".to_owned()
+}
+
+/// The message of a turn that ended with an error, such as a usage limit.
+fn task_error(payload: &Map<String, Value>) -> Option<String> {
+    let text = match payload.get("error") {
+        Some(Value::String(text)) => text.as_str(),
+        Some(Value::Object(error)) => string(error, "message")?,
+        _ => return None,
+    };
+    let text = trim(text);
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Paths of a Codex `changes` map (path -> change), with rename targets.
+fn changed_paths(changes: Option<&Value>, into: &mut BTreeSet<String>) {
+    let Some(Value::Object(changes)) = changes else {
+        return;
+    };
+    for (path, change) in changes {
+        if !trim(path).is_empty() {
+            into.insert(path.clone());
+        }
+        if let Value::Object(change) = change
+            && let Some(target) = string(change, "move_path")
+            && !trim(target).is_empty()
+        {
+            into.insert(target.to_owned());
+        }
     }
+}
+
+/// `files_changed` (sorted, bounded) and the latest `goal`, or `None`.
+fn codex_extra(files_changed: &BTreeSet<String>, goal: Option<Value>) -> Option<Value> {
+    let mut extra = Map::new();
+    if !files_changed.is_empty() {
+        extra.insert(
+            "files_changed".to_owned(),
+            Value::Array(
+                files_changed
+                    .iter()
+                    .take(MAX_FILES_CHANGED)
+                    .map(|path| Value::String(path.clone()))
+                    .collect(),
+            ),
+        );
+        if files_changed.len() > MAX_FILES_CHANGED {
+            extra.insert(
+                "files_changed_total".to_owned(),
+                Value::from(files_changed.len()),
+            );
+        }
+    }
+    if let Some(goal) = goal {
+        extra.insert("goal".to_owned(), goal);
+    }
+    (!extra.is_empty()).then_some(Value::Object(extra))
 }
 
 fn reasoning_summary(value: Option<&Value>) -> String {
@@ -840,7 +907,10 @@ fn tool_input(payload: &Map<String, Value>) -> String {
 
 const KNOWN_PASSIVE_RESPONSE_PAYLOAD_TYPES: [&str; 2] = ["ghost_snapshot", "reasoning"];
 
-const KNOWN_EVENT_PAYLOAD_TYPES: [&str; 22] = [
+/// Event types that are not warned about when they are stored as raw
+/// evidence. `item_completed`/`item_started` wrap app-server items; the ones
+/// that repeat stored content are dropped before this check.
+const KNOWN_EVENT_PAYLOAD_TYPES: [&str; 24] = [
     "agent_message",
     "agent_reasoning",
     "collab_agent_interaction_end",
@@ -851,6 +921,8 @@ const KNOWN_EVENT_PAYLOAD_TYPES: [&str; 22] = [
     "context_compacted",
     "error",
     "exec_command_end",
+    "item_completed",
+    "item_started",
     "mcp_tool_call_end",
     "model_reroute",
     "patch_apply_end",
@@ -1071,6 +1143,7 @@ impl Parser<'_> {
             warnings: Vec::new(),
             usage,
             last_turn_usage: Usage::EMPTY,
+            extra: None,
             source_path,
         }
     }
@@ -1215,6 +1288,8 @@ struct JsonlState {
     effective_working_directory_unc: Option<String>,
     usage_projection_status: String,
     provider: Option<String>,
+    files_changed: BTreeSet<String>,
+    goal: Option<Value>,
 }
 
 impl JsonlState {
@@ -1261,6 +1336,8 @@ impl JsonlState {
             effective_working_directory_unc: None,
             usage_projection_status: "complete".to_owned(),
             provider: None,
+            files_changed: BTreeSet::new(),
+            goal: None,
         }
     }
 
@@ -1357,6 +1434,11 @@ impl JsonlState {
         }
         if record_type == Some("event_msg") && payload_type == Some("token_count") {
             self.token_count(record, payload, timestamp);
+            return;
+        }
+        if record_type == Some("event_msg")
+            && self.consume_event(record, payload, payload_type, timestamp, parser)
+        {
             return;
         }
         if record_type != Some("response_item") && record_type != Some("event_msg") {
@@ -1492,6 +1574,24 @@ impl JsonlState {
             self.last_message_at_utc = max_date_time(self.last_message_at_utc, timestamp);
             return;
         }
+        // A message between agents of one thread tree; its readable header
+        // and payload are kept, encrypted parts are not.
+        if record_type == Some("response_item") && payload_type == Some("agent_message") {
+            let content = content_from_response_payload(payload);
+            if trim(&content).is_empty() {
+                return;
+            }
+            let message = parser.message(
+                self.messages.len() as i64,
+                AuthorType::System,
+                payload_type.map(str::to_owned),
+                timestamp,
+                &content,
+            );
+            add_message(&mut self.messages, message);
+            self.last_message_at_utc = max_date_time(self.last_message_at_utc, timestamp);
+            return;
+        }
 
         if record_type == Some("response_item")
             && !payload_type
@@ -1524,6 +1624,93 @@ impl JsonlState {
         );
         add_message(&mut self.messages, message);
         self.last_message_at_utc = max_date_time(self.last_message_at_utc, timestamp);
+    }
+
+    /// Events that are not conversation messages. Returns false for events
+    /// stored as before. Dropped: items and events that repeat a stored
+    /// message, reasoning, or tool call (`item_completed` agent/user messages,
+    /// reasoning, command executions; `exec_command_end`; `agent_reasoning`,
+    /// whose text the reasoning item's summary holds; a completed turn's
+    /// `last_agent_message`) and turn bookkeeping. File changes and goals
+    /// become source extras. Inherited (projected parent) records add none.
+    fn consume_event(
+        &mut self,
+        record: &Map<String, Value>,
+        payload: &Map<String, Value>,
+        payload_type: Option<&str>,
+        timestamp: Option<DartDateTime>,
+        parser: &Parser<'_>,
+    ) -> bool {
+        match payload_type {
+            Some(kind @ ("item_completed" | "item_started")) => {
+                let item = object(payload, "item");
+                match string(item, "type") {
+                    Some("FileChange") => {
+                        let status = string(item, "status");
+                        if kind == "item_completed"
+                            && !matches!(status, Some("failed" | "declined"))
+                            && !self.inherited(record)
+                        {
+                            changed_paths(item.get("changes"), &mut self.files_changed);
+                        }
+                        true
+                    }
+                    Some(
+                        "AgentMessage" | "Reasoning" | "UserMessage" | "ContextCompaction"
+                        | "CommandExecution",
+                    ) => true,
+                    _ => false,
+                }
+            }
+            Some("patch_apply_end") => {
+                if payload.get("success") != Some(&Value::Bool(false)) && !self.inherited(record) {
+                    changed_paths(payload.get("changes"), &mut self.files_changed);
+                }
+                true
+            }
+            Some("thread_goal_updated") => {
+                if !self.inherited(record) {
+                    self.goal = match payload.get("goal") {
+                        Some(Value::Object(goal)) => Some(serde_json::json!({
+                            "objective": goal.get("objective").cloned().unwrap_or(Value::Null),
+                            "status": goal.get("status").cloned().unwrap_or(Value::Null),
+                        })),
+                        _ => None,
+                    };
+                }
+                true
+            }
+            Some("thread_name_updated") => {
+                if !self.inherited(record)
+                    && let Some(name) = clean_thread_name(string(payload, "thread_name"))
+                {
+                    self.thread_name = Some(name);
+                }
+                true
+            }
+            Some("task_complete") => {
+                if let Some(error) = task_error(payload) {
+                    let message = ParsedMessage {
+                        has_error: true,
+                        ..parser.message(
+                            self.messages.len() as i64,
+                            AuthorType::System,
+                            payload_type.map(str::to_owned),
+                            timestamp,
+                            &error,
+                        )
+                    };
+                    add_message(&mut self.messages, message);
+                    self.last_message_at_utc = max_date_time(self.last_message_at_utc, timestamp);
+                }
+                true
+            }
+            Some(
+                "exec_command_end" | "task_started" | "context_compacted" | "turn_aborted"
+                | "agent_reasoning",
+            ) => true,
+            _ => false,
+        }
     }
 
     fn session_meta(&mut self, payload: &Map<String, Value>, timestamp: Option<DartDateTime>) {
@@ -1720,7 +1907,9 @@ impl JsonlState {
             .to_owned();
         }
         let display_path = self.source_path.clone();
+        let extra = codex_extra(&self.files_changed, self.goal.take());
         ParsedSession {
+            extra,
             internal_id: internal_id(&self.source_path, self.session_id.as_deref()),
             session_id: self.session_id,
             thread_name: self.thread_name,

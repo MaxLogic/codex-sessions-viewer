@@ -4,7 +4,7 @@
 library;
 
 /// `PARSER_VERSION` in `collector/src/codex/parser.rs`.
-const collectorCodexParserVersion = 4;
+const collectorCodexParserVersion = 5;
 
 /// `CLAUDE_PARSER_VERSION` in `collector/src/claude/parser.rs`.
 const collectorClaudeParserVersion = 1;

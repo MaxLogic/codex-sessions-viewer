@@ -48,6 +48,7 @@
     "total_tokens": 91,
     "is_empty": false
   },
+  "extra": null,
   "messages": [
     {
       "index": 0,
@@ -206,28 +207,6 @@
     {
       "index": 7,
       "author_type": "unknown",
-      "raw_type": "task_started",
-      "created_at_utc": "2026-09-01T08:00:27.000Z",
-      "first_line": "{\"type\":\"task_started\",\"model_context_window\":272000}",
-      "content_plain": "{\"type\":\"task_started\",\"model_context_window\":272000}",
-      "content_preview": "{\"type\":\"task_started\",\"model_context_window\":272000}",
-      "content_truncated": false,
-      "usage": {
-        "input_tokens": null,
-        "cached_input_tokens": null,
-        "cache_write_input_tokens": null,
-        "output_tokens": null,
-        "reasoning_output_tokens": null,
-        "total_tokens": null,
-        "is_empty": true
-      },
-      "model": null,
-      "has_tool_calls": false,
-      "has_error": false
-    },
-    {
-      "index": 8,
-      "author_type": "unknown",
       "raw_type": "brand_new_event",
       "created_at_utc": "2026-09-01T08:00:28.000Z",
       "first_line": "{\"type\":\"brand_new_event\",\"n\":1e+21,\"m\":123456789012345680000.0}",
@@ -248,7 +227,7 @@
       "has_error": false
     },
     {
-      "index": 9,
+      "index": 8,
       "author_type": "assistant",
       "raw_type": "message",
       "created_at_utc": "2026-09-01T06:00:29.000Z",
@@ -270,7 +249,7 @@
       "has_error": false
     },
     {
-      "index": 10,
+      "index": 9,
       "author_type": "system",
       "raw_type": "message",
       "created_at_utc": "2026-09-01T08:00:30.999999Z",
@@ -292,8 +271,8 @@
       "has_error": false
     },
     {
-      "index": 11,
-      "author_type": "unknown",
+      "index": 10,
+      "author_type": "system",
       "raw_type": "message",
       "created_at_utc": null,
       "first_line": "{\"structured\":true}",
@@ -314,7 +293,7 @@
       "has_error": false
     },
     {
-      "index": 12,
+      "index": 11,
       "author_type": "tool",
       "raw_type": "message",
       "created_at_utc": "2026-09-01T08:00:31.000Z",

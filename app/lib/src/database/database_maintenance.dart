@@ -501,7 +501,8 @@ final class DatabaseMaintenanceCoordinator {
         'usage_projection_migration' => DatabaseWriterPriority.migration,
         'usage_cost_repricing' => DatabaseWriterPriority.repair,
         'openrouter_price_refresh' => DatabaseWriterPriority.pricing,
-        'database_optimize' => DatabaseWriterPriority.optimize,
+        'database_optimize' ||
+        'database_reclaim_space' => DatabaseWriterPriority.optimize,
         _ => DatabaseWriterPriority.interactive,
       },
     );

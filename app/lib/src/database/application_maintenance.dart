@@ -10,9 +10,15 @@ import '../pricing/pricing_repository.dart';
 import '../pricing/hub_price_history.dart';
 import '../usage/usage_cost_projection.dart';
 import 'backup_retention.dart';
+import 'collector_versions.dart';
 import 'database_connection.dart';
 import 'database_maintenance.dart';
+import 'disk_space_probe.dart';
 import 'maintenance_job.dart';
+
+/// `app_metadata` key: the Codex parser version whose reparse has had its
+/// freed space reclaimed (or found too little to be worth a VACUUM).
+const spaceReclaimMarkerKey = 'space_reclaim.codex_parser_version';
 
 /// Application-owned schedules; the coordinator is also shared by UI writers.
 class ApplicationMaintenance extends ChangeNotifier {
@@ -22,13 +28,26 @@ class ApplicationMaintenance extends ChangeNotifier {
     this.client = const OpenRouterHttpClient(),
     DateTime Function()? clock,
     String? Function()? hubMachineToken,
+    DiskSpaceProbe? diskSpace,
+    this.reclaimMinimumDatabaseBytes = 256 * 1024 * 1024,
   }) : clock = clock ?? DateTime.now,
-       hubMachineToken = hubMachineToken ?? _environmentHubMachineToken;
+       hubMachineToken = hubMachineToken ?? _environmentHubMachineToken,
+       diskSpace = diskSpace ?? DiskSpaceProbe.forCurrentPlatform();
 
   final File databaseFile;
   final DatabaseMaintenanceCoordinator coordinator;
   final OpenRouterModelsClient client;
   final DateTime Function() clock;
+  final DiskSpaceProbe diskSpace;
+
+  /// Smaller databases are not compacted after a reparse: whatever the
+  /// reparse left unused is not worth the rewrite.
+  final int reclaimMinimumDatabaseBytes;
+
+  /// Set when freed space could not be reclaimed (for example, too little
+  /// free disk space); retried on the next start.
+  String? spaceReclaimWarning;
+  var _reclaimAttempted = false;
 
   /// The hub machine credential. It is read from the environment for each
   /// refresh and never stored in settings or the database.
@@ -159,6 +178,7 @@ class ApplicationMaintenance extends ChangeNotifier {
       }
       if (!_stopped) await _reprice();
       if (!_stopped && _due('database_optimize')) await _optimize();
+      if (!_stopped) await _reclaimSpace();
     } on Object {
       errorMessage =
           'Database maintenance failed. Retry after checking the database.';
@@ -329,6 +349,93 @@ class ApplicationMaintenance extends ChangeNotifier {
       );
     }, priority: DatabaseWriterPriority.optimize);
     _readStatus();
+  }
+
+  /// Once per Codex parser version, after every available local Codex
+  /// session was reparsed: the reparse replaced every session's rows, which
+  /// leaves free pages in the file (auto_vacuum is off) and deleted entries
+  /// in the full-text segments. The job merges the search indexes and runs
+  /// one VACUUM. VACUUM rewrites the used pages into a temporary copy and
+  /// then through the WAL, so it needs about the used size free both in the
+  /// temporary folder and next to the database. It runs as an atomic
+  /// maintenance job with progress; stopping the app interrupts it and
+  /// SQLite rolls the current step back. Skipped while database maintenance
+  /// is disabled in settings.
+  Future<void> _reclaimSpace() async {
+    final settings = _settings;
+    if (_reclaimAttempted ||
+        _stopped ||
+        settings == null ||
+        !settings.maintenance.databaseOptimizeEnabled) {
+      return;
+    }
+    final plan = _withDatabase(
+      (db) => spaceReclaimPlan(
+        db,
+        codexParserVersion: collectorCodexParserVersion,
+        minimumDatabaseBytes: reclaimMinimumDatabaseBytes,
+      ),
+    );
+    if (plan == null) return;
+    _reclaimAttempted = true;
+    if (!plan.worthwhile) {
+      await coordinator.runWriter(() async {
+        if (_stopped) return;
+        _withDatabase(_recordSpaceReclaimed);
+      }, priority: DatabaseWriterPriority.optimize);
+      return;
+    }
+    final shortage = _diskShortage(plan);
+    if (shortage != null) {
+      spaceReclaimWarning = shortage;
+      _report(
+        'reclaim_space_skipped',
+        shortage,
+        state: DatabaseMaintenanceState.succeeded,
+      );
+      return;
+    }
+    spaceReclaimWarning = null;
+    final result = await _watchOperation(
+      await coordinator.start(
+        jobType: 'database_reclaim_space',
+        initialPhase: 'reclaim_space',
+        initialStatusMessage: plan.statusMessage,
+        worker: _reclaimDatabaseSpace,
+        totalUnits: 1,
+        atomicPhases: const {'reclaim_space'},
+      ),
+    );
+    if (result.state == DatabaseMaintenanceState.failed) {
+      spaceReclaimWarning =
+          'Unused database space could not be reclaimed; retried on the next start.';
+    }
+    _dataRevision++;
+    if (!_disposed) notifyListeners();
+  }
+
+  /// Null when both the database folder and the temporary folder can hold
+  /// the rewrite; otherwise a message naming the space needed.
+  String? _diskShortage(SpaceReclaimPlan plan) {
+    final needed = plan.requiredBytesPerCopy;
+    try {
+      final required = <String, int>{};
+      final available = <String, int>{};
+      for (final directory in [databaseFile.parent, Directory.systemTemp]) {
+        final volume = diskSpace.probe(directory);
+        required[volume.volumeKey] = (required[volume.volumeKey] ?? 0) + needed;
+        available[volume.volumeKey] = volume.availableBytes;
+      }
+      final short = required.entries.any(
+        (entry) => available[entry.key]! < entry.value,
+      );
+      if (!short) return null;
+    } on Object {
+      // Without a reliable probe, do not start a rewrite that may not fit.
+    }
+    return 'Not enough free disk space to compact the database after the '
+        'parser update: it needs about ${_mib(needed)} free in the database '
+        'folder and in the temporary folder. Retried on the next start.';
   }
 
   Future<void> _refreshPrices({bool manual = false}) async {
@@ -634,6 +741,144 @@ Future<DatabaseMaintenanceWorkerOutcome> _optimizeDatabase(
   );
   return DatabaseMaintenanceWorkerOutcome.succeeded;
 }
+
+/// The database after a finished reparse, and whether compacting it is worth
+/// the rewrite. The free page count understates the gain: deleted full-text
+/// entries still occupy index pages until the job merges them.
+@visibleForTesting
+final class SpaceReclaimPlan {
+  const SpaceReclaimPlan({
+    required this.freeBytes,
+    required this.usedBytes,
+    required this.worthwhile,
+  });
+
+  final int freeBytes;
+  final int usedBytes;
+  final bool worthwhile;
+
+  /// One rewritten copy of the used pages, plus a tenth for the journal and
+  /// growth while it runs.
+  int get requiredBytesPerCopy => usedBytes + usedBytes ~/ 10;
+
+  String get statusMessage =>
+      'Compacting the ${_mib(freeBytes + usedBytes)} database after the '
+      'parser update; this can take several minutes.';
+}
+
+/// Null until reclaiming is due: [codexParserVersion] has not been reclaimed
+/// yet and no available Codex session still awaits that parser.
+@visibleForTesting
+SpaceReclaimPlan? spaceReclaimPlan(
+  Database db, {
+  required int codexParserVersion,
+  required int minimumDatabaseBytes,
+}) {
+  final marker = db.select('select value from app_metadata where key = ?', [
+    spaceReclaimMarkerKey,
+  ]);
+  if (marker.isNotEmpty && marker.single['value'] == '$codexParserVersion') {
+    return null;
+  }
+  // Sessions collected on other machines are never reparsed here.
+  final pending = db.select(
+    '''
+    select exists(
+      select 1 from sessions
+      where harness = 'codex' and scan_status = 'available'
+        and parse_status = 'available' and parser_version <> ?
+        and (machine_id is null or machine_id =
+          (select value from app_metadata where key = 'machine_id'))
+    ) as pending
+    ''',
+    [codexParserVersion],
+  );
+  if (pending.single['pending'] == 1) return null;
+  final pages = db.select('''
+    select page_count, freelist_count, page_size
+    from pragma_page_count, pragma_freelist_count, pragma_page_size
+  ''').single;
+  final pageSize = pages['page_size'] as int;
+  final total = (pages['page_count'] as int) * pageSize;
+  final free = (pages['freelist_count'] as int) * pageSize;
+  return SpaceReclaimPlan(
+    freeBytes: free,
+    usedBytes: total - free,
+    worthwhile: total >= minimumDatabaseBytes,
+  );
+}
+
+void _recordSpaceReclaimed(Database db) {
+  db.execute(
+    '''
+    insert into app_metadata(key, value, updated_at_utc) values (?, ?, ?)
+    on conflict(key) do update set
+      value = excluded.value, updated_at_utc = excluded.updated_at_utc
+    ''',
+    [
+      spaceReclaimMarkerKey,
+      '$collectorCodexParserVersion',
+      DateTime.now().toUtc().toIso8601String(),
+    ],
+  );
+}
+
+Future<DatabaseMaintenanceWorkerOutcome> _reclaimDatabaseSpace(
+  DatabaseMaintenanceWorkerContext context,
+) async {
+  if (context.stopRequested) {
+    return DatabaseMaintenanceWorkerOutcome.interrupted;
+  }
+  final db = context.database;
+  // A reparse deletes and reinserts every indexed row. FTS5 keeps deleted
+  // entries in its segments until they merge, so merge them first; VACUUM
+  // then returns the index's freed pages too. Each step is one statement an
+  // interrupt rolls back.
+  for (final (index, table) in _searchIndexes.indexed) {
+    context.publish(
+      state: DatabaseMaintenanceState.running,
+      phase: 'reclaim_space',
+      currentWork:
+          'Compacting search index ${index + 1} of ${_searchIndexes.length}.',
+      unitLabel: 'steps',
+      completedUnits: 0,
+      totalUnits: 1,
+    );
+    await context.runAtomic(
+      () => db.execute("insert into $table($table) values('optimize')"),
+    );
+    db.select('pragma wal_checkpoint(truncate)');
+  }
+  context.publish(
+    state: DatabaseMaintenanceState.running,
+    phase: 'reclaim_space',
+    currentWork: 'Rewriting the database file without its unused space.',
+    unitLabel: 'steps',
+    completedUnits: 0,
+    totalUnits: 1,
+  );
+  // VACUUM cannot run inside a transaction; an interrupt rolls it back.
+  await context.runAtomic(() => db.execute('vacuum'));
+  db.select('pragma wal_checkpoint(truncate)');
+  context.commitBatch(
+    phase: 'reclaim_space',
+    currentWork: 'Unused database space reclaimed.',
+    unitLabel: 'steps',
+    completedUnits: 1,
+    totalUnits: 1,
+    lastProcessedRowId: 0,
+    apply: _recordSpaceReclaimed,
+  );
+  return DatabaseMaintenanceWorkerOutcome.succeeded;
+}
+
+const _searchIndexes = [
+  'message_search',
+  'tool_output_search',
+  'session_search',
+];
+
+String _mib(int bytes) => '${(bytes / (1024 * 1024)).ceil()} MiB';
 
 Future<void> _applyCatalog(
   String path,

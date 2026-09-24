@@ -76,7 +76,9 @@ example from the Rust test suite.
   unknown material; `raw_type` can retain a source-specific type.
 - Optional `project_hints` and `extra`. Put unmodelled source fields in
   `extra` as JSON evidence rather than converting them to guessed known
-  values.
+  values. Do not store protocol events that repeat a message or tool call as
+  extra messages. The built-in Codex adapter keeps `files_changed` (sorted
+  changed paths) and `goal` (`{objective, status}`) there instead.
 
 The writer keys a Codex row as `session:<native-id>` and another harness as
 `<harness>:session:<native-id>`; sessions without an ID use a source-path
@@ -139,7 +141,7 @@ Three version numbers are independent:
 - `session.parser_version` is the adapter's own parser version. The example
   uses `1`. Increase it when the adapter would emit different records for an
   unchanged source file, so stored sessions are parsed again. Do not copy
-  another harness's value: `4` is the built-in Codex parser version and `1` is
+  another harness's value: `5` is the built-in Codex parser version and `1` is
   the built-in Claude Code parser version, each meaningful only for its own
   harness.
 - The viewer's cost projection version (currently `1`) belongs to the

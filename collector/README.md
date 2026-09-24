@@ -111,6 +111,41 @@ instead of failing.
 The collector never calculates cost. It stores token usage and marks the
 affected days dirty; the viewer's pricing maintenance prices them.
 
+## What a Codex session stores
+
+The database is an index of the session files, which stay on disk. Messages
+hold what people read and search: prompts, answers, reasoning summaries, and
+system content (Codex's injected developer context, messages between agents,
+and a turn that ended with an error such as a usage limit). Tool calls keep
+their input and output previews.
+
+Protocol events that repeat those rows or only mark progress are not stored:
+the app-server `item_completed`/`item_started` agent and user messages,
+reasoning, command executions, file changes, and compactions; the legacy
+`exec_command_end`, `patch_apply_end`, `agent_reasoning`, `task_started`,
+`task_complete`, `context_compacted`, and `turn_aborted` events. Two of them
+become source extras instead (`session_source_extras.extra_json`):
+`files_changed`, the sorted paths of applied patches and file changes
+(rename targets included, failed changes excluded, at most 500 with
+`files_changed_total` when there are more), and `goal`, the latest
+`{objective, status}`. `thread_name_updated` names the session when the
+session index does not. Other small events (collaboration, web search, MCP,
+image, review mode, errors) are still stored as raw evidence.
+
+Parser version 5 introduced this. Every Codex session is parsed again on the
+next scan, which replaces its rows; the full-text index follows through its
+triggers. SQLite keeps the freed pages in the file, and FTS5 keeps deleted
+entries in its index segments, so once no available local Codex session
+awaits the new parser the viewer runs one database maintenance job (skipped
+while database maintenance is disabled): it merges the three search indexes
+(`'optimize'`) and then runs `VACUUM`. VACUUM needs about the database's used
+size free in the temporary folder and the same again next to the database
+for the WAL; without it the viewer skips the job and retries on the next
+start. Measured on a copy of an 18.6 GB database with the removed rows
+deleted: the index merge took 2 minutes and freed 7.3 GB, and the VACUUM took
+1.5 minutes and left a 5.7 GB file (VACUUM alone, without the merge, took 6
+minutes and left 13 GB).
+
 ## Claude Code
 
 `claude scan` reads every transcript under `%USERPROFILE%\.claude\projects`

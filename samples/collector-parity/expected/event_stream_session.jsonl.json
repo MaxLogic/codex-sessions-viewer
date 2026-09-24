@@ -1,0 +1,289 @@
+{
+  "internal_id": "session:parity-events-003",
+  "session_id": "parity-events-003",
+  "thread_name": "Widget rename",
+  "thread_source": null,
+  "parent_thread_id": null,
+  "forked_from_id": null,
+  "history_base_thread_id": null,
+  "history_base_end_ordinal_exclusive": null,
+  "history_base_end_byte_offset": null,
+  "subagent_history_start_ordinal": null,
+  "usage_projection_status": "complete",
+  "agent_nickname": null,
+  "agent_role": null,
+  "subagent_depth": null,
+  "source_type": "windows",
+  "source_path": "../samples/collector-parity/sessions/event_stream_session.jsonl",
+  "source_file_unc_path": null,
+  "display_path": "../samples/collector-parity/sessions/event_stream_session.jsonl",
+  "platform_path": "../samples/collector-parity/sessions/event_stream_session.jsonl",
+  "working_directory_display": "C:\\nonexistent\\events",
+  "working_directory_platform": "C:\\nonexistent\\events",
+  "working_directory_unc": null,
+  "title": null,
+  "summary": null,
+  "started_at_utc": "2026-09-03T10:00:00.000Z",
+  "last_message_at_utc": "2026-09-03T10:00:20.000Z",
+  "model_ids": [
+    "gpt-events"
+  ],
+  "usage": {
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "cache_write_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_output_tokens": null,
+    "total_tokens": null,
+    "is_empty": true
+  },
+  "last_turn_usage": {
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "cache_write_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_output_tokens": null,
+    "total_tokens": null,
+    "is_empty": true
+  },
+  "extra": {
+    "files_changed": [
+      "C:\\nonexistent\\events\\src\\lib.rs",
+      "C:\\nonexistent\\events\\src\\moved_widget.rs",
+      "C:\\nonexistent\\events\\src\\new_widget.rs",
+      "C:\\nonexistent\\events\\src\\old_widget.rs"
+    ],
+    "goal": {
+      "objective": "Rename the widget and ship it",
+      "status": "complete"
+    }
+  },
+  "messages": [
+    {
+      "index": 0,
+      "author_type": "system",
+      "raw_type": "message",
+      "created_at_utc": "2026-09-03T10:00:03.000Z",
+      "first_line": "<permissions instructions>",
+      "content_plain": "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written.\n</permissions instructions>",
+      "content_preview": "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written.\n</permissions instructions>",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 1,
+      "author_type": "user",
+      "raw_type": "message",
+      "created_at_utc": "2026-09-03T10:00:04.000Z",
+      "first_line": "Rename the widget and fix the build.",
+      "content_plain": "Rename the widget and fix the build.",
+      "content_preview": "Rename the widget and fix the build.",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 2,
+      "author_type": "reasoning",
+      "raw_type": "reasoning",
+      "created_at_utc": "2026-09-03T10:00:05.000Z",
+      "first_line": "**Planning the rename**",
+      "content_plain": "**Planning the rename**",
+      "content_preview": "**Planning the rename**",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 3,
+      "author_type": "reasoning",
+      "raw_type": "reasoning",
+      "created_at_utc": "2026-09-03T10:00:06.000Z",
+      "first_line": "Reasoning content is encrypted and cannot be displayed.",
+      "content_plain": "Reasoning content is encrypted and cannot be displayed.",
+      "content_preview": "Reasoning content is encrypted and cannot be displayed.",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 4,
+      "author_type": "assistant",
+      "raw_type": "message",
+      "created_at_utc": "2026-09-03T10:00:12.000Z",
+      "first_line": "Renamed the widget; the build passes.",
+      "content_plain": "Renamed the widget; the build passes.",
+      "content_preview": "Renamed the widget; the build passes.",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 5,
+      "author_type": "system",
+      "raw_type": "agent_message",
+      "created_at_utc": "2026-09-03T10:00:16.000Z",
+      "first_line": "Message Type: FINAL_ANSWER",
+      "content_plain": "Message Type: FINAL_ANSWER\nSender: /root/worker\nPayload:\nWorker finished the audit.",
+      "content_preview": "Message Type: FINAL_ANSWER\nSender: /root/worker\nPayload:\nWorker finished the audit.",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 6,
+      "author_type": "unknown",
+      "raw_type": "item_completed",
+      "created_at_utc": "2026-09-03T10:00:16.000Z",
+      "first_line": "{\"type\":\"item_completed\",\"thread_id\":\"parity-events-003\",\"turn_id\":\"turn-2\",\"item\":{\"type\":\"SubAgentActivity\",\"id\":\"call-sub\",\"kind\":\"started\",\"agent_thread_id\":\"parity-sub-x\",\"agent_path\":\"/root/worker\"}}",
+      "content_plain": "{\"type\":\"item_completed\",\"thread_id\":\"parity-events-003\",\"turn_id\":\"turn-2\",\"item\":{\"type\":\"SubAgentActivity\",\"id\":\"call-sub\",\"kind\":\"started\",\"agent_thread_id\":\"parity-sub-x\",\"agent_path\":\"/root/worker\"}}",
+      "content_preview": "{\"type\":\"item_completed\",\"thread_id\":\"parity-events-003\",\"turn_id\":\"turn-2\",\"item\":{\"type\":\"SubAgentActivity\",\"id\":\"call-sub\",\"kind\":\"started\",\"agent_thread_id\":\"parity-sub-x\",\"agent_path\":\"/root/work",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 7,
+      "author_type": "unknown",
+      "raw_type": "web_search_end",
+      "created_at_utc": "2026-09-03T10:00:17.000Z",
+      "first_line": "{\"type\":\"web_search_end\",\"call_id\":\"ws-1\",\"query\":\"rename docs\"}",
+      "content_plain": "{\"type\":\"web_search_end\",\"call_id\":\"ws-1\",\"query\":\"rename docs\"}",
+      "content_preview": "{\"type\":\"web_search_end\",\"call_id\":\"ws-1\",\"query\":\"rename docs\"}",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 8,
+      "author_type": "system",
+      "raw_type": "task_complete",
+      "created_at_utc": "2026-09-03T10:00:20.000Z",
+      "first_line": "You have hit your usage limit.",
+      "content_plain": "You have hit your usage limit.",
+      "content_preview": "You have hit your usage limit.",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": true
+    }
+  ],
+  "tool_calls": [
+    {
+      "message_index": 4,
+      "tool_index": 0,
+      "tool_name": "shell_command",
+      "status": "finished",
+      "started_at_utc": "2026-09-03T10:00:07.000Z",
+      "finished_at_utc": "2026-09-03T10:00:08.000Z",
+      "input_preview": "{\"command\":\"cargo build\"}",
+      "output_preview": "Exit code: 0\nOutput:\nbuilt",
+      "output_truncated": false,
+      "error_message": null
+    },
+    {
+      "message_index": 4,
+      "tool_index": 1,
+      "tool_name": "apply_patch",
+      "status": "finished",
+      "started_at_utc": "2026-09-03T10:00:09.000Z",
+      "finished_at_utc": "2026-09-03T10:00:10.000Z",
+      "input_preview": "*** Begin Patch\n*** Add File: src/new_widget.rs\n+pub struct Widget;\n*** End Patch",
+      "output_preview": "Success. Updated the following files:\nA src/new_widget.rs",
+      "output_truncated": false,
+      "error_message": null
+    }
+  ],
+  "usage_events": [],
+  "warnings": []
+}

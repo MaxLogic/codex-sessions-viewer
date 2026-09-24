@@ -613,7 +613,7 @@ pub fn codex_snapshot(
             .map(UsageEventRecord::from)
             .collect(),
         project_hints,
-        extra: None,
+        extra: parsed.extra.clone(),
     }
 }
 
