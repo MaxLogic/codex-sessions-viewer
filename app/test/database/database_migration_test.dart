@@ -50,14 +50,14 @@ void main() {
       expect(oldCompatible.canStartNormalUi, isTrue);
       expect(
         (await migrator.openAndMigrate(dbFile)).lastAppliedSchemaVersion,
-        17,
+        18,
       );
       final reopened = await migrator.openAndMigrate(
         dbFile,
         deferUsageMigration: true,
       );
       expect(reopened.canStartNormalUi, isTrue);
-      expect(reopened.lastAppliedSchemaVersion, 17);
+      expect(reopened.lastAppliedSchemaVersion, 18);
     },
   );
 
@@ -80,7 +80,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.details,
       );
-      expect(result.lastAppliedSchemaVersion, 17);
+      expect(result.lastAppliedSchemaVersion, 18);
       expect(
         borrowed
             .select('select bootstrap_connection_marker()')
@@ -182,7 +182,7 @@ void main() {
         isTrue,
         reason: retried.fatalError?.details,
       );
-      expect(retried.lastAppliedSchemaVersion, 17);
+      expect(retried.lastAppliedSchemaVersion, 18);
     },
   );
 
@@ -316,6 +316,82 @@ void main() {
     },
   );
 
+  test(
+    'migration 018 adds machine and harness identity without touching annotations',
+    () async {
+      final at17 = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+        supportedSchemaVersion: 17,
+      ).openAndMigrate(dbFile);
+      expect(at17.lastAppliedSchemaVersion, 17);
+      var db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      try {
+        db.execute("""
+          insert into projects (name, is_active, created_at_utc, updated_at_utc)
+          values ('Mine', 1, 'now', 'now');
+          insert into sessions (id, session_id, source_type, source_file_path,
+            display_path, platform_path, scan_status, parse_status, is_pinned,
+            project_override, project_id, project_name_snapshot, eval_notes,
+            created_at_utc, updated_at_utc)
+          values ('session:old', 'old', 'windows', 'C:/a.jsonl', 'C:/a.jsonl',
+            'C:/a.jsonl', 'available', 'available', 1, 1, 1, 'Mine', 'keep',
+            'now', 'now');
+        """);
+      } finally {
+        db.close();
+      }
+
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(dbFile);
+      expect(result.lastAppliedSchemaVersion, 18);
+      db = openFileBackedDatabase(dbFile);
+      try {
+        final machineId =
+            db
+                    .select(
+                      "select value from app_metadata where key = 'machine_id'",
+                    )
+                    .single['value']
+                as String;
+        expect(machineId, matches(RegExp(r'^[0-9a-f]{32}$')));
+        expect(
+          db
+              .select(
+                "select value from app_metadata where key = 'database_owner'",
+              )
+              .single['value'],
+          'viewer',
+        );
+        final old = db
+            .select("select * from sessions where id = 'session:old'")
+            .single;
+        expect(old['harness'], 'codex');
+        expect(old['machine_id'], machineId);
+        expect(old['is_pinned'], 1);
+        expect(old['project_override'], 1);
+        expect(old['project_name_snapshot'], 'Mine');
+        expect(old['eval_notes'], 'keep');
+        db.execute("""
+          insert into sessions (id, source_type, source_file_path, display_path,
+            platform_path, created_at_utc, updated_at_utc)
+          values ('session:new', 'windows', 'x', 'x', 'x', 'now', 'now')
+        """);
+        expect(
+          db
+              .select(
+                "select machine_id from sessions where id = 'session:new'",
+              )
+              .single['machine_id'],
+          machineId,
+        );
+        expect(_tableExists(db, 'usage_event_inputs'), isTrue);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
   test('applies initial SQL schema and records migration metadata', () async {
     final result = await DatabaseMigrator(
       sqlRoot: Directory('../sql'),
@@ -359,7 +435,7 @@ void main() {
       'select version, filename, length(checksum) as checksum_length, success '
       'from schema_version order by version',
     );
-    expect(versionRows.length, 17);
+    expect(versionRows.length, 18);
     expect(versionRows.first['version'], 1);
     expect(versionRows.first['filename'], '001_initial_schema.sql');
     expect(versionRows.first['checksum_length'], greaterThan(20));
@@ -437,6 +513,12 @@ void main() {
     );
     expect(versionRows[16]['checksum_length'], greaterThan(20));
     expect(versionRows[16]['success'], 1);
+    expect(versionRows[17]['version'], 18);
+    expect(
+      versionRows[17]['filename'],
+      '018_collector_identity_and_usage_inputs.sql',
+    );
+    expect(versionRows[17]['success'], 1);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -647,7 +729,7 @@ void main() {
       isTrue,
       reason: freshResult.fatalError?.details,
     );
-    expect(freshResult.lastAppliedSchemaVersion, 17);
+    expect(freshResult.lastAppliedSchemaVersion, 18);
 
     final freshDb = openFileBackedDatabase(dbFile);
     addTearDown(freshDb.close);
@@ -680,7 +762,7 @@ void main() {
       isTrue,
       reason: upgradedResult.fatalError?.details,
     );
-    expect(upgradedResult.lastAppliedSchemaVersion, 17);
+    expect(upgradedResult.lastAppliedSchemaVersion, 18);
 
     final upgradedDb = openFileBackedDatabase(upgradeDbFile);
     addTearDown(upgradedDb.close);
@@ -912,7 +994,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.summary,
       );
-      expect(result.lastAppliedSchemaVersion, 17);
+      expect(result.lastAppliedSchemaVersion, 18);
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);
       final rows = migrated.select(
@@ -959,7 +1041,7 @@ void main() {
         isTrue,
         reason: result.fatalError?.summary,
       );
-      expect(result.lastAppliedSchemaVersion, 17);
+      expect(result.lastAppliedSchemaVersion, 18);
 
       final db = openFileBackedDatabase(dbFile);
       addTearDown(db.close);
@@ -1028,7 +1110,7 @@ void main() {
       expect(secondRun.canStartNormalUi, isFalse);
       expect(secondRun.fatalError?.summary, contains('checksum'));
       expect(secondRun.fatalError?.databasePath, dbFile.path);
-      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 17);
+      expect(secondRun.fatalError?.lastAppliedSchemaVersion, 18);
       expect(
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
@@ -1736,10 +1818,10 @@ void main() {
     ).copy(branchUsageMigration.path);
 
     final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
-    expect(migrator.supportedSchemaVersion, 17);
+    expect(migrator.supportedSchemaVersion, 18);
     final result = await migrator.openAndMigrate(dbFile);
     expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.summary);
-    expect(result.lastAppliedSchemaVersion, 17);
+    expect(result.lastAppliedSchemaVersion, 18);
 
     final migrated = openFileBackedDatabase(dbFile);
     addTearDown(migrated.close);
@@ -1861,7 +1943,7 @@ void main() {
         isTrue,
         reason: '${result.fatalError?.summary}: ${result.fatalError?.details}',
       );
-      expect(result.lastAppliedSchemaVersion, 17);
+      expect(result.lastAppliedSchemaVersion, 18);
 
       final migrated = openFileBackedDatabase(dbFile);
       addTearDown(migrated.close);

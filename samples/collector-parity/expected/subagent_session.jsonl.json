@@ -1,0 +1,179 @@
+{
+  "internal_id": "session:parity-sub-002",
+  "session_id": "parity-sub-002",
+  "thread_name": null,
+  "thread_source": "subagent",
+  "parent_thread_id": "parity-rich-001",
+  "forked_from_id": null,
+  "history_base_thread_id": null,
+  "history_base_end_ordinal_exclusive": null,
+  "history_base_end_byte_offset": null,
+  "subagent_history_start_ordinal": 4,
+  "usage_projection_status": "ambiguous",
+  "agent_nickname": "Beauvoir",
+  "agent_role": "explorer",
+  "subagent_depth": 1,
+  "source_type": "windows",
+  "source_path": "../samples/collector-parity/sessions/subagent_session.jsonl",
+  "source_file_unc_path": null,
+  "display_path": "../samples/collector-parity/sessions/subagent_session.jsonl",
+  "platform_path": "../samples/collector-parity/sessions/subagent_session.jsonl",
+  "working_directory_display": "C:\\nonexistent\\sub\\worker",
+  "working_directory_platform": "C:\\nonexistent\\sub\\worker",
+  "working_directory_unc": null,
+  "title": null,
+  "summary": null,
+  "started_at_utc": "2026-09-02T09:00:00.000Z",
+  "last_message_at_utc": "2026-09-02T09:00:07.000Z",
+  "model_ids": [
+    "sub-model"
+  ],
+  "usage": {
+    "input_tokens": 300,
+    "cached_input_tokens": 10,
+    "cache_write_input_tokens": null,
+    "output_tokens": 40,
+    "reasoning_output_tokens": 0,
+    "total_tokens": 340,
+    "is_empty": false
+  },
+  "last_turn_usage": {
+    "input_tokens": 150,
+    "cached_input_tokens": 10,
+    "cache_write_input_tokens": null,
+    "output_tokens": 20,
+    "reasoning_output_tokens": 0,
+    "total_tokens": 170,
+    "is_empty": false
+  },
+  "messages": [
+    {
+      "index": 0,
+      "author_type": "user",
+      "raw_type": "user_message",
+      "created_at_utc": "2026-09-02T09:00:07.000Z",
+      "first_line": "subagent task",
+      "content_plain": "subagent task",
+      "content_preview": "subagent task",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    }
+  ],
+  "tool_calls": [],
+  "usage_events": [
+    {
+      "source_record_ordinal": 2,
+      "rollout_ordinal": 2,
+      "turn_ordinal": null,
+      "counter_epoch": 0,
+      "occurred_at_utc": "2026-09-02T09:00:02.000Z",
+      "model": null,
+      "working_directory": "C:\\nonexistent\\sub\\worker",
+      "working_directory_unc": null,
+      "usage": {
+        "input_tokens": 100,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": null,
+        "output_tokens": 10,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 110,
+        "is_empty": false
+      },
+      "derivation": "last_token_usage",
+      "branch_scope": "inherited",
+      "cumulative_usage": {
+        "input_tokens": 100,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": null,
+        "output_tokens": 10,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 110,
+        "is_empty": false
+      },
+      "event_fingerprint": "c675e60d9f2e60be3c9ef80f47bbd8f61ef062e5c7e46c78182f4860eeea8989",
+      "provider": "azure",
+      "request_input_tokens": 100,
+      "model_context_window": null
+    },
+    {
+      "source_record_ordinal": 4,
+      "rollout_ordinal": null,
+      "turn_ordinal": null,
+      "counter_epoch": 0,
+      "occurred_at_utc": "2026-09-02T09:00:04.000Z",
+      "model": null,
+      "working_directory": "C:\\nonexistent\\sub\\worker",
+      "working_directory_unc": null,
+      "usage": {
+        "input_tokens": 50,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": null,
+        "output_tokens": 10,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 60,
+        "is_empty": false
+      },
+      "derivation": "last_token_usage",
+      "branch_scope": "ambiguous",
+      "cumulative_usage": {
+        "input_tokens": 150,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": null,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 170,
+        "is_empty": false
+      },
+      "event_fingerprint": "5751b0eb8eff9419f502898ea34ff5120b2d6375074d4166bf7708b9dc183c52",
+      "provider": "azure",
+      "request_input_tokens": 50,
+      "model_context_window": null
+    },
+    {
+      "source_record_ordinal": 6,
+      "rollout_ordinal": 6,
+      "turn_ordinal": 0,
+      "counter_epoch": 0,
+      "occurred_at_utc": "2026-09-02T09:00:06.000Z",
+      "model": "sub-model",
+      "working_directory": "C:\\nonexistent\\sub\\worker",
+      "working_directory_unc": null,
+      "usage": {
+        "input_tokens": 150,
+        "cached_input_tokens": 10,
+        "cache_write_input_tokens": null,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 170,
+        "is_empty": false
+      },
+      "derivation": "last_token_usage",
+      "branch_scope": "local",
+      "cumulative_usage": {
+        "input_tokens": 300,
+        "cached_input_tokens": 10,
+        "cache_write_input_tokens": null,
+        "output_tokens": 40,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 340,
+        "is_empty": false
+      },
+      "event_fingerprint": "ae2b7a9367fe5e09f9709a59bc189cf786ef56bcaad2bd9e3931bb357b2ce2ce",
+      "provider": "azure",
+      "request_input_tokens": 150,
+      "model_context_window": null
+    }
+  ],
+  "warnings": []
+}

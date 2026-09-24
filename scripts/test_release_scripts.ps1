@@ -33,6 +33,8 @@ foreach ($needle in @(
         'flutter analyze',
         'flutter test',
         'flutter build windows',
+        'cargo build --locked --release',
+        'codex-sessions-collector.exe',
         'codex_session_viewer.exe',
         'flutter_windows.dll',
         'data',
@@ -46,6 +48,7 @@ foreach ($needle in @(
 
 foreach ($needle in @(
         'build_windows.ps1',
+        'codex-sessions-collector.exe',
         'codex_session_viewer.exe',
         'flutter_windows.dll',
         'data',
@@ -59,7 +62,7 @@ foreach ($needle in @(
     Assert-True ($packageText.Contains($needle)) "package_release.ps1 must include '$needle'"
 }
 
-$requiredRoots = @('app', 'sql')
+$requiredRoots = @('app', 'collector', 'sql')
 foreach ($root in $requiredRoots) {
     Assert-True (Test-Path -LiteralPath (Join-Path $repoRoot $root)) "Missing required repo folder '$root'"
 }

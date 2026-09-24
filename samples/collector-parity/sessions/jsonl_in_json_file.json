@@ -1,0 +1,2 @@
+{"timestamp":"2026-09-06T13:00:00Z","type":"session_meta","payload":{"id":"parity-probe-006","cwd":"C:\\nonexistent\\probe"}}
+{"timestamp":"2026-09-06T13:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"jsonl in json"}}

@@ -300,6 +300,7 @@ class CodexSessionParser {
     String? effectiveModel;
     String? effectiveWorkingDirectory;
     String? effectiveWorkingDirectoryUnc;
+    String? modelProvider;
     var usageProjectionStatus = 'complete';
 
     await for (final record in records) {
@@ -364,6 +365,7 @@ class CodexSessionParser {
         }
         title = _cleanTitle(_string(payload['title'])) ?? title;
         sourceFileUncPath = _string(payload['source_file_unc_path']);
+        modelProvider = _string(payload['model_provider']);
         startedAtUtc =
             _dateTime(payload['timestamp']) ?? timestamp ?? startedAtUtc;
         continue;
@@ -539,6 +541,12 @@ class CodexSessionParser {
                 timestamp: timestamp,
                 cumulativeUsage: totalTokenUsage,
               ),
+              provider: modelProvider,
+              // Only a request's own usage tells that request's prompt size.
+              requestInputTokens: useLastTokenUsage
+                  ? lastTokenUsage.inputTokens
+                  : null,
+              modelContextWindow: _int(info['model_context_window']),
             ),
           );
           previousCumulativeUsage = totalTokenUsage;
@@ -1125,6 +1133,9 @@ class CodexParsedUsageEvent {
     this.branchScope = 'local',
     this.cumulativeUsage = const CodexUsage.empty(),
     this.eventFingerprint = '',
+    this.provider,
+    this.requestInputTokens,
+    this.modelContextWindow,
   });
 
   final int sourceRecordOrdinal;
@@ -1140,6 +1151,13 @@ class CodexParsedUsageEvent {
   final String branchScope;
   final CodexUsage cumulativeUsage;
   final String eventFingerprint;
+
+  /// `session_meta.model_provider`; null when the rollout does not say.
+  final String? provider;
+
+  /// Prompt size of the one request this event describes, when known.
+  final int? requestInputTokens;
+  final int? modelContextWindow;
 }
 
 class CodexParseWarning {

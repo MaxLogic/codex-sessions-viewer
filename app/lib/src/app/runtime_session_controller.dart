@@ -2987,6 +2987,16 @@ void _replaceUsageEvents(
   db.execute('delete from usage_events where session_row_id = ?', [
     parsed.internalId,
   ]);
+  final recordsInputs = db
+      .select(
+        "select 1 from sqlite_schema where type = 'table' and name = 'usage_event_inputs'",
+      )
+      .isNotEmpty;
+  if (recordsInputs) {
+    db.execute('delete from usage_event_inputs where session_row_id = ?', [
+      parsed.internalId,
+    ]);
+  }
   if (parsed.usageEvents.isEmpty) {
     return;
   }
@@ -3020,6 +3030,14 @@ void _replaceUsageEvents(
       event_fingerprint
     ) values (${List.filled(contextBased ? 17 : 20, '?').join(', ')})
     ''');
+  final insertInputs = recordsInputs
+      ? db.prepare('''
+          insert into usage_event_inputs (
+            session_row_id, source_record_ordinal, provider,
+            request_input_tokens, model_context_window
+          ) values (?, ?, ?, ?, ?)
+          ''')
+      : null;
   try {
     for (final event in parsed.usageEvents) {
       final autoProject = projectResolver.resolve(
@@ -3068,9 +3086,21 @@ void _replaceUsageEvents(
         event.derivation,
         event.eventFingerprint,
       ]);
+      if (event.provider != null ||
+          event.requestInputTokens != null ||
+          event.modelContextWindow != null) {
+        insertInputs?.execute([
+          parsed.internalId,
+          event.sourceRecordOrdinal,
+          event.provider,
+          event.requestInputTokens,
+          event.modelContextWindow,
+        ]);
+      }
     }
   } finally {
     insert.close();
+    insertInputs?.close();
   }
 }
 

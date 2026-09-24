@@ -7,6 +7,9 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $appRoot = Join-Path $repoRoot 'app'
+$collectorRoot = Join-Path $repoRoot 'collector'
+$collectorManifest = Join-Path $collectorRoot 'Cargo.toml'
+$collectorExeName = 'codex-sessions-collector.exe'
 $sqlRoot = Join-Path $repoRoot 'sql'
 $assetsRoot = Join-Path $repoRoot 'assets'
 $settingsFile = Join-Path $repoRoot 'settings.toml'
@@ -34,7 +37,7 @@ function Resolve-Tool {
         return $FallbackPath
     }
 
-    throw "Required tool '$Name' was not found. Add C:\tools\flutter\bin to PATH or install Flutter."
+    throw "Required tool '$Name' was not found. Add C:\tools\flutter\bin and the Rust toolchain (cargo) to PATH."
 }
 
 function Invoke-Step {
@@ -97,10 +100,32 @@ if (-not (Test-Path -LiteralPath $settingsFile -PathType Leaf)) {
     throw "Default settings file not found at '$settingsFile'."
 }
 
+if (-not (Test-Path -LiteralPath $collectorManifest -PathType Leaf)) {
+    throw "Collector manifest not found at '$collectorManifest'."
+}
+
 $flutter = Resolve-Tool -Name 'flutter' -FallbackPath 'C:\tools\flutter\bin\flutter.bat'
 $dart = Resolve-Tool -Name 'dart' -FallbackPath 'C:\tools\flutter\bin\dart.bat'
+$cargo = Resolve-Tool -Name 'cargo' -FallbackPath (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe')
 
 Invoke-Step 'Check Flutter installation' { & $flutter --version }
+
+# The collector links the C runtime statically (collector/.cargo/config.toml),
+# so the release needs neither a Rust toolchain nor a VC++ redistributable.
+Push-Location $collectorRoot
+try {
+    Invoke-Step 'Check collector formatting' { & $cargo fmt --check }
+    Invoke-Step 'Lint collector' { & $cargo clippy --locked --all-targets -- -D warnings }
+    Invoke-Step 'Test collector' { & $cargo test --locked --no-fail-fast }
+    Invoke-Step 'Build collector release' { & $cargo build --locked --release }
+}
+finally {
+    Pop-Location
+}
+$collectorBuildExe = Join-Path $collectorRoot "target\release\$collectorExeName"
+if (-not (Test-Path -LiteralPath $collectorBuildExe -PathType Leaf)) {
+    throw "Expected collector build output not found at '$collectorBuildExe'."
+}
 
 Push-Location $appRoot
 try {
@@ -130,6 +155,9 @@ if (Test-Path -LiteralPath $originalReleaseExe -PathType Leaf) {
     Remove-Item -LiteralPath $originalReleaseExe -Force
 }
 
+$releaseCollector = Join-Path $OutputDirectory $collectorExeName
+Copy-Item -LiteralPath $collectorBuildExe -Destination $releaseCollector -Force
+
 $releaseReadme = Join-Path $OutputDirectory 'README.md'
 if (Test-Path -LiteralPath $readmeFile -PathType Leaf) {
     Copy-Item -LiteralPath $readmeFile -Destination $releaseReadme -Force
@@ -150,6 +178,7 @@ Copy-DirectoryClean -Source $assetsRoot -Destination (Join-Path $OutputDirectory
 
 foreach ($requiredOutput in @(
         $releaseExe,
+        $releaseCollector,
         (Join-Path $OutputDirectory 'flutter_windows.dll'),
         (Join-Path $OutputDirectory 'data'),
         $releaseReadme,

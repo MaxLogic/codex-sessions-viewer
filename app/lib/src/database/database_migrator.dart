@@ -33,7 +33,7 @@ Directory defaultSqlRoot() {
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 17,
+    this.supportedSchemaVersion = 18,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
@@ -91,6 +91,11 @@ class DatabaseMigrator {
       final ftsResult = _verifyFts5(db, databaseFile.path);
       if (ftsResult != null) {
         return DatabaseStartupResult.blocked(ftsResult);
+      }
+
+      final ownerError = _validateOwner(db, databaseFile.path);
+      if (ownerError != null) {
+        return DatabaseStartupResult.blocked(ownerError);
       }
 
       _ensureSchemaVersionTable(db);
@@ -290,6 +295,33 @@ class DatabaseMigrator {
         details: error.toString(),
       );
     }
+  }
+
+  /// A standalone collector creates and migrates its own database; the
+  /// viewer must not migrate it out from under that collector.
+  DatabaseFatalError? _validateOwner(Database db, String databasePath) {
+    final hasMetadata = db
+        .select(
+          "select 1 from sqlite_schema where type = 'table' and name = 'app_metadata'",
+        )
+        .isNotEmpty;
+    if (!hasMetadata) {
+      return null;
+    }
+    final owner = db.select(
+      "select value from app_metadata where key = 'database_owner'",
+    );
+    if (owner.isEmpty || owner.single['value'] == 'viewer') {
+      return null;
+    }
+    return DatabaseFatalError(
+      summary: 'This database belongs to a standalone collector.',
+      databasePath: databasePath,
+      lastAppliedSchemaVersion: _safeLastAppliedVersion(db),
+      details:
+          'A standalone collector created this database and owns its '
+          'migrations. Open the viewer with its own database instead.',
+    );
   }
 
   void _ensureSchemaVersionTable(Database db) {

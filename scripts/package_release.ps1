@@ -37,6 +37,7 @@ Copy-Item -Path (Join-Path $BuildOutputDirectory '*') -Destination $PackageDirec
 
 foreach ($item in @(
         'codex_session_viewer.exe',
+        'codex-sessions-collector.exe',
         'flutter_windows.dll',
         'data',
         'README.md',

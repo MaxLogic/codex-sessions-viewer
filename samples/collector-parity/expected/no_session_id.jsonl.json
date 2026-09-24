@@ -1,0 +1,98 @@
+{
+  "internal_id": "source:../samples/collector-parity/sessions/no_session_id.jsonl",
+  "session_id": null,
+  "thread_name": null,
+  "thread_source": null,
+  "parent_thread_id": null,
+  "forked_from_id": null,
+  "history_base_thread_id": null,
+  "history_base_end_ordinal_exclusive": null,
+  "history_base_end_byte_offset": null,
+  "subagent_history_start_ordinal": null,
+  "usage_projection_status": "ambiguous",
+  "agent_nickname": null,
+  "agent_role": null,
+  "subagent_depth": null,
+  "source_type": "windows",
+  "source_path": "../samples/collector-parity/sessions/no_session_id.jsonl",
+  "source_file_unc_path": null,
+  "display_path": "../samples/collector-parity/sessions/no_session_id.jsonl",
+  "platform_path": "../samples/collector-parity/sessions/no_session_id.jsonl",
+  "working_directory_display": "C:\\nonexistent\\noid",
+  "working_directory_platform": "C:\\nonexistent\\noid",
+  "working_directory_unc": null,
+  "title": null,
+  "summary": null,
+  "started_at_utc": null,
+  "last_message_at_utc": "2026-09-05T12:00:02.000Z",
+  "model_ids": [
+    "m1"
+  ],
+  "usage": {
+    "input_tokens": 3,
+    "cached_input_tokens": null,
+    "cache_write_input_tokens": null,
+    "output_tokens": 4,
+    "reasoning_output_tokens": null,
+    "total_tokens": 8,
+    "is_empty": false
+  },
+  "last_turn_usage": {
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "cache_write_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_output_tokens": null,
+    "total_tokens": null,
+    "is_empty": true
+  },
+  "messages": [
+    {
+      "index": 0,
+      "author_type": "user",
+      "raw_type": "message",
+      "created_at_utc": "2026-09-05T12:00:01.000Z",
+      "first_line": "hello without id",
+      "content_plain": "hello without id",
+      "content_preview": "hello without id",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": null,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": null,
+        "reasoning_output_tokens": null,
+        "total_tokens": null,
+        "is_empty": true
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    },
+    {
+      "index": 1,
+      "author_type": "assistant",
+      "raw_type": "message",
+      "created_at_utc": "2026-09-05T12:00:02.000Z",
+      "first_line": "reply",
+      "content_plain": "reply",
+      "content_preview": "reply",
+      "content_truncated": false,
+      "usage": {
+        "input_tokens": 3,
+        "cached_input_tokens": null,
+        "cache_write_input_tokens": null,
+        "output_tokens": 4,
+        "reasoning_output_tokens": null,
+        "total_tokens": 8,
+        "is_empty": false
+      },
+      "model": null,
+      "has_tool_calls": false,
+      "has_error": false
+    }
+  ],
+  "tool_calls": [],
+  "usage_events": [],
+  "warnings": []
+}

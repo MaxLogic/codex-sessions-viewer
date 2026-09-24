@@ -1,0 +1,3 @@
+{"timestamp":"2026-09-05T12:00:00Z","type":"turn_context","payload":{"cwd":"C:\\nonexistent\\noid","model":"m1"}}
+{"timestamp":"2026-09-05T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":"hello without id"}}
+{"timestamp":"2026-09-05T12:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"reply","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":8}}}

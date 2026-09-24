@@ -1,0 +1,71 @@
+{
+  "session_id": "parity-legacy-007",
+  "source_type": "windows",
+  "title": "Legacy title",
+  "summary": "Legacy summary",
+  "session_name": "Legacy name",
+  "created_at": "2026-09-07T14:00:00Z",
+  "working_directory": "C:\\nonexistent\\legacy",
+  "model": "legacy-model",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5
+  },
+  "messages": [
+    {
+      "type": "user",
+      "content": "legacy question",
+      "created_at": "2026-09-07T14:00:01Z",
+      "usage": {
+        "input_tokens": 2,
+        "output_tokens": 0
+      }
+    },
+    {
+      "type": "assistant",
+      "content": [
+        "part",
+        1,
+        {
+          "k": 2.5
+        }
+      ],
+      "created_at": "2026-09-07T14:00:02Z",
+      "model": "legacy-model-2",
+      "error": "boom"
+    },
+    {
+      "type": "tool_call",
+      "tool_name": "grep",
+      "status": "ok",
+      "input": "needle",
+      "output": "found it",
+      "started_at": "2026-09-07T14:00:03Z",
+      "finished_at": "2026-09-07T14:00:04Z"
+    },
+    {
+      "type": "tool_call",
+      "status": "error",
+      "error": "x"
+    },
+    42,
+    [
+      1,
+      "two",
+      null,
+      {
+        "a": true
+      }
+    ],
+    null,
+    "plain string message",
+    3.0,
+    {
+      "type": "user",
+      "content": "<environment_context><timezone>UTC</timezone></environment_context>"
+    },
+    {
+      "type": "weird"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "codex-sessions-collector"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Collects local Codex sessions into the Codex Sessions Viewer database."
+
+[[bin]]
+name = "codex-sessions-collector"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "unbounded_depth"] }
+serde_stacker = "0.1.14"
+sha2 = "0.11.0"
+toml = "1.1.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

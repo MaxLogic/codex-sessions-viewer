@@ -1,0 +1,3 @@
+# Parser parity fixtures are byte-exact: CRLF, lone CR, NUL padding, and
+# invalid UTF-8 are part of what they test.
+* -text
