@@ -422,3 +422,233 @@ fn setup_preview_apply_repeat_preserves_configuration_for_both_harnesses() {
         assert_eq!(std::fs::read_to_string(&config).unwrap(), changed);
     }
 }
+
+fn notify_args(config: &std::path::Path) -> Vec<String> {
+    let config: toml::Table = std::fs::read_to_string(config)
+        .unwrap()
+        .trim_start_matches('\u{feff}')
+        .parse()
+        .unwrap();
+    config["notify"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn claude_commands(config: &std::path::Path, event: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(config).unwrap();
+    let config: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap();
+    config["hooks"][event]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry["hooks"].as_array().unwrap().clone())
+        .map(|item| item["command"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn codex_setup_replaces_moved_managed_notify_and_keeps_its_inner_previous_notify() {
+    let previous = r#"["previous-command","private-hook-secret"]"#;
+    let moved = serde_json::json!([
+        r"C:\Old Place\CODEX-SESSIONS-COLLECTOR.EXE",
+        "codex",
+        "notify",
+        "--db",
+        r"C:\old.sqlite",
+        "--previous-notify",
+        previous
+    ])
+    .to_string();
+    // A chain produced by earlier setups that wrapped their own notify.
+    let nested = serde_json::json!([
+        "/opt/other/codex-sessions-collector",
+        "codex",
+        "notify",
+        "--previous-notify",
+        moved
+    ])
+    .to_string();
+    for existing in [moved.clone(), nested] {
+        let f = Fixture::new("codex");
+        let array: Vec<String> = serde_json::from_str(&existing).unwrap();
+        let mut notify = toml_edit::Array::new();
+        for arg in &array {
+            notify.push(arg.as_str());
+        }
+        std::fs::write(&f.config, format!("model = 'x'\nnotify = {notify}\n")).unwrap();
+        f.setup();
+        let args = notify_args(&f.config);
+        assert!(
+            !args[0].contains("Old Place") && !args[0].starts_with("/opt"),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|a| *a == "--previous-notify").count(),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(args.last().unwrap(), previous, "{args:?}");
+        assert_eq!(f.run("setup", &[], 0)["changed"], false);
+        assert_eq!(
+            f.run("status", &[], 0)["configuration"]["hook_state"],
+            "registered"
+        );
+    }
+}
+
+#[test]
+fn claude_setup_replaces_its_managed_hook_when_arguments_or_location_change() {
+    let f = Fixture::new("claude");
+    let foreign =
+        r#""D:\Moved\Codex-Sessions-Collector.exe" "claude" "hook" "--db" "D:\old.sqlite""#;
+    std::fs::write(
+        &f.config,
+        serde_json::json!({"hooks":{"Stop":[{"hooks":[
+            {"type":"command","command":"old-hook private-hook-secret"},
+            {"type":"command","command":foreign}
+        ]}]}})
+        .to_string(),
+    )
+    .unwrap();
+    f.setup();
+    let other = f.temp.path().join("other-sessions");
+    std::fs::create_dir(&other).unwrap();
+    let mut cmd = collector();
+    cmd.args(["claude", "setup", "--json", "--apply", "--root"])
+        .arg(&other)
+        .arg("--config")
+        .arg(&f.config)
+        .arg("--db")
+        .arg(&f.db);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    for event in ["Stop", "SessionEnd"] {
+        let commands = claude_commands(&f.config, event);
+        let managed: Vec<_> = commands
+            .iter()
+            .filter(|c| c.to_ascii_lowercase().contains("codex-sessions-collector"))
+            .collect();
+        assert_eq!(managed.len(), 1, "{event}: {commands:?}");
+        assert!(managed[0].contains("other-sessions"), "{commands:?}");
+        assert!(!managed[0].contains("Moved"), "{commands:?}");
+        if event == "Stop" {
+            assert!(commands.iter().any(|c| c == "old-hook private-hook-secret"));
+        }
+    }
+}
+
+#[test]
+fn status_distinguishes_changed_managed_hook_from_absent_hook() {
+    for harness in ["codex", "claude"] {
+        let f = Fixture::new(harness);
+        let report = f.run("status", &[], 1);
+        assert_eq!(report["configuration"]["hook_state"], "absent", "{report}");
+        assert_eq!(report["configuration"]["hook_registered"], false);
+        f.setup();
+        assert_eq!(
+            f.run("status", &[], 0)["configuration"]["hook_state"],
+            "registered"
+        );
+        let other = f.temp.path().join("other-sessions");
+        std::fs::create_dir(&other).unwrap();
+        // Codex accepts one Windows root, so change its WSL root instead.
+        let flag = if harness == "codex" {
+            "--wsl-root"
+        } else {
+            "--claude-root"
+        };
+        let report = f.run("verify", &[flag, other.to_str().unwrap()], 1);
+        assert_eq!(report["configuration"]["hook_registered"], false);
+        assert_eq!(
+            report["configuration"]["hook_state"], "different_arguments",
+            "{report}"
+        );
+        assert!(
+            report["configuration"]["action"]
+                .as_str()
+                .unwrap()
+                .contains("different arguments")
+        );
+    }
+}
+
+#[test]
+fn setup_backs_up_an_existing_configuration_before_replacing_it() {
+    for harness in ["codex", "claude"] {
+        let f = Fixture::new(harness);
+        let applied = f.run("setup", &["--apply"], 0);
+        assert!(applied["backup"].is_null(), "{applied}");
+        let original = if harness == "codex" {
+            "api_key = 'private-test-secret'\n".to_owned()
+        } else {
+            r#"{"api_key":"private-test-secret"}"#.to_owned()
+        };
+        std::fs::write(&f.config, &original).unwrap();
+        let applied = f.run("setup", &["--apply"], 0);
+        let backup = std::path::PathBuf::from(applied["backup"].as_str().unwrap());
+        assert_eq!(backup.parent(), f.config.parent());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        assert_ne!(std::fs::read_to_string(&f.config).unwrap(), original);
+        assert!(!applied.to_string().contains("private-test-secret"));
+        // An unchanged repeat writes neither the file nor another backup.
+        assert!(f.run("setup", &["--apply"], 0)["backup"].is_null());
+    }
+}
+
+#[test]
+fn setup_accepts_and_preserves_a_utf8_byte_order_mark() {
+    for harness in ["codex", "claude"] {
+        let f = Fixture::new(harness);
+        let body = if harness == "codex" {
+            "model = 'x'\n"
+        } else {
+            r#"{"other":{"value":42}}"#
+        };
+        std::fs::write(&f.config, format!("\u{feff}{body}")).unwrap();
+        f.setup();
+        let written = std::fs::read_to_string(&f.config).unwrap();
+        assert!(written.starts_with('\u{feff}'), "{written}");
+        if harness == "codex" {
+            assert!(notify_args(&f.config).len() > 3);
+        } else {
+            assert_eq!(claude_commands(&f.config, "Stop").len(), 1);
+        }
+        assert_eq!(f.run("setup", &[], 0)["changed"], false);
+        assert_eq!(
+            f.run("status", &[], 0)["configuration"]["hook_state"],
+            "registered"
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn claude_setup_refuses_paths_that_git_bash_would_expand() {
+    for name in ["dollar$HOME", "tick`id`"] {
+        let f = Fixture::new("claude");
+        let root = f.temp.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        let mut cmd = collector();
+        cmd.args(["claude", "setup", "--json", "--apply", "--root"])
+            .arg(&root)
+            .arg("--config")
+            .arg(&f.config)
+            .arg("--db")
+            .arg(&f.db);
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            report["error"].as_str().unwrap().contains("expansion"),
+            "{report}"
+        );
+        assert!(!f.config.exists());
+    }
+}

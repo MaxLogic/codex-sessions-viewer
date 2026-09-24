@@ -16,3 +16,7 @@ app/flutter_*.log
 *.db-shm
 .codex/
 .claude/skills/
+
+# Python bytecode and local Windows shortcuts
+__pycache__/
+/*.lnk

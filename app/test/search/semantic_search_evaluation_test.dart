@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
@@ -175,4 +178,29 @@ void main() {
       expect(db.select('SELECT * FROM vectors'), isEmpty);
     },
   );
+
+  test('an unavailable run never overwrites retained measured evidence', () {
+    final temp = Directory.systemTemp.createTempSync('semantic-eval-out-');
+    addTearDown(() => temp.deleteSync(recursive: true));
+    final out = File('${temp.path}/evidence.json');
+    final measured = writeEvaluationResult(out, {'status': 'measured', 'n': 1});
+    expect(measured.path, out.path);
+    final retained = out.readAsStringSync();
+    expect(jsonDecode(retained)['n'], 1);
+
+    final failed = writeEvaluationResult(out, {
+      'status': 'unavailable',
+      'error': 'no model',
+    });
+    expect(failed.path, isNot(out.path));
+    expect(out.readAsStringSync(), retained);
+    expect(jsonDecode(failed.readAsStringSync())['status'], 'unavailable');
+
+    writeEvaluationResult(out, {'status': 'measured', 'n': 2});
+    expect(jsonDecode(out.readAsStringSync())['n'], 2);
+    expect(
+      temp.listSync().whereType<File>().where((f) => f.path.endsWith('.tmp')),
+      isEmpty,
+    );
+  });
 }
