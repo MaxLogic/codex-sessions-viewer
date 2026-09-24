@@ -6,6 +6,8 @@
 //! Parsed sessions reach the caller's sink in completion order; the sink
 //! persists them in small batches.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -101,8 +103,10 @@ pub struct ScanOptions {
     pub force: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ScanCounts {
+    pub cancelled: bool,
+    pub persistence_flushes: u64,
     pub directories_scanned: u64,
     pub files_found: u64,
     pub files_skipped: u64,
@@ -234,7 +238,11 @@ struct Discovery {
     failed_owners: HashSet<String>,
 }
 
-fn discover(options: &ScanOptions) -> Discovery {
+fn discover(
+    options: &ScanOptions,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(&ScanCounts),
+) -> Discovery {
     let mut discovery = Discovery {
         counts: ScanCounts::default(),
         statuses: Vec::new(),
@@ -247,6 +255,9 @@ fn discover(options: &ScanOptions) -> Discovery {
     let mut reported: HashSet<String> = HashSet::new();
     let mut directories: Vec<(String, String, SourceType, &'static str)> = Vec::new();
     for root in &options.roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if root.path.is_empty() {
             continue;
         }
@@ -272,10 +283,16 @@ fn discover(options: &ScanOptions) -> Discovery {
                 let mut reachable = owner_exists();
                 if root.source_type == SourceType::Wsl && is_wsl_unc_path(&owner_path) {
                     for delay in &options.wsl_root_retry_delays {
-                        if reachable {
+                        if reachable || cancel.load(Ordering::Relaxed) {
                             break;
                         }
-                        std::thread::sleep(*delay);
+                        let started = std::time::Instant::now();
+                        while started.elapsed() < *delay && !cancel.load(Ordering::Relaxed) {
+                            std::thread::sleep(
+                                (*delay - started.elapsed().min(*delay))
+                                    .min(Duration::from_millis(25)),
+                            );
+                        }
                         reachable = owner_exists();
                     }
                 }
@@ -338,7 +355,11 @@ fn discover(options: &ScanOptions) -> Discovery {
     }
 
     while let Some((directory, owner_path, source_type, source_state)) = directories.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         discovery.counts.directories_scanned += 1;
+        progress(&discovery.counts);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) => {
@@ -353,6 +374,9 @@ fn discover(options: &ScanOptions) -> Discovery {
             }
         };
         for entry in entries {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -424,15 +448,36 @@ type ParseResult = (usize, Result<ParseSuccess, ParseError>);
 pub fn scan<E>(
     options: &ScanOptions,
     cached: &[CachedSource],
-    mut sink: impl FnMut(SessionSnapshot) -> Result<(), E>,
+    sink: impl FnMut(SessionSnapshot) -> Result<(), E>,
 ) -> Result<ScanOutcome, E> {
-    let discovery = discover(options);
+    scan_controlled(
+        options,
+        cached,
+        sink,
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+}
+
+pub fn scan_controlled<E>(
+    options: &ScanOptions,
+    cached: &[CachedSource],
+    mut sink: impl FnMut(SessionSnapshot) -> Result<(), E>,
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(&ScanCounts),
+) -> Result<ScanOutcome, E> {
+    progress(&ScanCounts::default());
+    let discovery = discover(options, cancel, &mut progress);
     let mut counts = discovery.counts;
+    progress(&counts);
     let mut statuses = discovery.statuses;
     let mut errors = discovery.errors;
     let index = CachedIndex::new(cached);
     let mut to_parse: Vec<usize> = Vec::new();
     for (position, candidate) in discovery.candidates.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if options.force || should_parse(&candidate.path, &index) {
             to_parse.push(position);
         } else {
@@ -455,11 +500,12 @@ pub fn scan<E>(
         let jobs = Arc::clone(&job_receiver);
         let results = result_sender.clone();
         let parser = options.parser;
+        let cancellation = Arc::clone(cancel);
         handles.push(
             std::thread::Builder::new()
                 .name("codex-parser".to_owned())
                 .stack_size(16 * 1024 * 1024)
-                .spawn(move || parser_worker(&jobs, &results, parser))
+                .spawn(move || parser_worker(&jobs, &results, parser, &cancellation))
                 .expect("spawn parser thread"),
         );
     }
@@ -468,7 +514,8 @@ pub fn scan<E>(
         .iter()
         .map(|position| (*position, discovery.candidates[*position].path.clone()))
         .collect();
-    let feeder = std::thread::spawn(move || feed(jobs, job_sender));
+    let cancellation = Arc::clone(cancel);
+    let feeder = std::thread::spawn(move || feed(jobs, job_sender, &cancellation));
 
     let mut parsed = Vec::new();
     let mut project_cache: HashMap<String, Option<String>> = HashMap::new();
@@ -517,6 +564,7 @@ pub fn scan<E>(
                 }
             }
         }
+        progress(&counts);
     }
     let _ = feeder.join();
     for handle in handles {
@@ -547,7 +595,8 @@ pub fn scan<E>(
             !discovery.failed_owners.contains(&owner)
         })
         .collect();
-    if !complete_roots.is_empty() {
+    counts.cancelled = cancel.load(Ordering::Relaxed);
+    if !counts.cancelled && !complete_roots.is_empty() {
         let found: HashSet<String> = discovery
             .candidates
             .iter()
@@ -584,10 +633,20 @@ pub fn scan<E>(
     })
 }
 
-fn feed(jobs: Vec<ParseJob>, sender: SyncSender<ParseJob>) {
-    for job in jobs {
-        if sender.send(job).is_err() {
-            return;
+fn feed(jobs: Vec<ParseJob>, sender: SyncSender<ParseJob>, cancel: &AtomicBool) {
+    for mut job in jobs {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            match sender.try_send(job) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+                Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                    job = pending;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
         }
     }
 }
@@ -596,8 +655,12 @@ fn parser_worker(
     jobs: &Mutex<Receiver<ParseJob>>,
     results: &SyncSender<ParseResult>,
     options: ParserOptions,
+    cancel: &AtomicBool,
 ) {
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let job = {
             let Ok(receiver) = jobs.lock() else {
                 return;

@@ -6,6 +6,7 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+use rusqlite::OptionalExtension;
 use serde_json::json;
 
 use crate::codex::parser::{ParserOptions, SourceType, parse_file};
@@ -23,6 +24,9 @@ const USAGE: &str = "\
 codex-sessions-collector: collect local coding-agent sessions into the Codex Sessions Viewer database.
 
 USAGE:
+  codex-sessions-collector <codex|claude> setup [--apply] [DIAGNOSTIC OPTIONS]
+  codex-sessions-collector <codex|claude> verify [--local-proof] [--check-hub] [DIAGNOSTIC OPTIONS]
+  codex-sessions-collector <codex|claude> status [DIAGNOSTIC OPTIONS]
   codex-sessions-collector codex scan   [OPTIONS]         Scan the configured Codex homes
   codex-sessions-collector codex ingest [OPTIONS] <FILE>  Ingest one Codex session file
   codex-sessions-collector codex parse  [OPTIONS] <FILE>  Print one file as contract records
@@ -35,11 +39,20 @@ USAGE:
   codex-sessions-collector drain  [OPTIONS]               Ingest queued hook work
   codex-sessions-collector apply  [OPTIONS] [--input <FILE>]  Apply contract records (stdin by default)
   codex-sessions-collector query <COMMAND> [OPTIONS]      Read-only history queries (query --help)
+  codex-sessions-collector hub enable --hub-url <URL> [DATABASE OPTIONS]
+  codex-sessions-collector hub sync [DATABASE OPTIONS]    Deliver queued records
+  codex-sessions-collector hub status [DATABASE OPTIONS]  Show delivery state
   codex-sessions-collector version
 
 DATABASE OPTIONS:
   --db <FILE>           Viewer database (default: %APPDATA%\\CodexSessionViewer\\codex_sessions_viewer.sqlite)
   --standalone <FILE>   Collector-owned database; created and migrated by the collector
+
+DIAGNOSTIC OPTIONS:
+  --root <DIR>         Harness session root (repeatable)
+  --config <FILE>      Harness configuration file (Codex TOML / Claude JSON)
+  --json               Machine-readable report; setup previews by default
+  --hub-url <URL>      Explicit verify endpoint; only --check-hub makes a request
 
 SCAN OPTIONS:
   --settings <FILE>     Viewer settings.toml (default: next to this executable)
@@ -50,6 +63,11 @@ SCAN OPTIONS:
   --force               Reparse unchanged files
   --parser-workers <N>  Parallel parsers (default: CPU count - 1, at most 8)
   --json                Print a machine-readable summary
+  --progress-json       Stream progress JSON lines before the final summary
+  --cancel-stdin        Gracefully cancel when stdin receives cancel or closes
+  --coordinate-writes  Request a GUI writer lease before each database batch
+  --flush-sessions <N>  Sessions per persistence batch (default: 64)
+  --flush-bytes <N>     Source bytes per persistence batch (default: 8388608)
 
 CLAUDE OPTIONS:
   --claude-root <DIR>     Claude projects folder (default: %USERPROFILE%\\.claude\\projects); repeatable
@@ -61,6 +79,8 @@ HOOK OPTIONS:
   --no-wait                 drain: handle what is due now instead of waiting for retries
 Hooks exit 0 even when they fail; problems go to errors.log in the queue folder
 (CODEX_SESSIONS_COLLECTOR_QUEUE, default %LOCALAPPDATA%\\CodexSessionViewer\\collector\\queue).
+Hub sync reads CODEX_SESSIONS_HUB_MACHINE_TOKEN from the environment. Schedule it
+separately; local collection never waits for network delivery.
 ";
 
 struct Options {
@@ -74,6 +94,11 @@ struct Options {
     force: bool,
     parser_workers: Option<usize>,
     json: bool,
+    progress_json: bool,
+    cancel_stdin: bool,
+    coordinate_writes: bool,
+    flush_sessions: usize,
+    flush_bytes: u64,
     input: Option<PathBuf>,
     positional: Vec<String>,
     previous_notify: Option<String>,
@@ -81,6 +106,7 @@ struct Options {
     no_wait: bool,
     claude_roots: Vec<String>,
     claude_wsl_roots: Vec<String>,
+    hub_url: Option<String>,
 }
 
 enum CliError {
@@ -110,6 +136,11 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
         force: false,
         parser_workers: None,
         json: false,
+        progress_json: false,
+        cancel_stdin: false,
+        coordinate_writes: false,
+        flush_sessions: codex::FLUSH_SESSIONS,
+        flush_bytes: codex::FLUSH_SOURCE_BYTES,
         input: None,
         positional: Vec::new(),
         previous_notify: None,
@@ -117,6 +148,7 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
         no_wait: false,
         claude_roots: Vec::new(),
         claude_wsl_roots: Vec::new(),
+        hub_url: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -133,6 +165,7 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
             "--wsl-root" => options.wsl_root = Some(value("--wsl-root")?),
             "--wsl-unc-root" => options.wsl_unc_root = Some(value("--wsl-unc-root")?),
             "--input" => options.input = Some(PathBuf::from(value("--input")?)),
+            "--hub-url" => options.hub_url = Some(value("--hub-url")?),
             "--parser-workers" => {
                 let text = value("--parser-workers")?;
                 let count: usize =
@@ -146,6 +179,20 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
                         })?;
                 options.parser_workers = Some(count);
             }
+            "--flush-sessions" => {
+                options.flush_sessions = value("--flush-sessions")?
+                    .parse()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| CliError::Usage("--flush-sessions must be positive".into()))?
+            }
+            "--flush-bytes" => {
+                options.flush_bytes = value("--flush-bytes")?
+                    .parse()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| CliError::Usage("--flush-bytes must be positive".into()))?
+            }
             "--previous-notify" => options.previous_notify = Some(value("--previous-notify")?),
             "--claude-root" => options.claude_roots.push(value("--claude-root")?),
             "--claude-wsl-root" => options.claude_wsl_roots.push(value("--claude-wsl-root")?),
@@ -154,6 +201,17 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
             "--no-wsl-projects" => options.wsl_projects = false,
             "--force" => options.force = true,
             "--json" => options.json = true,
+            "--progress-json" => {
+                options.progress_json = true;
+                options.json = true;
+            }
+            "--cancel-stdin" => options.cancel_stdin = true,
+            "--coordinate-writes" => {
+                options.coordinate_writes = true;
+                options.cancel_stdin = true;
+                options.progress_json = true;
+                options.json = true;
+            }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown option {flag}")));
             }
@@ -173,6 +231,13 @@ pub fn run(args: &[String]) -> i32 {
     let mut stderr = std::io::stderr().lock();
     let command: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
     let result = match command.as_slice() {
+        [
+            harness @ ("codex" | "claude"),
+            action @ ("setup" | "verify" | "status"),
+            ..,
+        ] => {
+            return crate::diagnostics::run(harness, action, &args[2..], &mut stdout);
+        }
         ["codex", "scan", ..] => {
             parse_options(&args[2..]).and_then(|o| codex_scan(&o, &mut stdout))
         }
@@ -204,6 +269,13 @@ pub fn run(args: &[String]) -> i32 {
         ["apply", ..] => parse_options(&args[1..]).and_then(|o| apply(&o, &mut stdout)),
         ["query", ..] => {
             return crate::query::run(&args[1..], &mut stdout, &mut stderr);
+        }
+        ["hub", "enable", ..] => {
+            parse_options(&args[2..]).and_then(|o| hub_enable(&o, &mut stdout))
+        }
+        ["hub", "sync", ..] => parse_options(&args[2..]).and_then(|o| hub_sync(&o, &mut stdout)),
+        ["hub", "status", ..] => {
+            parse_options(&args[2..]).and_then(|o| hub_status(&o, &mut stdout))
         }
         ["version", ..] | ["--version", ..] => {
             let _ = writeln!(
@@ -252,6 +324,56 @@ fn open_store(options: &Options) -> Result<Store, CliError> {
             .ok_or_else(|| CliError::Usage("APPDATA is not set; pass --db <FILE>".to_owned()))?,
     };
     Ok(Store::open(&path, OwnerMode::Viewer)?)
+}
+
+fn hub_enable(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let url = options
+        .hub_url
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("hub enable needs --hub-url".into()))?;
+    let store = open_store(options)?;
+    crate::hub_client::enable_for_collection(std::path::Path::new(&store.path), store.mode, url)
+        .map_err(CliError::Failed)?;
+    writeln!(
+        out,
+        "{}",
+        json!({"command":"hub enable","enabled":true,"machine_id":store.machine_id()?})
+    )
+    .map_err(|error| CliError::Failed(error.to_string()))
+}
+
+fn hub_sync(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let store = open_store(options)?;
+    let row: Option<String> = store
+        .conn
+        .query_row(
+            "select hub_url from collector_hub_state where id = 1 and enabled = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Sql)?;
+    let url = row.ok_or_else(|| {
+        CliError::Refused("hub delivery is not enabled; run hub enable first".into())
+    })?;
+    let token = std::env::var("CODEX_SESSIONS_HUB_MACHINE_TOKEN")
+        .map_err(|_| CliError::Usage("set CODEX_SESSIONS_HUB_MACHINE_TOKEN for hub sync".into()))?;
+    let report =
+        crate::hub_client::sync(std::path::Path::new(&store.path), store.mode, &url, &token)
+            .map_err(CliError::Failed)?;
+    writeln!(out, "{}", json!({"command":"hub sync","sent":report.sent,"pending":report.pending,"last_sequence":report.last_sequence}))
+        .map_err(|error| CliError::Failed(error.to_string()))
+}
+
+fn hub_status(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let store = open_store(options)?;
+    let state: Option<(String, String, i64, bool)> = store.conn.query_row(
+        "select hub_url, machine_id, last_sequence, enabled from collector_hub_state where id = 1",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    ).optional().map_err(StoreError::Sql)?;
+    let pending = crate::hub_client::pending(&store.conn)?;
+    writeln!(out, "{}", json!({"command":"hub status","delivery":state.as_ref().map(|(url,machine,sequence,enabled)| json!({"hub_url":url,"machine_id":machine,"last_sequence":sequence,"enabled":enabled})),"pending":pending}))
+        .map_err(|error| CliError::Failed(error.to_string()))
 }
 
 fn load_settings(options: &Options) -> Result<CollectorSettings, CliError> {
@@ -325,7 +447,73 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     let settings = load_settings(options)?;
     let store = open_store(options)?;
     let scan = scan_options(options, &settings, configured_roots(&settings));
-    let report = codex::collect(&store, &scan, options.wsl_projects)?;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (grants, granted) = std::sync::mpsc::channel();
+    if options.cancel_stdin {
+        let cancellation = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                match line.as_deref() {
+                    Ok("grant") => {
+                        if grants.send(()).is_err() {
+                            break;
+                        }
+                    }
+                    Ok("cancel") => cancellation.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    let output = std::cell::RefCell::new(&mut *out);
+    let mut output_error = None;
+    let report = codex::collect_coordinated(
+        &store,
+        &scan,
+        options.wsl_projects,
+        &cancel,
+        |counts, committed| {
+            if options.progress_json && output_error.is_none() {
+                let event =
+                    json!({"event": "progress", "counts": counts, "sessions_written": committed});
+                let mut out = output.borrow_mut();
+                if let Err(error) = writeln!(out, "{event}").and_then(|_| out.flush()) {
+                    output_error = Some(error);
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        },
+        |acquire| {
+            if !options.coordinate_writes {
+                return Ok(());
+            }
+            let event = if acquire {
+                "write_requested"
+            } else {
+                "write_released"
+            };
+            {
+                let mut out = output.borrow_mut();
+                writeln!(out, "{}", json!({"event":event}))?;
+                out.flush()?;
+            }
+            if acquire {
+                granted.recv().map_err(|_| {
+                    StoreError::Refused("GUI writer coordinator disconnected".to_owned())
+                })?;
+            }
+            Ok(())
+        },
+        codex::CollectionBatching {
+            sessions: options.flush_sessions,
+            source_bytes: options.flush_bytes,
+        },
+    )?;
+    if let Some(error) = output_error {
+        return Err(CliError::Failed(error.to_string()));
+    }
     print_report(out, "codex scan", &store, &report, options.json)
 }
 
@@ -465,6 +653,8 @@ fn print_report(
     let counts = &report.counts;
     let text = if json {
         json!({
+            "event": "finished",
+            "cancelled": counts.cancelled,
             "command": command,
             "database": store.path,
             "owner": match store.mode { OwnerMode::Viewer => "viewer", OwnerMode::Standalone => "collector" },
@@ -478,6 +668,7 @@ fn print_report(
             "files_parsed": counts.files_parsed,
             "files_failed": counts.files_failed,
             "sessions_missing": counts.sessions_missing,
+            "persistence_flushes": counts.persistence_flushes,
             "errors": report.errors.iter().map(|error| json!({
                 "path": error.path,
                 "status": error.status,

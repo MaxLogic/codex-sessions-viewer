@@ -18,6 +18,9 @@ serde_json = { version = "1.0.151", features = ["preserve_order", "unbounded_dep
 serde_stacker = "0.1.14"
 sha2 = "0.11.0"
 toml = "1.1.6"
+toml_edit = "0.25"
+tiny_http = "0.12.0"
+ureq = { version = "3.4.2", features = ["json"] }
 
 [profile.release]
 lto = "thin"

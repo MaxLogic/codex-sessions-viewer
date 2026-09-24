@@ -32,17 +32,44 @@ Without `--db`, the collector writes the viewer's database at
 
 Exit codes: `0` success, `1` failure, `2` usage error, `3` database refused.
 
+## GUI scan transport
+
+Refresh launches the bundled executable with `codex scan --coordinate-writes`.
+The collector emits JSON lines on stdout. `write_requested` waits for `grant`
+on stdin; `write_released` returns that lease to the viewer's maintenance
+scheduler. This lets pricing and other queued writes run between scan batches.
+`progress` carries `counts` and `sessions_written`; the final `finished` record
+contains the scan summary, `cancelled`, and `persistence_flushes`.
+
+The viewer sends `cancel` on stdin to stop discovery and new parser work.
+Completed parser results are persisted, and cancelled scans do not mark unseen
+files missing. Closing stdin also requests cancellation. A disconnected writer
+coordinator stops further writes. `--progress-json` streams progress without
+writer leases; ordinary `--json` still emits only the final summary.
+
+Tests can set `CODEX_SESSIONS_COLLECTOR_EXE` to an explicitly built executable.
+Installed applications use the collector next to the viewer executable.
+
 ## Who owns the database
 
 - **Viewer database (`--db`)**: the viewer creates and migrates it. The
   collector writes only when the schema is exactly the version it was built
-  for and no viewer migration is pending. Otherwise it refuses with exit code
+  for, its Codex parser and cost projection versions match the viewer's
+  recorded versions, and no viewer migration is pending. Otherwise it refuses with exit code
   3 and says what to do, usually "open the viewer once". It never creates or
   migrates a viewer database.
 - **Standalone database (`--standalone`)**: for a machine without the viewer.
   The collector creates the database from the same schema files, records
   itself as the owner (`app_metadata.database_owner = 'collector'`), and
   migrates only databases it created.
+
+The viewer records `writer_codex_parser_version` and
+`writer_usage_cost_projection_version` in `app_metadata` during successful
+startup. A collector checks both at open and again under each batch's write
+lock. Missing metadata also refuses writes: install matching viewer/collector
+binaries and open the viewer once. Parser or cost algorithm releases must update
+both implementations together and run `collector_ingestion_compat_test.dart`;
+SQL migration checksums alone do not detect an algorithm-only version change.
 
 Writers coordinate through SQLite: WAL journaling, short `BEGIN IMMEDIATE`
 transactions, and a 30 second busy timeout. The viewer, several collectors,

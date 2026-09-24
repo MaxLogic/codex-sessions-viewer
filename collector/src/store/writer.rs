@@ -11,9 +11,11 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::codex::parser::{AuthorType, PARSER_VERSION, SourceType, Usage};
 use crate::contract::{
-    ProjectHint, SessionRef, SessionSnapshot, SourceStatus, ThreadName, UsageRecord, parse_time,
+    ProjectHint, ProjectHints, Record, SessionRef, SessionSnapshot, SourceStatus, ThreadName,
+    UsageRecord, parse_time,
 };
 use crate::dart::{DartDateTime, compare_utf16, to_lower, trim};
+use crate::hub_client;
 use crate::path_mapping::{canonical_scan_path, normalize_identity_path, normalize_windows_path};
 
 use super::projects::{
@@ -178,6 +180,11 @@ pub fn apply_session_batch(
                     .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
             );
             upsert_session(conn, id, snapshot, &now, &resolver)?;
+            hub_client::enqueue(
+                conn,
+                Record::SessionSnapshot(Box::new(snapshot.clone())),
+                &now,
+            )?;
         }
         Ok(())
     })();
@@ -1628,6 +1635,9 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
             }
         }
         conn.execute_batch("delete from temp_scan_statuses")?;
+        for status in statuses {
+            hub_client::enqueue(conn, Record::SourceStatus(status.clone()), &now)?;
+        }
         Ok(())
     })();
     finish(conn, result)
@@ -1641,6 +1651,7 @@ pub fn apply_thread_names(conn: &Connection, names: &[ThreadName]) -> StoreResul
     begin_write(conn)?;
     let result = (|| -> StoreResult<usize> {
         let mut changed: HashSet<String> = HashSet::new();
+        let now = DartDateTime::now().to_iso8601();
         for entry in names {
             let thread_name = trim(&entry.thread_name);
             if thread_name.is_empty() {
@@ -1664,6 +1675,7 @@ pub fn apply_thread_names(conn: &Connection, names: &[ThreadName]) -> StoreResul
                     .execute(params![thread_name, rowid])?;
                 changed.insert(id);
             }
+            hub_client::enqueue(conn, Record::ThreadName(entry.clone()), &now)?;
         }
         Ok(changed.len())
     })();
@@ -1733,6 +1745,15 @@ pub fn apply_project_hints(
             .execute(params![project_id, now, id])?;
             refresh_session_project(conn, id)?;
         }
+        hub_client::enqueue(
+            conn,
+            Record::ProjectHints(ProjectHints {
+                harness: harness.to_owned(),
+                sessions: sessions.to_vec(),
+                hints: hints.to_vec(),
+            }),
+            &now,
+        )?;
         Ok(rows.len())
     })();
     finish(conn, result)

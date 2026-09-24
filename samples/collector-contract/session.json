@@ -1,0 +1,8 @@
+{
+  "session_id": "example-001",
+  "messages": [
+    {"role": "user", "text": "Find the local session"},
+    {"role": "assistant", "text": "The local session is searchable."}
+  ],
+  "extra": {"future_source_field": "retained as source evidence"}
+}

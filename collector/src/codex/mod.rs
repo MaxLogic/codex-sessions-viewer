@@ -5,7 +5,9 @@ pub mod scanner;
 pub mod session_index;
 pub mod wsl;
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::contract::{
     ProjectHint, ProjectHints, SessionRef, SessionSnapshot, SourceStatus, ThreadName,
@@ -22,6 +24,20 @@ use scanner::{ParsedRef, ScanCounts, ScanOptions, ScanRoot};
 pub const FLUSH_SESSIONS: usize = 64;
 pub const FLUSH_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+pub struct CollectionBatching {
+    pub sessions: usize,
+    pub source_bytes: u64,
+}
+impl Default for CollectionBatching {
+    fn default() -> Self {
+        Self {
+            sessions: FLUSH_SESSIONS,
+            source_bytes: FLUSH_SOURCE_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CollectReport {
     pub counts: ScanCounts,
@@ -37,36 +53,119 @@ pub fn collect(
     options: &ScanOptions,
     resolve_wsl_projects: bool,
 ) -> StoreResult<CollectReport> {
-    writer::clean_session_metadata_placeholders(&store.conn)?;
+    collect_controlled(
+        store,
+        options,
+        resolve_wsl_projects,
+        &Arc::new(AtomicBool::new(false)),
+        |_, _| {},
+    )
+}
+
+pub fn collect_controlled(
+    store: &Store,
+    options: &ScanOptions,
+    resolve_wsl_projects: bool,
+    cancel: &Arc<AtomicBool>,
+    progress: impl FnMut(&ScanCounts, usize),
+) -> StoreResult<CollectReport> {
+    collect_coordinated(
+        store,
+        options,
+        resolve_wsl_projects,
+        cancel,
+        progress,
+        |_| Ok(()),
+        CollectionBatching::default(),
+    )
+}
+
+/// A GUI may grant each write batch through its own maintenance scheduler.
+/// `gate(true)` acquires a lease; `gate(false)` releases it even on failure.
+pub fn collect_coordinated(
+    store: &Store,
+    options: &ScanOptions,
+    resolve_wsl_projects: bool,
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(&ScanCounts, usize),
+    mut gate: impl FnMut(bool) -> StoreResult<()>,
+    batching: CollectionBatching,
+) -> StoreResult<CollectReport> {
+    gated(&mut gate, || {
+        writer::clean_session_metadata_placeholders(&store.conn)
+    })?;
     let cached = writer::cached_sources(&store.conn, "codex")?;
     let mut pending: Vec<SessionSnapshot> = Vec::new();
     let mut pending_bytes = 0u64;
     let mut applied = ApplySummary::default();
-    let outcome = scanner::scan(options, &cached, |snapshot| {
-        pending_bytes += snapshot.source.size;
-        pending.push(snapshot);
-        if pending.len() >= FLUSH_SESSIONS || pending_bytes >= FLUSH_SOURCE_BYTES {
-            applied.sessions +=
-                writer::apply_session_batch(&store.conn, std::mem::take(&mut pending))?;
-            pending_bytes = 0;
-        }
-        Ok::<(), crate::store::StoreError>(())
-    })?;
+    let committed = Cell::new(0);
+    let flushes = Cell::new(0u64);
+    let mut outcome = scanner::scan_controlled(
+        options,
+        &cached,
+        |snapshot| {
+            pending_bytes += snapshot.source.size;
+            pending.push(snapshot);
+            if pending.len() >= batching.sessions.max(1)
+                || pending_bytes >= batching.source_bytes.max(1)
+            {
+                applied.sessions += gated(&mut gate, || {
+                    writer::apply_session_batch(&store.conn, std::mem::take(&mut pending))
+                })?;
+                committed.set(applied.sessions);
+                flushes.set(flushes.get() + 1);
+                pending_bytes = 0;
+            }
+            Ok::<(), crate::store::StoreError>(())
+        },
+        cancel,
+        |counts| {
+            let mut counts = counts.clone();
+            counts.persistence_flushes = flushes.get();
+            progress(&counts, committed.get());
+        },
+    )?;
     if !pending.is_empty() {
-        applied.sessions += writer::apply_session_batch(&store.conn, pending)?;
+        applied.sessions += gated(&mut gate, || {
+            writer::apply_session_batch(&store.conn, pending)
+        })?;
+        flushes.set(flushes.get() + 1);
     }
+    outcome.counts.persistence_flushes = flushes.get();
     let hints = refined_project_hints(&outcome.parsed, resolve_wsl_projects);
-    applied.project_updates +=
-        writer::apply_project_hints(&store.conn, &hints.harness, &hints.sessions, &hints.hints)?;
-    writer::apply_source_statuses(&store.conn, &outcome.statuses)?;
+    applied.project_updates += gated(&mut gate, || {
+        writer::apply_project_hints(&store.conn, &hints.harness, &hints.sessions, &hints.hints)
+    })?;
+    gated(&mut gate, || {
+        writer::apply_source_statuses(&store.conn, &outcome.statuses)
+    })?;
     applied.statuses = outcome.statuses.len();
     let names: Vec<ThreadName> = thread_name_records(&options.thread_names);
-    applied.thread_names_changed = writer::apply_thread_names(&store.conn, &names)?;
+    applied.thread_names_changed = gated(&mut gate, || {
+        writer::apply_thread_names(&store.conn, &names)
+    })?;
+    outcome.counts.cancelled |= cancel.load(std::sync::atomic::Ordering::Relaxed);
     Ok(CollectReport {
         counts: outcome.counts,
         applied,
         errors: outcome.errors,
     })
+}
+
+fn gated<T>(
+    gate: &mut impl FnMut(bool) -> StoreResult<()>,
+    write: impl FnOnce() -> StoreResult<T>,
+) -> StoreResult<T> {
+    gate(true)?;
+    let result = write();
+    let released = gate(false);
+    match result {
+        Ok(value) => {
+            released?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn thread_name_records(

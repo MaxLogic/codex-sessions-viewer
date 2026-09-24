@@ -1,0 +1,36 @@
+{
+  "observation": {
+    "origin": "machine-a",
+    "authority": "local",
+    "observed_at_utc": "2026-09-01T00:00:00.000000Z",
+    "provider": "provider",
+    "model_id": "provider/model",
+    "model": {
+      "id": "provider/model",
+      "pricing": {
+        "prompt": "0.1",
+        "completion": "0.2",
+        "input_cache_read": "0.01",
+        "input_cache_write": "0.0000000833333333333333",
+        "internal_reasoning": "0.3",
+        "overrides": [
+          {
+            "min_prompt_tokens": 9,
+            "prompt": "0.4"
+          }
+        ]
+      }
+    }
+  },
+  "usage": {
+    "occurred_at_utc": "2026-09-01T01:00:00.000000Z",
+    "input_tokens": 10,
+    "cached_input_tokens": 2,
+    "cache_write_input_tokens": 3,
+    "output_tokens": 4,
+    "reasoning_output_tokens": 1
+  },
+  "expected_cost": "2.9200002499999999999999",
+  "expected_fingerprint": "f448230d55bf69f6f060cf947213ac223b8ba6d69b0043c9e34b9b94c18eaf5d",
+  "expected_revision": "adb9702ef02b328ae842655ac60c609390035dc195a98902cbb6df607ed5212a"
+}

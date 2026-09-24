@@ -54,6 +54,8 @@ FILTERS:
 COMMON:
   --db FILE        database (default: %APPDATA%\\CodexSessionViewer\\codex_sessions_viewer.sqlite)
   --format json|text   json (default) or readable text
+  --hub URL        optional personal hub (HTTPS or loopback)
+  --hub-machine ID  machine on the hub; owner token from CODEX_SESSIONS_HUB_OWNER_TOKEN
 ";
 
 #[derive(Debug)]
@@ -108,6 +110,8 @@ type QueryResult<T> = Result<T, QueryError>;
 #[derive(Default)]
 struct Options {
     db: Option<PathBuf>,
+    hub_url: Option<String>,
+    hub_machine: Option<String>,
     text: bool,
     query: Option<String>,
     project: Option<String>,
@@ -157,6 +161,8 @@ fn parse_options(args: &[String]) -> QueryResult<Options> {
         };
         match arg.as_str() {
             "--db" => options.db = Some(PathBuf::from(value("--db")?)),
+            "--hub" => options.hub_url = Some(value("--hub")?),
+            "--hub-machine" => options.hub_machine = Some(value("--hub-machine")?),
             "--format" => {
                 let format = value("--format")?;
                 options.text = match format.as_str() {
@@ -224,6 +230,10 @@ pub fn run(args: &[String], out: &mut impl Write, err: &mut impl Write) -> i32 {
         return 0;
     }
     let result = parse_options(&args[1..]).and_then(|options| {
+        if options.hub_url.is_some() {
+            let payload = remote_execute(args, &options)?;
+            return Ok((payload, options.text));
+        }
         let database = match &options.db {
             Some(path) => path.clone(),
             None => default_viewer_database().ok_or_else(|| {
@@ -267,6 +277,78 @@ pub fn run(args: &[String], out: &mut impl Write, err: &mut impl Write) -> i32 {
             error.exit_code()
         }
     }
+}
+
+fn remote_execute(args: &[String], options: &Options) -> QueryResult<Value> {
+    if options.db.is_some() {
+        return Err(QueryError::Usage(
+            "--hub and --db cannot be combined".to_owned(),
+        ));
+    }
+    let machine = options
+        .hub_machine
+        .as_deref()
+        .ok_or_else(|| QueryError::Usage("--hub-machine is required with --hub".to_owned()))?;
+    let url = options.hub_url.as_deref().unwrap().trim_end_matches('/');
+    if !url.starts_with("https://")
+        && !url.starts_with("http://127.0.0.1:")
+        && !url.starts_with("http://localhost:")
+        && !url.starts_with("http://[::1]:")
+    {
+        return Err(QueryError::Usage(
+            "hub URL must use HTTPS, except a loopback listener".to_owned(),
+        ));
+    }
+    let token = std::env::var("CODEX_SESSIONS_HUB_OWNER_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            QueryError::Usage(
+                "CODEX_SESSIONS_HUB_OWNER_TOKEN is required for hub queries".to_owned(),
+            )
+        })?;
+    let mut forwarded = vec![args[0].clone()];
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        let special = ["--hub", "--hub-machine", "--format"];
+        if special.iter().any(|name| arg == name) {
+            index += 2;
+            continue;
+        }
+        if special
+            .iter()
+            .any(|name| arg.starts_with(&format!("{name}=")))
+        {
+            index += 1;
+            continue;
+        }
+        forwarded.push(arg.clone());
+        index += 1;
+    }
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    let mut response = agent
+        .post(format!("{url}/v1/query"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send_json(json!({
+            "protocol": crate::hub_server::HUB_PROTOCOL_VERSION,
+            "machine": machine,
+            "args": forwarded,
+        }))
+        .map_err(|error| QueryError::Failed(format!("hub query failed: {error}")))?;
+    let payload: Value = response
+        .body_mut()
+        .read_json()
+        .map_err(|_| QueryError::Failed("hub returned invalid JSON".to_owned()))?;
+    if payload["contract"] != QUERY_CONTRACT || payload["version"] != QUERY_CONTRACT_VERSION {
+        return Err(QueryError::Refused(
+            "hub query contract version differs from this collector".to_owned(),
+        ));
+    }
+    Ok(payload)
 }
 
 /// Open without write access. `query_only` also blocks writes through this

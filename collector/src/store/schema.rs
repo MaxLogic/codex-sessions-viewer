@@ -9,9 +9,11 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::writer::USAGE_COST_PROJECTION_VERSION;
+use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 20;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 23;
 
 pub struct Migration {
     pub version: i64,
@@ -72,6 +74,9 @@ pub const MIGRATIONS: &[Migration] = &[
     ),
     migration!(19, "migration", "019_session_history_views.sql"),
     migration!(20, "migration", "020_harness_scoped_session_identity.sql"),
+    migration!(21, "migration", "021_session_change_journal.sql"),
+    migration!(22, "migration", "022_collector_upload_outbox.sql"),
+    migration!(23, "migration", "023_price_history_sync.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +188,40 @@ pub fn metadata(conn: &Connection, key: &str) -> StoreResult<Option<String>> {
         .optional()?)
 }
 
+/// The owner records the writer algorithms independently of schema checksums:
+/// parser and cost changes need not change the SQL schema.
+pub const PARSER_VERSION_KEY: &str = "writer_codex_parser_version";
+pub const COST_VERSION_KEY: &str = "writer_usage_cost_projection_version";
+
+fn check_writer_versions(conn: &Connection) -> StoreResult<()> {
+    let parser = metadata(conn, PARSER_VERSION_KEY)?;
+    let cost = metadata(conn, COST_VERSION_KEY)?;
+    if parser.as_deref() != Some(PARSER_VERSION.to_string().as_str())
+        || cost.as_deref() != Some(USAGE_COST_PROJECTION_VERSION.to_string().as_str())
+    {
+        return Err(StoreError::Refused(format!(
+            "Writer version mismatch: database/viewer parser={}, cost projection={}; collector parser={}, cost projection={}. Install the viewer and collector from the same release, then open the viewer once to record its versions. Standalone databases must use their matching collector release.",
+            parser.as_deref().unwrap_or("missing"),
+            cost.as_deref().unwrap_or("missing"),
+            PARSER_VERSION,
+            USAGE_COST_PROJECTION_VERSION,
+        )));
+    }
+    Ok(())
+}
+
+fn record_writer_versions(conn: &Connection) -> StoreResult<()> {
+    let now = DartDateTime::now().to_iso8601();
+    for (key, version) in [
+        (PARSER_VERSION_KEY, PARSER_VERSION),
+        (COST_VERSION_KEY, USAGE_COST_PROJECTION_VERSION),
+    ] {
+        conn.execute("insert into app_metadata(key,value,updated_at_utc) values (?,?,?) on conflict(key) do update set value=excluded.value, updated_at_utc=excluded.updated_at_utc",
+            params![key,version.to_string(),now])?;
+    }
+    Ok(())
+}
+
 /// `database_owner`; databases older than schema 18 belong to the viewer.
 pub fn database_owner(conn: &Connection) -> StoreResult<String> {
     Ok(metadata(conn, "database_owner")?.unwrap_or_else(|| OWNER_VIEWER.to_owned()))
@@ -282,7 +321,8 @@ pub fn check_writable(conn: &Connection, mode: OwnerMode, path: &str) -> StoreRe
             "{path} is at schema version {version}; this collector writes schema {SUPPORTED_SCHEMA_VERSION}. Open the viewer once to upgrade the database."
         )));
     }
-    ensure_no_pending_viewer_migration(conn)
+    ensure_no_pending_viewer_migration(conn)?;
+    check_writer_versions(conn)
 }
 
 const SCHEMA_VERSION_TABLE: &str = "create table if not exists schema_version (
@@ -307,6 +347,18 @@ pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
             "{path} belongs to the viewer. A standalone collector only writes a database it created; drop --standalone to collect into the viewer's database."
         )));
     }
+    // Only the standalone owner may adopt a legacy database without the pair.
+    // Never overwrite a recorded mismatch or a partially damaged pair.
+    conn.execute_batch("begin immediate")?;
+    let agreement = (|| -> StoreResult<()> {
+        if metadata(conn, PARSER_VERSION_KEY)?.is_none()
+            && metadata(conn, COST_VERSION_KEY)?.is_none()
+        {
+            record_writer_versions(conn)?;
+        }
+        check_writer_versions(conn)
+    })();
+    finish(conn, agreement)?;
     for migration in MIGRATIONS {
         let applied: bool = conn
             .query_row(
@@ -347,6 +399,7 @@ fn create_standalone(conn: &Connection, path: &str, migrations: &[Migration]) ->
         }
         let now = DartDateTime::now().to_iso8601();
         activate_empty_usage_generation(conn, &now)?;
+        record_writer_versions(conn)?;
         conn.execute(
             "insert into app_metadata (key, value, updated_at_utc) values ('database_owner', ?, ?)
              on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc",
@@ -386,7 +439,11 @@ fn activate_empty_usage_generation(conn: &Connection, now: &str) -> StoreResult<
             now,
             now,
             now,
-            r#"{"context_parity":{"event_count":0},"cost_projection_version":1}"#
+            serde_json::json!({
+                "context_parity": {"event_count": 0},
+                "cost_projection_version": USAGE_COST_PROJECTION_VERSION,
+            })
+            .to_string()
         ],
     )?;
     let generation = conn.last_insert_rowid();
@@ -455,7 +512,8 @@ pub fn begin_write(conn: &Connection) -> StoreResult<()> {
                 "The database moved to schema version {version} while collecting; this collector writes schema {SUPPORTED_SCHEMA_VERSION}. Use a collector from the same release as the viewer."
             )));
         }
-        ensure_no_pending_viewer_migration(conn)
+        ensure_no_pending_viewer_migration(conn)?;
+        check_writer_versions(conn)
     })();
     if let Err(error) = check {
         let _ = conn.execute_batch("rollback");

@@ -689,7 +689,7 @@ fn queries_never_change_the_database() {
     }
     assert_eq!(database_fingerprint(&fixture.db), before);
     let status = ok(&fixture.db, &["status"]);
-    assert_eq!(status["schema_version"], 20);
+    assert_eq!(status["schema_version"], 23);
     let harnesses: Vec<(String, i64)> = status["harnesses"]
         .as_array()
         .unwrap()

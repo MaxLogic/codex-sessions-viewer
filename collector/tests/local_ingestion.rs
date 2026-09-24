@@ -206,6 +206,78 @@ fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
+#[test]
+fn writer_versions_refuse_mismatched_or_missing_viewer_metadata_without_writes() {
+    for key in [
+        "writer_codex_parser_version",
+        "writer_usage_cost_projection_version",
+    ] {
+        for recorded in [Some("999"), None] {
+            let temp = TempDir::new("writer-version-refusal");
+            let db = viewer_database(&temp);
+            let conn = open(&db);
+            conn.execute("delete from app_metadata where key = ?", [key])
+                .unwrap();
+            if let Some(value) = recorded {
+                conn.execute(
+                    "insert into app_metadata(key,value,updated_at_utc) values (?,?,'now')",
+                    [key, value],
+                )
+                .unwrap();
+            }
+            let before = support::content_snapshot(&db);
+            let input = temp.path().join("record.jsonl");
+            std::fs::write(
+                &input,
+                serde_json::to_string(&Envelope::new(Record::SessionSnapshot(Box::new(
+                    support::sample_snapshot("must-not-write"),
+                ))))
+                .unwrap(),
+            )
+            .unwrap();
+            let output = collector()
+                .args(["apply", "--db"])
+                .arg(&db)
+                .arg("--input")
+                .arg(&input)
+                .output()
+                .unwrap();
+            let error = refused(&output);
+            assert!(
+                error.contains("parser") && error.contains("projection"),
+                "{error}"
+            );
+            assert!(
+                error.contains("collector") && error.contains("viewer"),
+                "{error}"
+            );
+            assert!(error.contains(recorded.unwrap_or("missing")), "{error}");
+            support::assert_same(&before, &support::content_snapshot(&db));
+            assert_eq!(count(&conn, "select count(*) from scan_runs"), 0);
+            assert_eq!(count(&conn, "select count(*) from sessions"), 0);
+        }
+    }
+}
+
+#[test]
+fn writer_versions_are_rechecked_under_the_write_lock_between_batches() {
+    use codex_sessions_collector::store::{OwnerMode, Store, StoreError};
+    let temp = TempDir::new("writer-version-mid-scan");
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    let conn = open(&db);
+    conn.execute("insert into app_metadata(key,value,updated_at_utc) values ('writer_codex_parser_version','999','now') on conflict(key) do update set value=excluded.value", []).unwrap();
+    let result = store.apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+        support::sample_snapshot("later"),
+    )))]);
+    assert!(matches!(result, Err(StoreError::Refused(_))), "{result:?}");
+    assert!(
+        store.conn.is_autocommit(),
+        "failed version guard must roll back"
+    );
+    assert_eq!(count(&conn, "select count(*) from sessions"), 0);
+}
+
 fn open(path: &Path) -> Connection {
     let conn = Connection::open(path).unwrap();
     conn.busy_timeout(std::time::Duration::from_secs(30))
@@ -670,7 +742,7 @@ fn refuses_databases_it_does_not_own_or_cannot_write_safely() {
     let newer = viewer_database(&temp);
     open(&newer)
         .execute(
-            "insert into schema_version (version, filename, checksum, applied_at_utc, success) values (21, '019_future.sql', 'x', 'now', 1)",
+            "insert into schema_version (version, filename, checksum, applied_at_utc, success) values (24, '024_future.sql', 'x', 'now', 1)",
             [],
         )
         .unwrap();
@@ -774,7 +846,7 @@ fn a_standalone_collector_creates_and_then_reuses_its_own_database() {
             &conn,
             "select max(version) from schema_version where success = 1"
         ),
-        20
+        23
     );
     assert_eq!(
         count(
@@ -1032,7 +1104,7 @@ fn the_cli_reports_usage_errors_with_exit_code_two() {
     assert_eq!(output.status.code(), Some(2));
     let output = collector().arg("version").output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("schema 20"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("schema 23"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1144,7 @@ fn a_viewer_migration_started_mid_collection_stops_further_writes() {
     conn.execute_batch(
         "delete from app_metadata where key = 'usage_migration_bootstrap';
          insert into schema_version (version, filename, checksum, applied_at_utc, success)
-         values (21, '019_future.sql', 'x', 'now', 1);",
+         values (24, '024_future.sql', 'x', 'now', 1);",
     )
     .unwrap();
     let result = store.apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
