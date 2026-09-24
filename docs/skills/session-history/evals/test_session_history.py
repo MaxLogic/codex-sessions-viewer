@@ -1,6 +1,6 @@
-"""Retained native-Windows CLI regressions, using only owned temporary databases."""
+"""Retained native-Windows regressions for the session-history launcher, using
+only owned temporary databases built by the collector."""
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import sqlite3
@@ -9,95 +9,112 @@ import sys
 import tempfile
 import unittest
 
-SKILL = Path(__file__).resolve().parents[1]
-ROOT = SKILL.parents[2]
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import fixture  # noqa: E402
+
+SKILL = HERE.parent
 SCRIPT = SKILL / 'scripts' / 'session_history.py'
-
-
-def fixture(path):
-    db = sqlite3.connect(path)
-    db.executescript((ROOT / 'sql/init/001_initial_schema.sql').read_text())
-    db.executescript((ROOT / 'sql/migration/012_external_content_search.sql').read_text())
-    db.execute("INSERT INTO projects(id,name,created_at_utc,updated_at_utc) VALUES(1,'Atlas','2026-09-01','2026-09-01')")
-    for sid, directory in [('s-a', 'F:/projects/Atlas'), ('s-b', 'F:/projects/Atlas-old')]:
-        db.execute("""INSERT INTO sessions(id,session_id,source_type,source_file_path,display_path,platform_path,
-            working_directory_platform,project_id,title,last_parsed_utc,created_at_utc,updated_at_utc)
-            VALUES(?,?,'windows','fixture.jsonl','fixture.jsonl','fixture.jsonl',?,1,'Queue investigation',
-            '2026-09-10T08:00:00Z','2026-09-01','2026-09-10')""", (sid, sid, directory))
-    messages = [
-        ('s-a', 0, 'user', '2026-09-09T08:00:00Z', 'Investigate shutdown queue race.'),
-        ('s-a', 1, 'assistant', '2026-09-09T08:01:00Z', 'Proposed closing the queue under one lock. Not implemented yet.'),
-        ('s-a', 2, 'tool', '2026-09-09T08:02:00Z', 'shutdown queue test failed'),
-        ('s-a', 3, 'assistant', '2026-09-09T10:03:00+02:00', 'shutdown queue: claimed fixed, no commit or test evidence. ' + 'x' * 9000),
-        ('s-a', 4, 'user', None, 'shutdown queue with no timestamp'),
-        ('s-b', 0, 'assistant', '2026-09-09T08:04:00Z', 'shutdown queue unrelated sibling project'),
-    ]
-    for sid, index, role, at, content in messages:
-        db.execute("""INSERT INTO messages(session_id,message_index,author_type,created_at_utc,
-          content_plain,created_at_db_utc,updated_at_db_utc) VALUES(?,?,?,?,?,'2026-09-10','2026-09-10')""",
-          (sid, index, role, at, content))
-    db.execute("INSERT INTO message_search(message_search) VALUES('rebuild')")
-    db.commit()
-    db.close()
+EXE = fixture.collector_exe()
 
 
 class HistoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='session-history-test-')
         self.addCleanup(self.temp.cleanup)
-        self.db = Path(self.temp.name) / 'history space.sqlite'
-        fixture(self.db)
+        self.db = fixture.build(Path(self.temp.name) / 'history space.sqlite', EXE)
 
     def invoke(self, *args, expected=0):
-        result = subprocess.run([sys.executable, str(SCRIPT), '--db', str(self.db), *args],
-                                capture_output=True, text=True, encoding='utf-8')
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), '--exe', str(EXE), '--db', str(self.db), *args],
+            capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, expected, result.stderr)
-        return json.loads(result.stdout if expected == 0 else result.stderr)
+        text = result.stdout if expected == 0 else result.stderr.splitlines()[0]
+        return json.loads(text)
+
+    def reference(self, session, index=None):
+        status = self.invoke('status')
+        machine = status['machine_id']
+        harness = 'claude' if session.startswith('c-') else 'codex'
+        base = f'history://{machine}/{harness}/{session}'
+        return base if index is None else f'{base}#{index}'
 
     def test_scope_and_readonly(self):
         before = hashlib.sha256(self.db.read_bytes()).hexdigest()
         result = self.invoke('search', '--query', 'shutdown queue', '--path', 'f:\\projects\\Atlas')
-        self.assertEqual({r['session_id'] for r in result['results']}, {'s-a'})
+        sessions = {r['session_key'] for r in result['results']}
+        self.assertEqual(sessions, {'s-a', 'c-1'})
         self.assertNotIn('tool', {r['author_type'] for r in result['results']})
         self.assertEqual(before, hashlib.sha256(self.db.read_bytes()).hexdigest())
 
+    def test_harness_filter(self):
+        result = self.invoke('search', '--query', 'shutdown queue', '--harness', 'claude')
+        self.assertEqual([r['session_key'] for r in result['results']], ['c-1'])
+
     def test_tool_opt_in_and_date_offsets(self):
         result = self.invoke('search', '--query', 'shutdown queue', '--include-tools',
-                             '--since', '2026-09-09T08:02:00Z', '--until', '2026-09-09T08:04:00Z')
+                             '--since', '2026-09-09T08:02:00Z', '--until', '2026-09-09T10:04:00+02:00')
         self.assertEqual({r['message_index'] for r in result['results']}, {2, 3})
 
     def test_message_pagination_and_long_text(self):
-        result = self.invoke('messages', '--session', 's-a', '--limit', '2')
+        session = self.reference('s-a')
+        result = self.invoke('messages', '--session', session, '--limit', '2', '--include-tools')
         self.assertTrue(result['has_more'])
         self.assertEqual(result['next_after_index'], 1)
-        second = self.invoke('messages', '--session', 's-a', '--after-index', '1', '--limit', '2')
+        second = self.invoke('messages', '--session', session, '--after-index', '1', '--limit', '2')
         self.assertEqual([r['message_index'] for r in second['results']], [3, 4])
-        page = self.invoke('message', '--session', 's-a', '--index', '3', '--chars', '100')['results'][0]
+        page = self.invoke('message', '--ref', self.reference('s-a', 3), '--chars', '100')['result']
         self.assertEqual(page['next_text_offset'], 100)
-        self.assertEqual(page['reference'], 's-a#message-3')
-        self.assertEqual(page['last_parsed_utc'], '2026-09-10T08:00:00Z')
-        tail = self.invoke('message', '--session', 's-a', '--index', '3', '--text-offset', '9000')['results'][0]
+        self.assertEqual(page['reference'], self.reference('s-a', 3))
+        self.assertIsNotNone(page['last_parsed_utc'])
+        tail = self.invoke('message', '--ref', self.reference('s-a', 3), '--text-offset', '9000')['result']
         self.assertIsNone(tail['next_text_offset'])
 
     def test_search_pages_and_bounds(self):
-        first = self.invoke('search', '--query', 'shutdown', '--limit', '1')
-        second = self.invoke('search', '--query', 'shutdown', '--limit', '1', '--offset', '1')
-        self.assertNotEqual(first['results'][0]['reference'], second['results'][0]['reference'])
-        self.assertEqual(first['next_offset'], 1)
-        result = subprocess.run([sys.executable, str(SCRIPT), '--db', str(self.db), 'search', '--query', 'queue', '--limit', '999'], capture_output=True)
-        self.assertEqual(result.returncode, 2)
+        expected = [r['reference'] for r in self.invoke(
+            'search', '--query', 'shutdown', '--include-tools', '--limit', '50')['results']]
+        self.assertGreater(len(expected), 3)
+        paged, cursor = [], None
+        while True:
+            args = ['search', '--query', 'shutdown', '--include-tools', '--limit', '1']
+            if cursor:
+                args += ['--cursor', cursor]
+            page = self.invoke(*args)
+            paged += [r['reference'] for r in page['results']]
+            cursor = page['next_cursor']
+            if not cursor:
+                break
+        self.assertEqual(paged, expected)
+        self.invoke('search', '--query', 'queue', '--limit', '999', expected=2)
 
-    def test_missing_and_wrong_schema(self):
-        self.db.unlink()
-        self.assertIn('does not exist', self.invoke('status', expected=2)['error'])
-        self.assertFalse(self.db.exists())
-        db = sqlite3.connect(self.db)
+    def test_leading_options_in_either_form(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), '--exe', str(EXE), f'--db={self.db}', '--format', 'text',
+             'search', '--query', 'shutdown queue', '--limit', '1'],
+            capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('history://', result.stdout)
+
+    def test_missing_and_old_schema(self):
+        missing = Path(self.temp.name) / 'absent.sqlite'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), '--exe', str(EXE), '--db', str(missing), 'status'],
+            capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('No database', result.stderr)
+        self.assertFalse(missing.exists())
+        unrelated = Path(self.temp.name) / 'unrelated.sqlite'
+        db = sqlite3.connect(unrelated)
         try:
             db.execute('CREATE TABLE unrelated(id)')
             db.commit()
         finally:
             db.close()
-        self.assertIn('Unsupported schema', self.invoke('status', expected=2)['error'])
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), '--exe', str(EXE), '--db', str(unrelated), 'status'],
+            capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 3)
+        self.assertIn('history queries need schema', result.stderr)
 
     def test_bad_queries_and_empty_results(self):
         self.assertEqual(self.invoke('search', '--query', 'unfindable')['results'], [])
@@ -106,28 +123,63 @@ class HistoryTests(unittest.TestCase):
         self.invoke('search', '--query', 'queue', '--since', '2026-09-10', '--until', '2026-09-09', expected=2)
         self.assertEqual(self.invoke('search', '--query', 'queue', '--project', "Atlas' OR 1=1 --")['results'], [])
 
-    def test_projects_and_index_status(self):
-        self.assertEqual(self.invoke('projects')['results'][0]['name'], 'Atlas')
+    def test_projects_and_status(self):
+        names = [row['project'] for row in self.invoke('projects')['results']]
+        self.assertEqual(names, ['Atlas', 'Atlas-old'])
         status = self.invoke('status')
-        self.assertTrue(status['fts_available'])
-        self.assertEqual(status['backfill']['message_search.backfill.last_message_rowid'], '0')
+        self.assertEqual(status['schema_version'], 19)
+        self.assertEqual(status['database_owner'], 'collector')
+        self.assertEqual(sum(row['sessions'] for row in status['harnesses']), 3)
 
-    def test_native_readonly_wal_sees_committed_updates(self):
+    def test_reads_committed_wal_updates(self):
         db = sqlite3.connect(self.db)
         self.addCleanup(db.close)
-        db.execute('PRAGMA journal_mode=WAL')
-        db.execute("UPDATE projects SET name='Atlas renamed' WHERE id=1")
+        db.execute("UPDATE projects SET name='Atlas renamed' WHERE name='Atlas'")
         db.commit()
-        self.assertEqual(self.invoke('projects')['results'][0]['name'], 'Atlas renamed')
+        names = [row['project'] for row in self.invoke('projects')['results']]
+        self.assertIn('Atlas renamed', names)
 
-    def test_connection_rejects_writes(self):
-        spec = importlib.util.spec_from_file_location('history_helper', SCRIPT)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        db = module.connect(self.db)
-        self.addCleanup(db.close)
-        with self.assertRaises(sqlite3.OperationalError):
-            db.execute("DELETE FROM sessions")
+
+def wsl_available():
+    try:
+        return subprocess.run(['wsl.exe', '-e', 'python3', '--version'], capture_output=True,
+                              timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def to_wsl(path):
+    drive, rest = str(path)[0].lower(), str(path)[2:].replace('\\', '/')
+    return f'/mnt/{drive}{rest}'
+
+
+@unittest.skipUnless(wsl_available(), 'WSL with python3 is not available')
+class WslLauncherTests(unittest.TestCase):
+    """The launcher inside WSL runs the Windows executable through interop."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='session-history-wsl-')
+        self.addCleanup(self.temp.cleanup)
+        self.db = fixture.build(Path(self.temp.name) / 'wsl.sqlite', EXE)
+
+    def run_wsl(self, *args):
+        return subprocess.run(
+            ['wsl.exe', '-e', 'python3', to_wsl(SCRIPT), '--exe', to_wsl(EXE), *args],
+            capture_output=True, text=True, encoding='utf-8', timeout=120)
+
+    def test_wsl_paths_reach_the_windows_database(self):
+        result = self.run_wsl('--db', to_wsl(self.db), 'search', '--query', 'shutdown queue',
+                              '--path', '/mnt/f/projects/Atlas')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        keys = {row['session_key'] for row in json.loads(result.stdout)['results']}
+        self.assertEqual(keys, {'s-a', 'c-1'})
+
+    def test_default_database_comes_from_windows_appdata(self):
+        result = self.run_wsl('status')
+        # Whatever the local database holds, the launcher must have found
+        # the Windows default instead of failing on a missing APPDATA.
+        self.assertNotIn('APPDATA is not set', result.stderr)
+        self.assertIn('CodexSessionViewer', result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

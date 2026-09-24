@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 18;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 19;
 
 pub struct Migration {
     pub version: i64,
@@ -70,6 +70,7 @@ pub const MIGRATIONS: &[Migration] = &[
         "migration",
         "018_collector_identity_and_usage_inputs.sql"
     ),
+    migration!(19, "migration", "019_session_history_views.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

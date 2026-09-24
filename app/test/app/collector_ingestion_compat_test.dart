@@ -199,7 +199,7 @@ void main() {
     ).openAndMigrate(standalone);
     expect(startup.canStartNormalUi, isFalse);
     expect(startup.fatalError?.summary, contains('standalone collector'));
-    expect(await _schemaVersion(standalone), 18);
+    expect(await _schemaVersion(standalone), 19);
     expect(await standalone.readAsBytes(), hasLength(before.length));
   });
 

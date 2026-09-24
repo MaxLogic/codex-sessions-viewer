@@ -60,6 +60,24 @@ Unknown fields are ignored; an unknown contract, version, or kind is rejected
 before anything is written. Token buckets that a source did not report are
 `null`, never `0`.
 
+## Querying history
+
+`codex-sessions-collector query <command>` reads collected history without
+the viewer: `status`, `projects`, `sessions`, `search`, `session`,
+`messages`, `message`, and `export`. It opens the database read-only with
+`query_only`, bounds every limit, pages with opaque `next_cursor` values that
+never repeat or skip results, and returns the JSON contract
+`codex-sessions-viewer.query` version 1 (`--format text` for people).
+
+Results carry stable references such as
+`history://<machine>/<harness>/<session>#<message_index>`; pass one back with
+`--ref` or `--session`. Filters (`--project`, `--path`, `--since`, `--until`,
+`--harness`, `--machine`) keep their meaning across pages. For direct SQL,
+schema 19 publishes the read-only views `history_sessions`,
+`history_messages`, and `history_tool_calls`
+(`docs/skills/session-history/references/database.md`). The session-history
+agent skill uses these commands through `scripts/session_history.py`.
+
 ## Parity with the viewer
 
 The Codex parser and the database writer are ports of the viewer's Dart code

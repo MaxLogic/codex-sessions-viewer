@@ -33,7 +33,7 @@ Directory defaultSqlRoot() {
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 18,
+    this.supportedSchemaVersion = 19,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 

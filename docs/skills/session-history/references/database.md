@@ -1,40 +1,43 @@
-# Current database contract
+# Read-only views for direct SQL
 
-Verified against product schema migrations through 017. Inspect actual columns
-before writing custom SQL; the helper validates the required columns itself.
+Schema 19 publishes views that form a stable query contract; the tables
+behind them may change. Prefer the `session_history.py` commands; use these
+views only for an explicitly requested custom query.
 
-| Table | Relevant columns / relationship |
-| --- | --- |
-| sessions | `id` is the database session key; `session_id` is the original Codex ID. Includes title, project_id, project_name_snapshot, source_type (windows/wsl), working_directory_display/platform, source_file_path, scan_status, parse_status, last_parsed_utc. |
-| messages | `session_id` references sessions.id; `message_index` orders the parsed conversation; content_plain contains indexed text; author_type distinguishes user/assistant/tool; created_at_utc may be absent. Integer id is a cache row ID. |
-| projects | id and current name; prefer current name over sessions.project_name_snapshot. |
-| message_search | External-content FTS5 index, joined through message_search.rowid = messages.id. Coverage may be incomplete during backfill. |
-| app_metadata | message_search.backfill.* keys report progress; inspect them without advancing the backfill. |
+| View | One row per | Key columns |
+| --- | --- | --- |
+| `history_sessions` | collected session | `reference`, `machine_id`, `harness`, `session_key`, `session_id`, `project`, `working_directory`, `environment` (windows/wsl), `title`, `thread_name`, `started_at_utc`, `last_message_at_utc`, `activity_at_utc`, `last_parsed_utc`, `message_count`, token totals, `source_state` |
+| `history_messages` | parsed message | `reference` (`<session reference>#<message_index>`), `session_reference`, `message_index`, `author_type`, `created_at_utc` (may be null), `content_plain`, `content_truncated`, `message_rowid` |
+| `history_tool_calls` | tool call | `session_reference`, `tool_index`, `tool_name`, `status`, `input_preview`, `output_preview`, `error_message` |
 
-There are no published agent query views yet. Do not invent `session_history`,
-`machine_id`, or `harness` columns. Do not equate source_type with harness.
-Usage/cost reporting is outside this initial helper: branch-aware usage and
-historical pricing require the application's dedicated projections.
+References have the form `history://<machine_id>/<harness>/<session_key>`. The
+session key is the agent's own session ID, or a database row ID for a source
+without one. `harness` names the agent (codex, claude, ...); `environment` is
+where it ran. Do not equate the two.
 
-For an explicitly requested custom query, open the named database with a native
-Windows connection using `mode=ro`; set `PRAGMA query_only=ON` and a bounded busy
-timeout. Use parameters and LIMIT. Never use `immutable=1` on an active WAL
-database, run repair/FTS rebuild/PRAGMA optimize, change journal mode, or migrate
-as part of retrieval. An error from a mismatched schema is not permission to fix it.
+There is no usage view: token usage and costs come from the viewer's
+projections, and `session_history.py session` reports a session's own token
+counts. Full-text search uses `message_search` joined through
+`message_search.rowid = history_messages.message_rowid`.
 
-Example parameterized SQL (execute through Windows Python sqlite3):
+Open the database with a native Windows connection using `mode=ro`, set
+`PRAGMA query_only=ON` and a bounded busy timeout, and use parameters and
+LIMIT. Never use `immutable=1` on an active WAL database, run repair, FTS
+rebuild, `PRAGMA optimize`, change the journal mode, or migrate as part of
+retrieval. An error from a mismatched schema is not permission to fix it.
+
+Example parameterized SQL (execute through Windows Python `sqlite3`):
 
 ```sql
-SELECT s.id AS session_id, m.message_index, m.author_type,
-       m.created_at_utc, substr(m.content_plain, 1, 1200) AS excerpt
+SELECT m.reference, m.author_type, m.created_at_utc,
+       substr(m.content_plain, 1, 1200) AS excerpt
 FROM message_search
-JOIN messages m ON m.id = message_search.rowid
-JOIN sessions s ON s.id = m.session_id
-WHERE message_search MATCH ? AND s.id = ?
+JOIN history_messages m ON m.message_rowid = message_search.rowid
+WHERE message_search MATCH ? AND m.session_reference = ?
 ORDER BY m.message_index
 LIMIT ?;
 ```
 
-The helper reports `source_content_truncated` independently from its own excerpt
-limit. Paging text cannot recover material the parser did not retain. Do not read
-raw session sources automatically to conceal that limitation.
+`content_truncated` reports what the parser did not retain; paging text cannot
+recover it. Do not read raw session sources automatically to conceal that
+limitation.

@@ -27,6 +27,7 @@ USAGE:
   codex-sessions-collector codex ingest [OPTIONS] <FILE>  Ingest one Codex session file
   codex-sessions-collector codex parse  [OPTIONS] <FILE>  Print one file as contract records
   codex-sessions-collector apply  [OPTIONS] [--input <FILE>]  Apply contract records (stdin by default)
+  codex-sessions-collector query <COMMAND> [OPTIONS]      Read-only history queries (query --help)
   codex-sessions-collector version
 
 DATABASE OPTIONS:
@@ -149,6 +150,9 @@ pub fn run(args: &[String]) -> i32 {
             parse_options(&args[2..]).and_then(|o| codex_parse(&o, &mut stdout))
         }
         ["apply", ..] => parse_options(&args[1..]).and_then(|o| apply(&o, &mut stdout)),
+        ["query", ..] => {
+            return crate::query::run(&args[1..], &mut stdout, &mut stderr);
+        }
         ["version", ..] | ["--version", ..] => {
             let _ = writeln!(
                 stdout,

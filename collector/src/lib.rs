@@ -6,5 +6,6 @@ pub mod codex;
 pub mod contract;
 pub mod dart;
 pub mod path_mapping;
+pub mod query;
 pub mod settings;
 pub mod store;
