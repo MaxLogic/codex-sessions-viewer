@@ -27,7 +27,7 @@ void main() {
           isTrue,
           reason: result.fatalError?.details,
         );
-        expect(result.lastAppliedSchemaVersion, priorVersion == 15 ? 15 : 19);
+        expect(result.lastAppliedSchemaVersion, priorVersion == 15 ? 15 : 20);
         if (priorVersion == 16) {
           final db = openFileBackedDatabase(file);
           try {
@@ -37,7 +37,7 @@ void main() {
                     'select last_optimized_schema_version v from database_state',
                   )
                   .single['v'],
-              19,
+              20,
             );
           } finally {
             db.close();

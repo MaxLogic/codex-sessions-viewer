@@ -26,6 +26,13 @@ USAGE:
   codex-sessions-collector codex scan   [OPTIONS]         Scan the configured Codex homes
   codex-sessions-collector codex ingest [OPTIONS] <FILE>  Ingest one Codex session file
   codex-sessions-collector codex parse  [OPTIONS] <FILE>  Print one file as contract records
+  codex-sessions-collector codex notify [--previous-notify <JSON>] <PAYLOAD>
+                                                          Codex notify hook: queue the turn's session
+  codex-sessions-collector claude scan   [OPTIONS]        Scan Claude Code transcripts
+  codex-sessions-collector claude ingest [OPTIONS] <FILE> Ingest one transcript and its subagents
+  codex-sessions-collector claude parse  <FILE>           Print one transcript as contract records
+  codex-sessions-collector claude hook                    Claude Code hook (JSON on stdin): queue it
+  codex-sessions-collector drain  [OPTIONS]               Ingest queued hook work
   codex-sessions-collector apply  [OPTIONS] [--input <FILE>]  Apply contract records (stdin by default)
   codex-sessions-collector query <COMMAND> [OPTIONS]      Read-only history queries (query --help)
   codex-sessions-collector version
@@ -43,6 +50,17 @@ SCAN OPTIONS:
   --force               Reparse unchanged files
   --parser-workers <N>  Parallel parsers (default: CPU count - 1, at most 8)
   --json                Print a machine-readable summary
+
+CLAUDE OPTIONS:
+  --claude-root <DIR>     Claude projects folder (default: %USERPROFILE%\\.claude\\projects); repeatable
+  --claude-wsl-root <DIR> A WSL Claude projects folder as a \\\\wsl.localhost path; repeatable
+
+HOOK OPTIONS:
+  --previous-notify <JSON>  The notify command this one replaced, as a JSON array; it still runs
+  --no-drain                Queue the work but do not start a drain
+  --no-wait                 drain: handle what is due now instead of waiting for retries
+Hooks exit 0 even when they fail; problems go to errors.log in the queue folder
+(CODEX_SESSIONS_COLLECTOR_QUEUE, default %LOCALAPPDATA%\\CodexSessionViewer\\collector\\queue).
 ";
 
 struct Options {
@@ -58,6 +76,11 @@ struct Options {
     json: bool,
     input: Option<PathBuf>,
     positional: Vec<String>,
+    previous_notify: Option<String>,
+    no_drain: bool,
+    no_wait: bool,
+    claude_roots: Vec<String>,
+    claude_wsl_roots: Vec<String>,
 }
 
 enum CliError {
@@ -89,6 +112,11 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
         json: false,
         input: None,
         positional: Vec::new(),
+        previous_notify: None,
+        no_drain: false,
+        no_wait: false,
+        claude_roots: Vec::new(),
+        claude_wsl_roots: Vec::new(),
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -118,6 +146,11 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
                         })?;
                 options.parser_workers = Some(count);
             }
+            "--previous-notify" => options.previous_notify = Some(value("--previous-notify")?),
+            "--claude-root" => options.claude_roots.push(value("--claude-root")?),
+            "--claude-wsl-root" => options.claude_wsl_roots.push(value("--claude-wsl-root")?),
+            "--no-drain" => options.no_drain = true,
+            "--no-wait" => options.no_wait = true,
             "--no-wsl-projects" => options.wsl_projects = false,
             "--force" => options.force = true,
             "--json" => options.json = true,
@@ -149,6 +182,25 @@ pub fn run(args: &[String]) -> i32 {
         ["codex", "parse", ..] => {
             parse_options(&args[2..]).and_then(|o| codex_parse(&o, &mut stdout))
         }
+        ["codex", "notify", ..] => {
+            // Hooks never fail the harness; problems are logged.
+            codex_notify(&args[2..]);
+            Ok(())
+        }
+        ["claude", "hook", ..] => {
+            claude_hook(&args[2..]);
+            Ok(())
+        }
+        ["claude", "scan", ..] => {
+            parse_options(&args[2..]).and_then(|o| claude_scan(&o, &mut stdout))
+        }
+        ["claude", "ingest", ..] => {
+            parse_options(&args[2..]).and_then(|o| claude_ingest(&o, &mut stdout))
+        }
+        ["claude", "parse", ..] => {
+            parse_options(&args[2..]).and_then(|o| claude_parse(&o, &mut stdout))
+        }
+        ["drain", ..] => parse_options(&args[1..]).and_then(|o| drain(&o, &mut stdout)),
         ["apply", ..] => parse_options(&args[1..]).and_then(|o| apply(&o, &mut stdout)),
         ["query", ..] => {
             return crate::query::run(&args[1..], &mut stdout, &mut stderr);
@@ -454,4 +506,389 @@ fn print_report(
         text
     };
     writeln!(out, "{text}").map_err(|error| CliError::Failed(error.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code
+
+fn claude_roots(options: &Options) -> Vec<crate::claude::ClaudeRoot> {
+    let mut roots: Vec<crate::claude::ClaudeRoot> = options
+        .claude_roots
+        .iter()
+        .map(|path| crate::claude::ClaudeRoot {
+            path: path.clone(),
+            source_type: SourceType::Windows,
+        })
+        .collect();
+    if roots.is_empty()
+        && options.claude_wsl_roots.is_empty()
+        && let Some(root) = crate::claude::default_root()
+    {
+        roots.push(root);
+    }
+    roots.extend(
+        options
+            .claude_wsl_roots
+            .iter()
+            .map(|path| crate::claude::ClaudeRoot {
+                path: path.clone(),
+                source_type: SourceType::Wsl,
+            }),
+    );
+    roots
+}
+
+fn claude_parser_options(settings: &CollectorSettings) -> crate::claude::parser::ClaudeOptions {
+    crate::claude::parser::ClaudeOptions {
+        max_tool_output_preview_chars: settings.max_tool_output_preview_chars,
+        ..crate::claude::parser::ClaudeOptions::default()
+    }
+}
+
+fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    if !options.positional.is_empty() {
+        return Err(CliError::Usage(format!(
+            "unexpected argument {:?}",
+            options.positional[0]
+        )));
+    }
+    let settings = load_settings(options)?;
+    let store = open_store(options)?;
+    let report = crate::claude::collect(
+        &store,
+        &crate::claude::ClaudeScanOptions {
+            roots: claude_roots(options),
+            mapper: PathMapper {
+                wsl_unc_root: settings.wsl_linux_root_unc.clone(),
+            },
+            parser: claude_parser_options(&settings),
+            workers: options
+                .parser_workers
+                .unwrap_or_else(default_parser_workers),
+            force: options.force,
+        },
+    )?;
+    print_report(out, "claude scan", &store, &report, options.json)
+}
+
+fn claude_source_type(options: &Options, file: &str) -> SourceType {
+    let key = canonical_scan_path(file);
+    if options
+        .claude_wsl_roots
+        .iter()
+        .any(|root| is_path_under_root(&key, root))
+        || file.starts_with("\\\\wsl")
+    {
+        SourceType::Wsl
+    } else {
+        SourceType::Windows
+    }
+}
+
+fn claude_ingest(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let [file] = options.positional.as_slice() else {
+        return Err(CliError::Usage(
+            "claude ingest needs exactly one <FILE>".to_owned(),
+        ));
+    };
+    let settings = load_settings(options)?;
+    let store = open_store(options)?;
+    let report = crate::claude::collect_file(
+        &store,
+        std::path::Path::new(file),
+        claude_source_type(options, file),
+        &PathMapper {
+            wsl_unc_root: settings.wsl_linux_root_unc.clone(),
+        },
+        &claude_parser_options(&settings),
+    )?;
+    print_report(out, "claude ingest", &store, &report, options.json)?;
+    if report.counts.files_parsed == 0 {
+        return Err(CliError::Failed(format!("{file} was not ingested")));
+    }
+    Ok(())
+}
+
+fn claude_parse(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let [file] = options.positional.as_slice() else {
+        return Err(CliError::Usage(
+            "claude parse needs exactly one <FILE>".to_owned(),
+        ));
+    };
+    let settings = load_settings(options)?;
+    let transcript =
+        crate::claude::parser::parse_transcript(file, &claude_parser_options(&settings))
+            .map_err(|error| CliError::Failed(error.display_message()))?;
+    let snapshot = crate::claude::snapshot(
+        file,
+        claude_source_type(options, file),
+        &PathMapper {
+            wsl_unc_root: settings.wsl_linux_root_unc.clone(),
+        },
+        transcript,
+    );
+    let line = serde_json::to_string(&Envelope::new(Record::SessionSnapshot(Box::new(snapshot))))
+        .map_err(|error| CliError::Failed(error.to_string()))?;
+    writeln!(out, "{line}").map_err(|error| CliError::Failed(error.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Hooks and the queue
+
+/// Database, settings, and root options a hook passes on to its drain.
+fn drain_arguments(args: &[String]) -> Vec<String> {
+    const FORWARDED: [&str; 8] = [
+        "--db",
+        "--standalone",
+        "--settings",
+        "--windows-root",
+        "--wsl-root",
+        "--wsl-unc-root",
+        "--claude-root",
+        "--claude-wsl-root",
+    ];
+    let mut forwarded = vec!["drain".to_owned()];
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if FORWARDED.contains(&arg.as_str())
+            && let Some(value) = iter.next()
+        {
+            forwarded.push(arg.clone());
+            forwarded.push(value.clone());
+        } else if arg == "--no-wsl-projects" {
+            forwarded.push(arg.clone());
+        }
+    }
+    forwarded
+}
+
+fn start_drain(args: &[String]) {
+    let queue = crate::hooks::queue_dir();
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Err(error) = crate::hooks::spawn_detached(&exe, &drain_arguments(args)) {
+                crate::hooks::log_error(&queue, &format!("could not start drain: {error}"));
+            }
+        }
+        Err(error) => crate::hooks::log_error(&queue, &format!("could not start drain: {error}")),
+    }
+}
+
+/// Codex calls its `notify` program with the event JSON as the last argument.
+fn codex_notify(args: &[String]) {
+    let queue = crate::hooks::queue_dir();
+    let options = match parse_options(args) {
+        Ok(options) => options,
+        Err(CliError::Usage(message) | CliError::Failed(message) | CliError::Refused(message)) => {
+            crate::hooks::log_error(&queue, &format!("codex notify: {message}"));
+            return;
+        }
+    };
+    let payload = options.positional.last().cloned().unwrap_or_default();
+    if let Some(previous) = &options.previous_notify
+        && let Err(error) = crate::hooks::run_previous_notify(previous, &payload)
+    {
+        crate::hooks::log_error(&queue, &format!("codex notify: {error}"));
+    }
+    let item = crate::hooks::codex_work_item(&payload);
+    if let Err(error) = crate::hooks::enqueue(&queue, &item) {
+        crate::hooks::log_error(&queue, &format!("codex notify: could not queue: {error}"));
+        return;
+    }
+    if !options.no_drain {
+        start_drain(args);
+    }
+}
+
+/// Claude Code passes the hook event as JSON on stdin.
+fn claude_hook(args: &[String]) {
+    let queue = crate::hooks::queue_dir();
+    let input = crate::hooks::read_hook_input();
+    let item = crate::hooks::claude_work_item(&input);
+    if item.transcript_path.is_none() {
+        crate::hooks::log_error(&queue, "claude hook: the event named no transcript_path");
+        return;
+    }
+    if let Err(error) = crate::hooks::enqueue(&queue, &item) {
+        crate::hooks::log_error(&queue, &format!("claude hook: could not queue: {error}"));
+        return;
+    }
+    if !args.iter().any(|arg| arg == "--no-drain") {
+        start_drain(args);
+    }
+}
+
+#[derive(Default)]
+struct DrainCounts {
+    completed: usize,
+    retried: usize,
+}
+
+fn drain(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let queue = crate::hooks::queue_dir();
+    crate::hooks::reclaim_stale(&queue);
+    let settings = load_settings(options)?;
+    let mapper = PathMapper {
+        wsl_unc_root: settings.wsl_linux_root_unc.clone(),
+    };
+    let codex_homes: Vec<String> = [&settings.windows_codex_path, &settings.wsl_codex_unc_path]
+        .into_iter()
+        .filter(|home| !home.trim().is_empty())
+        .cloned()
+        .collect();
+    let mut store: Option<Store> = None;
+    let mut open_error: Option<CliError> = None;
+    let mut counts = DrainCounts::default();
+    // A drain started by a hook stays until the queued retries are done, so
+    // the last hook of a day is not left waiting for the next one; it is
+    // bounded by MAX_DRAIN_TIME and by each item's retry limit.
+    let deadline = std::time::Instant::now() + MAX_DRAIN_TIME;
+    loop {
+        let claims = crate::hooks::claim_due(&queue);
+        if claims.is_empty() {
+            if options.no_wait {
+                break;
+            }
+            match crate::hooks::next_retry_in(&queue) {
+                Some(wait) if std::time::Instant::now() + wait < deadline => {
+                    std::thread::sleep(wait.max(std::time::Duration::from_millis(50)));
+                    crate::hooks::reclaim_stale(&queue);
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        if store.is_none() {
+            match open_store(options) {
+                Ok(opened) => {
+                    store = Some(opened);
+                    open_error = None;
+                }
+                Err(error) => {
+                    let message = match &error {
+                        CliError::Usage(message)
+                        | CliError::Failed(message)
+                        | CliError::Refused(message) => message.clone(),
+                    };
+                    for claim in claims {
+                        crate::hooks::retry(&queue, claim, &message);
+                        counts.retried += 1;
+                    }
+                    open_error = Some(error);
+                    continue;
+                }
+            }
+        }
+        let store = store.as_ref().expect("opened above");
+        for claim in claims {
+            match drain_one(
+                store,
+                options,
+                &settings,
+                &mapper,
+                &codex_homes,
+                &claim.item,
+            ) {
+                Ok(()) => {
+                    crate::hooks::complete(&claim);
+                    counts.completed += 1;
+                }
+                Err(message) => {
+                    crate::hooks::retry(&queue, claim, &message);
+                    counts.retried += 1;
+                }
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "{}",
+        json!({"command": "drain", "completed": counts.completed, "retried": counts.retried})
+    );
+    match open_error {
+        Some(error) if counts.completed == 0 => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// The longest a drain keeps waiting for queued retries.
+const MAX_DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn drain_one(
+    store: &Store,
+    options: &Options,
+    settings: &CollectorSettings,
+    mapper: &PathMapper,
+    codex_homes: &[String],
+    item: &crate::hooks::WorkItem,
+) -> Result<(), String> {
+    match item.harness.as_str() {
+        "codex" => {
+            let thread = item
+                .session_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or("the notification named no thread")?;
+            let file = crate::hooks::find_codex_rollout(codex_homes, thread)
+                .ok_or_else(|| format!("no rollout for thread {thread} yet"))?;
+            let file = file.to_string_lossy().into_owned();
+            let root = root_for_file(settings, &file);
+            let mut scan = scan_options(options, settings, Vec::new());
+            scan.force = true;
+            let report = codex::collect_file(store, &scan, &root, options.wsl_projects)
+                .map_err(|error| error.to_string())?;
+            if report.counts.files_parsed == 0 {
+                return Err(report
+                    .errors
+                    .first()
+                    .map_or_else(|| "not parsed".to_owned(), |error| error.status.clone()));
+            }
+            Ok(())
+        }
+        "claude" => {
+            let reported = item
+                .transcript_path
+                .as_deref()
+                .ok_or("the hook named no transcript")?;
+            // Claude Code in WSL reports a Linux path.
+            let mapped = if reported.starts_with('/') {
+                mapper.linux_to_windows_access_path(reported).ok_or_else(|| {
+                    format!(
+                        "transcript {reported} is a WSL path; configure the WSL root (wsl_linux_root_unc or --wsl-unc-root)"
+                    )
+                })?
+            } else {
+                reported.to_owned()
+            };
+            let path = mapped.as_str();
+            if !std::path::Path::new(path).is_file() {
+                return Err(format!("transcript {path} does not exist yet"));
+            }
+            let report = crate::claude::collect_file(
+                store,
+                std::path::Path::new(path),
+                claude_source_type(options, path),
+                mapper,
+                &claude_parser_options(settings),
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(error) = report.errors.first() {
+                return Err(format!("{}: {}", error.status, error.path));
+            }
+            // A transcript still being written is stored and read again later.
+            let conn = &store.conn;
+            let pending: i64 = conn
+                .query_row(
+                    "select count(*) from sessions where harness = 'claude' and source_file_path = ? and scan_status = 'changed_pending_parse'",
+                    [path],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if pending > 0 {
+                return Err("the transcript was still being written".to_owned());
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown harness {other:?}")),
+    }
 }

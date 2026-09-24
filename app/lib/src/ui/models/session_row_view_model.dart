@@ -22,6 +22,7 @@ class SessionRowViewModel {
     required this.tags,
     required this.status,
     this.sessionId = '',
+    this.harness = 'codex',
     this.threadName = '',
     this.threadSource = '',
     this.parentThreadId = '',
@@ -75,6 +76,10 @@ class SessionRowViewModel {
   final List<String> tags;
   final String status;
   final String sessionId;
+
+  /// The agent harness that wrote the session (`codex`, `claude`). Session
+  /// IDs are unique only within a harness.
+  final String harness;
   final String threadName;
   final String threadSource;
   final String parentThreadId;
@@ -125,6 +130,13 @@ class SessionRowViewModel {
   }
 
   String get platformLabel => SessionLabelFormatter.platform(platform.name);
+
+  /// [id] (a session or parent thread ID) qualified by [harness], so equal
+  /// IDs from different harnesses never match; empty for an empty ID.
+  String harnessSessionKey(String id) {
+    final trimmed = id.trim();
+    return trimmed.isEmpty ? '' : '$harness:$trimmed';
+  }
 
   bool get isSubagentSession => threadSource.toLowerCase() == 'subagent';
 
@@ -231,6 +243,7 @@ class SessionRowViewModel {
     return SessionRowViewModel(
       id: id,
       sessionId: sessionId,
+      harness: harness,
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
@@ -287,6 +300,7 @@ class SessionRowViewModel {
     return SessionRowViewModel(
       id: id,
       sessionId: sessionId,
+      harness: harness,
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
@@ -349,6 +363,7 @@ class SessionRowViewModel {
     return SessionRowViewModel(
       id: id,
       sessionId: sessionId,
+      harness: harness,
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
@@ -408,6 +423,7 @@ class SessionRowViewModel {
     return SessionRowViewModel(
       id: id,
       sessionId: sessionId,
+      harness: harness,
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,

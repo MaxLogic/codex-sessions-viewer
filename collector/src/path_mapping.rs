@@ -62,6 +62,20 @@ impl PathMapper {
         }
     }
 
+    /// A Linux path reported by a WSL program, as a path Windows can open:
+    /// `/mnt/c/x` becomes `C:\x`, anything else goes under the WSL root.
+    /// `None` without a configured WSL root.
+    pub fn linux_to_windows_access_path(&self, linux_path: &str) -> Option<String> {
+        if let Some(alias) = mnt_to_windows_path(linux_path) {
+            return Some(alias);
+        }
+        let root = trim_trailing_slash(&self.wsl_unc_root.replace('/', "\\"));
+        if trim(&root).is_empty() || root == "\\" {
+            return None;
+        }
+        Some(format!("{root}{}", linux_path.replace('/', "\\")))
+    }
+
     fn unc_to_linux(&self, unc_path: &str) -> String {
         let normalized_root = trim_trailing_slash(&to_lower(&self.wsl_unc_root.replace('/', "\\")));
         let normalized_unc = unc_path.replace('/', "\\");
@@ -305,6 +319,29 @@ mod tests {
         PathMapper {
             wsl_unc_root: "\\\\wsl.localhost\\Ubuntu\\".to_owned(),
         }
+    }
+
+    #[test]
+    fn opens_linux_paths_reported_from_wsl() {
+        assert_eq!(
+            mapper()
+                .linux_to_windows_access_path("/home/dev/.claude/projects/p/s.jsonl")
+                .as_deref(),
+            Some(r"\\wsl.localhost\Ubuntu\home\dev\.claude\projects\p\s.jsonl")
+        );
+        assert_eq!(
+            mapper()
+                .linux_to_windows_access_path("/mnt/c/x/s.jsonl")
+                .as_deref(),
+            Some(r"C:\x\s.jsonl")
+        );
+        let unconfigured = PathMapper {
+            wsl_unc_root: String::new(),
+        };
+        assert_eq!(
+            unconfigured.linux_to_windows_access_path("/home/dev/s.jsonl"),
+            None
+        );
     }
 
     #[test]

@@ -670,7 +670,7 @@ fn refuses_databases_it_does_not_own_or_cannot_write_safely() {
     let newer = viewer_database(&temp);
     open(&newer)
         .execute(
-            "insert into schema_version (version, filename, checksum, applied_at_utc, success) values (20, '019_future.sql', 'x', 'now', 1)",
+            "insert into schema_version (version, filename, checksum, applied_at_utc, success) values (21, '019_future.sql', 'x', 'now', 1)",
             [],
         )
         .unwrap();
@@ -774,7 +774,7 @@ fn a_standalone_collector_creates_and_then_reuses_its_own_database() {
             &conn,
             "select max(version) from schema_version where success = 1"
         ),
-        19
+        20
     );
     assert_eq!(
         count(
@@ -1032,7 +1032,7 @@ fn the_cli_reports_usage_errors_with_exit_code_two() {
     assert_eq!(output.status.code(), Some(2));
     let output = collector().arg("version").output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("schema 19"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("schema 20"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1072,7 @@ fn a_viewer_migration_started_mid_collection_stops_further_writes() {
     conn.execute_batch(
         "delete from app_metadata where key = 'usage_migration_bootstrap';
          insert into schema_version (version, filename, checksum, applied_at_utc, success)
-         values (20, '019_future.sql', 'x', 'now', 1);",
+         values (21, '019_future.sql', 'x', 'now', 1);",
     )
     .unwrap();
     let result = store.apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(

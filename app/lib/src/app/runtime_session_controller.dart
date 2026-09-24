@@ -2300,6 +2300,7 @@ _IdentityMergeState? _captureIdentityMergeState(
     where id = ?
        or (
          id <> ?
+         ${_codexRowsOnly(db)}
          and (
            trim(coalesce(session_id, '')) = ?
            or (
@@ -3148,7 +3149,7 @@ Set<String> _reconcileAffectedLegacyUsage(
       '''
       select $legacyColumns, ($legacyPredicate) as needs_reconciliation
       from sessions
-      where (
+      where true ${_codexRowsOnly(db)} and (
           forked_from_id = ?
           or (
             (forked_from_id is null or forked_from_id = '')
@@ -3180,7 +3181,7 @@ Set<String> _reconcileAffectedLegacyUsage(
             '''
             select $legacyColumns
             from sessions
-            where session_id = ?
+            where session_id = ? ${_codexRowsOnly(db)}
             order by id
             ''',
             [parentLogicalId],
@@ -3604,6 +3605,7 @@ SessionRowViewModel _loadRow(
   return SessionRowViewModel(
     id: row['id'] as String,
     sessionId: row['session_id'] as String? ?? '',
+    harness: row['harness'] as String? ?? 'codex',
     threadName: row['thread_name'] as String? ?? '',
     threadSource: row['thread_source'] as String? ?? '',
     parentThreadId: row['parent_thread_id'] as String? ?? '',
@@ -3997,7 +3999,7 @@ Set<String> _applySessionIndexThreadNames(
         '''
         select rowid, id, thread_name
         from sessions
-        where session_id = ?
+        where session_id = ? ${_codexRowsOnly(db)}
         ''',
         [entry.id],
       );
@@ -4019,6 +4021,17 @@ Set<String> _applySessionIndexThreadNames(
     rethrow;
   }
   return changedIds;
+}
+
+/// `and harness = 'codex'` once schema 18 records the harness; session IDs
+/// are only unique per harness, and this writer owns Codex sessions.
+String _codexRowsOnly(Database db) {
+  final hasHarness = db
+      .select(
+        "select 1 from pragma_table_info('sessions') where name = 'harness'",
+      )
+      .isNotEmpty;
+  return hasHarness ? "and harness = 'codex'" : '';
 }
 
 void _cleanSessionMetadataPlaceholders(Database db) {

@@ -31,7 +31,7 @@ void main() {
           }
         }
       }
-      await File('${root.path}/migration/020_optimize_probe.sql').writeAsString(
+      await File('${root.path}/migration/021_optimize_probe.sql').writeAsString(
         '''
       create table optimize_probe (id integer primary key, value integer);
       create index idx_optimize_probe_value on optimize_probe(value);
@@ -40,7 +40,7 @@ void main() {
       select count(*) from optimize_probe where value = 42;
     ''',
       );
-      await File('${root.path}/migration/021_optimize_audit.sql').writeAsString(
+      await File('${root.path}/migration/022_optimize_audit.sql').writeAsString(
         '''
       create table optimize_steps as select
         (select last_optimized_schema_version from database_state) previous_version,
@@ -49,7 +49,7 @@ void main() {
       );
       final result = await DatabaseMigrator(
         sqlRoot: root,
-        supportedSchemaVersion: 21,
+        supportedSchemaVersion: 22,
       ).openAndMigrate(file);
       expect(
         result.canStartNormalUi,
@@ -59,7 +59,7 @@ void main() {
       final db = openFileBackedDatabase(file);
       addTearDown(db.close);
       final step = db.select('select * from optimize_steps').single;
-      expect(step['previous_version'], 20);
+      expect(step['previous_version'], 21);
       expect(step['previous_stats'], '1000 10');
       expect(
         db
@@ -75,7 +75,7 @@ void main() {
               'select last_optimized_schema_version v from database_state',
             )
             .single['v'],
-        21,
+        22,
       );
     },
   );
@@ -95,7 +95,7 @@ void main() {
                 'select last_optimized_schema_version v from database_state',
               )
               .single['v'],
-          19,
+          20,
         );
         db.execute('''
       update database_state set last_optimized_schema_version = 15;
@@ -144,7 +144,7 @@ void main() {
               'select last_optimized_schema_version v from database_state',
             )
             .single['v'],
-        19,
+        20,
       );
       expect(
         db

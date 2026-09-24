@@ -127,7 +127,7 @@ class HistoryTests(unittest.TestCase):
         names = [row['project'] for row in self.invoke('projects')['results']]
         self.assertEqual(names, ['Atlas', 'Atlas-old'])
         status = self.invoke('status')
-        self.assertEqual(status['schema_version'], 19)
+        self.assertEqual(status['schema_version'], 20)
         self.assertEqual(status['database_owner'], 'collector')
         self.assertEqual(sum(row['sessions'] for row in status['harnesses']), 3)
 

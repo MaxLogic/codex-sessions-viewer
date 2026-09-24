@@ -1066,7 +1066,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final parentByChildId = <String, SessionRowViewModel>{};
     final orphanSubagents = <SessionRowViewModel>[];
     for (final child in subagents) {
-      final parent = parentByKey[child.parentThreadId.trim()];
+      final parent =
+          parentByKey[child.harnessSessionKey(child.parentThreadId)] ??
+          parentByKey[child.parentThreadId.trim()];
       if (parent == null) {
         orphanSubagents.add(child);
         continue;
@@ -1084,7 +1086,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   Iterable<String> _sessionIdentityKeys(SessionRowViewModel row) sync* {
-    final sessionId = row.sessionId.trim();
+    final sessionId = row.harnessSessionKey(row.sessionId);
     if (sessionId.isNotEmpty) {
       yield sessionId;
     }
@@ -2756,7 +2758,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final result = <SessionRowViewModel>[];
     final indexBySessionId = <String, int>{};
     for (final row in rows) {
-      final sessionId = row.sessionId.trim();
+      final sessionId = row.harnessSessionKey(row.sessionId);
       if (sessionId.isEmpty) {
         result.add(row);
         continue;

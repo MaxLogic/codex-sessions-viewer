@@ -2140,7 +2140,7 @@ void main() {
     );
     generations.markReady(generation.id, validationReportJson: '{}');
     generations.activate(generation.id);
-    db.execute('drop index idx_sessions_session_id_unique');
+    db.execute('drop index idx_sessions_harness_session_id_unique');
     for (final row in [
       (
         id: 'session:merge-parent',

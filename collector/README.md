@@ -1,7 +1,7 @@
 # Codex sessions collector
 
-`codex-sessions-collector.exe` collects Codex session history into the Codex
-Sessions Viewer database without the viewer running. It ships next to
+`codex-sessions-collector.exe` collects Codex and Claude Code session history
+into the Codex Sessions Viewer database without the viewer running. It ships next to
 `codex_session_viewer.exe` and reads the same `settings.toml`.
 
 ## Commands
@@ -10,6 +10,12 @@ Sessions Viewer database without the viewer running. It ships next to
 codex-sessions-collector codex scan   [--db FILE | --standalone FILE] [--settings FILE] [--json]
 codex-sessions-collector codex ingest [--db FILE | --standalone FILE] <SESSION.jsonl>
 codex-sessions-collector codex parse  <SESSION.jsonl>            # print contract records, no database
+codex-sessions-collector codex notify [--previous-notify JSON] <PAYLOAD>
+codex-sessions-collector claude scan   [--claude-root DIR] [--db FILE | --standalone FILE] [--json]
+codex-sessions-collector claude ingest [--db FILE | --standalone FILE] <TRANSCRIPT.jsonl>
+codex-sessions-collector claude parse  <TRANSCRIPT.jsonl>
+codex-sessions-collector claude hook                              # hook input as JSON on stdin
+codex-sessions-collector drain  [--db FILE | --standalone FILE]
 codex-sessions-collector apply  [--db FILE | --standalone FILE] [--input FILE]   # stdin by default
 codex-sessions-collector version
 ```
@@ -45,6 +51,49 @@ instead of failing.
 
 The collector never calculates cost. It stores token usage and marks the
 affected days dirty; the viewer's pricing maintenance prices them.
+
+## Claude Code
+
+`claude scan` reads every transcript under `%USERPROFILE%\.claude\projects`
+(or each `--claude-root` / `--claude-wsl-root`). A transcript's subagents
+(`<session>/subagents/agent-<id>.jsonl`) become their own sessions,
+`<session>:agent-<id>`, linked to the parent. Records that share one
+`message.id` are one response and count its usage once. Input tokens include
+cache reads and cache writes, as the viewer expects; the cache-write split and
+server tool requests are kept as billable units. Record types and usage fields
+the parser does not model are listed in the session's source extras rather
+than dropped. A response without usage stays unknown.
+
+Session IDs are unique per harness: a Claude session and a Codex session may
+share an ID and remain separate sessions (row IDs `claude:session:<id>` and
+`session:<id>`).
+
+## Hooks
+
+Hooks keep the database current between scans without slowing the agent. A
+hook only writes a small work item to the queue folder and starts a detached
+`drain`; it never opens the database and always exits 0. `drain` claims queue
+items by renaming them, ingests the named session, and deletes each item
+after its commit. Failed items return with a growing delay; the drain waits
+for them (at most 5 minutes; `drain --no-wait` handles only what is due) and
+drops an item after 6 attempts. A claim left by a crashed drain is reclaimed
+10 minutes after it was claimed. Problems go to `errors.log` in the queue folder
+(`CODEX_SESSIONS_COLLECTOR_QUEUE`, default
+`%LOCALAPPDATA%\CodexSessionViewer\collector\queue`). A transcript caught
+mid-write is stored up to its last complete line and retried.
+
+- **Codex**: set `notify` in `~/.codex/config.toml` to
+  `['<path>\codex-sessions-collector.exe', 'codex', 'notify']` (single quotes
+  keep the backslashes literal). To keep an
+  existing notify program, pass it as JSON with `--previous-notify`; it runs
+  with the same payload.
+- **Claude Code**: add a `Stop` and a `SessionEnd` command hook running
+  `"<path>\codex-sessions-collector.exe" claude hook`.
+  Claude Code running in WSL reports Linux transcript paths; the drain opens
+  them through the configured WSL root (`--wsl-unc-root` or settings).
+
+Hooks are an accelerator: run `codex scan` and `claude scan` periodically to
+repair anything a hook missed.
 
 ## Records
 

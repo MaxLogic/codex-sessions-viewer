@@ -29,6 +29,7 @@
     select
       s.id,
       s.session_id,
+      s.harness,
       s.thread_name,
       s.thread_source,
       s.parent_thread_id,

@@ -291,8 +291,12 @@ fn upsert_session(
     if !candidate_should_replace(conn, id, snapshot)? {
         if let Some(merge) = identity_merge {
             apply_identity_merge(conn, id, &merge)?;
-            let affected =
-                reconcile_affected_legacy_usage(conn, id, session.session_id.as_deref())?;
+            let affected = reconcile_affected_legacy_usage(
+                conn,
+                &snapshot.harness,
+                id,
+                session.session_id.as_deref(),
+            )?;
             replace_daily_projections(conn, &affected)?;
         }
         return Ok(());
@@ -420,11 +424,17 @@ fn upsert_session(
     replace_messages(conn, id, snapshot, now)?;
     replace_tool_calls(conn, id, snapshot)?;
     replace_usage_events(conn, id, snapshot, now, resolver, source_type)?;
+    replace_source_extras(conn, id, snapshot, now)?;
     if let Some(merge) = identity_merge {
         apply_identity_merge(conn, id, &merge)?;
     }
     refresh_session_project(conn, id)?;
-    let affected = reconcile_affected_legacy_usage(conn, id, session.session_id.as_deref())?;
+    let affected = reconcile_affected_legacy_usage(
+        conn,
+        &snapshot.harness,
+        id,
+        session.session_id.as_deref(),
+    )?;
     replace_daily_projections(conn, &affected)
 }
 
@@ -605,6 +615,31 @@ fn replace_messages(
             now,
             now,
         ])?;
+    }
+    Ok(())
+}
+
+/// Unmodeled source fields, kept as evidence (see migration 020).
+fn replace_source_extras(
+    conn: &Connection,
+    id: &str,
+    snapshot: &SessionSnapshot,
+    now: &str,
+) -> StoreResult<()> {
+    match &snapshot.extra {
+        Some(extra) if !extra.is_null() => {
+            conn.prepare_cached(
+                "insert into session_source_extras (session_row_id, extra_json, updated_at_utc)
+                 values (?, ?, ?)
+                 on conflict(session_row_id) do update set
+                   extra_json = excluded.extra_json, updated_at_utc = excluded.updated_at_utc",
+            )?
+            .execute(params![id, extra.to_string(), now])?;
+        }
+        _ => {
+            conn.prepare_cached("delete from session_source_extras where session_row_id = ?")?
+                .execute([id])?;
+        }
     }
     Ok(())
 }
@@ -908,7 +943,7 @@ fn capture_identity_merge(
     let sql = format!(
         "select rowid as session_rowid, * from sessions
          where id = ?
-            or (id <> ? and (
+            or (id <> ? and harness = ? and (
               trim(coalesce(session_id, '')) = ?
               or (trim(coalesce(session_id, '')) = '' and source_type = ? and (
                 {} in ({placeholders})
@@ -929,6 +964,7 @@ fn capture_identity_merge(
     let mut values: Vec<rusqlite::types::Value> = vec![
         canonical_id.to_owned().into(),
         canonical_id.to_owned().into(),
+        snapshot.harness.clone().into(),
         stable.to_owned().into(),
         source.environment.clone().into(),
     ];
@@ -1189,6 +1225,7 @@ fn mark_unresolved(conn: &Connection, row_id: &str, status: &str) -> StoreResult
 /// projections must be rebuilt, in the order the Dart set yields them.
 fn reconcile_affected_legacy_usage(
     conn: &Connection,
+    harness: &str,
     replaced_row_id: &str,
     replaced_logical_id: Option<&str>,
 ) -> StoreResult<Vec<String>> {
@@ -1227,9 +1264,9 @@ fn reconcile_affected_legacy_usage(
         let mut statement = conn.prepare_cached(&format!(
             "select {LEGACY_COLUMNS}, ({LEGACY_PREDICATE}) as needs_reconciliation
              from sessions
-             where (forked_from_id = ? or ((forked_from_id is null or forked_from_id = '') and parent_thread_id = ?))"
+             where harness = ? and (forked_from_id = ? or ((forked_from_id is null or forked_from_id = '') and parent_thread_id = ?))"
         ))?;
-        let rows = statement.query_map(params![parent_id, parent_id], |row| {
+        let rows = statement.query_map(params![harness, parent_id, parent_id], |row| {
             let needs: i64 = row.get("needs_reconciliation")?;
             let session_id: Option<String> = row.get("session_id")?;
             Ok((needs == 1, session_id, LegacyUsageSession::from_row(row)?))
@@ -1254,10 +1291,10 @@ fn reconcile_affected_legacy_usage(
      -> StoreResult<Vec<(String, i64, String, bool)>> {
         if !cache.contains_key(parent) {
             let mut statement = conn.prepare_cached(&format!(
-                "select {LEGACY_COLUMNS} from sessions where session_id = ? order by id"
+                "select {LEGACY_COLUMNS} from sessions where session_id = ? and harness = ? order by id"
             ))?;
             let rows = statement
-                .query_map([parent], LegacyUsageSession::from_row)?
+                .query_map([parent, harness], LegacyUsageSession::from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             cache.insert(parent.to_owned(), rows);
         }
