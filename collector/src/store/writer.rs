@@ -259,10 +259,27 @@ fn candidate_should_replace(
         .optional()?;
     Ok(match existing {
         None => true,
+        // A new parse of the file the row came from always replaces it: a
+        // newer parser may drop trailing records, so the reparse can end
+        // earlier than the stored row. The evidence ranking only chooses
+        // between different copies of a session.
+        Some(existing) if same_source_file(&existing, snapshot) => true,
         Some(existing) => {
             compare_candidates(&Evidence::from_snapshot(snapshot), &existing) != Ordering::Less
         }
     })
+}
+
+fn same_source_file(existing: &Evidence, snapshot: &SessionSnapshot) -> bool {
+    let snapshot_type = source_type(snapshot);
+    if existing.source_type != snapshot_type {
+        return false;
+    }
+    if snapshot_type == SourceType::Wsl {
+        existing.source_path == snapshot.source.path
+    } else {
+        to_lower(&existing.source_path) == to_lower(&snapshot.source.path)
+    }
 }
 
 fn message_token_buckets(snapshot: &SessionSnapshot) -> (i64, i64, i64) {

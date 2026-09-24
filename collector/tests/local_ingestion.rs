@@ -2174,3 +2174,80 @@ fn scans_backfill_projects_and_clean_placeholders_the_viewer_no_longer_writes() 
         ]
     );
 }
+
+#[test]
+fn a_reparse_of_the_same_file_replaces_the_row_even_if_it_now_ends_earlier() {
+    // A newer parser can drop trailing records (for example bookkeeping
+    // events), so the reparse of the very same file ends earlier than the
+    // stored row. It must still replace the row; the evidence ranking only
+    // decides between different copies of a session.
+    let temp = TempDir::new("reparse-same-file");
+    let db = viewer_database(&temp);
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    assert!(support::scan(&db, &home, &[]).status.success());
+    let fresh = support::content_snapshot(&db);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "update sessions set parser_version = 1,
+           last_message_at_utc = '2099-01-01T00:00:00.000Z'
+         where harness = 'codex'",
+    )
+    .unwrap();
+    drop(conn);
+    let output = support::scan(&db, &home, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let conn = Connection::open(&db).unwrap();
+    let (version, last): (i64, String) = conn
+        .query_row(
+            "select parser_version, last_message_at_utc from sessions where harness = 'codex' and session_id = 'parity-rich-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        version,
+        codex_sessions_collector::codex::parser::PARSER_VERSION
+    );
+    assert_ne!(last, "2099-01-01T00:00:00.000Z");
+    // Rewritten messages get new row IDs; links must still point at the
+    // same message positions.
+    let linked = |conn: &Connection| -> Vec<(i64, Option<i64>)> {
+        conn.prepare(
+            "select t.tool_index, m.message_index from tool_calls t
+             left join messages m on m.id = t.message_id and m.session_id = t.session_id
+             order by t.session_id, t.tool_index",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    let rescanned = linked(&conn);
+    let without_links = |mut value: Value| {
+        if let Some(calls) = value.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for call in calls {
+                call.as_object_mut().unwrap().remove("message_id");
+            }
+        }
+        value
+    };
+    support::assert_same(
+        &without_links(fresh),
+        &without_links(support::content_snapshot(&db)),
+    );
+    let reference = TempDir::new("reparse-same-file-reference");
+    let reference_db = viewer_database(&reference);
+    let reference_home = support::codex_home(&reference, &["rich_session.jsonl"]);
+    assert!(
+        support::scan(&reference_db, &reference_home, &[])
+            .status
+            .success()
+    );
+    assert_eq!(rescanned, linked(&Connection::open(&reference_db).unwrap()));
+    assert!(rescanned.iter().any(|(_, index)| index.is_some()));
+}
