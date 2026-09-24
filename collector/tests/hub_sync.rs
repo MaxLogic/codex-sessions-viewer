@@ -376,19 +376,28 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
     {
         let reopened = Store::open(&db, OwnerMode::Standalone).unwrap();
         assert_eq!(hub_client::pending(&reopened.conn).unwrap(), 1);
-        // The server commits this record, but the client does not receive
-        // an acknowledgment. Retrying must accept the duplicate ack.
-        let queued: String = reopened
+        // The client persisted its in-flight batch and the server committed
+        // it, but the acknowledgment was lost. Retrying must accept the
+        // duplicate ack.
+        let (id, queued): (i64, String) = reopened
             .conn
             .query_row(
-                "select record_json from collector_upload_outbox order by id limit 1",
+                "select id, record_json from collector_upload_outbox order by id limit 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let batch_id = format!("machine-a:1:{id}:00112233aabbccdd");
+        reopened
+            .conn
+            .execute(
+                "update collector_hub_state set inflight_batch_id = ?, inflight_last_id = ? where id = 1",
+                rusqlite::params![batch_id, id],
             )
             .unwrap();
         let envelope: Value = serde_json::from_str(&queued).unwrap();
         assert_eq!(
-            upload(&hub, MACHINE_A_TOKEN, 1, "machine-a:1:1", vec![envelope]).unwrap()["duplicate"],
+            upload(&hub, MACHINE_A_TOKEN, 1, &batch_id, vec![envelope]).unwrap()["duplicate"],
             false
         );
     }
@@ -826,4 +835,316 @@ fn slow_or_oversized_requests_do_not_block_the_hub() {
     let mut response = String::new();
     let _ = anonymous.read_to_string(&mut response);
     assert!(response.starts_with("HTTP/1.1 401"), "{response:?}");
+}
+
+/// The ingest reply of a stand-in hub or proxy; `None` closes the connection
+/// without a response.
+type IngestReply = Box<dyn FnMut(&Value) -> Option<(u16, String)> + Send>;
+
+/// A stand-in for a hub behind a proxy: it answers the compatibility check
+/// like machine-a's hub and lets the test choose every ingest reply. It
+/// records each ingest body.
+struct FakeHub {
+    url: String,
+    bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+fn fake_hub(mut reply: IngestReply) -> FakeHub {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = bodies.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let path = request_line.split(' ').nth(1).unwrap_or("").to_owned();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0u8; length];
+            let _ = reader.read_exact(&mut body);
+            let (status, text) = if path == "/v1/verify" {
+                (
+                    200,
+                    json!({
+                        "protocol": codex_sessions_collector::hub_server::HUB_PROTOCOL_VERSION,
+                        "schema_version": codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION,
+                        "contract": codex_sessions_collector::contract::CONTRACT_NAME,
+                        "contract_version": codex_sessions_collector::contract::CONTRACT_VERSION,
+                        "machine_id": "machine-a",
+                        "high_water": 0
+                    })
+                    .to_string(),
+                )
+            } else {
+                let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                seen.lock().unwrap().push(value.clone());
+                match reply(&value) {
+                    Some(answer) => answer,
+                    None => continue,
+                }
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+    });
+    FakeHub { url, bodies }
+}
+
+fn acknowledge(body: &Value) -> (u16, String) {
+    (
+        200,
+        json!({"protocol": 1, "sequence": body["sequence"], "batch_id": body["batch_id"], "duplicate": false})
+            .to_string(),
+    )
+}
+
+fn queue_sessions(db: &std::path::Path, names: &[&str]) {
+    let store = Store::open(db, OwnerMode::Standalone).unwrap();
+    store
+        .apply(
+            names
+                .iter()
+                .map(|name| Envelope::new(Record::SessionSnapshot(Box::new(sample_snapshot(name)))))
+                .collect(),
+        )
+        .unwrap();
+}
+
+fn local_count(db: &std::path::Path, sql: &str) -> i64 {
+    Store::open(db, OwnerMode::Standalone)
+        .unwrap()
+        .conn
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn http_errors_without_a_hub_rejection_code_keep_records_queued() {
+    let replies = [
+        (400, "<html><body>400 Bad Request</body></html>".to_owned()),
+        (
+            413,
+            "<html><body>413 Request Entity Too Large</body></html>".to_owned(),
+        ),
+        (409, "{}".to_owned()),
+        (
+            400,
+            json!({"error":"cannot read request","code":"request"}).to_string(),
+        ),
+    ];
+    for (index, (status, text)) in replies.into_iter().enumerate() {
+        let temp = TempDir::new(&format!("hub_proxy_error_{index}"));
+        let fake = fake_hub(Box::new(move |_| Some((status, text.clone()))));
+        let db = paired_database(&temp, &fake.url);
+        queue_sessions(&db, &["proxied-a", "proxied-b"]);
+        let result = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN);
+        assert!(result.is_err(), "HTTP {status}: {result:?}");
+        assert_eq!(
+            (
+                local_count(&db, "select count(*) from collector_upload_outbox"),
+                local_count(&db, "select count(*) from collector_upload_dead_letters")
+            ),
+            (2, 0),
+            "HTTP {status}"
+        );
+    }
+}
+
+#[test]
+fn a_body_cut_off_by_the_client_is_a_transient_failure() {
+    use std::io::{Read, Write};
+    let temp = TempDir::new("hub_truncated_body");
+    let hub = start(&temp);
+    let address = hub.url.trim_start_matches("http://").to_owned();
+    let mut client = std::net::TcpStream::connect(&address).unwrap();
+    client
+        .write_all(
+            format!(
+                "POST /v1/ingest HTTP/1.1\r\nHost: hub\r\nAuthorization: Bearer {MACHINE_A_TOKEN}\r\nContent-Length: 1000\r\n\r\n{{\"protocol\""
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut response = String::new();
+    let _ = client.read_to_string(&mut response);
+    assert!(response.starts_with("HTTP/1.1 408"), "{response:?}");
+    assert!(!response.contains("record_rejected"), "{response:?}");
+}
+
+#[test]
+fn a_restored_local_database_cannot_acknowledge_a_batch_the_hub_never_stored() {
+    let temp = TempDir::new("hub_restored_batch_id");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let backup = temp.path().join("backup.sqlite");
+    Store::open(&db, OwnerMode::Standalone)
+        .unwrap()
+        .conn
+        .execute("vacuum into ?", [backup.to_str().unwrap()])
+        .unwrap();
+    queue_sessions(&db, &["before-restore"]);
+    let first = hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(first.sent, 1);
+    // Restoring the backup rewinds the queue: the next record reuses the
+    // first outbox row ID at the same sequence.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    std::fs::copy(&backup, &db).unwrap();
+    queue_sessions(&db, &["after-restore"]);
+    let second = hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN);
+    assert!(
+        second
+            .as_ref()
+            .is_err_and(|error| error.contains("hub resync")),
+        "{second:?}"
+    );
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_outbox"),
+        1
+    );
+    hub_client::resync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    let delivered =
+        hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(delivered.sent, 1);
+    assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 2);
+}
+
+#[test]
+fn repeated_transport_failures_shrink_the_inflight_batch_under_the_same_id() {
+    let temp = TempDir::new("hub_shrink_inflight");
+    let mut dropped = 0;
+    let fake = fake_hub(Box::new(move |body| {
+        if dropped < 2 {
+            dropped += 1;
+            return None;
+        }
+        Some(acknowledge(body))
+    }));
+    let db = paired_database(&temp, &fake.url);
+    let names: Vec<String> = (0..8).map(|index| format!("slow-{index}")).collect();
+    queue_sessions(&db, &names.iter().map(String::as_str).collect::<Vec<_>>());
+    for _ in 0..2 {
+        assert!(hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).is_err());
+    }
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.sent, report.pending), (8, 0));
+    let bodies = fake.bodies.lock().unwrap();
+    let sizes: Vec<usize> = bodies
+        .iter()
+        .map(|body| body["records"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(sizes, vec![8, 8, 4, 4], "{sizes:?}");
+    // A retry keeps the persisted batch ID, also when it is shrunk.
+    assert_eq!(bodies[0]["batch_id"], bodies[2]["batch_id"]);
+    assert_eq!(bodies[0]["sequence"], bodies[2]["sequence"]);
+    assert_ne!(bodies[2]["batch_id"], bodies[3]["batch_id"]);
+}
+
+#[test]
+fn batches_are_bounded_by_utf8_bytes_not_characters() {
+    let temp = TempDir::new("hub_utf8_budget");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    // Each name is 3 Mi characters but 9 MiB of UTF-8.
+    let name = "\u{20ac}".repeat(3 * 1024 * 1024);
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .apply(vec![
+                thread_name("wide-a", &name),
+                thread_name("wide-b", &name),
+            ])
+            .unwrap();
+    }
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.sent, report.batches), (2, 2));
+}
+
+#[test]
+fn busy_responses_do_not_stall_the_listener() {
+    use std::io::{Read, Write};
+    let temp = TempDir::new("hub_busy");
+    let hub = start(&temp);
+    let address = hub.url.trim_start_matches("http://").to_owned();
+    // Fill every connection slot with a client that never finishes its head.
+    let stalled: Vec<std::net::TcpStream> = (0..32)
+        .map(|_| {
+            let mut stream = std::net::TcpStream::connect(&address).unwrap();
+            stream.write_all(b"GET /v1/health HTTP/1.1\r\n").unwrap();
+            stream
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+    // Clients that stay silent after connecting must not hold the listener.
+    let started = Instant::now();
+    let mut busy: Vec<std::net::TcpStream> = (0..6)
+        .map(|_| std::net::TcpStream::connect(&address).unwrap())
+        .collect();
+    for stream in &mut busy {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut response = [0u8; 12];
+        stream.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"HTTP/1.1 503");
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(stalled);
+}
+
+#[test]
+fn malformed_header_syntax_is_rejected() {
+    use std::io::{Read, Write};
+    let temp = TempDir::new("hub_header_syntax");
+    let hub = start(&temp);
+    let address = hub.url.trim_start_matches("http://").to_owned();
+    for request in [
+        "GET /v1/health HTTP/1.1\r\nHost : hub\r\n\r\n",
+        "GET /v1/health HTTP/1.1\r\nHost: hub\r\n folded-continuation\r\n\r\n",
+        "GET /v1/health HTTP/1.1\r\nHost: hub\r\nContent-Length: +0\r\n\r\n",
+    ] {
+        let mut stream = std::net::TcpStream::connect(&address).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "{request:?}: {response:?}"
+        );
+    }
 }

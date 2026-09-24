@@ -75,9 +75,12 @@ Windows trusts it; use a publicly trusted certificate for the proxy.
 The server accepts up to 128 records and 64 MiB per upload and refuses a
 larger declared body before reading it. Credentials are checked before a body
 is read. Each connection is served on its own thread, up to 32 at once; further
-clients receive HTTP 503. Every socket read and write must progress within
-`request_timeout_seconds` (default 30), and a whole request must arrive within
-ten times that, so a stalled client cannot hold the hub:
+clients receive HTTP 503 at once. Every socket read and write must progress
+within `request_timeout_seconds` (default 30), the request head must arrive
+within that time, and a whole request within ten times it, so a stalled client
+cannot hold the hub. A request that ends early or times out is answered with
+HTTP 408, which the collector treats as transient. Raise the timeout when a
+slow uplink sends single records of many megabytes:
 
 ```json
 {
@@ -121,18 +124,36 @@ continue while the hub is unavailable; committed records stay in
 Only changes are queued. A scan that finds a source or thread name unchanged
 queues nothing, and a newer state of a source replaces its older unsent state,
 so an unreachable hub does not grow the outbox with repeated scans. The sync
-command sends batches of up to 128 records (and at most 48 MiB) until the
-outbox is empty. A batch and its sequence are recorded before sending, so a
-lost acknowledgment is retried with the same sequence and the hub answers
-with a duplicate acknowledgment.
+command sends batches of up to 128 records and 8 MiB of UTF-8 until the
+outbox is empty; a single larger record (up to 48 MiB) is sent alone. Each
+upload may take a minute plus one second per 64 KiB. A batch, its sequence and
+a batch ID with a random part are recorded before sending, so a lost
+acknowledgment is retried with the same sequence and batch ID and the hub
+answers with a duplicate acknowledgment. After two consecutive network
+failures (for example timeouts on a slow uplink) the in-flight batch is halved
+under the same batch ID; if the hub did store the full batch, it acknowledges
+the smaller one as a duplicate and the rest is sent again, which the hub
+applies idempotently.
 
-A record the hub permanently refuses (HTTP 400, 409 or 413, other than a
-sequence conflict), or one too large to send, moves to a dead-letter table and no longer blocks the records behind
-it. The hub's reason is kept with it; the credential is never echoed.
-Transient failures (network errors, HTTP 5xx, a rejected credential) leave the
-queue untouched for the next run. `hub status` reports the pending count, the
-last acknowledged sequence, and the number and most recent reasons of
-rejected records:
+### Dead letters
+
+Only the hub's own refusal moves records aside: a response whose JSON `code`
+is `record_rejected` (a record the hub cannot store, a batch above its size
+limit, or a record for another machine) or `invalid_batch` (an upload the hub
+cannot parse). The hub applies a batch atomically, so a refused batch of
+several records is resent one record at a time to find the refused record.
+That record, or one above 48 MiB that is never sent, moves to the
+`collector_upload_dead_letters` table with the HTTP status, the time and the
+hub's reason (the credential is never echoed), and no longer blocks the
+records behind it. Dead letters are not retried; `hub disable` discards them.
+
+Every other failure is transient and leaves the queue untouched for the next
+run: network errors and timeouts, HTTP 408 and 5xx, a rejected credential, a
+protocol mismatch, and any error without a hub code, such as the HTML error
+page of a reverse proxy (for example nginx's 413 when its body limit is below
+the hub's). A sequence conflict stops the sync and names `hub resync`.
+`hub status` reports the pending count, the last acknowledged sequence, and
+the number and most recent reasons of dead-lettered records:
 
 ```powershell
 codex-sessions-collector.exe hub status --db C:\Path\codex_sessions_viewer.sqlite
@@ -162,6 +183,17 @@ codex-sessions-collector.exe hub sync --db C:\Path\codex_sessions_viewer.sqlite
 
 The hub applies source revisions idempotently, so records it already has are
 harmless to send again.
+
+A hub restored from an older backup has lost every record accepted after that
+backup, and the collector has already removed those records from its outbox.
+`hub resync` alone cannot bring them back: after it, always collect again with
+`--force` on every paired machine (`codex scan --force` and `claude scan
+--force`) and then run `hub sync`, as above.
+
+A restored local database cannot make the hub skip new records: each batch ID
+contains a random part, so a batch the restored database builds for an already
+used sequence is refused as a sequence conflict instead of being acknowledged
+as a duplicate.
 
 The sync command checks the authenticated hub protocol, schema, contract, and
 machine identity before sending records. A mismatch fails closed. The hub

@@ -188,6 +188,53 @@ void main() {
     semantics.dispose();
   });
 
+  testWidgets(
+    'a legacy hub token is kept on save and reported without its value',
+    (tester) async {
+      const secret = 'synthetic-legacy-hub-secret';
+      final initial = AppSettings.fromTomlMap({
+        'pricing': {'hub_token': secret, 'hub_machine_id': 'laptop-1'},
+      });
+      AppSettings? saved;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SettingsScreen(
+            initialSettings: initial,
+            onSave: (settings) async => saved = settings,
+          ),
+        ),
+      );
+      final warning = find.textContaining('legacy pricing.hub_token');
+      expect(warning, findsOneWidget);
+      expect(
+        find.textContaining('CODEX_SESSIONS_HUB_MACHINE_TOKEN'),
+        findsWidgets,
+      );
+      expect(find.textContaining(secret), findsNothing);
+      final interval = find.bySemanticsLabel(
+        'Price refresh interval (hours) input',
+      );
+      await tester.ensureVisible(interval);
+      await tester.enterText(interval, '12');
+      await tester.pump();
+      await tester.tap(find.text('Save settings'));
+      await tester.pump();
+      final pricing = saved!.toTomlMap()['pricing'] as Map;
+      expect(pricing['refresh_interval_hours'], 12);
+      expect(pricing['hub_token'], secret);
+      expect(pricing['hub_machine_id'], 'laptop-1');
+    },
+  );
+
+  testWidgets('no legacy hub warning without a legacy token', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(initialSettings: AppSettings.defaults()),
+      ),
+    );
+    expect(find.textContaining('legacy pricing.hub_token'), findsNothing);
+  });
+
   testWidgets('changing the price interval away from 6 turns UTC slots off', (
     tester,
   ) async {

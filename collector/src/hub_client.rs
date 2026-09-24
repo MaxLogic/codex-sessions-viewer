@@ -15,10 +15,17 @@ use crate::store::schema::{
 use crate::store::writer::{session_row_id, source_status_id};
 use crate::store::{OwnerMode, Store};
 
-/// A batch body stays below the hub's 64 MiB request limit, with headroom for
-/// the envelope. A single record above this size can never be delivered and
+/// Byte budget of one batch. Small enough that a batch finishes on a slow
+/// uplink within its upload timeout. A larger single record is sent alone.
+pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// A single record stays below the hub's 64 MiB request limit, with headroom
+/// for the envelope. A record above this size can never be delivered and
 /// moves to the dead-letter table without contacting the hub.
-pub const MAX_BATCH_BYTES: usize = 48 * 1024 * 1024;
+pub const MAX_RECORD_BYTES: usize = 48 * 1024 * 1024;
+/// After this many consecutive transport failures (for example timeouts) of
+/// one in-flight batch, the batch is halved before the next attempt.
+const SHRINK_AFTER_FAILURES: i64 = 2;
+const INFLIGHT_FAILURES_KEY: &str = "hub.inflight_transport_failures";
 /// Upper bound of batches per `hub sync` run.
 const MAX_BATCHES_PER_RUN: usize = 1000;
 
@@ -243,6 +250,12 @@ pub fn dead_letters(conn: &Connection) -> StoreResult<(i64, Vec<Value>)> {
     Ok((count, recent))
 }
 
+/// Time allowed for one upload: a minute plus one second per 64 KiB, so a
+/// full batch still completes on an uplink of about 64 KiB/s.
+fn upload_timeout(bytes: usize) -> Duration {
+    Duration::from_secs(60 + (bytes / (64 * 1024)) as u64)
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(120)))
@@ -385,8 +398,9 @@ fn next_batch(
         let mut bytes = 0usize;
         let mut oversized = None;
         {
+            // Sizes in UTF-8 bytes: length() of text counts characters.
             let mut statement = conn.prepare(
-                "select id, length(record_json) from collector_upload_outbox order by id limit ?",
+                "select id, length(cast(record_json as blob)) from collector_upload_outbox order by id limit ?",
             )?;
             let limit = if isolate_until.is_some() {
                 1
@@ -400,13 +414,14 @@ fn next_batch(
                 .collect::<Result<Vec<_>, _>>()?;
             for (id, size) in candidates {
                 let size = usize::try_from(size).unwrap_or(usize::MAX);
-                if size > MAX_BATCH_BYTES {
+                if size > MAX_RECORD_BYTES {
                     if rows.is_empty() {
                         oversized = Some(id);
                     }
                     break;
                 }
-                if bytes + size > MAX_BATCH_BYTES {
+                // A record above the batch budget is sent alone.
+                if !rows.is_empty() && bytes + size > MAX_BATCH_BYTES {
                     break;
                 }
                 bytes += size;
@@ -431,10 +446,21 @@ fn next_batch(
         let Some(&(last_id, _)) = rows.last() else {
             return Ok(None);
         };
-        let batch_id = format!("{machine}:{sequence}:{last_id}");
+        // The random part keeps the ID unique when a restored database
+        // builds a different batch with the same sequence and outbox row:
+        // the hub then reports a sequence conflict instead of a duplicate
+        // that would drop records it never stored. Retries reuse the
+        // persisted ID.
+        let nonce: String =
+            conn.query_row("select lower(hex(randomblob(8)))", [], |row| row.get(0))?;
+        let batch_id = format!("{machine}:{sequence}:{last_id}:{nonce}");
         conn.execute(
             "update collector_hub_state set inflight_batch_id = ?, inflight_last_id = ? where id = 1",
             params![batch_id, last_id],
+        )?;
+        conn.execute(
+            "delete from app_metadata where key = ?",
+            [INFLIGHT_FAILURES_KEY],
         )?;
         return Ok(Some(Batch {
             batch_id,
@@ -442,6 +468,46 @@ fn next_batch(
             rows,
         }));
     }
+}
+
+/// Counts a transport failure of the persisted in-flight batch. After
+/// repeated failures a batch of several records is halved; it keeps its batch
+/// ID, so if the hub did store the full batch it acknowledges the smaller one
+/// as a duplicate and the rest is sent again (records apply idempotently).
+/// Returns whether the batch was shrunk.
+fn record_transport_failure(conn: &Connection, batch: &Batch) -> StoreResult<bool> {
+    begin_write(conn)?;
+    let result = (|| -> StoreResult<bool> {
+        let failures = conn
+            .query_row(
+                "select value from app_metadata where key = ?",
+                [INFLIGHT_FAILURES_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let shrink = failures >= SHRINK_AFTER_FAILURES && batch.rows.len() > 1;
+        if shrink {
+            let last_id = batch.rows[batch.rows.len() / 2 - 1].0;
+            conn.execute(
+                "update collector_hub_state set inflight_last_id = ? where id = 1 and inflight_batch_id = ?",
+                params![last_id, batch.batch_id],
+            )?;
+        }
+        conn.execute(
+            "insert into app_metadata(key, value, updated_at_utc) values (?, ?, ?)
+             on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc",
+            params![
+                INFLIGHT_FAILURES_KEY,
+                if shrink { 0 } else { failures }.to_string(),
+                now_utc()
+            ],
+        )?;
+        Ok(shrink)
+    })();
+    finish(conn, result)
 }
 
 fn batch_body(sequence: i64, batch: &Batch) -> String {
@@ -467,11 +533,12 @@ fn batch_body(sequence: i64, batch: &Batch) -> String {
     body
 }
 
-/// Records are sent in batches of up to the hub's record limit. A batch is
-/// persisted before sending; a lost acknowledgment retries the same sequence
-/// and batch ID and the hub answers with a duplicate acknowledgment. A record
-/// the hub permanently rejects moves to the dead-letter table; transient
-/// failures leave the queue untouched for the next run.
+/// Records are sent in batches of up to the hub's record limit and
+/// [`MAX_BATCH_BYTES`]. A batch is persisted before sending; a lost
+/// acknowledgment retries the same sequence and batch ID and the hub answers
+/// with a duplicate acknowledgment. A record the hub rejects with its
+/// `record_rejected` or `invalid_batch` code moves to the dead-letter table;
+/// every other failure leaves the queue untouched for the next run.
 pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<SyncReport, String> {
     let url = validate_url(url)?;
     if token.trim().is_empty() {
@@ -517,12 +584,30 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
             break;
         };
         let expected = sequence + 1;
-        let mut response = agent
+        let body = batch_body(expected, &batch);
+        let sent = agent
             .post(format!("{url}/v1/ingest"))
+            .config()
+            .timeout_global(Some(upload_timeout(body.len())))
+            .build()
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
-            .send(batch_body(expected, &batch))
-            .map_err(|error| format!("hub upload failed; local records remain queued: {error}"))?;
+            .send(body);
+        let mut response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                let shrunk =
+                    record_transport_failure(conn, &batch).map_err(|error| error.to_string())?;
+                let next = if shrunk {
+                    "; the next attempt sends a smaller batch"
+                } else {
+                    ""
+                };
+                return Err(format!(
+                    "hub upload failed; local records remain queued{next}: {error}"
+                ));
+            }
+        };
         let status = response.status().as_u16();
         if status != 200 {
             let (code, message) = error_text(&mut response, token);
@@ -531,8 +616,10 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
                     "hub rejected upload sequence {expected}: {message}. Local records remain queued; run `hub resync` to continue from the hub's last accepted sequence"
                 ));
             }
-            let permanent = code == "record_rejected"
-                || (matches!(status, 400 | 409 | 413) && code != "protocol");
+            // Only the hub's own rejection codes are permanent. Any other
+            // failure, including a proxy's error page without a hub code,
+            // leaves the queue untouched.
+            let permanent = matches!(code.as_str(), "record_rejected" | "invalid_batch");
             if !permanent {
                 return Err(format!(
                     "hub upload failed (HTTP {status}): {message}. Local records remain queued"
@@ -642,4 +729,22 @@ pub fn enable_for_collection(db_path: &Path, mode: OwnerMode, url: &str) -> Resu
         .ok_or_else(|| "local database has no machine identity".to_owned())?;
     enable(&store, &url, &machine)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_batch_fits_its_upload_timeout_on_a_slow_uplink() {
+        const SLOW_UPLINK_BYTES_PER_SECOND: u64 = 64 * 1024;
+        let transfer = MAX_BATCH_BYTES as u64 / SLOW_UPLINK_BYTES_PER_SECOND;
+        assert!(upload_timeout(MAX_BATCH_BYTES).as_secs() > transfer);
+        // A single large record gets proportionally more time.
+        assert!(
+            upload_timeout(MAX_RECORD_BYTES).as_secs()
+                > MAX_RECORD_BYTES as u64 / SLOW_UPLINK_BYTES_PER_SECOND
+        );
+        const _: () = assert!(MAX_BATCH_BYTES <= 8 * 1024 * 1024);
+    }
 }

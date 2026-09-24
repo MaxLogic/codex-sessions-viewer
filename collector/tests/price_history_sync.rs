@@ -264,6 +264,122 @@ fn unchanged_hub_catalog_confirms_instead_of_storing_new_observations() {
 }
 
 #[test]
+fn a_missed_hub_fetch_ends_confirmed_coverage_so_local_gap_evidence_remains() {
+    use chrono::{Duration as Span, SecondsFormat, Utc};
+    let temp = TempDir::new("price-gap");
+    let stale = json!({"id":"provider/stale","pricing":{"prompt":"0.1"}});
+    let steady = json!({"id":"provider/steady","pricing":{"prompt":"0.2"}});
+    let hub_observation = |model: &Value, at: chrono::DateTime<Utc>| {
+        let id = model["id"].as_str().unwrap();
+        Observation::parse(&json!({"origin":"hub","authority":"hub",
+            "observed_at_utc":at.to_rfc3339_opts(SecondsFormat::Micros,true),
+            "provider":"provider","model_id":id,
+            "model":{"id":id,"pricing":model["pricing"],"raw_pricing_json":serde_json::to_string(model).unwrap()}}))
+        .unwrap()
+    };
+    price_history::synchronize(
+        temp.path(),
+        "machine-a",
+        json!({"protocol":1,"observations":[]}),
+    )
+    .unwrap();
+    let conn = rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap();
+    let now = Utc::now();
+    let at = |hours: i64| (now - Span::hours(hours)).to_rfc3339_opts(SecondsFormat::Micros, true);
+    // Both models were observed 30 hours ago. `stale` was last confirmed
+    // 13 hours ago: the six-hourly fetches since then were missed. `steady`
+    // was confirmed in the previous slot.
+    for (model, confirmed, seq) in [(&stale, 13, 1), (&steady, 5, 2)] {
+        let observation = hub_observation(model, now - Span::hours(30));
+        conn.execute(
+            "insert into price_observations(fingerprint,origin,authority,observed_at_utc,provider,model_id,payload_json) values (?,'hub','hub',?,'provider',?,?)",
+            rusqlite::params![observation.fingerprint, at(30), model["id"].as_str().unwrap(), price_history::canonical_json(&observation.value)],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into price_observation_confirmations(fingerprint, confirmed_at_utc, change_seq) values (?, ?, ?)",
+            rusqlite::params![observation.fingerprint, at(confirmed), seq],
+        )
+        .unwrap();
+    }
+    let fetch = || {
+        let (url, server) = provider(vec![
+            json!({"data":[stale.clone(), steady.clone()],"total_count":2}),
+        ]);
+        let count = price_history::fetch_once(
+            temp.path(),
+            &FetchConfig {
+                enabled: true,
+                endpoint: url,
+                interval_hours: 6,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+        count
+    };
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(fetch(), 2);
+    // After the gap the unchanged `stale` price is new evidence; its earlier
+    // coverage ends at its last contiguous confirmation.
+    assert_eq!(
+        count("select count(*) from price_observations where model_id = 'provider/stale'"),
+        2
+    );
+    assert_eq!(
+        count("select count(*) from price_observations where model_id = 'provider/steady'"),
+        1
+    );
+    // The next contiguous fetch confirms the newest observations.
+    assert_eq!(fetch(), 2);
+    assert_eq!(count("select count(*) from price_observations"), 3);
+    assert_eq!(
+        count("select count(*) from price_observation_confirmations"),
+        3
+    );
+    // Local evidence from the missed fetches remains a winner; the same
+    // evidence inside `steady`'s contiguous coverage is superseded.
+    let mut observations: Vec<Observation> = conn
+        .prepare("select payload_json from price_observations")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|text| Observation::parse(&serde_json::from_str(&text.unwrap()).unwrap()).unwrap())
+        .collect();
+    for model in ["provider/stale", "provider/steady"] {
+        observations.push(
+            Observation::parse(&json!({"origin":"machine-a","authority":"local",
+                "observed_at_utc":at(8),"provider":"provider","model_id":model,
+                "model":{"id":model,"pricing":{"prompt":"9"}}}))
+            .unwrap(),
+        );
+    }
+    let confirmations: Vec<(String, chrono::DateTime<Utc>)> = conn
+        .prepare("select fingerprint, confirmed_at_utc from price_observation_confirmations")
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .map(|row| {
+            let (fingerprint, at) = row.unwrap();
+            (
+                fingerprint,
+                chrono::DateTime::parse_from_rfc3339(&at)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+        })
+        .collect();
+    let history = History::new(observations).with_confirmations(confirmations);
+    let local_winners: Vec<&str> = history
+        .winners()
+        .iter()
+        .filter(|o| o.value["authority"] == "local")
+        .map(|o| o.value["model_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(local_winners, vec!["provider/stale"]);
+}
+
+#[test]
 fn full_conditional_rules_and_exact_decimal_dart_fixture_survive_http_roundtrip() {
     let fixture: Value =
         serde_json::from_str(include_str!("../../samples/pricing/hub-parity.json")).unwrap();

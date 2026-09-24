@@ -177,7 +177,21 @@ class AppSettings {
     required this.logging,
     this.maintenance = const MaintenanceSettings(),
     this.hub = const HubSettings(),
+    this.legacyPricingHubKeys = const {},
   });
+
+  /// Former `pricing.hub_*` keys that are no longer read. Credentials are not
+  /// rewritten or dropped without an explicit request, so the values found
+  /// in the file are written back unchanged. Never shown or logged.
+  static const legacyPricingHubKeyNames = ['hub_token', 'hub_machine_id'];
+  final Map<String, Object?> legacyPricingHubKeys;
+
+  /// Whether the file still holds a former `pricing.hub_token`. Price sync
+  /// reads `CODEX_SESSIONS_HUB_MACHINE_TOKEN` instead.
+  bool get hasLegacyHubToken {
+    final token = legacyPricingHubKeys['hub_token'];
+    return token is String && token.isNotEmpty;
+  }
 
   final GeneralAppSettings app;
   final PathSettings paths;
@@ -312,7 +326,12 @@ class AppSettings {
 
   factory AppSettings.fromTomlMap(Map<String, dynamic> map) {
     final defaults = AppSettings.defaults();
+    final pricingTable = _table(map, 'pricing');
     return defaults.copyWith(
+      legacyPricingHubKeys: Map.unmodifiable({
+        for (final key in legacyPricingHubKeyNames)
+          if (pricingTable.containsKey(key)) key: pricingTable[key],
+      }),
       app: GeneralAppSettings.fromMap(_table(map, 'app'), defaults.app),
       paths: PathSettings.fromMap(_table(map, 'paths'), defaults.paths),
       wsl: WslSettings.fromMap(_table(map, 'wsl'), defaults.wsl),
@@ -359,6 +378,7 @@ class AppSettings {
     LoggingSettings? logging,
     MaintenanceSettings? maintenance,
     HubSettings? hub,
+    Map<String, Object?>? legacyPricingHubKeys,
   }) => AppSettings(
     app: app ?? this.app,
     paths: paths ?? this.paths,
@@ -372,6 +392,7 @@ class AppSettings {
     logging: logging ?? this.logging,
     maintenance: maintenance ?? this.maintenance,
     hub: hub ?? this.hub,
+    legacyPricingHubKeys: legacyPricingHubKeys ?? this.legacyPricingHubKeys,
   );
 
   Map<String, Object?> toTomlMap() => {
@@ -383,7 +404,7 @@ class AppSettings {
     'terminal': terminal.toTomlMap(),
     'tool_output': toolOutput.toTomlMap(),
     'voice_over': voiceOver.toTomlMap(),
-    'pricing': pricing.toTomlMap(),
+    'pricing': {...pricing.toTomlMap(), ...legacyPricingHubKeys},
     'logging': logging.toTomlMap(),
     'maintenance': maintenance.toTomlMap(),
     'hub': hub.toTomlMap(),
@@ -434,7 +455,8 @@ class HubSettings {
   final String machine;
 
   /// [legacyPricing] adopts the former `pricing.hub_url` when `[hub] url` is
-  /// empty. The former `pricing.hub_token` is not read or written back.
+  /// empty. The former `pricing.hub_token` is not read; it is written back
+  /// unchanged (see [AppSettings.legacyPricingHubKeys]).
   factory HubSettings.fromMap(
     Map<String, dynamic> map, [
     Map<String, dynamic> legacyPricing = const {},
@@ -1262,8 +1284,9 @@ class PricingSettings {
 
   /// Hub price sync uses the shared `[hub] url` and this database's machine
   /// identity. The machine credential comes only from the
-  /// `CODEX_SESSIONS_HUB_MACHINE_TOKEN` environment variable; legacy
-  /// `pricing.hub_*` keys are migrated by [AppSettings.fromTomlMap] or ignored.
+  /// `CODEX_SESSIONS_HUB_MACHINE_TOKEN` environment variable. The legacy
+  /// `pricing.hub_url` is migrated by [AppSettings.fromTomlMap]; a legacy
+  /// `pricing.hub_token` and `hub_machine_id` are not read but kept unchanged.
   factory PricingSettings.fromMap(
     Map<String, dynamic> map,
     PricingSettings defaults,

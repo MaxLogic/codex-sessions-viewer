@@ -631,6 +631,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           'openrouter_price_refresh',
                           'OpenRouter price refresh status',
                         ),
+                        // The value itself is never shown.
+                        if (_settings.hasLegacyHubToken)
+                          const Text(
+                            'Warning: settings.toml contains a legacy pricing.hub_token. '
+                            'Hub price sync no longer reads it; it reads the machine '
+                            'token from the CODEX_SESSIONS_HUB_MACHINE_TOKEN environment '
+                            'variable. The legacy value is kept unchanged in the file.',
+                          ),
                       ],
                     ),
                     _Section(

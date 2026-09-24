@@ -533,6 +533,47 @@ void main() {
     expect(repo.hubSyncSnapshot('https://hub.example.test').confirmationSeq, 1);
   });
 
+  test('a hub coverage gap keeps local evidence, as in the Rust hub', () {
+    // The hub confirmed its 00:00 price through 06:00, missed the 12:00
+    // fetch, and stored the unchanged price again at 18:00 (the rule of
+    // price_history::fetch_once). Local evidence from the gap remains; the
+    // same winners come from Rust `History::winners`.
+    final first = observation(0, '0.4', authority: 'hub', origin: 'hub');
+    final gap = observation(12, '0.9');
+    final restarted = observation(18, '0.4', authority: 'hub', origin: 'hub');
+    final inside = observation(20, '0.7');
+    final history = CanonicalPriceHistory(
+      [first, gap, restarted, inside],
+      confirmations: {
+        first.fingerprint: DateTime.utc(2026, 9, 1, 6),
+        restarted.fingerprint: DateTime.utc(2026, 9, 1, 23),
+      },
+    );
+    expect(history.winners.map((o) => o.model['pricing']['prompt']), [
+      '0.4',
+      '0.9',
+      '0.4',
+    ]);
+  });
+
+  test('plain HTTP is allowed only to a literal loopback address', () async {
+    for (final url in [
+      'http://localhost:9/',
+      'http://example.test/',
+      'http://127.0.0.2:9/',
+    ]) {
+      await expectLater(
+        HubPriceHistoryClient().synchronizeIncremental(
+          endpoint: Uri.parse(url),
+          token: 'synthetic-token',
+          observations: const [],
+        ),
+        throwsA(isA<FormatException>()),
+        reason: url,
+      );
+    }
+  });
+
   test(
     'client downloads confirmations with their own bounded cursor',
     () async {

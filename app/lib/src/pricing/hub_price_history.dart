@@ -130,10 +130,12 @@ class PriceObservation {
 
 /// Hub evidence wins where it covers the same provider/model: from a hub
 /// observation's time through the last complete hub catalog that confirmed it
-/// unchanged ([confirmations], by fingerprint). Local evidence inside that
-/// coverage is superseded; local evidence outside it, such as during a missed
-/// hub fetch, remains. At one exact instant hub evidence wins, and equal
-/// authorities use the fingerprint tie break.
+/// unchanged ([confirmations], by fingerprint). The hub confirms only
+/// contiguous fetches; after a missed fetch slot it stores the unchanged
+/// price as a new observation, so a coverage interval never spans the gap.
+/// Local evidence inside that coverage is superseded; local evidence outside
+/// it, such as during a missed hub fetch, remains. At one exact instant hub
+/// evidence wins, and equal authorities use the fingerprint tie break.
 class CanonicalPriceHistory {
   CanonicalPriceHistory(
     Iterable<PriceObservation> input, {
@@ -387,7 +389,9 @@ class HubPriceHistoryClient {
     int confirmationsAfter = 0,
     Future<void>? cancellation,
   }) async {
-    final loopback = ['localhost', '127.0.0.1', '::1'].contains(endpoint.host);
+    // Literal loopback addresses only, as in the collector: a host name such
+    // as `localhost` can resolve elsewhere.
+    final loopback = ['127.0.0.1', '::1'].contains(endpoint.host);
     if (endpoint.userInfo.isNotEmpty ||
         endpoint.query.isNotEmpty ||
         endpoint.fragment.isNotEmpty ||

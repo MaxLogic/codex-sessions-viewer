@@ -24,7 +24,11 @@ not fetch provider data.
 A fetch that finds a model's price unchanged does not store another copy of
 the same evidence. It records a last-confirmed time on the model's latest hub
 observation instead, so the log grows only when a price, rule or catalog entry
-changes. A new revision is computed only when the log changes; unchanged
+changes. Confirmation is contiguous: it applies only when the previous
+confirmation (or the observation) is in the current or the previous fetch
+slot. After a missed slot, for example while the hub or the provider was
+unreachable, the unchanged price is stored as a new observation, so the
+earlier coverage ends at its last contiguous confirmation. A new revision is computed only when the log changes; unchanged
 synchronizations read the stored revision.
 
 Configure a viewer with the one hub setting in its `settings.toml`, the same
@@ -46,15 +50,20 @@ The viewer uploads its evidence as this database's machine identity, the same
 identity the collector uses (`hub status` shows it), so that ID must be
 registered on the hub with this credential. The former `pricing.hub_url` is
 adopted as `[hub] url` when `[hub] url` is empty; the former `pricing.hub_token`
-and `pricing.hub_machine_id` are no longer read, and the next save of
-`settings.toml` drops them.
+and `pricing.hub_machine_id` are no longer read. Saving `settings.toml` keeps
+them unchanged, since secrets are never rewritten or dropped without an
+explicit request, and Settings shows a warning that a legacy hub token was
+found and that price sync reads `CODEX_SESSIONS_HUB_MACHINE_TOKEN`. The token
+value is never shown. Remove the legacy keys from the file by hand.
 
 The viewer prefers fresh authoritative hub observations. An unavailable or
 stale hub allows the existing local OpenRouter fetch to run. The reason of the
 last failed hub price sync (for example a rejected credential, a missing
 `CODEX_SESSIONS_HUB_MACHINE_TOKEN`, or an unreachable hub) is shown in Settings
 under the OpenRouter price refresh status; it is fixed text and never contains
-the credential. Leaving `[hub] url` empty preserves standalone operation.
+the credential. Plain `http://` is accepted only for a literal loopback
+address (`127.0.0.1` or `[::1]`), as in the collector. Leaving `[hub] url` empty
+preserves standalone operation.
 Disabling external pricing preserves the existing explicit local-override
 policy. Credentials are not sent to OpenRouter.
 
@@ -67,9 +76,10 @@ and event timestamps are never changed by price reconciliation.
 
 Hub evidence wins wherever it covers the same provider and model: from a hub
 observation's time through the last complete hub catalog that confirmed it
-unchanged. Local observations inside that coverage are superseded, even at
-different instants. Local observations outside it, such as those made during
-a missed hub fetch, remain separate historical evidence. At the same provider,
+unchanged in contiguous fetches. Local observations inside that coverage are
+superseded, even at different instants. Local observations outside it, such as
+those made during a missed hub fetch, remain separate historical evidence:
+coverage never spans a missed fetch slot (see above). At the same provider,
 model and exact observation time, hub evidence wins over local evidence.
 Otherwise equal-authority conflicts use a deterministic fingerprint tie break.
 Rust and Dart apply the same rule. The hub refuses uploaded observations more
