@@ -8,6 +8,7 @@ import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/models/session_project_change.dart';
+import '../support/session_search_fixture.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 

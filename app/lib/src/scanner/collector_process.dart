@@ -4,7 +4,7 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
-import 'session_scanner.dart';
+import 'scan_types.dart';
 
 /// Starts the collector; tests substitute a scripted process.
 typedef CollectorProcessStarter =
@@ -230,12 +230,7 @@ class CollectorProcess {
       allConfiguredRootsReachable: !failures.any(
         (failure) => failure.status == SessionFileStatus.pathUnreachable,
       ),
-      sessions: const [],
       errors: failures,
-      fileStatuses: const [],
-      statusEvents: const [],
-      skippedFiles: const [],
-      cachedSessions: const [],
     );
   }
 

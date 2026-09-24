@@ -3,7 +3,7 @@ import 'package:codex_sessions_viewer/src/ui/number_formatting.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
-import 'package:codex_sessions_viewer/src/parser/session_activity_analyzer.dart';
+import 'package:codex_sessions_viewer/src/usage/session_activity.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_stats_view.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';

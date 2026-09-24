@@ -16,10 +16,9 @@ import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/database/collector_versions.dart';
 import 'package:codex_sessions_viewer/src/database/usage_path_context_migration.dart';
-import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/scanner/collector_process.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
-import 'package:codex_sessions_viewer/src/scanner/session_scanner.dart';
+import 'package:codex_sessions_viewer/src/scanner/scan_types.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
@@ -887,7 +886,7 @@ void main() {
         '2026-07-28T10:00:00Z', '2026-07-28T10:00:00Z'
       )
       ''',
-      [CodexSessionParser.currentVersion],
+      [collectorCodexParserVersion],
     );
     db.execute(
       '''
@@ -2401,7 +2400,7 @@ void main() {
           row.sourcePath,
           row.sourcePath,
           row.sourcePath,
-          CodexSessionParser.currentVersion,
+          collectorCodexParserVersion,
           row.id == 'session:merge-parent'
               ? '2027-07-27T14:00:00Z'
               : '2026-07-27T14:00:00Z',
@@ -3745,7 +3744,7 @@ void main() {
       {
         'parse_status': 'available',
         'usage_projection_status': 'complete',
-        'parser_version': CodexSessionParser.currentVersion,
+        'parser_version': collectorCodexParserVersion,
       },
     );
     db.execute('''
@@ -3790,7 +3789,7 @@ void main() {
     final batch = UsageSummaryRepository(db).loadPersistedSessionCosts([
       for (var i = 0; i < 520; i++) 'missing-$i',
       id,
-    ], projectionVersion: CodexSessionParser.currentVersion)!;
+    ], projectionVersion: collectorCodexParserVersion)!;
     expect(batch, hasLength(521));
     expect(batch[id]!.estimatedCostText, '0.3');
     expect(batch['missing-0']!.costUnknown, isTrue);
@@ -4662,7 +4661,7 @@ void main() {
           session.name,
           session.manual,
           r'C:\work\client\repo',
-          CodexSessionParser.currentVersion,
+          collectorCodexParserVersion,
           now,
           now,
         ],

@@ -1,5 +1,5 @@
 //! Port of `app/lib/src/path_mapping/path_mapper.dart` and the path helpers the
-//! Dart scanner uses for identity and cache lookups.
+//! retired Dart scanner used for identity and cache lookups.
 
 use crate::codex::parser::SourceType;
 use crate::dart::{to_lower, trim};
@@ -183,7 +183,7 @@ fn mnt_to_windows_path(linux_path: &str) -> Option<String> {
     }
 }
 
-/// `_canonicalScanPath` from `session_scanner.dart`.
+/// `_canonicalScanPath` from the retired Dart scanner.
 pub fn canonical_scan_path(path: &str) -> String {
     let mut normalized = collapse_slashes(&to_lower(&path.replace('\\', "/")));
     while normalized.len() > 1 && normalized.ends_with('/') {

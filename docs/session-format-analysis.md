@@ -1,7 +1,11 @@
 # Codex Session Format Analysis
 
+> Historical report. The Dart session scanner, parser, and the command that
+> generated this file were removed when the Rust collector became the only
+> session parser; the numbers describe that retired implementation.
+
 Generated from a content-safe local scan of the local Codex sessions directory
-on 2026-06-12. To reproduce, pass your own local root:
+on 2026-06-12 with the retired Dart analyzer:
 
 ```powershell
 cd app

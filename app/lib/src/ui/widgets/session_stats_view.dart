@@ -1,6 +1,9 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
-import '../../parser/session_activity_analyzer.dart';
+import '../../database/session_activity_reader.dart';
+import '../../usage/session_activity.dart';
 import '../models/session_row_view_model.dart';
 import '../number_formatting.dart';
 
@@ -18,44 +21,46 @@ typedef SessionActivityLoader =
       List<SessionRowViewModel> subagents,
     );
 
-/// Reads activity from the local session files on a background isolate.
-///
-/// Results are cached per file and last-message time, so switching tabs or
-/// sessions does not re-read unchanged files.
-Future<SessionActivityBundle> loadSessionActivityFromFiles(
+/// No activity source: the Stats tab shows what the session row holds.
+Future<SessionActivityBundle> noSessionActivity(
   SessionRowViewModel row,
   List<SessionRowViewModel> subagents,
-) async {
-  final all = [row, ...subagents];
-  final missing = <String>[];
-  for (final item in all) {
-    final path = item.sourceFilePath.trim();
-    if (path.isNotEmpty && !_activityCache.containsKey(_cacheKey(item))) {
-      missing.add(path);
-    }
-  }
-  if (missing.isNotEmpty) {
-    final analyzed = await analyzeSessionActivityFiles(missing);
-    for (final item in all) {
-      final stats = analyzed[item.sourceFilePath.trim()];
-      if (stats != null) {
-        _rememberActivity(_cacheKey(item), stats);
+) async => const SessionActivityBundle(main: null, subagents: {});
+
+/// Reads activity from the messages and tool calls the collector stored, on
+/// a background isolate, for sessions of every harness.
+///
+/// Results are cached per row and last-message time, so switching tabs or
+/// sessions does not re-read unchanged sessions.
+SessionActivityLoader storedSessionActivityLoader(File databaseFile) {
+  return (row, subagents) async {
+    final all = [row, ...subagents];
+    final missing = [
+      for (final item in all)
+        if (!_activityCache.containsKey(_cacheKey(databaseFile, item))) item.id,
+    ];
+    if (missing.isNotEmpty) {
+      final loaded = await loadSessionActivity(databaseFile, missing);
+      for (final item in all) {
+        if (loaded[item.id] case final stats?) {
+          _rememberActivity(_cacheKey(databaseFile, item), stats);
+        }
       }
     }
-  }
-  return SessionActivityBundle(
-    main: _activityCache[_cacheKey(row)],
-    subagents: {
-      for (final child in subagents)
-        child.id: ?_activityCache[_cacheKey(child)],
-    },
-  );
+    return SessionActivityBundle(
+      main: _activityCache[_cacheKey(databaseFile, row)],
+      subagents: {
+        for (final child in subagents)
+          child.id: ?_activityCache[_cacheKey(databaseFile, child)],
+      },
+    );
+  };
 }
 
 final _activityCache = <String, SessionActivityStats>{};
 
-String _cacheKey(SessionRowViewModel row) =>
-    '${row.sourceFilePath}|${row.lastMessageAtUtc.microsecondsSinceEpoch}';
+String _cacheKey(File databaseFile, SessionRowViewModel row) =>
+    '${databaseFile.path}|${row.id}|${row.lastMessageAtUtc.microsecondsSinceEpoch}';
 
 void _rememberActivity(String key, SessionActivityStats stats) {
   _activityCache.remove(key);
@@ -65,19 +70,41 @@ void _rememberActivity(String key, SessionActivityStats stats) {
   }
 }
 
+/// Supplies the activity loader to every Stats tab below it, so the screens
+/// between the app and the tab need not pass it along.
+class SessionActivityScope extends InheritedWidget {
+  const SessionActivityScope({
+    super.key,
+    required this.loadActivity,
+    required super.child,
+  });
+
+  final SessionActivityLoader loadActivity;
+
+  static SessionActivityLoader? maybeOf(BuildContext context) => context
+      .getInheritedWidgetOfExactType<SessionActivityScope>()
+      ?.loadActivity;
+
+  @override
+  bool updateShouldNotify(SessionActivityScope oldWidget) =>
+      loadActivity != oldWidget.loadActivity;
+}
+
 /// The session Stats tab: time split, token split, tools, subagents, models.
 class SessionStatsView extends StatefulWidget {
   const SessionStatsView({
     super.key,
     required this.row,
     this.subagents = const [],
-    this.loadActivity = loadSessionActivityFromFiles,
+    this.loadActivity,
     this.onOpenSession,
   });
 
   final SessionRowViewModel row;
   final List<SessionRowViewModel> subagents;
-  final SessionActivityLoader loadActivity;
+
+  /// Null uses the nearest [SessionActivityScope], else no activity.
+  final SessionActivityLoader? loadActivity;
   final ValueChanged<String>? onOpenSession;
 
   @override
@@ -104,11 +131,13 @@ class _SessionStatsViewState extends State<SessionStatsView> {
   }
 
   Future<SessionActivityBundle> _load() {
-    return widget
-        .loadActivity(widget.row, widget.subagents)
-        .catchError(
-          (Object _) => const SessionActivityBundle(main: null, subagents: {}),
-        );
+    final load =
+        widget.loadActivity ??
+        SessionActivityScope.maybeOf(context) ??
+        noSessionActivity;
+    return load(widget.row, widget.subagents).catchError(
+      (Object _) => const SessionActivityBundle(main: null, subagents: {}),
+    );
   }
 
   @override

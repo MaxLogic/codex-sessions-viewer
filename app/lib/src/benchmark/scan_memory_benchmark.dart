@@ -9,7 +9,6 @@ import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
 import '../database/database_maintenance.dart';
 import '../database/collector_versions.dart';
-import '../parser/codex_session_parser.dart';
 import '../scanner/scan_batching.dart';
 
 const scanMemoryBenchmarkFlag = '--benchmark-scan-memory';
@@ -134,6 +133,8 @@ Future<int> runScanMemoryBenchmark(ScanMemoryBenchmarkRequest request) async {
     databaseFile: databaseFile,
     parserWorkerCountOverride: request.workers,
     scanBatchingPolicy: batchingPolicy,
+    // Only the requested corpus is timed.
+    claudeProjectRoots: const [],
   ).refresh();
   stopwatch.stop();
 
@@ -173,7 +174,7 @@ Future<int> runScanMemoryBenchmark(ScanMemoryBenchmarkRequest request) async {
   }
 
   final report = <String, Object?>{
-    'parser_version': CodexSessionParser.currentVersion,
+    'parser_version': collectorCodexParserVersion,
     'workers': request.workers,
     'batch_size': request.batchSize,
     'batch_source_bytes': batchingPolicy.parsedSessionFlushSourceBytes,

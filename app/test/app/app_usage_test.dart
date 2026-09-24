@@ -7,7 +7,7 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_generation.dart';
-import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
+import 'package:codex_sessions_viewer/src/database/collector_versions.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter/material.dart'
@@ -70,7 +70,7 @@ void main() {
       );
       db.execute(
         "update sessions set parse_status = 'available', usage_projection_status = 'complete', parser_version = ?, usage_local_event_count = 1",
-        [CodexSessionParser.currentVersion],
+        [collectorCodexParserVersion],
       );
       db.execute(
         '''

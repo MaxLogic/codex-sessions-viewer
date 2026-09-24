@@ -21,9 +21,9 @@ import '../database/session_eval_state.dart';
 import '../app/runtime_session_controller.dart';
 import 'logs_loader.dart';
 import '../export/eval_dataset_exporter.dart';
+import '../export/eval_dataset_loader.dart';
 import '../export/session_list_message_loader.dart';
 import '../database/collector_versions.dart';
-import '../parser/codex_session_parser.dart';
 import '../platform/terminal_launcher.dart';
 import '../pricing/pricing_repository.dart';
 import '../search/message_search.dart';
@@ -40,6 +40,7 @@ import '../ui/screens/settings_screen.dart';
 import '../ui/screens/usage_screen.dart';
 import '../ui/themes.dart';
 import '../ui/widgets/app_button.dart';
+import '../ui/widgets/session_stats_view.dart';
 import '../ui/widgets/database_migration_progress.dart';
 import '../usage/usage_summary.dart';
 import '../voice_over/voice_over_service.dart';
@@ -287,6 +288,18 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     }
   }
 
+  SessionActivityLoader? _activityLoader;
+  String? _activityLoaderPath;
+
+  SessionActivityLoader get _sessionActivityLoader {
+    final path = widget.databaseFile.path;
+    if (_activityLoaderPath != path) {
+      _activityLoaderPath = path;
+      _activityLoader = storedSessionActivityLoader(widget.databaseFile);
+    }
+    return _activityLoader!;
+  }
+
   @override
   Widget build(BuildContext context) {
     final ui = (_settings ?? AppSettings.defaults()).ui;
@@ -304,282 +317,289 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           : data;
     }
 
-    return MaterialApp(
-      navigatorKey: _navigatorKey,
-      scaffoldMessengerKey: _scaffoldMessengerKey,
-      title: CodexSessionsViewerApp.appTitle,
-      debugShowCheckedModeBanner: false,
-      theme: themed(
-        mode == CodexThemeMode.highContrastLight
-            ? CodexThemeMode.highContrastLight
-            : CodexThemeMode.light,
-      ),
-      darkTheme: themed(
-        mode == CodexThemeMode.highContrastDark
-            ? CodexThemeMode.highContrastDark
-            : CodexThemeMode.dark,
-      ),
-      highContrastTheme: themed(CodexThemeMode.highContrastLight),
-      highContrastDarkTheme: themed(CodexThemeMode.highContrastDark),
-      themeMode: CodexAppTheme.themeMode(mode),
-      // The font size setting scales text on top of the Windows text size;
-      // the button settings reach every AppButton.
-      builder: (context, child) {
-        final media = MediaQuery.of(context);
-        final factor = ui.fontSize / AppSettings.defaults().ui.fontSize;
-        return ButtonAppearance(
-          showIcons: ui.showIcons,
-          showText: ui.showTextOnButtons,
-          child: MediaQuery(
-            data: factor == 1
-                ? media
-                : media.copyWith(
-                    textScaler: TextScaler.linear(
-                      media.textScaler.scale(1) * factor,
-                    ),
-                  ),
-            child: child ?? const SizedBox.shrink(),
-          ),
-        );
-      },
-      home: FutureBuilder<DatabaseStartupResult>(
-        future: widget.databaseStartup,
-        builder: (context, snapshot) {
-          if (snapshot.hasError) {
-            return _fatalScreen(error: _fatalErrorFromSnapshot(snapshot));
-          }
-          if (!snapshot.hasData) {
-            return const Scaffold(
-              body: Center(child: Text('Loading database...')),
-            );
-          }
-          final result = snapshot.requireData;
-          if (!result.canStartNormalUi) {
-            return _fatalScreen(error: result.fatalError!);
-          }
-          return FutureBuilder<DatabaseMaintenanceResult?>(
-            future: widget.databaseMaintenanceStartup == null
-                ? null
-                : _ensureDatabaseMaintenanceStarted(),
-            builder: (context, maintenanceSnapshot) {
-              if (maintenanceSnapshot.hasError) {
-                return _fatalScreen(
-                  error: DatabaseFatalError(
-                    summary: 'Database maintenance startup failed.',
-                    databasePath: widget.databaseFile.path,
-                    lastAppliedSchemaVersion: result.lastAppliedSchemaVersion,
-                    details: maintenanceSnapshot.error.toString(),
-                  ),
-                );
-              }
-              final maintenanceResult = maintenanceSnapshot.data;
-              if (widget.databaseMaintenanceStartup != null &&
-                  (maintenanceSnapshot.connectionState !=
-                          ConnectionState.done ||
-                      (maintenanceResult != null &&
-                          !maintenanceResult.succeeded))) {
-                return DatabaseMigrationProgressHost(
-                  progress: _databaseMaintenanceProgress,
-                  onStop: () async =>
-                      _databaseMaintenanceOperation?.requestStop(),
-                  onResume: _restartDatabaseMaintenance,
-                  onRetry: _restartDatabaseMaintenance,
-                  child: const Scaffold(
-                    body: Center(
-                      child: Text('Preparing database maintenance...'),
-                    ),
-                  ),
-                );
-              }
-              return FutureBuilder<AppSettings>(
-                future: widget.settingsStartup,
-                initialData: AppSettings.defaults(),
-                builder: (context, settingsSnapshot) {
-                  if (settingsSnapshot.hasError) {
-                    return _fatalScreen(
-                      error: DatabaseFatalError(
-                        summary: 'Settings startup failed.',
-                        databasePath: widget.settingsFile.path,
-                        lastAppliedSchemaVersion:
-                            result.lastAppliedSchemaVersion,
-                        details: settingsSnapshot.error.toString(),
+    // Stats tabs read activity from the rows the collector stored.
+    return SessionActivityScope(
+      loadActivity: _sessionActivityLoader,
+      child: MaterialApp(
+        navigatorKey: _navigatorKey,
+        scaffoldMessengerKey: _scaffoldMessengerKey,
+        title: CodexSessionsViewerApp.appTitle,
+        debugShowCheckedModeBanner: false,
+        theme: themed(
+          mode == CodexThemeMode.highContrastLight
+              ? CodexThemeMode.highContrastLight
+              : CodexThemeMode.light,
+        ),
+        darkTheme: themed(
+          mode == CodexThemeMode.highContrastDark
+              ? CodexThemeMode.highContrastDark
+              : CodexThemeMode.dark,
+        ),
+        highContrastTheme: themed(CodexThemeMode.highContrastLight),
+        highContrastDarkTheme: themed(CodexThemeMode.highContrastDark),
+        themeMode: CodexAppTheme.themeMode(mode),
+        // The font size setting scales text on top of the Windows text size;
+        // the button settings reach every AppButton.
+        builder: (context, child) {
+          final media = MediaQuery.of(context);
+          final factor = ui.fontSize / AppSettings.defaults().ui.fontSize;
+          return ButtonAppearance(
+            showIcons: ui.showIcons,
+            showText: ui.showTextOnButtons,
+            child: MediaQuery(
+              data: factor == 1
+                  ? media
+                  : media.copyWith(
+                      textScaler: TextScaler.linear(
+                        media.textScaler.scale(1) * factor,
                       ),
-                    );
-                  }
-                  final settings =
-                      _settings ??
-                      settingsSnapshot.data ??
-                      AppSettings.defaults();
-                  Widget readyShell() {
-                    if (_settings == null &&
-                        settingsSnapshot.connectionState ==
-                            ConnectionState.done) {
-                      _settings = settings;
-                      _syncStartupPreferenceLater(settings);
-                      // Apply the theme, density, and font size settings.
-                      WidgetsBinding.instance.addPostFrameCallback((_) {
-                        if (mounted) setState(() {});
-                      });
+                    ),
+              child: child ?? const SizedBox.shrink(),
+            ),
+          );
+        },
+        home: FutureBuilder<DatabaseStartupResult>(
+          future: widget.databaseStartup,
+          builder: (context, snapshot) {
+            if (snapshot.hasError) {
+              return _fatalScreen(error: _fatalErrorFromSnapshot(snapshot));
+            }
+            if (!snapshot.hasData) {
+              return const Scaffold(
+                body: Center(child: Text('Loading database...')),
+              );
+            }
+            final result = snapshot.requireData;
+            if (!result.canStartNormalUi) {
+              return _fatalScreen(error: result.fatalError!);
+            }
+            return FutureBuilder<DatabaseMaintenanceResult?>(
+              future: widget.databaseMaintenanceStartup == null
+                  ? null
+                  : _ensureDatabaseMaintenanceStarted(),
+              builder: (context, maintenanceSnapshot) {
+                if (maintenanceSnapshot.hasError) {
+                  return _fatalScreen(
+                    error: DatabaseFatalError(
+                      summary: 'Database maintenance startup failed.',
+                      databasePath: widget.databaseFile.path,
+                      lastAppliedSchemaVersion: result.lastAppliedSchemaVersion,
+                      details: maintenanceSnapshot.error.toString(),
+                    ),
+                  );
+                }
+                final maintenanceResult = maintenanceSnapshot.data;
+                if (widget.databaseMaintenanceStartup != null &&
+                    (maintenanceSnapshot.connectionState !=
+                            ConnectionState.done ||
+                        (maintenanceResult != null &&
+                            !maintenanceResult.succeeded))) {
+                  return DatabaseMigrationProgressHost(
+                    progress: _databaseMaintenanceProgress,
+                    onStop: () async =>
+                        _databaseMaintenanceOperation?.requestStop(),
+                    onResume: _restartDatabaseMaintenance,
+                    onRetry: _restartDatabaseMaintenance,
+                    child: const Scaffold(
+                      body: Center(
+                        child: Text('Preparing database maintenance...'),
+                      ),
+                    ),
+                  );
+                }
+                return FutureBuilder<AppSettings>(
+                  future: widget.settingsStartup,
+                  initialData: AppSettings.defaults(),
+                  builder: (context, settingsSnapshot) {
+                    if (settingsSnapshot.hasError) {
+                      return _fatalScreen(
+                        error: DatabaseFatalError(
+                          summary: 'Settings startup failed.',
+                          databasePath: widget.settingsFile.path,
+                          lastAppliedSchemaVersion:
+                              result.lastAppliedSchemaVersion,
+                          details: settingsSnapshot.error.toString(),
+                        ),
+                      );
                     }
-                    if (_visibleSection == CodexAppSection.usage) {
-                      _startUsageSummaryLoad(settings);
-                    }
-                    _startMessageSearchBackfill();
-                    return CodexAppShell(
-                      onSectionChanged: _visibleSectionChanged,
-                      motionMode: settings.ui.motion,
-                      requestedSection: _requestedSection,
-                      sectionRequestSerial: _sectionRequestSerial,
-                      sessionsScreenBuilder: (context, onOpenSettings) =>
-                          SessionSourcePane(
-                            settings: settings,
-                            settingsFile: widget.settingsFile,
-                            databaseFile: widget.databaseFile,
-                            local: _SessionsScreenLoader(
+                    final settings =
+                        _settings ??
+                        settingsSnapshot.data ??
+                        AppSettings.defaults();
+                    Widget readyShell() {
+                      if (_settings == null &&
+                          settingsSnapshot.connectionState ==
+                              ConnectionState.done) {
+                        _settings = settings;
+                        _syncStartupPreferenceLater(settings);
+                        // Apply the theme, density, and font size settings.
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (mounted) setState(() {});
+                        });
+                      }
+                      if (_visibleSection == CodexAppSection.usage) {
+                        _startUsageSummaryLoad(settings);
+                      }
+                      _startMessageSearchBackfill();
+                      return CodexAppShell(
+                        onSectionChanged: _visibleSectionChanged,
+                        motionMode: settings.ui.motion,
+                        requestedSection: _requestedSection,
+                        sectionRequestSerial: _sectionRequestSerial,
+                        sessionsScreenBuilder: (context, onOpenSettings) =>
+                            SessionSourcePane(
                               settings: settings,
                               settingsFile: widget.settingsFile,
                               databaseFile: widget.databaseFile,
-                              writerCoordinator: _writerCoordinator,
-                              externalRevision: _externalRevision,
-                              pricingRevision: _pricingRevision,
-                              pricingUpdating: _pricingUpdating,
-                              onRefreshOperation: _sessionRefreshOperation,
-                              onLoadCachedRows: widget.sessionCachedRowsLoader,
-                              deferInitialLoad: widget.deferInitialSessionLoad,
-                              onOpenSettings: onOpenSettings,
-                              onSessionAction: (request) =>
-                                  _handleSessionAction(request),
-                              onExportMarkdown: _exportConversationMarkdown,
-                              onSaveSessionListCsv: _saveSessionListCsv,
-                              onCopyText: _copyText,
-                              onVoiceEvent: _playVoiceEvent,
-                              onTableStateChanged: (state) {
-                                unawaited(_saveSessionTableState(state));
-                              },
-                              openTarget: _sessionOpenTarget,
-                              openTargetSerial: _sessionOpenTargetSerial,
-                              projectFilterRequest: _sessionsProjectFilter,
-                              projectFilterSerial: _sessionsProjectFilterSerial,
-                              now: widget.now,
+                              local: _SessionsScreenLoader(
+                                settings: settings,
+                                settingsFile: widget.settingsFile,
+                                databaseFile: widget.databaseFile,
+                                writerCoordinator: _writerCoordinator,
+                                externalRevision: _externalRevision,
+                                pricingRevision: _pricingRevision,
+                                pricingUpdating: _pricingUpdating,
+                                onRefreshOperation: _sessionRefreshOperation,
+                                onLoadCachedRows:
+                                    widget.sessionCachedRowsLoader,
+                                deferInitialLoad:
+                                    widget.deferInitialSessionLoad,
+                                onOpenSettings: onOpenSettings,
+                                onSessionAction: (request) =>
+                                    _handleSessionAction(request),
+                                onExportMarkdown: _exportConversationMarkdown,
+                                onSaveSessionListCsv: _saveSessionListCsv,
+                                onCopyText: _copyText,
+                                onVoiceEvent: _playVoiceEvent,
+                                onTableStateChanged: (state) {
+                                  unawaited(_saveSessionTableState(state));
+                                },
+                                openTarget: _sessionOpenTarget,
+                                openTargetSerial: _sessionOpenTargetSerial,
+                                projectFilterRequest: _sessionsProjectFilter,
+                                projectFilterSerial:
+                                    _sessionsProjectFilterSerial,
+                                now: widget.now,
+                              ),
                             ),
+                        projectsScreen: ProjectsScreen(
+                          dataRevision: _externalRevision,
+                          repository: RuntimeSessionController(
+                            settingsFile: widget.settingsFile,
+                            databaseFile: widget.databaseFile,
+                            writerCoordinator: _writerCoordinator,
                           ),
-                      projectsScreen: ProjectsScreen(
-                        dataRevision: _externalRevision,
-                        repository: RuntimeSessionController(
+                          viewState: _projectsViewState,
+                          openProjectName: _projectsOpenName,
+                          openProjectSerial: _projectsOpenSerial,
+                          onProjectsChanged: _projectsChanged,
+                          onShowSessions: _showProjectSessions,
+                          now: widget.now,
+                        ),
+                        evalsScreen: _EvalsScreenLoader(
+                          externalRevision: _externalRevision,
                           settingsFile: widget.settingsFile,
                           databaseFile: widget.databaseFile,
                           writerCoordinator: _writerCoordinator,
+                          onLoadCachedRows: widget.sessionCachedRowsLoader,
+                          deferInitialLoad: widget.deferInitialSessionLoad,
+                          onUpdateEvalMetadata: (row, metadata) async =>
+                              _updateEvalMetadata(row.id, metadata),
+                          onExport: _exportEvalDataset,
                         ),
-                        viewState: _projectsViewState,
-                        openProjectName: _projectsOpenName,
-                        openProjectSerial: _projectsOpenSerial,
-                        onProjectsChanged: _projectsChanged,
-                        onShowSessions: _showProjectSessions,
-                        now: widget.now,
-                      ),
-                      evalsScreen: _EvalsScreenLoader(
-                        externalRevision: _externalRevision,
-                        settingsFile: widget.settingsFile,
-                        databaseFile: widget.databaseFile,
-                        writerCoordinator: _writerCoordinator,
-                        onLoadCachedRows: widget.sessionCachedRowsLoader,
-                        deferInitialLoad: widget.deferInitialSessionLoad,
-                        onUpdateEvalMetadata: (row, metadata) async =>
-                            _updateEvalMetadata(row.id, metadata),
-                        onExport: _exportEvalDataset,
-                      ),
-                      contextScreen: _ContextSearchLoader(
-                        externalRevision: _externalRevision,
-                        settingsFile: widget.settingsFile,
-                        databaseFile: widget.databaseFile,
-                        writerCoordinator: _writerCoordinator,
-                        onLoadCachedRows: widget.sessionCachedRowsLoader,
-                        deferInitialLoad: widget.deferInitialSessionLoad,
-                        onOpenResult: _openContextResult,
-                      ),
-                      usageScreen: UsageScreen(
-                        summary: _usageSummary,
-                        request: _usageRequest,
-                        isRefreshing: _usageIsRefreshing,
-                        refreshFailed: _usageRefreshFailed,
-                        onPeriodChanged: (request) {
-                          _usageRequest = request;
-                          // A snapshot from another range must not appear under
-                          // the new selection, even if the reload fails.
-                          _usageSummary = null;
-                          unawaited(_loadUsageSummary(settings));
-                        },
-                      ),
-                      settingsScreen: SettingsScreen(
-                        initialSettings: settings,
-                        diagnostics: DatabaseSettingsDiagnostics(
-                          widget.databaseFile,
-                          refreshPrices:
-                              widget.applicationMaintenance?.refreshPrices,
+                        contextScreen: _ContextSearchLoader(
+                          externalRevision: _externalRevision,
+                          settingsFile: widget.settingsFile,
+                          databaseFile: widget.databaseFile,
+                          writerCoordinator: _writerCoordinator,
+                          onLoadCachedRows: widget.sessionCachedRowsLoader,
+                          deferInitialLoad: widget.deferInitialSessionLoad,
+                          onOpenResult: _openContextResult,
                         ),
-                        maintenanceSchedules:
-                            widget.applicationMaintenance?.schedules ??
-                            const [],
-                        maintenanceProgress:
-                            widget.applicationMaintenance?.progress,
-                        onSave: _saveSettings,
-                        onReload: _reloadSettings,
-                      ),
-                      logsScreen: LogsLoader(
-                        databaseFile: widget.databaseFile,
-                        settings: settings.logging,
-                        writerCoordinator: _writerCoordinator,
-                      ),
-                    );
-                  }
+                        usageScreen: UsageScreen(
+                          summary: _usageSummary,
+                          request: _usageRequest,
+                          isRefreshing: _usageIsRefreshing,
+                          refreshFailed: _usageRefreshFailed,
+                          onPeriodChanged: (request) {
+                            _usageRequest = request;
+                            // A snapshot from another range must not appear under
+                            // the new selection, even if the reload fails.
+                            _usageSummary = null;
+                            unawaited(_loadUsageSummary(settings));
+                          },
+                        ),
+                        settingsScreen: SettingsScreen(
+                          initialSettings: settings,
+                          diagnostics: DatabaseSettingsDiagnostics(
+                            widget.databaseFile,
+                            refreshPrices:
+                                widget.applicationMaintenance?.refreshPrices,
+                          ),
+                          maintenanceSchedules:
+                              widget.applicationMaintenance?.schedules ??
+                              const [],
+                          maintenanceProgress:
+                              widget.applicationMaintenance?.progress,
+                          onSave: _saveSettings,
+                          onReload: _reloadSettings,
+                        ),
+                        logsScreen: LogsLoader(
+                          databaseFile: widget.databaseFile,
+                          settings: settings.logging,
+                          writerCoordinator: _writerCoordinator,
+                        ),
+                      );
+                    }
 
-                  final maintenance = widget.applicationMaintenance;
-                  if (maintenance == null) return readyShell();
-                  if (settingsSnapshot.connectionState !=
-                      ConnectionState.done) {
-                    return const Scaffold(
-                      body: Center(child: Text('Loading settings...')),
-                    );
-                  }
-                  _scheduleStartup ??= maintenance.configure(settings).then((
-                    _,
-                  ) {
-                    if (mounted && !_exitRequested) maintenance.start();
-                  });
-                  return FutureBuilder<void>(
-                    future: _scheduleStartup,
-                    builder: (context, scheduleSnapshot) {
-                      if (scheduleSnapshot.hasError) {
-                        return _fatalScreen(
-                          error: DatabaseFatalError(
-                            summary:
-                                'Database maintenance configuration failed.',
-                            databasePath: widget.databaseFile.path,
-                            lastAppliedSchemaVersion:
-                                result.lastAppliedSchemaVersion,
-                            details:
-                                'Saved pricing policy could not be synchronized. Normal database access remains disabled.',
-                          ),
-                        );
-                      }
-                      if (scheduleSnapshot.connectionState !=
-                          ConnectionState.done) {
-                        return const Scaffold(
-                          body: Center(
-                            child: Text(
-                              'Synchronizing pricing and maintenance...',
+                    final maintenance = widget.applicationMaintenance;
+                    if (maintenance == null) return readyShell();
+                    if (settingsSnapshot.connectionState !=
+                        ConnectionState.done) {
+                      return const Scaffold(
+                        body: Center(child: Text('Loading settings...')),
+                      );
+                    }
+                    _scheduleStartup ??= maintenance.configure(settings).then((
+                      _,
+                    ) {
+                      if (mounted && !_exitRequested) maintenance.start();
+                    });
+                    return FutureBuilder<void>(
+                      future: _scheduleStartup,
+                      builder: (context, scheduleSnapshot) {
+                        if (scheduleSnapshot.hasError) {
+                          return _fatalScreen(
+                            error: DatabaseFatalError(
+                              summary:
+                                  'Database maintenance configuration failed.',
+                              databasePath: widget.databaseFile.path,
+                              lastAppliedSchemaVersion:
+                                  result.lastAppliedSchemaVersion,
+                              details:
+                                  'Saved pricing policy could not be synchronized. Normal database access remains disabled.',
                             ),
-                          ),
-                        );
-                      }
-                      return readyShell();
-                    },
-                  );
-                },
-              );
-            },
-          );
-        },
+                          );
+                        }
+                        if (scheduleSnapshot.connectionState !=
+                            ConnectionState.done) {
+                          return const Scaffold(
+                            body: Center(
+                              child: Text(
+                                'Synchronizing pricing and maintenance...',
+                              ),
+                            ),
+                          );
+                        }
+                        return readyShell();
+                      },
+                    );
+                  },
+                );
+              },
+            );
+          },
+        ),
       ),
     );
   }
@@ -1219,32 +1239,12 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     if (destination == null) {
       return const EvalsScreenExportResult.cancelled();
     }
-    final sessions = <EvalDatasetSession>[];
-    var skipped = 0;
-    final parser = CodexSessionParser();
-    for (final row in request.rows) {
-      final sourcePath = row.sourcePathForDisplay.trim();
-      if (sourcePath.isEmpty) {
-        skipped++;
-        continue;
-      }
-      final result = await parser.parseFile(File(sourcePath));
-      final session = result.session;
-      if (session == null) {
-        skipped++;
-        continue;
-      }
-      sessions.add(
-        EvalDatasetSession(
-          session: session,
-          expectedOutput: row.evalExpectedOutput.trim().isEmpty
-              ? null
-              : row.evalExpectedOutput,
-          status: row.evalStatus.trim().isEmpty ? null : row.evalStatus,
-          notes: row.evalNotes.trim().isEmpty ? null : row.evalNotes,
-        ),
-      );
-    }
+    // Stored messages and tool calls, so every harness exports the same way
+    // and a moved or deleted source file does not matter.
+    final sessions = await loadEvalDatasetSessions(widget.databaseFile, [
+      for (final row in request.rows) row.id,
+    ]);
+    final skipped = request.rows.length - sessions.length;
     final files = const EvalDatasetExporter().export(
       EvalDatasetExportRequest(
         sessions: sessions,

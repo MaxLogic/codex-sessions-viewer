@@ -47,24 +47,13 @@ The local `release\windows\settings.toml` is preserved across builds. The
 package and ZIP always contain `settings.sample.toml` as `settings.toml`, so
 local paths and credentials are not distributed.
 
-Refresh local benchmark results with:
-
-```powershell
-cd app
-dart run bin/benchmark_local.dart --fixtures ../samples/sessions --out ../docs/benchmark-results.md
-```
-
-For realistic scan timing, copy local Codex session files into ignored private
-benchmark storage and write the aggregate report to ignored benchmark storage:
-
-```powershell
-cd app
-dart run bin/benchmark_local.dart --copy-from-settings --private-corpus ../.agents/private-session-corpus --out ../.agents/benchmark-results/session-scan-baseline.md --skip-release
-```
-
-Do not commit `.agents/private-session-corpus/` or
-`.agents/benchmark-results/`. The private benchmark report is designed to
-contain aggregate timings and counts only.
+The Rust collector parses every session file; the viewer reads only what it
+stored. To time a refresh through the collector on a local corpus, run the
+scan memory benchmark (`--benchmark-scan-memory` on the built viewer, see
+`app/lib/src/benchmark/scan_memory_benchmark.dart`). Keep private corpora and
+their reports in ignored storage such as `.agents/private-session-corpus/` and
+`.agents/benchmark-results/`; reports contain aggregate timings and counts
+only.
 
 ## Configuration
 

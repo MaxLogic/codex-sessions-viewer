@@ -1,5 +1,9 @@
 # Local Benchmark Results
 
+> Historical report. The Dart session scanner, parser, and the command that
+> generated this file were removed when the Rust collector became the only
+> session parser; the numbers describe that retired implementation.
+
 Generated UTC: 2026-06-14T23:59:40.268312Z
 
 ## Machine and Toolchain

@@ -1,7 +1,6 @@
 import 'dart:convert';
 
 import 'package:codex_sessions_viewer/src/export/eval_dataset_exporter.dart';
-import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -9,7 +8,7 @@ void main() {
     final files = const EvalDatasetExporter().export(
       EvalDatasetExportRequest(
         sessions: [
-          EvalDatasetSession(
+          _evalSession(
             session: _session(),
             expectedOutput: 'Cache entries are invalidated after writes.',
             status: 'needs_review',
@@ -48,9 +47,9 @@ void main() {
     final files = const EvalDatasetExporter().export(
       EvalDatasetExportRequest(
         sessions: [
-          EvalDatasetSession(
+          _evalSession(
             session: _session(
-              sourceType: CodexSessionSourceType.windows,
+              sourceType: 'windows',
               modelIds: const {'anthropic/claude-sonnet-4', ''},
             ),
           ),
@@ -75,7 +74,7 @@ void main() {
     final openAiFiles = exporter.export(
       EvalDatasetExportRequest(
         sessions: [
-          EvalDatasetSession(
+          _evalSession(
             session: _session(messages: _twoTurnMessages()),
             expectedOutput: 'Second expected answer.',
           ),
@@ -103,7 +102,7 @@ void main() {
     final promptfooFiles = exporter.export(
       EvalDatasetExportRequest(
         sessions: [
-          EvalDatasetSession(
+          _evalSession(
             session: _session(messages: _twoTurnMessages()),
             expectedOutput: 'Final expected answer.',
           ),
@@ -129,7 +128,7 @@ void main() {
     final exporter = const EvalDatasetExporter();
     final request = EvalDatasetExportRequest(
       sessions: [
-        EvalDatasetSession(
+        _evalSession(
           session: _session(),
           expectedOutput: 'Cache entries are invalidated after writes.',
         ),
@@ -161,7 +160,7 @@ void main() {
       final files = const EvalDatasetExporter().export(
         EvalDatasetExportRequest(
           sessions: [
-            EvalDatasetSession(
+            _evalSession(
               session: _session(),
               expectedOutput: 'Expected answer.',
             ),
@@ -205,19 +204,18 @@ void main() {
     final files = const EvalDatasetExporter().export(
       EvalDatasetExportRequest(
         sessions: [
-          EvalDatasetSession(
+          _evalSession(
             session: _session(
               messages: [
                 _message(
                   0,
-                  CodexMessageAuthorType.user,
+                  EvalMessageAuthor.user,
                   r'Inspect F:\projects\secret\TASKS.md and /home/pawel/private/log.txt',
                 ),
                 _message(
                   1,
-                  CodexMessageAuthorType.assistant,
+                  EvalMessageAuthor.assistant,
                   r'Updated F:\projects\secret\TASKS.md and D:\Research and Development\Private Notes\plan.md.',
-                  hasToolCalls: true,
                 ),
               ],
               toolCalls: [
@@ -253,22 +251,22 @@ void main() {
     final files = const EvalDatasetExporter().export(
       EvalDatasetExportRequest(
         sessions: [
-          EvalDatasetSession(
+          _evalSession(
             session: _session(
               messages: [
-                _message(0, CodexMessageAuthorType.user, '''
+                _message(0, EvalMessageAuthor.user, '''
 <environment_context>
   <current_date>2026-07-07</current_date>
   <filesystem><workspace_roots><root>F:\\repo</root></workspace_roots></filesystem>
 </environment_context>'''),
                 _message(
                   1,
-                  CodexMessageAuthorType.user,
+                  EvalMessageAuthor.user,
                   'Explain the cache behavior.',
                 ),
                 _message(
                   2,
-                  CodexMessageAuthorType.assistant,
+                  EvalMessageAuthor.assistant,
                   'The cache is invalidated after writes.',
                 ),
               ],
@@ -289,105 +287,84 @@ extension on Map<String, String> {
   String get singleContent => values.single;
 }
 
-List<CodexParsedMessage> _twoTurnMessages() {
+List<EvalDatasetMessage> _twoTurnMessages() {
   return [
-    _message(0, CodexMessageAuthorType.user, 'First question?'),
-    _message(1, CodexMessageAuthorType.assistant, 'First answer.'),
-    _message(2, CodexMessageAuthorType.user, 'Second question?'),
-    _message(3, CodexMessageAuthorType.assistant, 'Second answer.'),
+    _message(0, EvalMessageAuthor.user, 'First question?'),
+    _message(1, EvalMessageAuthor.assistant, 'First answer.'),
+    _message(2, EvalMessageAuthor.user, 'Second question?'),
+    _message(3, EvalMessageAuthor.assistant, 'Second answer.'),
   ];
 }
 
-CodexParsedSession _session({
-  List<CodexParsedMessage>? messages,
-  List<CodexParsedToolCall>? toolCalls,
-  CodexSessionSourceType sourceType = CodexSessionSourceType.wsl,
+EvalDatasetSession _evalSession({
+  required EvalDatasetSession session,
+  String? expectedOutput,
+  String? status,
+  String? notes,
+}) {
+  return EvalDatasetSession(
+    id: session.id,
+    sessionId: session.sessionId,
+    title: session.title,
+    sourceType: session.sourceType,
+    displayPath: session.displayPath,
+    modelIds: session.modelIds,
+    totalTokens: session.totalTokens,
+    messages: session.messages,
+    toolCalls: session.toolCalls,
+    expectedOutput: expectedOutput,
+    status: status,
+    notes: notes,
+  );
+}
+
+EvalDatasetSession _session({
+  List<EvalDatasetMessage>? messages,
+  List<EvalDatasetToolCall>? toolCalls,
+  String sourceType = 'wsl',
   Set<String> modelIds = const {'gpt-5.5-thinking'},
 }) {
-  return CodexParsedSession(
-    internalId: 'internal-demo',
+  return EvalDatasetSession(
+    id: 'internal-demo',
     sessionId: 'demo-session',
     sourceType: sourceType,
-    sourcePath: '/home/pawel/.codex/sessions/demo.jsonl',
-    sourceFileUncPath:
-        r'\\wsl.localhost\Ubuntu\home\pawel\.codex\sessions\demo.jsonl',
     displayPath: '/home/pawel/.codex/sessions/demo.jsonl',
-    platformPath: '/home/pawel/.codex/sessions/demo.jsonl',
-    workingDirectoryDisplay: '/home/pawel/projects/codex-sessions-viewer',
-    workingDirectoryPlatform: '/home/pawel/projects/codex-sessions-viewer',
-    workingDirectoryUnc:
-        r'\\wsl.localhost\Ubuntu\home\pawel\projects\codex-sessions-viewer',
     title: 'Build cache invalidation',
-    summary: 'Synthetic eval export session',
-    startedAtUtc: DateTime.utc(2026, 6, 10, 9, 42),
-    lastMessageAtUtc: DateTime.utc(2026, 6, 10, 9, 50),
     modelIds: modelIds,
+    totalTokens: 22,
     messages:
         messages ??
         [
-          _message(
-            0,
-            CodexMessageAuthorType.user,
-            'Please add cache invalidation.',
-            usage: const CodexUsage(inputTokens: 12),
-          ),
+          _message(0, EvalMessageAuthor.user, 'Please add cache invalidation.'),
           _message(
             1,
-            CodexMessageAuthorType.assistant,
+            EvalMessageAuthor.assistant,
             'Implemented it.\n\n```dart\nprint("done")\n```',
-            usage: const CodexUsage(outputTokens: 8),
-            model: 'gpt-5.5-thinking',
-            hasToolCalls: true,
           ),
-          _message(2, CodexMessageAuthorType.tool, 'Tool call completed.'),
+          _message(2, EvalMessageAuthor.tool, 'Tool call completed.'),
         ],
     toolCalls: toolCalls ?? [_toolCall()],
-    warnings: const [],
-    usage: const CodexUsage(
-      inputTokens: 12,
-      outputTokens: 8,
-      cachedInputTokens: 2,
-      totalTokens: 22,
-    ),
-    lastTurnUsage: const CodexUsage.empty(),
   );
 }
 
-CodexParsedToolCall _toolCall({String outputPreview = 'TASKS.md'}) {
-  return CodexParsedToolCall(
+EvalDatasetToolCall _toolCall({String outputPreview = 'TASKS.md'}) {
+  return EvalDatasetToolCall(
     messageIndex: 1,
-    toolIndex: 0,
     toolName: 'shell_command',
     status: 'success',
-    startedAtUtc: DateTime.utc(2026, 6, 10, 9, 43, 30),
-    finishedAtUtc: DateTime.utc(2026, 6, 10, 9, 43, 35),
     inputPreview: 'Get-ChildItem',
     outputPreview: outputPreview,
-    outputTruncated: true,
-    errorMessage: null,
   );
 }
 
-CodexParsedMessage _message(
+EvalDatasetMessage _message(
   int index,
-  CodexMessageAuthorType authorType,
-  String content, {
-  CodexUsage usage = const CodexUsage.empty(),
-  String? model,
-  bool hasToolCalls = false,
-}) {
-  return CodexParsedMessage(
+  EvalMessageAuthor author,
+  String content,
+) {
+  return EvalDatasetMessage(
     index: index,
-    authorType: authorType,
-    rawType: 'message',
-    createdAtUtc: DateTime.utc(2026, 6, 10, 9, 42 + index),
-    firstLine: content.split('\n').first,
+    author: author,
     contentPlain: content,
-    contentPreview: content,
-    contentTruncated: false,
-    usage: usage,
-    model: model,
-    hasToolCalls: hasToolCalls,
-    hasError: false,
   );
 }

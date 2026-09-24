@@ -184,15 +184,22 @@ schema 19 publishes the read-only views `history_sessions`,
 (`docs/skills/session-history/references/database.md`). The session-history
 agent skill uses these commands through `scripts/session_history.py`.
 
-## Parity with the viewer
+## Parser goldens and the viewer
 
-The Codex parser and the database writer are ports of the viewer's Dart code
-and must produce identical rows:
+The collector is the only session parser; the viewer has none and reads what
+the collector stored. Two suites hold that contract:
 
-- `cargo test --test local_ingestion` compares the Rust parser with the Dart
-  parser's retained output in `samples/collector-parity/expected`.
-- `app/test/app/collector_ingestion_compat_test.dart` scans one fixture tree
-  with the Dart writer and with this executable and compares every table.
-
-After an intended parser change, update both parsers and regenerate the
-goldens with `CODEX_PARITY_UPDATE=1 flutter test test/parser/collector_parity_golden_test.dart`.
+- `cargo test --test local_ingestion` compares the Codex parser's normalized
+  output for every fixture in `samples/collector-parity/sessions` with the
+  goldens in `samples/collector-parity/expected`. The goldens began as the
+  retired Dart parser's output and are now owned here. After an intended
+  parser change, regenerate them with
+  `CODEX_PARITY_UPDATE=1 cargo test --test local_ingestion parser_output`,
+  review the diff, and bump `PARSER_VERSION` (and the viewer's mirror in
+  `app/lib/src/database/collector_versions.dart`) when stored rows change.
+- `app/test/app/collector_ingestion_compat_test.dart` collects one fixture
+  tree through GUI Refresh and through this executable, compares every
+  table, and checks that the viewer's production reads (session rows,
+  conversations, usage, and costs) return the same results from both.
+  `app/test/app/multi_harness_ingestion_test.dart` does the same for Claude
+  Code sessions, including the Stats tab and eval exports.

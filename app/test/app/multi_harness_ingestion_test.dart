@@ -8,6 +8,9 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/session_activity_reader.dart';
+import 'package:codex_sessions_viewer/src/export/eval_dataset_exporter.dart';
+import 'package:codex_sessions_viewer/src/export/eval_dataset_loader.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
@@ -161,6 +164,40 @@ void main() {
       } finally {
         db.close();
       }
+    },
+  );
+
+  test(
+    'stats and eval exports read Claude sessions from stored rows',
+    () async {
+      final claudeId = 'claude:session:$_claudeSession';
+      final activity = await loadSessionActivity(database, [
+        claudeId,
+        'session:$_sharedId',
+      ]);
+      final claude = activity[claudeId]!;
+      expect(claude.turnCount, greaterThan(0));
+      expect(claude.toolCallCount, greaterThan(0));
+      expect(claude.span, greaterThan(Duration.zero));
+      expect(
+        claude.models.map((model) => model.model),
+        contains('claude-opus-5-5'),
+      );
+      expect(activity['session:$_sharedId']!.turnCount, greaterThan(0));
+
+      final sessions = await loadEvalDatasetSessions(database, [claudeId]);
+      final session = sessions.single;
+      expect(session.messages, isNotEmpty);
+      expect(session.toolCalls, isNotEmpty);
+      final files = const EvalDatasetExporter().export(
+        EvalDatasetExportRequest(
+          sessions: sessions,
+          format: EvalDatasetFormat.plainTextFiles,
+          turnMode: EvalTurnMode.fullConversation,
+        ),
+      );
+      expect(files.values.single, contains('Input:'));
+      expect(files.values.single, isNot(endsWith('Actual output:')));
     },
   );
 

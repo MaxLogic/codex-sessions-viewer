@@ -1,4 +1,5 @@
-//! Port of `app/lib/src/parser/codex_session_parser.dart`.
+//! The Codex rollout parser, the only one: the viewer reads what it stores.
+//! Originally ported from the viewer's retired Dart parser.
 //!
 //! Behavior is intentionally identical, including quirks, because the viewer
 //! and the collector write the same rows. Keep the two in lockstep; the parity

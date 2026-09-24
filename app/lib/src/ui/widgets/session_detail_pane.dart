@@ -189,8 +189,7 @@ class SessionDetailPane extends StatelessWidget {
                     SessionStatsView(
                       row: row,
                       subagents: subagents,
-                      loadActivity:
-                          loadActivity ?? loadSessionActivityFromFiles,
+                      loadActivity: loadActivity,
                       onOpenSession: onOpenSession,
                     ),
                     _DetailsTab(

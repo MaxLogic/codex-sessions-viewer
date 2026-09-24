@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/database/session_eval_state.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
+import '../support/session_search_fixture.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 

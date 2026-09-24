@@ -1,12 +1,10 @@
 import 'dart:io';
 
+import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
 import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
-import 'package:codex_sessions_viewer/src/export/markdown_exporter.dart';
-import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
-import 'package:codex_sessions_viewer/src/path_mapping/path_mapper.dart';
-import 'package:codex_sessions_viewer/src/scanner/session_scanner.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter/material.dart';
@@ -14,6 +12,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
+/// Runs against the built collector: set CODEX_SESSIONS_COLLECTOR_EXE to
+/// `collector\target\debug\codex-sessions-collector.exe` (cargo build).
 void main() {
   test('core local workflows work together on fixtures', () async {
     final temp = await Directory.systemTemp.createTemp('csv_integration_');
@@ -24,15 +24,9 @@ void main() {
     });
 
     final settingsFile = File(p.join(temp.path, 'settings.toml'));
-    final settings = await SettingsRepository(settingsFile).loadOrCreate();
+    final defaults = await SettingsRepository(settingsFile).loadOrCreate();
     expect(settingsFile.existsSync(), isTrue);
-    expect(settings.paths.windowsCodexPath, isNotEmpty);
-
-    final dbFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(dbFile);
-    expect(startup.canStartNormalUi, isTrue);
+    expect(defaults.paths.windowsCodexPath, isNotEmpty);
 
     final windowsRoot = Directory(p.join(temp.path, 'windows'));
     final wslRoot = Directory(p.join(temp.path, 'wsl'));
@@ -42,119 +36,90 @@ void main() {
       'sample_windows_session.json',
       windowsRoot,
     );
-    final wslFixture = await _copyFixture('sample_wsl_session.json', wslRoot);
-
-    final scanner = SessionScanner(
-      parser: CodexSessionParser(),
-      pathMapper: const CodexPathMapper(
-        wslDistro: 'Ubuntu',
-        wslLinuxHome: '/home/pawel',
-        wslUncRoot: r'\\wsl.localhost\Ubuntu\',
+    await _copyFixture('sample_wsl_session.json', wslRoot);
+    final settings = defaults.copyWith(
+      paths: PathSettings(
+        windowsCodexPath: windowsRoot.path,
+        wslCodexUncPath: wslRoot.path,
       ),
-      maxConcurrentParses: 2,
     );
+    await SettingsRepository(settingsFile).save(settings);
 
-    final firstScan = await scanner.scan(
-      SessionScanRequest(windowsRoot: windowsRoot.path, wslRoot: wslRoot.path),
+    final dbFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final sqlRoot = Directory(p.normalize(p.join('..', 'sql')));
+    final startup = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(dbFile, deferUsageMigration: true);
+    expect(startup.canStartNormalUi, isTrue);
+    final migration = await startPendingDatabaseMigration(
+      dbFile,
+      sqlRoot: sqlRoot,
     );
+    if (migration != null) {
+      expect((await migration.result).succeeded, isTrue);
+    }
+
+    // The collector parses and writes; the viewer reads what it stored.
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: dbFile,
+      claudeProjectRoots: const [],
+    );
+    final firstScan = await controller.refresh();
     expect(
-      firstScan.sessions.map((session) => session.sourceType),
-      containsAll([SessionSourceType.windows, SessionSourceType.wsl]),
-    );
-    expect(firstScan.errors, isEmpty);
-
-    final cached = [
-      await CachedSessionSnapshot.fromFile(
-        windowsFixture,
-        status: SessionFileStatus.available,
-        parserVersion: CodexSessionParser.currentVersion,
-      ),
-      await CachedSessionSnapshot.fromFile(
-        wslFixture,
-        status: SessionFileStatus.available,
-        parserVersion: CodexSessionParser.currentVersion,
-      ),
-    ];
-    final unchangedScan = await scanner.scan(
-      SessionScanRequest(
-        windowsRoot: windowsRoot.path,
-        wslRoot: wslRoot.path,
-        cachedSessions: cached,
-      ),
-    );
-    expect(unchangedScan.progress.filesSkipped, 2);
-    expect(unchangedScan.sessions, isEmpty);
-
-    final selectedReparse = await scanner.scan(
-      SessionScanRequest(
-        windowsRoot: windowsRoot.path,
-        wslRoot: wslRoot.path,
-        cachedSessions: cached,
-        forceReparsePlan: ForceReparsePlan.selected(windowsFixture.path),
-      ),
-    );
-    expect(
-      selectedReparse.sessions.single.sourceType,
-      SessionSourceType.windows,
+      firstScan.rows.map((row) => row.platform).toSet(),
+      containsAll([SessionRowPlatform.windows, SessionRowPlatform.wsl]),
     );
 
-    final allReparse = await scanner.scan(
-      SessionScanRequest(
-        windowsRoot: windowsRoot.path,
-        wslRoot: wslRoot.path,
-        cachedSessions: cached,
-        forceReparsePlan: const ForceReparsePlan.all(),
-      ),
-    );
-    expect(allReparse.sessions, hasLength(2));
+    final db = sqlite3.open(dbFile.path);
+    addTearDown(db.close);
+    int lastRun(String column) =>
+        db
+                .select(
+                  'select $column from scan_runs order by id desc limit 1',
+                )
+                .single[column]
+            as int;
+    expect(lastRun('files_parsed'), 2);
 
-    final filteredReparse = await scanner.scan(
-      SessionScanRequest(
-        windowsRoot: windowsRoot.path,
-        wslRoot: wslRoot.path,
-        cachedSessions: cached,
-        forceReparsePlan: ForceReparsePlan.filtered(
-          (snapshot) => snapshot.sourcePath == wslFixture.path,
-        ),
-      ),
-    );
-    expect(filteredReparse.sessions.single.sourceType, SessionSourceType.wsl);
+    final unchangedScan = await controller.refresh();
+    expect(unchangedScan.rows, hasLength(firstScan.rows.length));
+    expect(lastRun('files_skipped'), 2);
+    expect(lastRun('files_parsed'), 0);
 
-    final parsed = firstScan.sessions.first.parsedSession;
-    final markdown = const MarkdownSessionExporter().exportMarkdown(
-      parsed,
-      const MarkdownExportRequest(scope: MarkdownExportScope.all()),
+    final windowsRow = firstScan.rows.firstWhere(
+      (row) => row.platform == SessionRowPlatform.windows,
     );
-    expect(markdown, contains('## Conversation'));
+    final reloaded = await controller.reloadSessionDetailFromSource(
+      windowsRow.id,
+    );
+    expect(reloaded?.id, windowsRow.id);
+    expect(windowsFixture.existsSync(), isTrue);
 
     final commandSet = ResumeCommandGenerator(settings: settings).build(
       ResumeCommandSession(
-        sessionId: parsed.sessionId ?? 'fallback-session',
+        sessionId: windowsRow.sessionId,
         sourceType: ResumeSessionSourceType.windows,
-        workingDirectory: parsed.workingDirectoryDisplay ?? temp.path,
+        workingDirectory: windowsRow.workingDirectory.isEmpty
+            ? temp.path
+            : windowsRow.workingDirectory,
       ),
     );
     expect(commandSet.plainResumeCommand, startsWith('codex resume '));
     expect(commandSet.terminalLaunchCommand, isNotNull);
 
-    final db = sqlite3.open(dbFile.path);
-    addTearDown(db.close);
-    _insertUsageSession(db, id: 'windows', sourceType: 'windows');
-    _insertUsageSession(db, id: 'wsl', sourceType: 'wsl', isArchived: true);
     final summary = UsageSummaryRepository(db).summarize(
       UsageSummaryRequest(
-        period: UsagePeriod.today,
-        nowUtc: DateTime.utc(2026, 6, 13, 12),
+        period: UsagePeriod.custom,
+        nowUtc: DateTime.utc(2030),
+        customStartUtc: DateTime.utc(2000),
+        customEndExclusiveUtc: DateTime.utc(2030),
       ),
     );
-    expect(summary.totalSessions, 2);
+    expect(summary.totalSessions, firstScan.rows.length);
     expect(
       summary.byPlatform.map((row) => row.key),
       containsAll(['Windows', 'WSL']),
-    );
-    expect(
-      summary.byArchiveState.map((row) => row.key),
-      containsAll(['active', 'archived']),
     );
   });
 
@@ -218,46 +183,5 @@ SessionRowViewModel _row(
     model: 'gpt-5.4',
     tags: const [],
     status: 'Available',
-  );
-}
-
-void _insertUsageSession(
-  Database db, {
-  required String id,
-  required String sourceType,
-  bool isArchived = false,
-}) {
-  final now = DateTime.utc(2026, 6, 13, 12).toIso8601String();
-  db.execute(
-    '''
-    insert into sessions (
-      id, source_type, source_file_path, display_path, platform_path,
-      parse_status, scan_status, started_at_utc, last_message_at_utc,
-      title, message_count, input_tokens, output_tokens, cached_input_tokens,
-      total_tokens, model_primary, models_used, project_name_snapshot,
-      is_archived, created_at_utc, updated_at_utc
-    ) values (?, ?, ?, ?, ?, 'available', 'available', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''',
-    [
-      id,
-      sourceType,
-      '$id.jsonl',
-      '$id.jsonl',
-      '$id.jsonl',
-      DateTime.utc(2026, 6, 13, 9).toIso8601String(),
-      DateTime.utc(2026, 6, 13, 10).toIso8601String(),
-      id,
-      2,
-      10,
-      5,
-      1,
-      16,
-      'gpt-5.4',
-      '|gpt-5.4|',
-      'Codex Viewer',
-      isArchived ? 1 : 0,
-      now,
-      now,
-    ],
   );
 }

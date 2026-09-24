@@ -1,8 +1,9 @@
-//! Applies contract records with the same SQL the Dart scan writer runs
-//! (`_persistParsedSessions` and helpers in `runtime_session_controller.dart`,
-//! `SessionSearchIndex.upsert`, and `UsageSummaryRepository`). Every write runs
-//! in a short `BEGIN IMMEDIATE` transaction; SQLite's lock and busy timeout
-//! serialize the collector with the viewer and with other collectors.
+//! Applies contract records: the only writer of parsed session state. The SQL
+//! began as a port of the viewer's retired Dart scan writer, and the daily
+//! usage projection matches `UsageSummaryRepository`, which the viewer still
+//! uses for its own repricing. Every write runs in a short `BEGIN IMMEDIATE`
+//! transaction; SQLite's lock and busy timeout serialize the collector with
+//! the viewer and with other collectors.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};

@@ -1,6 +1,5 @@
 import 'dart:convert';
 
-import '../parser/codex_session_parser.dart';
 import '../ui/models/session_label_formatter.dart';
 import '../utils/injected_context_filter.dart';
 
@@ -71,7 +70,7 @@ class EvalDatasetExporter {
     EvalDatasetExportOptions options,
     _PathAnonymizer anonymizer,
   ) {
-    final visible = evalSession.session.messages
+    final visible = evalSession.messages
         .where(_isVisibleEvalMessage)
         .toList(growable: false);
     return switch (mode) {
@@ -80,15 +79,10 @@ class EvalDatasetExporter {
           evalSession,
           idSuffix: 'full',
           inputMessages: visible
-              .where(
-                (message) => message.authorType == CodexMessageAuthorType.user,
-              )
+              .where((message) => message.author == EvalMessageAuthor.user)
               .toList(growable: false),
           actualMessages: visible
-              .where(
-                (message) =>
-                    message.authorType == CodexMessageAuthorType.assistant,
-              )
+              .where((message) => message.author == EvalMessageAuthor.assistant)
               .toList(growable: false),
           options: options,
           anonymizer: anonymizer,
@@ -101,10 +95,7 @@ class EvalDatasetExporter {
             idSuffix: 'final',
             inputMessages: visible
                 .takeWhile((message) => message != _lastAssistant(visible))
-                .where(
-                  (message) =>
-                      message.authorType == CodexMessageAuthorType.user,
-                )
+                .where((message) => message.author == EvalMessageAuthor.user)
                 .toList(growable: false),
             actualMessages: [_lastAssistant(visible)!],
             options: options,
@@ -122,19 +113,19 @@ class EvalDatasetExporter {
 
   List<_EvalCase> _perTurnCases(
     EvalDatasetSession evalSession,
-    List<CodexParsedMessage> visible,
+    List<EvalDatasetMessage> visible,
     EvalDatasetExportOptions options,
     _PathAnonymizer anonymizer,
   ) {
     final cases = <_EvalCase>[];
-    CodexParsedMessage? pendingUser;
+    EvalDatasetMessage? pendingUser;
     var turn = 1;
     for (final message in visible) {
-      if (message.authorType == CodexMessageAuthorType.user) {
+      if (message.author == EvalMessageAuthor.user) {
         pendingUser = message;
         continue;
       }
-      if (message.authorType != CodexMessageAuthorType.assistant ||
+      if (message.author != EvalMessageAuthor.assistant ||
           pendingUser == null) {
         continue;
       }
@@ -157,8 +148,8 @@ class EvalDatasetExporter {
   _EvalCase _caseFromMessages(
     EvalDatasetSession evalSession, {
     required String idSuffix,
-    required List<CodexParsedMessage> inputMessages,
-    required List<CodexParsedMessage> actualMessages,
+    required List<EvalDatasetMessage> inputMessages,
+    required List<EvalDatasetMessage> actualMessages,
     required EvalDatasetExportOptions options,
     required _PathAnonymizer anonymizer,
   }) {
@@ -172,12 +163,8 @@ class EvalDatasetExporter {
         .join('\n\n');
     final metadata = _metadata(evalSession, options, anonymizer);
     return _EvalCase(
-      id: '${evalSession.session.internalId}-$idSuffix',
-      title: _exportText(
-        _sessionTitle(evalSession.session),
-        options,
-        anonymizer,
-      ),
+      id: '${evalSession.id}-$idSuffix',
+      title: _exportText(_sessionTitle(evalSession), options, anonymizer),
       input: _exportText(input, options, anonymizer),
       actualOutput: _exportText(actualOutput, options, anonymizer),
       expectedOutput: _blankToNull(
@@ -197,7 +184,7 @@ class EvalDatasetExporter {
       ],
       metadata: metadata,
       toolCalls: options.includeToolCalls
-          ? _toolCalls(evalSession.session.toolCalls, options, anonymizer)
+          ? _toolCalls(evalSession.toolCalls, options, anonymizer)
           : const [],
     );
   }
@@ -231,15 +218,78 @@ class EvalDatasetExportRequest {
   }
 }
 
+/// Who wrote a stored message, as the collector records `author_type`.
+enum EvalMessageAuthor { user, assistant, reasoning, system, tool }
+
+EvalMessageAuthor evalMessageAuthor(String? value) => switch (value) {
+  'user' => EvalMessageAuthor.user,
+  'assistant' => EvalMessageAuthor.assistant,
+  'reasoning' => EvalMessageAuthor.reasoning,
+  'system' => EvalMessageAuthor.system,
+  _ => EvalMessageAuthor.tool,
+};
+
+/// A stored message, read from the `messages` table.
+class EvalDatasetMessage {
+  const EvalDatasetMessage({
+    required this.index,
+    required this.author,
+    required this.contentPlain,
+  });
+
+  final int index;
+  final EvalMessageAuthor author;
+  final String contentPlain;
+}
+
+/// A stored tool call, read from the `tool_calls` table.
+class EvalDatasetToolCall {
+  const EvalDatasetToolCall({
+    required this.toolName,
+    required this.status,
+    this.messageIndex,
+    this.inputPreview = '',
+    this.outputPreview = '',
+  });
+
+  /// The message the call belongs to, when its time places it; null
+  /// otherwise.
+  final int? messageIndex;
+  final String toolName;
+  final String status;
+  final String inputPreview;
+  final String outputPreview;
+}
+
+/// One stored session of any harness with its local eval annotations.
 class EvalDatasetSession {
   const EvalDatasetSession({
-    required this.session,
+    required this.id,
+    required this.sourceType,
+    required this.displayPath,
+    this.sessionId,
+    this.title,
+    this.modelIds = const {},
+    this.totalTokens,
+    this.messages = const [],
+    this.toolCalls = const [],
     this.expectedOutput,
     this.status,
     this.notes,
   });
 
-  final CodexParsedSession session;
+  /// The `sessions.id` row identity.
+  final String id;
+  final String? sessionId;
+  final String? title;
+
+  /// `windows` or `wsl`.
+  final String sourceType;
+  final String displayPath;
+  final Set<String> modelIds;
+  final int? totalTokens;
+  final List<EvalDatasetMessage> messages;
+  final List<EvalDatasetToolCall> toolCalls;
   final String? expectedOutput;
   final String? status;
   final String? notes;
@@ -388,12 +438,12 @@ Map<String, Object?> _metadata(
   if (!options.includeMetadata) {
     return const {};
   }
-  final session = evalSession.session;
+  final session = evalSession;
   final metadata = <String, Object?>{
     'session_id': session.sessionId,
     'title': _exportText(_sessionTitle(session), options, anonymizer),
-    'source': session.sourceType.name,
-    'source_label': SessionLabelFormatter.sourceType(session.sourceType.name),
+    'source': session.sourceType,
+    'source_label': SessionLabelFormatter.sourceType(session.sourceType),
     'path': options.anonymizePaths
         ? anonymizer.pathFor(session.displayPath)
         : session.displayPath,
@@ -401,8 +451,8 @@ Map<String, Object?> _metadata(
     'model_labels': SessionLabelFormatter.modelLabels(session.modelIds),
     'provider_labels': SessionLabelFormatter.providerLabels(session.modelIds),
   };
-  if (options.includeTokenUsage && session.usage.totalTokens != null) {
-    metadata['total_tokens'] = session.usage.totalTokens;
+  if (options.includeTokenUsage && session.totalTokens != null) {
+    metadata['total_tokens'] = session.totalTokens;
   }
   final status = _blankToNull(evalSession.status);
   if (status != null) {
@@ -416,7 +466,7 @@ Map<String, Object?> _metadata(
 }
 
 List<Map<String, Object?>> _toolCalls(
-  List<CodexParsedToolCall> toolCalls,
+  List<EvalDatasetToolCall> toolCalls,
   EvalDatasetExportOptions options,
   _PathAnonymizer anonymizer,
 ) {
@@ -436,23 +486,23 @@ List<Map<String, Object?>> _toolCalls(
   ];
 }
 
-CodexParsedMessage? _lastAssistant(List<CodexParsedMessage> messages) {
+EvalDatasetMessage? _lastAssistant(List<EvalDatasetMessage> messages) {
   for (var index = messages.length - 1; index >= 0; index--) {
     final message = messages[index];
-    if (message.authorType == CodexMessageAuthorType.assistant) {
+    if (message.author == EvalMessageAuthor.assistant) {
       return message;
     }
   }
   return null;
 }
 
-bool _isVisibleEvalMessage(CodexParsedMessage message) {
-  return message.authorType != CodexMessageAuthorType.user ||
+bool _isVisibleEvalMessage(EvalDatasetMessage message) {
+  return message.author != EvalMessageAuthor.user ||
       !isInjectedEnvironmentContextMessage(message.contentPlain);
 }
 
 String _messageContent(
-  CodexParsedMessage message,
+  EvalDatasetMessage message,
   EvalDatasetExportOptions options,
 ) {
   if (options.includeCodeBlocks) {
@@ -473,21 +523,22 @@ String _messageContent(
   return kept.join('\n').trim();
 }
 
-String? _openAiRole(CodexParsedMessage message) {
-  return switch (message.authorType) {
-    CodexMessageAuthorType.user => 'user',
-    CodexMessageAuthorType.assistant => 'assistant',
-    CodexMessageAuthorType.system => 'system',
+String? _openAiRole(EvalDatasetMessage message) {
+  return switch (message.author) {
+    EvalMessageAuthor.user => 'user',
+    EvalMessageAuthor.assistant => 'assistant',
+    EvalMessageAuthor.system => 'system',
     _ => null,
   };
 }
 
-String _sessionTitle(CodexParsedSession session) {
+String _sessionTitle(EvalDatasetSession session) {
   final title = session.title?.trim();
   if (title != null && title.isNotEmpty) {
     return title;
   }
-  return session.sessionId ?? session.internalId;
+  final sessionId = session.sessionId?.trim();
+  return sessionId == null || sessionId.isEmpty ? session.id : sessionId;
 }
 
 String _exportText(

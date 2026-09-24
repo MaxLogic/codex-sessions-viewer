@@ -1,4 +1,5 @@
-//! Port of `SessionScanner` and the scan flow in `RuntimeSessionController`.
+//! Codex session discovery and parallel parsing, originally ported from the
+//! viewer's retired Dart scanner.
 //!
 //! Discovery and skip decisions run on the calling thread. Changed files are
 //! parsed by a fixed pool of worker threads connected through bounded

@@ -17,7 +17,7 @@ import '../logging/structured_logger.dart';
 import '../pricing/pricing_repository.dart';
 import '../scanner/scan_batching.dart';
 import '../scanner/collector_process.dart';
-import '../scanner/session_scanner.dart';
+import '../scanner/scan_types.dart';
 import '../search/message_search.dart';
 import '../search/session_search.dart';
 import '../usage/usage_summary.dart';

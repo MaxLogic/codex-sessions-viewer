@@ -3,7 +3,8 @@
 //! Every test uses isolated temporary folders and databases. Tests that need
 //! a viewer database build one from the same SQL files the viewer applies and
 //! record the viewer as owner; `app/test/app/collector_ingestion_compat_test.dart`
-//! additionally proves the collector against a database the Dart viewer made.
+//! additionally proves the viewer's production reads against databases the
+//! collector wrote.
 #![recursion_limit = "256"]
 
 mod support;
@@ -18,7 +19,14 @@ use serde_json::{Value, json};
 use support::{TempDir, collector, viewer_database};
 
 // ---------------------------------------------------------------------------
-// Parser parity with the Dart viewer
+// Parser goldens
+//
+// `samples/collector-parity/expected` holds the collector's normalized parser
+// output for every fixture in `samples/collector-parity/sessions`. The goldens
+// started as the retired Dart parser's output; the collector owns them now.
+// After an intended parser change, regenerate them with
+// `CODEX_PARITY_UPDATE=1 cargo test --test local_ingestion parser_output`,
+// review the diff, and bump `PARSER_VERSION` when stored rows change.
 
 fn usage_view(usage: &Usage) -> Value {
     json!({
@@ -36,7 +44,7 @@ fn time(value: Option<codex_sessions_collector::dart::DartDateTime>) -> Value {
     value.map_or(Value::Null, |value| Value::String(value.to_iso8601()))
 }
 
-/// Mirrors `parityView` in `app/test/parser/collector_parity_golden_test.dart`.
+/// The normalized view of one parsed file that the goldens record.
 fn parity_view(path: &str) -> Value {
     let result = parse_file(path, ParserOptions::default());
     let session = match result {
@@ -165,7 +173,8 @@ fn first_difference(path: &str, expected: &Value, actual: &Value) -> Option<Stri
 }
 
 #[test]
-fn normalized_parser_output_matches_retained_dart_fixtures() {
+fn normalized_parser_output_matches_the_goldens() {
+    let update = std::env::var("CODEX_PARITY_UPDATE").is_ok_and(|value| value == "1");
     let sessions = Path::new("../samples/collector-parity/sessions");
     let mut names: Vec<String> = std::fs::read_dir(sessions)
         .expect("parity fixtures")
@@ -178,16 +187,20 @@ fn normalized_parser_output_matches_retained_dart_fixtures() {
     );
     let mut failures = Vec::new();
     for name in &names {
-        // The Dart test passes the same relative path, so IDs derived from
-        // the path agree.
+        // IDs derived from the path depend on this relative form.
         let path = format!("../samples/collector-parity/sessions/{name}");
         let golden_path = format!("../samples/collector-parity/expected/{name}.json");
+        let actual = parity_view(&path);
+        if update {
+            let text = serde_json::to_string_pretty(&actual).unwrap();
+            std::fs::write(&golden_path, format!("{text}\n")).unwrap();
+            continue;
+        }
         let golden: Value = serde_json::from_str(
             &std::fs::read_to_string(&golden_path)
                 .unwrap_or_else(|error| panic!("{golden_path}: {error}")),
         )
         .unwrap();
-        let actual = parity_view(&path);
         if let Some(difference) = first_difference(name, &golden, &actual) {
             failures.push(difference);
         }

@@ -6,19 +6,21 @@ import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/database/collector_versions.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
-import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
-/// GUI Refresh and the collector CLI share Rust ingestion after T-134. This
-/// suite proves their public entry points converge on the same stored content
-/// and do not reparse unchanged sessions when interleaved. Independent parser
-/// golden suites retain the Dart-versus-Rust parsing comparison.
+/// The Rust collector is the only session parser and writer. GUI Refresh
+/// (the collector over the writer-lease protocol) and the collector CLI must
+/// converge on the same stored content, must not reparse unchanged sessions
+/// when interleaved, and the viewer's production reads must return the same
+/// rows, conversations, and usage from either database. The collector's own
+/// parser goldens live in `samples/collector-parity` (see collector/README.md).
 /// A database prepared the way production startup prepares it: schema files,
 /// then the persisted-usage startup migration. Migrated once (the startup
 /// migration takes about a minute) and copied for each test database.
@@ -86,7 +88,7 @@ void main() {
 
   tearDownAll(() => _template.parent.delete(recursive: true));
 
-  test('viewer startup records both writer versions for collector agreement', () {
+  test('viewer startup records the writer versions collectors agree on', () {
     final db = openFileBackedDatabase(_template);
     try {
       final versions = {
@@ -97,7 +99,11 @@ void main() {
       };
       expect(
         versions['writer_codex_parser_version'],
-        CodexSessionParser.currentVersion.toString(),
+        collectorCodexParserVersion.toString(),
+      );
+      expect(
+        versions['writer_claude_parser_version'],
+        collectorClaudeParserVersion.toString(),
       );
       expect(
         versions['writer_usage_cost_projection_version'],
