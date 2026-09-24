@@ -1107,12 +1107,18 @@ class _ActivityToggle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    const help = 'Off: only your prompts and the assistant replies are shown.';
+    // One named toggle; the inner checkbox would otherwise be a second,
+    // unlabeled tap target.
     return Semantics(
       label: 'Show tool calls and reasoning',
+      hint: help,
       toggled: value,
       container: true,
+      excludeSemantics: true,
+      onTap: () => onChanged(!value),
       child: Tooltip(
-        message: 'Off: only your prompts and the assistant replies are shown.',
+        message: help,
         child: InkWell(
           borderRadius: BorderRadius.circular(6),
           onTap: () => onChanged(!value),
@@ -1318,7 +1324,8 @@ class _ConversationMessageCard extends StatelessWidget {
       container: true,
       focusable: true,
       readOnly: true,
-      button: true,
+      // Selectable, not a button: a button role would hide the card's own
+      // controls (copy, expand) from screen readers.
       selected: selected,
       onTap: onSelect,
       label: _messageSemanticsLabel(

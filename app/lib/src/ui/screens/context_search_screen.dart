@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -49,6 +51,11 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
   var _isSearching = false;
   var _statusMessage = '';
   var _searchGeneration = 0;
+  Timer? _rowsChangedTimer;
+
+  /// Collector commits can replace the session rows several times a second;
+  /// only the settled rows re-run an active query.
+  static const _rowsChangedDebounce = Duration(milliseconds: 400);
 
   @override
   void initState() {
@@ -61,7 +68,12 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.initialSessionRows != widget.initialSessionRows &&
         _queryController.text.trim().isNotEmpty) {
-      _search(preserveSelection: true);
+      _rowsChangedTimer?.cancel();
+      _rowsChangedTimer = Timer(_rowsChangedDebounce, () {
+        if (mounted && _queryController.text.trim().isNotEmpty) {
+          _search(preserveSelection: true);
+        }
+      });
     }
     if (oldWidget.statusMessage != widget.statusMessage) {
       _statusMessage = widget.statusMessage;
@@ -70,6 +82,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
 
   @override
   void dispose() {
+    _rowsChangedTimer?.cancel();
     _queryController.dispose();
     super.dispose();
   }
@@ -159,14 +172,16 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
             ),
           ),
         ),
+        // Stays enabled while searching so keyboard focus is not dropped; a
+        // new search supersedes the running one.
         Semantics(
           label: 'Search context',
           button: true,
-          enabled: !_isSearching,
+          enabled: true,
           excludeSemantics: true,
-          onTap: _isSearching ? null : _search,
+          onTap: _search,
           child: AppButton.filled(
-            onPressed: _isSearching ? null : _search,
+            onPressed: _search,
             icon: const Icon(Icons.search),
             label: Text(_isSearching ? 'Searching' : 'Search'),
           ),

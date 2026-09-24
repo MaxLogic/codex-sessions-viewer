@@ -4,6 +4,9 @@ class MessageSearchIndex {
   const MessageSearchIndex(this.db);
 
   final Database db;
+
+  /// Whether `sessions.harness` exists, cached per connection.
+  static final _sessionsHaveHarness = Expando<bool>('sessions.harness');
   static const _lastMessageRowIdKey =
       'message_search.backfill.last_message_rowid';
   static const _targetMessageRowIdKey =
@@ -99,13 +102,13 @@ class MessageSearchIndex {
     if (tokens.isEmpty || query.limit <= 0) {
       return const [];
     }
-    // Older read-only indexes predate the multi-harness schema.
-    final harnessExpression =
-        db
-            .select('pragma table_info(sessions)')
-            .any((row) => row['name'] == 'harness')
-        ? 's.harness'
-        : "'codex'";
+    // Older read-only indexes predate the multi-harness schema. The schema
+    // of an open connection does not change under a search, so the column
+    // check runs once per connection.
+    final hasHarness = _sessionsHaveHarness[db] ??= db
+        .select('pragma table_info(sessions)')
+        .any((row) => row['name'] == 'harness');
+    final harnessExpression = hasHarness ? 's.harness' : "'codex'";
     final rows = db.select(
       '''
       select

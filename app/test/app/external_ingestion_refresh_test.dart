@@ -210,6 +210,8 @@ void main() {
       await tester.tap(find.bySemanticsLabel('Search context'));
       await tester.pump();
       await show();
+      // Row changes re-run the query once they settle.
+      await tester.pump(const Duration(milliseconds: 500));
       expect(pending.length, 2);
       pending.last.complete([
         MessageSearchResult(
@@ -516,7 +518,7 @@ void main() {
         final sessionRow = find.byWidgetPredicate(
           (widget) =>
               widget is Semantics &&
-              widget.properties.button == true &&
+              widget.properties.onTap != null &&
               (widget.properties.label ?? '').startsWith('Session ') &&
               (widget.properties.label ?? '').contains('. Status '),
         );

@@ -46,9 +46,15 @@ class ResumeCommandGenerator {
       );
     }
 
-    final plainCommand = harness == 'claude'
+    // Terminal profiles start in the session folder, so they run the bare
+    // command. Claude Code looks sessions up per project folder, so copied
+    // commands change to that folder first.
+    final bareCommand = harness == 'claude'
         ? 'claude --resume $sessionId'
         : _plainCodexCommand('resume', sessionId);
+    final plainCommand = harness == 'claude'
+        ? _inWorkingDirectory(session, bareCommand)
+        : bareCommand;
     final plainForkCommand = _plainCodexCommand('fork', sessionId);
     final bashResumeCommand = harness == 'claude'
         ? _bashCommand(['claude', '--resume', sessionId])
@@ -67,7 +73,7 @@ class ResumeCommandGenerator {
     final terminalCommand = _terminalCommand(
       settings.terminal.defaultTerminal,
       session,
-      plainCommand,
+      bareCommand,
       bashResumeCommand,
     );
     final terminalForkCommand = _terminalCommand(
@@ -95,10 +101,26 @@ class ResumeCommandGenerator {
       terminalLaunchCommandFor: (profileName) => _terminalCommand(
         profileName,
         session,
-        plainCommand,
+        bareCommand,
         bashResumeCommand,
       ).command,
     );
+  }
+
+  /// Prefixes a folder change that works in cmd.exe and PowerShell 7
+  /// (`pushd`) for Windows sessions, or in bash for WSL sessions. Without a
+  /// folder that can be quoted safely the bare command is returned.
+  String _inWorkingDirectory(ResumeCommandSession session, String command) {
+    final folder = session.workingDirectory.trim();
+    if (folder.isEmpty || _hasUnsafeShellActiveChars(folder)) {
+      return command;
+    }
+    return switch (session.sourceType) {
+      // cmd.exe expands %NAME% even inside double quotes.
+      ResumeSessionSourceType.windows =>
+        folder.contains('%') ? command : 'pushd "$folder" && $command',
+      ResumeSessionSourceType.wsl => 'cd ${_quoteBashArg(folder)} && $command',
+    };
   }
 
   String? _platformCommand(

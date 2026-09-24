@@ -746,6 +746,7 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
                 trailing: Semantics(
                   label: 'Merge ${folder.folder} into another project',
                   button: true,
+                  enabled: !_busy,
                   container: true,
                   onTap: _busy
                       ? null

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 
 import '../config/app_settings.dart';
@@ -115,7 +116,17 @@ class _CodexAppShellState extends State<CodexAppShell> {
   void _reportSection() {
     final section = CodexAppSection.values[_selectedIndex];
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) widget.onSectionChanged?.call(section);
+      if (!mounted) return;
+      widget.onSectionChanged?.call(section);
+      // One announcement per navigation instead of a screen-wide live region
+      // that would re-read content on every update.
+      unawaited(
+        SemanticsService.sendAnnouncement(
+          View.of(context),
+          '${section.label} screen',
+          Directionality.maybeOf(context) ?? TextDirection.ltr,
+        ),
+      );
     });
   }
 
@@ -261,7 +272,6 @@ class _SectionContent extends StatelessWidget {
         key: ValueKey(section),
         child: Semantics(
           label: '${section.label} screen',
-          liveRegion: true,
           container: true,
           explicitChildNodes: true,
           child: _buildSection(context),

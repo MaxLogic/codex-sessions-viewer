@@ -1284,7 +1284,7 @@ void main() {
     await tester.pumpAndSettle();
     final archiveItem = find.ancestor(
       of: find.text('Archived only').last,
-      matching: find.byType(CheckedPopupMenuItem<int>),
+      matching: find.byWidgetPredicate((w) => w is CheckedPopupMenuItem),
     );
     expect(archiveItem, findsOneWidget);
     await tester.ensureVisible(archiveItem);
@@ -2022,6 +2022,8 @@ void main() {
       find.semantics.byLabel('Resize session table and detail panes'),
     );
     await tester.pumpAndSettle();
+    // Keyboard and accessibility nudges save once they settle.
+    await tester.pump(const Duration(seconds: 1));
     expect(saved.length, greaterThan(savedCount));
     expect(saved.last.paneFraction, greaterThan(after / (1800 - 9)));
     tester.semantics.performAction(
@@ -2868,7 +2870,7 @@ Future<void> _setOriginFilter(WidgetTester tester, String label) async {
     };
     final menuItem = find.ancestor(
       of: find.text(menuLabel).last,
-      matching: find.byType(CheckedPopupMenuItem<int>),
+      matching: find.byWidgetPredicate((w) => w is CheckedPopupMenuItem),
     );
     expect(menuItem, findsOneWidget);
     await tester.ensureVisible(menuItem);
@@ -2910,7 +2912,7 @@ Future<void> _setTimeFilter(
     }
     final menuItem = find.ancestor(
       of: find.text(label).last,
-      matching: find.byType(CheckedPopupMenuItem<int>),
+      matching: find.byWidgetPredicate((w) => w is CheckedPopupMenuItem),
     );
     expect(menuItem, findsOneWidget);
     await tester.ensureVisible(menuItem);

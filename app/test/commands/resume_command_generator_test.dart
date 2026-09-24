@@ -3,6 +3,54 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  group('Claude Code resume changes to the session folder', () {
+    ResumeCommandSet build(
+      String cwd, {
+      ResumeSessionSourceType source = ResumeSessionSourceType.windows,
+    }) => ResumeCommandGenerator(settings: _settings()).build(
+      ResumeCommandSession(
+        sessionId: 'abc-123',
+        sourceType: source,
+        workingDirectory: cwd,
+        harness: 'claude',
+      ),
+    );
+
+    test('Windows plain and platform commands quote the folder', () {
+      final commands = build(r'C:\Projects\Client App & Co');
+      const expected =
+          r'pushd "C:\Projects\Client App & Co" && claude --resume abc-123';
+      expect(commands.plainResumeCommand, expected);
+      expect(commands.platformResumeCommand, expected);
+      // The terminal profile already starts in the folder.
+      expect(
+        commands.terminalLaunchSpec?.arguments.last,
+        'claude --resume abc-123',
+      );
+    });
+
+    test('WSL plain command changes directory with bash quoting', () {
+      final commands = build(
+        "/home/pawel/it's here",
+        source: ResumeSessionSourceType.wsl,
+      );
+      expect(
+        commands.plainResumeCommand,
+        "cd '/home/pawel/it'\"'\"'s here' && claude --resume abc-123",
+      );
+      expect(commands.platformResumeCommand, contains('--cd'));
+    });
+
+    test('falls back to the bare command without a usable folder', () {
+      expect(build('').plainResumeCommand, 'claude --resume abc-123');
+      for (final unsafe in [r'C:\a"b', r'C:\100%\x', 'C:\\a\nb']) {
+        final commands = build(unsafe);
+        expect(commands.plainResumeCommand, 'claude --resume abc-123');
+        expect(commands.platformResumeCommand, 'claude --resume abc-123');
+      }
+    });
+  });
+
   test('generates plain and Windows terminal commands with safe quoting', () {
     final commands = ResumeCommandGenerator(settings: _settings()).build(
       const ResumeCommandSession(

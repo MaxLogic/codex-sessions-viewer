@@ -11,6 +11,7 @@ import '../number_formatting.dart';
 import 'command_preview.dart';
 import 'conversation_view.dart';
 import 'focus_reader_view.dart';
+import 'menu_header_entry.dart';
 import 'session_stats_view.dart';
 import 'svg_icon.dart';
 import 'app_button.dart';
@@ -901,10 +902,7 @@ class _ActionArea extends StatelessWidget {
           tooltip: 'More actions for selected session',
           onSelected: (value) => _handleMoreAction(context, value),
           itemBuilder: (context) => [
-            PopupMenuItem<String>(
-              enabled: false,
-              child: Text(row.harnessLabel),
-            ),
+            MenuHeaderEntry<String>(row.harnessLabel),
             _moreItem(
               'open-folder',
               'Open containing folder',

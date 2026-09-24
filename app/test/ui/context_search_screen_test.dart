@@ -1,7 +1,11 @@
+import 'dart:async';
+import 'dart:ui' show Tristate;
+
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/ui/models/session_row_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/context_search_screen.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -92,6 +96,56 @@ void main() {
     expect(opened.single.sessionId, 'parser');
     expect(opened.single.messageIndex, 2);
   });
+
+  testWidgets(
+    'row changes re-run the search once, debounced, and Search stays enabled',
+    (tester) async {
+      final handle = tester.ensureSemantics();
+      final searched = <String>[];
+      final pending = <Completer<List<MessageSearchResult>>>[];
+      Widget screen(List<SessionRowViewModel> rows) => MaterialApp(
+        home: Scaffold(
+          body: ContextSearchScreen(
+            initialSessionRows: rows,
+            onSearchMessages: (query) {
+              searched.add(query.text);
+              final completer = Completer<List<MessageSearchResult>>();
+              pending.add(completer);
+              return completer.future;
+            },
+          ),
+        ),
+      );
+      await tester.pumpWidget(screen([_row(id: 'a', title: 'A')]));
+      await tester.enterText(find.bySemanticsLabel('Context query'), 'cache');
+      await tester.tap(find.bySemanticsLabel('Search context'));
+      await tester.pump();
+      expect(searched, ['cache']);
+
+      final button = tester
+          .getSemantics(find.bySemanticsLabel('Search context'))
+          .getSemanticsData();
+      expect(
+        button.flagsCollection.isEnabled,
+        isNot(Tristate.isFalse),
+        reason: 'A running search must not disable the focused button.',
+      );
+      expect(button.hasAction(SemanticsAction.tap), isTrue);
+
+      for (var i = 0; i < 5; i++) {
+        await tester.pumpWidget(screen([_row(id: 'a$i', title: 'A$i')]));
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(searched, ['cache'], reason: 'Row churn is debounced.');
+      await tester.pump(const Duration(seconds: 1));
+      expect(searched, ['cache', 'cache']);
+      for (final completer in pending) {
+        completer.complete(const []);
+      }
+      await tester.pumpAndSettle();
+      handle.dispose();
+    },
+  );
 
   testWidgets('searches sessions and opens a session result', (tester) async {
     final opened = <ContextOpenRequest>[];
