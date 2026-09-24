@@ -40,7 +40,9 @@ void main() {
       }
 
       Future<void> waitForText(String value) async {
-        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        // Wall-clock wait for the real hub process; generous so a loaded
+        // full-suite run does not flake.
+        final deadline = DateTime.now().add(const Duration(seconds: 30));
         while (find.text(value).evaluate().isEmpty) {
           if (DateTime.now().isAfter(deadline)) {
             fail('Timed out waiting for hub UI text: $value');

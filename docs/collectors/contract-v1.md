@@ -234,6 +234,7 @@ Tool call:
 | --- | --- | --- | --- |
 | `tool_index` | integer | yes | Stable, unique position within the session. |
 | `tool_name` | string | yes | Tool name. |
+| `message_index` | integer | no | `message_index` of the first message after the one that issued the call (the number of messages before the call). Links the call to its issuing message; when absent, the viewer falls back to timestamps. |
 | `status` | string | yes | Source-reported outcome, such as `completed` or `failed`. |
 | `started_at_utc`, `finished_at_utc` | timestamp | no | Call duration. |
 | `input_preview`, `output_preview` | string | no | Default `""`. |
