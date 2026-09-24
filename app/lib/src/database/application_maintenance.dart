@@ -19,12 +19,25 @@ class ApplicationMaintenance extends ChangeNotifier {
     required this.coordinator,
     this.client = const OpenRouterHttpClient(),
     DateTime Function()? clock,
-  }) : clock = clock ?? DateTime.now;
+    String? Function()? hubMachineToken,
+  }) : clock = clock ?? DateTime.now,
+       hubMachineToken = hubMachineToken ?? _environmentHubMachineToken;
 
   final File databaseFile;
   final DatabaseMaintenanceCoordinator coordinator;
   final OpenRouterModelsClient client;
   final DateTime Function() clock;
+
+  /// The hub machine credential. It is read from the environment for each
+  /// refresh and never stored in settings or the database.
+  final String? Function() hubMachineToken;
+
+  static String? _environmentHubMachineToken() =>
+      Platform.environment['CODEX_SESSIONS_HUB_MACHINE_TOKEN'];
+
+  /// The last hub price sync problem in this session; also persisted as the
+  /// price schedule's fixed-text warning for Settings.
+  String? hubPriceSyncError;
 
   AppSettings? _settings;
   List<MaintenanceScheduleRecord> schedules = const [];
@@ -254,8 +267,12 @@ class ApplicationMaintenance extends ChangeNotifier {
   Future<void> _refreshPrices({bool manual = false}) async {
     const type = 'openrouter_price_refresh';
     PricingSettings? requestSettings;
+    var hubUrl = '';
+    var origin = 'local';
     var localObservations = <PriceObservation>[];
     var knownHub = const HubPriceSyncResult([], 0, '');
+    String? hubWarning;
+    final token = hubMachineToken()?.trim() ?? '';
     final started = clock().toUtc();
     _lastPricingSucceeded = false;
     await coordinator.runWriter(() async {
@@ -272,15 +289,24 @@ class ApplicationMaintenance extends ChangeNotifier {
         ).recordScheduleAttempt(type, manual: manual),
       );
       requestSettings = settings;
-      if (settings.hubUrl.isNotEmpty && settings.hubMachineId.isNotEmpty) {
-        final prepared = await _prepareHubHistory(
-          databaseFile.path,
-          settings.hubMachineId,
-          settings.hubUrl,
-        );
-        localObservations = prepared.$1;
-        knownHub = prepared.$2;
+      hubUrl = _settings!.hub.url.trim();
+      if (hubUrl.isEmpty) return;
+      // Price sync identifies this machine like the collector does: by the
+      // database's machine identity, authenticated by the machine token.
+      final prepared = await _prepareHubHistory(databaseFile.path, hubUrl);
+      if (prepared == null) {
+        hubWarning =
+            'Not synchronized: this database has no machine identity yet.';
+        return;
       }
+      origin = prepared.$3;
+      if (token.isEmpty) {
+        hubWarning =
+            'Not synchronized: set CODEX_SESSIONS_HUB_MACHINE_TOKEN for this machine.';
+        return;
+      }
+      localObservations = prepared.$1;
+      knownHub = prepared.$2;
     }, priority: DatabaseWriterPriority.pricing);
     final settings = requestSettings;
     if (_stopped || settings == null) return;
@@ -288,9 +314,7 @@ class ApplicationMaintenance extends ChangeNotifier {
         !_stopped &&
         _settings!.pricing.useExternalPricing &&
         _settings!.pricing.openRouter == settings.openRouter &&
-        _settings!.pricing.hubUrl == settings.hubUrl &&
-        _settings!.pricing.hubToken == settings.hubToken &&
-        _settings!.pricing.hubMachineId == settings.hubMachineId;
+        _settings!.hub.url.trim() == hubUrl;
     _readStatus();
     _report(
       'catalog_download',
@@ -308,21 +332,22 @@ class ApplicationMaintenance extends ChangeNotifier {
     try {
       List<PriceObservation>? hubObservations;
       HubPriceSyncResult? hubResult;
-      if (settings.hubUrl.isNotEmpty &&
-          settings.hubToken.isNotEmpty &&
-          settings.hubMachineId.isNotEmpty) {
+      if (hubUrl.isNotEmpty && hubWarning == null) {
         try {
           hubResult = await HubPriceHistoryClient().synchronizeIncremental(
-            endpoint: Uri.parse(settings.hubUrl),
-            token: settings.hubToken,
+            endpoint: Uri.parse(hubUrl),
+            token: token,
             cancellation: _stopSignal.future,
             observations: localObservations,
             known: knownHub.observations,
             after: knownHub.through,
+            confirmationsAfter: knownHub.confirmationSeq,
           );
           hubObservations = hubResult.observations;
-        } on Object {
-          // A disconnected optional hub must not disable local observations.
+        } on Object catch (error) {
+          // A disconnected optional hub must not disable local observations,
+          // but the reason is reported instead of silently ignored.
+          hubWarning = hubPriceSyncWarning(error);
         }
       }
       if (hubObservations != null && hubObservations.isNotEmpty) {
@@ -331,17 +356,29 @@ class ApplicationMaintenance extends ChangeNotifier {
             superseded = true;
             return;
           }
-          await _mergeHubHistory(
-            databaseFile.path,
-            hubResult!,
-            settings.hubUrl,
+          try {
+            await _mergeHubHistory(databaseFile.path, hubResult!, hubUrl);
+          } on Object catch (error) {
+            hubWarning = hubPriceSyncWarning(error);
+            return;
+          }
+          // An unchanged hub price is confirmed rather than observed again;
+          // a confirmation in the current slot is fresh hub evidence.
+          final hubTimes = [
+            for (final item in hubObservations!)
+              if (item.authority == 'hub') item.observedAtUtc,
+            ...hubResult.confirmations.values,
+          ];
+          final allTimes = [
+            for (final item in hubObservations) item.observedAtUtc,
+            ...hubResult.confirmations.values,
+          ];
+          successfulObservationAtUtc = allTimes.reduce(
+            (a, b) => a.isAfter(b) ? a : b,
           );
-          successfulObservationAtUtc = hubObservations!
-              .map((item) => item.observedAtUtc)
-              .reduce((a, b) => a.isAfter(b) ? a : b);
           final currentSlot = started.millisecondsSinceEpoch ~/ 21600000;
-          succeeded = hubObservations.any(
-            (item) => item.authority == 'hub' && item.slot >= currentSlot,
+          succeeded = hubTimes.any(
+            (at) => at.millisecondsSinceEpoch ~/ 21600000 >= currentSlot,
           );
           _dataRevision++;
           if (!_disposed) notifyListeners();
@@ -381,7 +418,7 @@ class ApplicationMaintenance extends ChangeNotifier {
             response,
             started,
             observed,
-            settings.hubMachineId.isEmpty ? 'local' : settings.hubMachineId,
+            origin,
           );
           succeeded = true;
           successfulObservationAtUtc = observed;
@@ -409,6 +446,7 @@ class ApplicationMaintenance extends ChangeNotifier {
         MaintenanceJobRepository(db, clock: clock).completeScheduleAttempt(
           type,
           succeeded: succeeded,
+          warning: hubWarning,
           retryAfter: retryAfter,
           utcSlots: _settings!.pricing.refreshUtcSlots,
           successfulObservationAtUtc: successfulObservationAtUtc,
@@ -425,6 +463,7 @@ class ApplicationMaintenance extends ChangeNotifier {
       return;
     }
     _lastPricingSucceeded = succeeded;
+    hubPriceSyncError = hubWarning;
     _readStatus();
     _report(
       succeeded ? 'complete' : 'catalog_failed',
@@ -560,23 +599,29 @@ Future<void> _mergeHubHistory(
       hubUrl: url,
       through: snapshot.through,
       hubRevision: snapshot.revision,
+      confirmations: snapshot.confirmations,
+      confirmationSeq: snapshot.confirmationSeq,
     );
   } finally {
     db.close();
   }
 });
 
-Future<(List<PriceObservation>, HubPriceSyncResult)> _prepareHubHistory(
-  String path,
-  String origin,
-  String url,
-) => Isolate.run(() {
+/// Null when the database has no machine identity to sync as.
+Future<(List<PriceObservation>, HubPriceSyncResult, String)?>
+_prepareHubHistory(String path, String url) => Isolate.run(() {
   final db = openFileBackedDatabase(File(path));
   try {
+    final rows = db.select(
+      "select value from app_metadata where key = 'machine_id'",
+    );
+    final machine = rows.isEmpty ? '' : (rows.single['value'] as String? ?? '');
+    if (machine.isEmpty) return null;
     final repository = PricingRepository(db);
     return (
-      repository.localPriceObservationsForHub(origin),
+      repository.localPriceObservationsForHub(machine),
       repository.hubSyncSnapshot(url),
+      machine,
     );
   } finally {
     db.close();

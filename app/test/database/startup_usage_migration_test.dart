@@ -819,7 +819,7 @@ void main() {
         reopened
             .select('select max(version) v from schema_version where success=1')
             .single['v'],
-        23,
+        24,
       );
       expect(
         MaintenanceJobRepository(

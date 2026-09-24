@@ -159,10 +159,12 @@ void main() {
         );
     for (final file in scripts) {
       // This isolated ordering fixture omits the usage-generation schema.
-      // Later migrations install triggers that require those usage tables.
+      // Later migrations install triggers that require those usage tables;
+      // 024 extends the price tables that 023 creates.
       if (file.uri.pathSegments.last.startsWith('016_') ||
           file.uri.pathSegments.last.startsWith('021_') ||
-          file.uri.pathSegments.last.startsWith('023_')) {
+          file.uri.pathSegments.last.startsWith('023_') ||
+          file.uri.pathSegments.last.startsWith('024_')) {
         continue;
       }
       db.execute(file.readAsStringSync());

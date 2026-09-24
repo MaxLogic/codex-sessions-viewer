@@ -93,7 +93,7 @@ void main() {
                 'select last_optimized_schema_version v from database_state',
               )
               .single['v'],
-          23,
+          24,
         );
         db.execute('''
       update database_state set last_optimized_schema_version = 15;
@@ -142,7 +142,7 @@ void main() {
               'select last_optimized_schema_version v from database_state',
             )
             .single['v'],
-        23,
+        24,
       );
       expect(
         db

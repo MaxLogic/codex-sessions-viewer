@@ -20,16 +20,21 @@ background_rescan_enabled = false
 [terminal]
 default_terminal = 'windows_terminal'
 
+# Public model prices refresh at 00:00, 06:00, 12:00 and 18:00 UTC. Only the
+# public OpenRouter model catalog is downloaded; it needs no API key, and no
+# session data is sent.
 [pricing]
-use_external_pricing = false
-automatic_refresh_enabled = false
-hub_url = ''
-hub_token = ''
-hub_machine_id = ''
+use_external_pricing = true
+automatic_refresh_enabled = true
+refresh_interval_hours = 6
+refresh_utc_slots = true
 
 [pricing.openrouter]
 api_key = ''
 
+# Optional personal hub, used to browse hub sessions and share price history.
+# Credentials never belong here: price sync reads the machine token from the
+# CODEX_SESSIONS_HUB_MACHINE_TOKEN environment variable.
 [hub]
 url = ''
 machine = ''

@@ -183,3 +183,72 @@ fn remote_query_rejects_protocol_and_credential_mismatch() {
         .send_json(json!({"protocol":1,"machine":"test-machine","args":["sessions","--db=C:\\other.sqlite"]}));
     assert!(override_attempt.is_err());
 }
+
+#[test]
+fn remote_query_never_forwards_to_another_hub_with_the_server_credential() {
+    let temp = TempDir::new("hub_query_forward");
+    // Another destination that must never receive a connection.
+    let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+    trap.set_nonblocking(true).unwrap();
+    let trap_url = format!("http://{}", trap.local_addr().unwrap());
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let config = temp.path().join("hub.json");
+    std::fs::write(
+        &config,
+        json!({"owner_token": OWNER_TOKEN, "machines": {"test-machine": MACHINE_TOKEN}})
+            .to_string(),
+    )
+    .unwrap();
+    // The hub process has an owner credential in its environment, which a
+    // forwarded `--hub` would send to the chosen destination.
+    let child = Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
+        .arg(format!("127.0.0.1:{port}"))
+        .arg(temp.path().join("hub-data"))
+        .arg(config)
+        .env("CODEX_SESSIONS_HUB_OWNER_TOKEN", OWNER_TOKEN)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let hub = Hub(child, format!("http://127.0.0.1:{port}"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ureq::get(format!("{}/v1/health", hub.1)).call().is_err() {
+        assert!(Instant::now() < deadline, "hub did not start");
+        thread::sleep(Duration::from_millis(25));
+    }
+    for args in [
+        vec![
+            "sessions",
+            "--hub",
+            &trap_url,
+            "--hub-machine",
+            "test-machine",
+        ],
+        vec!["sessions", "--hub-machine=test-machine", "--hub=x"],
+        vec!["sessions", "--format", "text"],
+        vec!["sessions", "--unknown-option", "1"],
+        vec!["--hub", &trap_url],
+    ] {
+        let result = ureq::post(format!("{}/v1/query", hub.1))
+            .header("Authorization", format!("Bearer {OWNER_TOKEN}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
+            .send_json(json!({"protocol":1,"machine":"test-machine","args":args}));
+        assert!(
+            matches!(result, Err(ureq::Error::StatusCode(400))),
+            "{args:?}: {result:?}"
+        );
+    }
+    assert!(
+        trap.accept().is_err(),
+        "the hub connected to a forwarded destination"
+    );
+    // A search text that looks like an option is a value, not an option.
+    let search = remote(&hub, &["search", "--query", "--hub", "--limit", "2"]);
+    assert_eq!(search["results"].as_array().map(Vec::len), Some(0));
+}

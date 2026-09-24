@@ -41,7 +41,9 @@ USAGE:
   codex-sessions-collector query <COMMAND> [OPTIONS]      Read-only history queries (query --help)
   codex-sessions-collector hub enable --hub-url <URL> [DATABASE OPTIONS]
   codex-sessions-collector hub sync [DATABASE OPTIONS]    Deliver queued records
-  codex-sessions-collector hub status [DATABASE OPTIONS]  Show delivery state
+  codex-sessions-collector hub status [DATABASE OPTIONS]  Show delivery state and rejected records
+  codex-sessions-collector hub resync [DATABASE OPTIONS]  Continue from the hub's last accepted sequence
+  codex-sessions-collector hub disable [DATABASE OPTIONS] Stop queuing and clear the outbox
   codex-sessions-collector version
 
 DATABASE OPTIONS:
@@ -277,6 +279,12 @@ pub fn run(args: &[String]) -> i32 {
         ["hub", "status", ..] => {
             parse_options(&args[2..]).and_then(|o| hub_status(&o, &mut stdout))
         }
+        ["hub", "resync", ..] => {
+            parse_options(&args[2..]).and_then(|o| hub_resync(&o, &mut stdout))
+        }
+        ["hub", "disable", ..] => {
+            parse_options(&args[2..]).and_then(|o| hub_disable(&o, &mut stdout))
+        }
         ["version", ..] | ["--version", ..] => {
             let _ = writeln!(
                 stdout,
@@ -342,8 +350,15 @@ fn hub_enable(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     .map_err(|error| CliError::Failed(error.to_string()))
 }
 
-fn hub_sync(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
-    let store = open_store(options)?;
+fn hub_token(command: &str) -> Result<String, CliError> {
+    std::env::var("CODEX_SESSIONS_HUB_MACHINE_TOKEN").map_err(|_| {
+        CliError::Usage(format!(
+            "set CODEX_SESSIONS_HUB_MACHINE_TOKEN for {command}"
+        ))
+    })
+}
+
+fn enabled_hub_url(store: &Store) -> Result<String, CliError> {
     let row: Option<String> = store
         .conn
         .query_row(
@@ -353,15 +368,40 @@ fn hub_sync(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
         )
         .optional()
         .map_err(StoreError::Sql)?;
-    let url = row.ok_or_else(|| {
-        CliError::Refused("hub delivery is not enabled; run hub enable first".into())
-    })?;
-    let token = std::env::var("CODEX_SESSIONS_HUB_MACHINE_TOKEN")
-        .map_err(|_| CliError::Usage("set CODEX_SESSIONS_HUB_MACHINE_TOKEN for hub sync".into()))?;
+    row.ok_or_else(|| CliError::Refused("hub delivery is not enabled; run hub enable first".into()))
+}
+
+fn hub_resync(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let store = open_store(options)?;
+    let url = enabled_hub_url(&store)?;
+    let token = hub_token("hub resync")?;
+    let report =
+        crate::hub_client::resync(std::path::Path::new(&store.path), store.mode, &url, &token)
+            .map_err(CliError::Failed)?;
+    writeln!(out, "{}", json!({"command":"hub resync","previous_sequence":report.previous_sequence,"last_sequence":report.last_sequence,"pending":report.pending}))
+        .map_err(|error| CliError::Failed(error.to_string()))
+}
+
+fn hub_disable(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let store = open_store(options)?;
+    let cleared = crate::hub_client::disable(std::path::Path::new(&store.path), store.mode)
+        .map_err(CliError::Failed)?;
+    writeln!(
+        out,
+        "{}",
+        json!({"command":"hub disable","enabled":false,"cleared":cleared})
+    )
+    .map_err(|error| CliError::Failed(error.to_string()))
+}
+
+fn hub_sync(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let store = open_store(options)?;
+    let url = enabled_hub_url(&store)?;
+    let token = hub_token("hub sync")?;
     let report =
         crate::hub_client::sync(std::path::Path::new(&store.path), store.mode, &url, &token)
             .map_err(CliError::Failed)?;
-    writeln!(out, "{}", json!({"command":"hub sync","sent":report.sent,"pending":report.pending,"last_sequence":report.last_sequence}))
+    writeln!(out, "{}", json!({"command":"hub sync","sent":report.sent,"batches":report.batches,"dead_lettered":report.dead_lettered,"pending":report.pending,"last_sequence":report.last_sequence}))
         .map_err(|error| CliError::Failed(error.to_string()))
 }
 
@@ -372,7 +412,8 @@ fn hub_status(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
     ).optional().map_err(StoreError::Sql)?;
     let pending = crate::hub_client::pending(&store.conn)?;
-    writeln!(out, "{}", json!({"command":"hub status","delivery":state.as_ref().map(|(url,machine,sequence,enabled)| json!({"hub_url":url,"machine_id":machine,"last_sequence":sequence,"enabled":enabled})),"pending":pending}))
+    let (dead_count, dead_recent) = crate::hub_client::dead_letters(&store.conn)?;
+    writeln!(out, "{}", json!({"command":"hub status","delivery":state.as_ref().map(|(url,machine,sequence,enabled)| json!({"hub_url":url,"machine_id":machine,"last_sequence":sequence,"enabled":enabled})),"pending":pending,"dead_letters":dead_count,"recent_dead_letters":dead_recent}))
         .map_err(|error| CliError::Failed(error.to_string()))
 }
 

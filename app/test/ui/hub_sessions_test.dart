@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -149,6 +150,51 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
     },
   );
+
+  testWidgets('a row tap during a poll never overlaps hub requests', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1300, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final source = _GatedSource();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: HubSessionsScreen(
+            settings: AppSettings.defaults(),
+            settingsFile: File('unused.toml'),
+            databaseFile: File('unused.sqlite'),
+            source: source,
+            pollInterval: const Duration(seconds: 1),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('Gated session'), findsOneWidget);
+    // The tap handler of the rendered, enabled row.
+    final staleTap = tester.widget<ListTile>(find.byType(ListTile)).onTap!;
+    source.listGate = Completer<void>();
+    await tester.pump(const Duration(seconds: 1));
+    expect(source.inFlight, 1, reason: 'the poll is holding a list request');
+    staleTap();
+    await tester.pump();
+    expect(source.maxInFlight, 1);
+    source.listGate!.complete();
+    source.listGate = null;
+    await tester.pump();
+    await tester.pump();
+    expect(source.maxInFlight, 1);
+    // After the poll, selecting works and still never overlaps a poll.
+    await tester.tap(find.text('Gated session'));
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 400));
+    }
+    expect(source.requests, contains('session'));
+    expect(source.maxInFlight, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   testWidgets('This machine works without any hub connection', (tester) async {
     await tester.pumpWidget(
@@ -351,3 +397,54 @@ void main() {
 }
 
 class _RealHttp extends HttpOverrides {}
+
+/// Counts concurrent hub requests; a list request can be held open.
+class _GatedSource extends HubDataSource {
+  _GatedSource() : super(url: 'http://127.0.0.1:9', ownerToken: 'test-token');
+  var inFlight = 0;
+  var maxInFlight = 0;
+  final requests = <String>[];
+  Completer<void>? listGate;
+
+  Future<T> _track<T>(String name, Future<T> Function() body) async {
+    requests.add(name);
+    inFlight++;
+    if (inFlight > maxInFlight) maxInFlight = inFlight;
+    try {
+      return await body();
+    } finally {
+      inFlight--;
+    }
+  }
+
+  @override
+  Future<List<String>> machines() => _track('machines', () async => ['m']);
+
+  @override
+  Future<Map<String, dynamic>> query(String machine, List<String> args) =>
+      _track(args.first, () async {
+        const session = {
+          'reference': 'history://m/codex/a',
+          'title': 'Gated session',
+          'harness': 'codex',
+          'environment': 'windows',
+        };
+        if (args.first == 'sessions') {
+          final gate = listGate;
+          if (gate != null) await gate.future;
+          return {
+            'results': [session],
+            'next_cursor': null,
+          };
+        }
+        if (args.first == 'session') return {'session': session};
+        return {'results': <Object?>[], 'next_after_index': null};
+      });
+
+  @override
+  Future<Map<String, dynamic>> annotations(String machine, String reference) =>
+      _track(
+        'annotations',
+        () async => {'revision': 0, 'title': '', 'notes': ''},
+      );
+}

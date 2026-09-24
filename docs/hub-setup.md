@@ -11,8 +11,12 @@ Sessions starts on **This machine**, with all local operations available offline
 Choose **Hub**, enter the HTTPS URL and an owner token, and select **Connect to
 hub**. The owner token may instead come from `CODEX_SESSIONS_HUB_OWNER_TOKEN`.
 Only the URL and selected machine are saved in `[hub]` in `settings.toml`; the
-dialog token stays in memory. Switching back to This machine retains the hub
-connection for this window and pauses its polling.
+dialog token stays in memory. The same `[hub] url` is the only hub setting: price
+history sharing uses it too (see [shared price history](hub-price-history.md)).
+No hub credential is ever stored in `settings.toml`. Switching back to This
+machine retains the hub connection for this window and pauses its polling. The
+screen runs one hub request at a time; a click that arrives while a refresh is
+running is ignored.
 
 Hub sessions, message search, conversation pages, and the last 30 days of token
 usage are requested on demand. While Hub is visible, the current page refreshes
@@ -57,9 +61,34 @@ codex-sessions-hub.exe 127.0.0.1:8765 C:\HubData C:\HubData\hub.json
 
 The HTTP listener accepts loopback only. For another machine, place an HTTPS
 reverse proxy in front of it and configure the collector with the proxy's
-`https://` URL. The collector refuses plain HTTP except for loopback. Limit
-proxy request bodies to at least 64 MiB and protect the owner token. The
-server accepts up to 128 records per upload; current collectors send one.
+`https://` URL. The collector refuses plain HTTP except on a literal loopback
+address (`http://127.0.0.1:PORT` or `http://[::1]:PORT`; `localhost` is refused
+because the name can resolve elsewhere). A URL path prefix of the proxy, such
+as `https://example.test/hub`, is kept. Allow proxy request bodies of at least
+64 MiB and protect the owner token.
+
+The collector checks HTTPS certificates against its bundled Mozilla root
+certificates, not the Windows certificate store. A hub behind a certificate
+from a private or corporate CA is therefore refused by the collector even when
+Windows trusts it; use a publicly trusted certificate for the proxy.
+
+The server accepts up to 128 records and 64 MiB per upload and refuses a
+larger declared body before reading it. Credentials are checked before a body
+is read. Each connection is served on its own thread, up to 32 at once; further
+clients receive HTTP 503. Every socket read and write must progress within
+`request_timeout_seconds` (default 30), and a whole request must arrive within
+ten times that, so a stalled client cannot hold the hub:
+
+```json
+{
+  "owner_token": "...",
+  "machines": { "laptop-1": "..." },
+  "request_timeout_seconds": 30
+}
+```
+
+An upload's records and its sequence number are stored in one transaction: a
+refused record leaves neither data nor a consumed sequence on the hub.
 
 ## Pair a collector
 
@@ -87,15 +116,55 @@ FILE`. Keep the machine secret outside command arguments, logs, and the viewer
 settings file. Run `hub sync` periodically in Task Scheduler with the secret
 provided to the task process through its environment. Local scan and queries
 continue while the hub is unavailable; committed records stay in
-`collector_upload_outbox` and the next sync retries them. `hub status` reports
-the pending count and last acknowledged sequence. Back up the local database
-while preserving its hub state and outbox; replacing it with an older copy can
-reuse a sequence and requires an explicit reconciliation before upload.
+`collector_upload_outbox` and the next sync retries them.
+
+Only changes are queued. A scan that finds a source or thread name unchanged
+queues nothing, and a newer state of a source replaces its older unsent state,
+so an unreachable hub does not grow the outbox with repeated scans. The sync
+command sends batches of up to 128 records (and at most 48 MiB) until the
+outbox is empty. A batch and its sequence are recorded before sending, so a
+lost acknowledgment is retried with the same sequence and the hub answers
+with a duplicate acknowledgment.
+
+A record the hub permanently refuses (HTTP 400, 409 or 413, other than a
+sequence conflict), or one too large to send, moves to a dead-letter table and no longer blocks the records behind
+it. The hub's reason is kept with it; the credential is never echoed.
+Transient failures (network errors, HTTP 5xx, a rejected credential) leave the
+queue untouched for the next run. `hub status` reports the pending count, the
+last acknowledged sequence, and the number and most recent reasons of
+rejected records:
+
+```powershell
+codex-sessions-collector.exe hub status --db C:\Path\codex_sessions_viewer.sqlite
+```
+
+`hub disable` stops queuing and discards queued, in-flight and rejected
+records. The pairing and last acknowledged sequence remain, so `hub enable`
+with the same URL continues the same hub history; collect again with `--force`
+to queue existing sessions.
+
+### Reconcile after restoring a backup
+
+Back up the local database while preserving its hub state and outbox.
+Replacing it with an older copy rewinds its sequence; the next sync then fails
+with a sequence conflict and names `hub resync`. The same happens after
+restoring an older hub backup. `hub resync` asks the hub for the last sequence
+it accepted from this machine and continues from there, keeping the queued
+records; it also forgets which statuses and thread names were already queued.
+Collect again with `--force` so that records the hub lost are queued again:
+
+```powershell
+$env:CODEX_SESSIONS_HUB_MACHINE_TOKEN = 'the-machine-secret'
+codex-sessions-collector.exe hub resync --db C:\Path\codex_sessions_viewer.sqlite
+codex-sessions-collector.exe codex scan --force --db C:\Path\codex_sessions_viewer.sqlite
+codex-sessions-collector.exe hub sync --db C:\Path\codex_sessions_viewer.sqlite
+```
+
+The hub applies source revisions idempotently, so records it already has are
+harmless to send again.
 
 The sync command checks the authenticated hub protocol, schema, contract, and
-machine identity before sending records. A mismatch fails closed. It delivers
-at most 256 queued records per invocation, so schedule it often enough for
-your collection volume. The hub applies source revisions idempotently and
+machine identity before sending records. A mismatch fails closed. The hub
 never treats an absent machine as a deletion. A missing source is sent only
 when the collector records an explicit missing-source status.
 
@@ -110,8 +179,11 @@ codex-sessions-collector.exe query sessions --hub https://hub.example.test --hub
 codex-sessions-collector.exe query search --hub https://hub.example.test --hub-machine laptop-1 --query 'example' --limit 20
 ```
 
-The owner API also exposes `/v1/machines` and `/v1/usage`. Machine credentials
-can upload and verify compatibility but cannot query another machine. The
+The hub forwards only listed query options; destination and output options
+(`--db`, `--format`, `--hub`, `--hub-machine`) are chosen by the hub and refused
+in a request. The owner API also exposes `/v1/machines` and `/v1/usage`.
+Machine credentials can upload and verify compatibility but cannot query
+another machine. The
 hub stores normalized content, paths, and usage inputs; treat its database and
 backups as private session data. Pricing history reconciliation is a separate
 feature and is not implied by the usage totals returned here.
