@@ -1,0 +1,1098 @@
+{
+  "status": "measured",
+  "corpus_sha256": "5b6c6a86d7316d9e26994b1b61b5330865881e3c4e2e80b7f3b90fa341ccf5bb",
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+  "dimension": 384,
+  "chunk_max_chars": 400,
+  "tool_output": "excluded",
+  "sessions": 24,
+  "chunks": 61,
+  "queries": 14,
+  "device": "cpu",
+  "hybrid_weights": {
+    "lexical": 0.35,
+    "semantic": 0.65
+  },
+  "notes": "Synthetic labeled corpus; screening experiment, not production certification.",
+  "corpus_cache_write_ms": 54.659,
+  "index_bytes_without_queries": 557056,
+  "cold_embedding_and_cache_ms": 13926.71,
+  "worker": {
+    "load_ms": 11478.352400008589,
+    "corpus_encode_ms": 346.37990000192076,
+    "query_encode_ms": [
+      103.27019999385811,
+      28.66169999470003,
+      66.05139997554943,
+      30.06630000891164,
+      17.42829999420792,
+      18.474499986041337,
+      14.216399984434247,
+      13.9521999808494,
+      11.480099987238646,
+      12.258200003998354,
+      20.463599998038262,
+      11.652399989543483,
+      10.248799982946366,
+      19.14839999517426
+    ],
+    "peak_rss_bytes": 770285568
+  },
+  "index_bytes": 679936,
+  "parent_peak_rss_bytes": 262373376,
+  "embedded_unique_texts": 75,
+  "warm_reembedding_count": 0,
+  "modes": {
+    "lexical": {
+      "recall_at_10": 0.7142857142857143,
+      "mrr_at_10": 0.7142857142857143,
+      "mean_ranking_ms": 2.319714285714286,
+      "mean_query_encode_ms": 0.0,
+      "results": [
+        {
+          "id": "q1",
+          "ranking_ms": 10.106,
+          "query_encode_ms": 0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        },
+        {
+          "id": "q2",
+          "ranking_ms": 3.417,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "db/a1@0",
+              "score": 2.0
+            },
+            {
+              "citation": "backup/u1@0",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "id": "q3",
+          "ranking_ms": 2.388,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "a11y/a1@0",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "id": "q4",
+          "ranking_ms": 1.481,
+          "query_encode_ms": 0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        },
+        {
+          "id": "q5",
+          "ranking_ms": 1.613,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "tls/a1@0",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "id": "q6",
+          "ranking_ms": 1.969,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cache/a1@0",
+              "score": 2.0
+            }
+          ]
+        },
+        {
+          "id": "q7",
+          "ranking_ms": 1.638,
+          "query_encode_ms": 0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        },
+        {
+          "id": "q8",
+          "ranking_ms": 1.547,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "retry/a1@0",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "id": "q9",
+          "ranking_ms": 0.924,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "backup/a1@0",
+              "score": 2.0
+            }
+          ]
+        },
+        {
+          "id": "q10",
+          "ranking_ms": 1.443,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "key/a1@0",
+              "score": 2.0
+            },
+            {
+              "citation": "theme/a1@0",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "id": "q11",
+          "ranking_ms": 2.132,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "path/a1@0",
+              "score": 3.0
+            }
+          ]
+        },
+        {
+          "id": "q12",
+          "ranking_ms": 1.49,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cost/a1@0",
+              "score": 2.0
+            }
+          ]
+        },
+        {
+          "id": "q13",
+          "ranking_ms": 1.08,
+          "query_encode_ms": 0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cancel/u1@0",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "id": "q14",
+          "ranking_ms": 1.248,
+          "query_encode_ms": 0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        }
+      ]
+    },
+    "hybrid": {
+      "recall_at_10": 0.7142857142857143,
+      "mrr_at_10": 0.7142857142857143,
+      "mean_ranking_ms": 0.9326428571428572,
+      "mean_query_encode_ms": 26.955178562535107,
+      "results": [
+        {
+          "id": "q1",
+          "ranking_ms": 1.996,
+          "query_encode_ms": 103.27019999385811,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        },
+        {
+          "id": "q2",
+          "ranking_ms": 1.519,
+          "query_encode_ms": 28.66169999470003,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "db/a1@0",
+              "score": 0.8497661096082001
+            },
+            {
+              "citation": "backup/u1@0",
+              "score": 0.5650700504841133
+            }
+          ]
+        },
+        {
+          "id": "q3",
+          "ranking_ms": 1.021,
+          "query_encode_ms": 66.05139997554943,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "a11y/u1@0",
+              "score": 0.8185456057871057
+            }
+          ]
+        },
+        {
+          "id": "q4",
+          "ranking_ms": 0.74,
+          "query_encode_ms": 30.06630000891164,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        },
+        {
+          "id": "q5",
+          "ranking_ms": 0.789,
+          "query_encode_ms": 17.42829999420792,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "tls/u1@0",
+              "score": 0.9791768216534212
+            }
+          ]
+        },
+        {
+          "id": "q6",
+          "ranking_ms": 0.806,
+          "query_encode_ms": 18.474499986041337,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cache/a1@0",
+              "score": 0.8170794592634907
+            }
+          ]
+        },
+        {
+          "id": "q7",
+          "ranking_ms": 0.721,
+          "query_encode_ms": 14.216399984434247,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        },
+        {
+          "id": "q8",
+          "ranking_ms": 0.835,
+          "query_encode_ms": 13.9521999808494,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "retry/a1@0",
+              "score": 0.8992143368210848
+            }
+          ]
+        },
+        {
+          "id": "q9",
+          "ranking_ms": 0.743,
+          "query_encode_ms": 11.480099987238646,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "backup/a1@0",
+              "score": 0.8825626571269167
+            }
+          ]
+        },
+        {
+          "id": "q10",
+          "ranking_ms": 0.821,
+          "query_encode_ms": 12.258200003998354,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "key/u1@0",
+              "score": 0.9444755495253542
+            },
+            {
+              "citation": "theme/a1@0",
+              "score": 0.6151022665196161
+            }
+          ]
+        },
+        {
+          "id": "q11",
+          "ranking_ms": 0.706,
+          "query_encode_ms": 20.463599998038262,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "path/a1@0",
+              "score": 0.8941909712495704
+            }
+          ]
+        },
+        {
+          "id": "q12",
+          "ranking_ms": 0.698,
+          "query_encode_ms": 11.652399989543483,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cost/a1@0",
+              "score": 0.8169624235700975
+            }
+          ]
+        },
+        {
+          "id": "q13",
+          "ranking_ms": 1.067,
+          "query_encode_ms": 10.248799982946366,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cancel/u1@0",
+              "score": 0.8788310932959926
+            }
+          ]
+        },
+        {
+          "id": "q14",
+          "ranking_ms": 0.595,
+          "query_encode_ms": 19.14839999517426,
+          "recall_at_10": 0.0,
+          "reciprocal_rank": 0.0,
+          "hits": []
+        }
+      ]
+    },
+    "semantic": {
+      "recall_at_10": 1.0,
+      "mrr_at_10": 1.0,
+      "mean_ranking_ms": 1.3365714285714287,
+      "mean_query_encode_ms": 26.955178562535107,
+      "results": [
+        {
+          "id": "q1",
+          "ranking_ms": 5.713,
+          "query_encode_ms": 103.27019999385811,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "car/u1@0",
+              "score": 0.9299335459209668
+            },
+            {
+              "citation": "cancel/a1@0",
+              "score": 0.6007886996330931
+            },
+            {
+              "citation": "travel/u1@0",
+              "score": 0.6004335513259182
+            },
+            {
+              "citation": "dns/a1@0",
+              "score": 0.5791534159638765
+            },
+            {
+              "citation": "retry/u1@0",
+              "score": 0.5743051772808566
+            },
+            {
+              "citation": "mem/u1@0",
+              "score": 0.5592361203235793
+            },
+            {
+              "citation": "zip/u1@0",
+              "score": 0.5544889793098355
+            },
+            {
+              "citation": "tls/u1@0",
+              "score": 0.5541635178792662
+            },
+            {
+              "citation": "backup/u1@0",
+              "score": 0.549825442943366
+            },
+            {
+              "citation": "garden/a1@0",
+              "score": 0.5494478823409306
+            }
+          ]
+        },
+        {
+          "id": "q2",
+          "ranking_ms": 0.918,
+          "query_encode_ms": 28.66169999470003,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "db/u1@0",
+              "score": 0.7730529764795515
+            },
+            {
+              "citation": "cancel/a1@0",
+              "score": 0.7157523077751102
+            },
+            {
+              "citation": "mem/long@4000",
+              "score": 0.6789266063100452
+            },
+            {
+              "citation": "retry/u1@0",
+              "score": 0.6134643456176561
+            },
+            {
+              "citation": "backup/u1@0",
+              "score": 0.600107769975559
+            },
+            {
+              "citation": "cost/a1@0",
+              "score": 0.5918843234321289
+            },
+            {
+              "citation": "sort/a1@0",
+              "score": 0.5812965294619166
+            },
+            {
+              "citation": "dns/a1@0",
+              "score": 0.5802137544608329
+            },
+            {
+              "citation": "car/u1@0",
+              "score": 0.5618556206785271
+            },
+            {
+              "citation": "zip/u1@0",
+              "score": 0.5559801080769369
+            }
+          ]
+        },
+        {
+          "id": "q3",
+          "ranking_ms": 0.892,
+          "query_encode_ms": 66.05139997554943,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "a11y/u1@0",
+              "score": 0.7208393935186241
+            },
+            {
+              "citation": "key/u1@0",
+              "score": 0.6022425895181729
+            },
+            {
+              "citation": "music/u1@0",
+              "score": 0.5718243583254186
+            },
+            {
+              "citation": "csv/a1@0",
+              "score": 0.5652173521863891
+            },
+            {
+              "citation": "theme/a1@0",
+              "score": 0.5537868251856182
+            },
+            {
+              "citation": "dns/u1@0",
+              "score": 0.5439127737072904
+            },
+            {
+              "citation": "travel/u1@0",
+              "score": 0.5282435426775192
+            },
+            {
+              "citation": "car/u1@0",
+              "score": 0.5229801409938842
+            },
+            {
+              "citation": "mem/long@3200",
+              "score": 0.520459769261337
+            },
+            {
+              "citation": "photo/a1@0",
+              "score": 0.5179781209235019
+            }
+          ]
+        },
+        {
+          "id": "q4",
+          "ranking_ms": 0.899,
+          "query_encode_ms": 30.06630000891164,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "mem/u1@0",
+              "score": 0.6959454139464799
+            },
+            {
+              "citation": "zip/u1@0",
+              "score": 0.6545375424664249
+            },
+            {
+              "citation": "window/u1@0",
+              "score": 0.6187759265423431
+            },
+            {
+              "citation": "cancel/a1@0",
+              "score": 0.5898288176051103
+            },
+            {
+              "citation": "cost/a1@0",
+              "score": 0.5738262117445807
+            },
+            {
+              "citation": "theme/a1@0",
+              "score": 0.5723304410286905
+            },
+            {
+              "citation": "db/u1@0",
+              "score": 0.5659988480729504
+            },
+            {
+              "citation": "key/u1@0",
+              "score": 0.5643379934680446
+            },
+            {
+              "citation": "music/a1@0",
+              "score": 0.5583715984423375
+            },
+            {
+              "citation": "travel/a1@0",
+              "score": 0.5529670805084439
+            }
+          ]
+        },
+        {
+          "id": "q5",
+          "ranking_ms": 1.056,
+          "query_encode_ms": 17.42829999420792,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "tls/u1@0",
+              "score": 0.9679643410052634
+            },
+            {
+              "citation": "backup/u1@0",
+              "score": 0.5926232378143044
+            },
+            {
+              "citation": "path/u1@0",
+              "score": 0.5628505085684646
+            },
+            {
+              "citation": "cancel/a1@0",
+              "score": 0.5522652801731434
+            },
+            {
+              "citation": "battery/u1@0",
+              "score": 0.5438112899671066
+            },
+            {
+              "citation": "music/a1@0",
+              "score": 0.5385280065753941
+            },
+            {
+              "citation": "garden/u1@0",
+              "score": 0.5199425335397595
+            },
+            {
+              "citation": "csv/a1@0",
+              "score": 0.5187905311001711
+            },
+            {
+              "citation": "travel/u1@0",
+              "score": 0.5171508483247554
+            },
+            {
+              "citation": "a11y/a1@0",
+              "score": 0.5083240100995826
+            }
+          ]
+        },
+        {
+          "id": "q6",
+          "ranking_ms": 0.825,
+          "query_encode_ms": 18.474499986041337,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cache/u1@0",
+              "score": 0.7914525162685924
+            },
+            {
+              "citation": "dns/a1@0",
+              "score": 0.6693885369321384
+            },
+            {
+              "citation": "zip/u1@0",
+              "score": 0.6185930909329764
+            },
+            {
+              "citation": "cancel/a1@0",
+              "score": 0.6015646977374056
+            },
+            {
+              "citation": "mem/long@1600",
+              "score": 0.5756686388578196
+            },
+            {
+              "citation": "car/a1@0",
+              "score": 0.5726704189293171
+            },
+            {
+              "citation": "db/a1@0",
+              "score": 0.5723351103086296
+            },
+            {
+              "citation": "cost/a1@0",
+              "score": 0.5708670626032272
+            },
+            {
+              "citation": "tls/a1@0",
+              "score": 0.5668567922575325
+            },
+            {
+              "citation": "sort/u1@0",
+              "score": 0.5662991670590865
+            }
+          ]
+        },
+        {
+          "id": "q7",
+          "ranking_ms": 0.861,
+          "query_encode_ms": 14.216399984434247,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "sort/u1@0",
+              "score": 0.8243257355753498
+            },
+            {
+              "citation": "mem/long@4800",
+              "score": 0.6069692772004692
+            },
+            {
+              "citation": "zip/u1@0",
+              "score": 0.5867278237623417
+            },
+            {
+              "citation": "dns/u1@0",
+              "score": 0.581103018127308
+            },
+            {
+              "citation": "cancel/u1@0",
+              "score": 0.5759099669947585
+            },
+            {
+              "citation": "travel/u1@0",
+              "score": 0.5713450370784303
+            },
+            {
+              "citation": "retry/u1@0",
+              "score": 0.5486721267182271
+            },
+            {
+              "citation": "cost/a1@0",
+              "score": 0.5474102636161674
+            },
+            {
+              "citation": "window/u1@0",
+              "score": 0.5438739654280021
+            },
+            {
+              "citation": "music/u1@0",
+              "score": 0.5425554749702524
+            }
+          ]
+        },
+        {
+          "id": "q8",
+          "ranking_ms": 0.815,
+          "query_encode_ms": 13.9521999808494,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "retry/a1@0",
+              "score": 0.8449451335708996
+            },
+            {
+              "citation": "cancel/a1@0",
+              "score": 0.6462131851033415
+            },
+            {
+              "citation": "backup/u1@0",
+              "score": 0.6362085596096508
+            },
+            {
+              "citation": "dns/a1@0",
+              "score": 0.6199110431204928
+            },
+            {
+              "citation": "cache/u1@0",
+              "score": 0.6063302404957656
+            },
+            {
+              "citation": "car/u1@0",
+              "score": 0.6033597258504695
+            },
+            {
+              "citation": "mem/long@2000",
+              "score": 0.5977100366983429
+            },
+            {
+              "citation": "db/u1@0",
+              "score": 0.5907626795596235
+            },
+            {
+              "citation": "tls/u1@0",
+              "score": 0.5862809567731921
+            },
+            {
+              "citation": "cost/a1@0",
+              "score": 0.5518124325950396
+            }
+          ]
+        },
+        {
+          "id": "q9",
+          "ranking_ms": 1.705,
+          "query_encode_ms": 11.480099987238646,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "backup/a1@0",
+              "score": 0.819327164810641
+            },
+            {
+              "citation": "cancel/a1@0",
+              "score": 0.63774790699145
+            },
+            {
+              "citation": "csv/u1@0",
+              "score": 0.6180471933260387
+            },
+            {
+              "citation": "path/u1@0",
+              "score": 0.5616069197225397
+            },
+            {
+              "citation": "sort/u1@0",
+              "score": 0.5437393604078616
+            },
+            {
+              "citation": "tls/u1@0",
+              "score": 0.5397092097162088
+            },
+            {
+              "citation": "music/u1@0",
+              "score": 0.5286372709405538
+            },
+            {
+              "citation": "a11y/u1@0",
+              "score": 0.5136424943665964
+            },
+            {
+              "citation": "garden/a1@0",
+              "score": 0.5059387732746854
+            },
+            {
+              "citation": "travel/a1@0",
+              "score": 0.5042501793582964
+            }
+          ]
+        },
+        {
+          "id": "q10",
+          "ranking_ms": 0.951,
+          "query_encode_ms": 12.258200003998354,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "key/u1@0",
+              "score": 0.9145777685005448
+            },
+            {
+              "citation": "a11y/a1@0",
+              "score": 0.6890352191124118
+            },
+            {
+              "citation": "theme/a1@0",
+              "score": 0.6770804100301786
+            },
+            {
+              "citation": "music/u1@0",
+              "score": 0.6062759992059816
+            },
+            {
+              "citation": "photo/a1@0",
+              "score": 0.601055271381132
+            },
+            {
+              "citation": "cancel/u1@0",
+              "score": 0.5873192043295532
+            },
+            {
+              "citation": "window/a1@0",
+              "score": 0.5593014290549483
+            },
+            {
+              "citation": "csv/a1@0",
+              "score": 0.5407710292873036
+            },
+            {
+              "citation": "db/a1@0",
+              "score": 0.5364326960591597
+            },
+            {
+              "citation": "cost/u1@0",
+              "score": 0.5272613338286418
+            }
+          ]
+        },
+        {
+          "id": "q11",
+          "ranking_ms": 1.14,
+          "query_encode_ms": 20.463599998038262,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "path/a1@0",
+              "score": 0.8372168788454931
+            },
+            {
+              "citation": "zip/a1@0",
+              "score": 0.5859126853858262
+            },
+            {
+              "citation": "travel/a1@0",
+              "score": 0.5846749326812151
+            },
+            {
+              "citation": "window/a1@0",
+              "score": 0.5633183986436
+            },
+            {
+              "citation": "garden/u1@0",
+              "score": 0.5587188449544669
+            },
+            {
+              "citation": "music/u1@0",
+              "score": 0.5509132198453918
+            },
+            {
+              "citation": "mem/long@3200",
+              "score": 0.5428074398625592
+            },
+            {
+              "citation": "backup/u1@0",
+              "score": 0.526642552183479
+            },
+            {
+              "citation": "car/u1@0",
+              "score": 0.523436409284034
+            },
+            {
+              "citation": "sort/a1@0",
+              "score": 0.5213916839986354
+            }
+          ]
+        },
+        {
+          "id": "q12",
+          "ranking_ms": 1.309,
+          "query_encode_ms": 11.652399989543483,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cost/a1@0",
+              "score": 0.7184037285693808
+            },
+            {
+              "citation": "window/u1@0",
+              "score": 0.5840857006042922
+            },
+            {
+              "citation": "mem/long@4000",
+              "score": 0.5817462079087315
+            },
+            {
+              "citation": "retry/u1@0",
+              "score": 0.5749190325415773
+            },
+            {
+              "citation": "battery/u1@0",
+              "score": 0.5645743739774028
+            },
+            {
+              "citation": "zip/u1@0",
+              "score": 0.555703138424881
+            },
+            {
+              "citation": "tls/u1@0",
+              "score": 0.550638978227048
+            },
+            {
+              "citation": "car/u1@0",
+              "score": 0.5505848478151133
+            },
+            {
+              "citation": "theme/a1@0",
+              "score": 0.5461376744410289
+            },
+            {
+              "citation": "key/u1@0",
+              "score": 0.5446645884360442
+            }
+          ]
+        },
+        {
+          "id": "q13",
+          "ranking_ms": 0.747,
+          "query_encode_ms": 10.248799982946366,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "cancel/u1@0",
+              "score": 0.8135862973784502
+            },
+            {
+              "citation": "sort/a1@0",
+              "score": 0.5562676159727379
+            },
+            {
+              "citation": "music/a1@0",
+              "score": 0.5476857110547475
+            },
+            {
+              "citation": "travel/a1@0",
+              "score": 0.5335879506980662
+            },
+            {
+              "citation": "tls/a1@0",
+              "score": 0.5248924756007273
+            },
+            {
+              "citation": "backup/a1@0",
+              "score": 0.5224899209526209
+            },
+            {
+              "citation": "garden/a1@0",
+              "score": 0.5185811965109828
+            },
+            {
+              "citation": "a11y/u1@0",
+              "score": 0.5054818539551086
+            },
+            {
+              "citation": "battery/u1@0",
+              "score": 0.4997322828037067
+            },
+            {
+              "citation": "path/u1@0",
+              "score": 0.4848726687186743
+            }
+          ]
+        },
+        {
+          "id": "q14",
+          "ranking_ms": 0.881,
+          "query_encode_ms": 19.14839999517426,
+          "recall_at_10": 1.0,
+          "reciprocal_rank": 1.0,
+          "hits": [
+            {
+              "citation": "window/a1@0",
+              "score": 0.7684921681361596
+            },
+            {
+              "citation": "key/u1@0",
+              "score": 0.6195858608417671
+            },
+            {
+              "citation": "photo/a1@0",
+              "score": 0.6097279911554232
+            },
+            {
+              "citation": "a11y/u1@0",
+              "score": 0.5948936837956964
+            },
+            {
+              "citation": "music/a1@0",
+              "score": 0.5705971919347791
+            },
+            {
+              "citation": "theme/a1@0",
+              "score": 0.5617584207106601
+            },
+            {
+              "citation": "cook/a1@0",
+              "score": 0.5443232309409549
+            },
+            {
+              "citation": "mem/u1@0",
+              "score": 0.5436915861746522
+            },
+            {
+              "citation": "travel/a1@0",
+              "score": 0.5407740867120066
+            },
+            {
+              "citation": "car/a1@0",
+              "score": 0.5357784978804951
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
