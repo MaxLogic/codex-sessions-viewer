@@ -755,7 +755,7 @@ fn refuses_databases_it_does_not_own_or_cannot_write_safely() {
     let newer = viewer_database(&temp);
     open(&newer)
         .execute(
-            "insert into schema_version (version, filename, checksum, applied_at_utc, success) values (24, '024_future.sql', 'x', 'now', 1)",
+            "insert into schema_version (version, filename, checksum, applied_at_utc, success) values (999, '999_future.sql', 'x', 'now', 1)",
             [],
         )
         .unwrap();

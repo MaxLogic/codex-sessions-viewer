@@ -68,6 +68,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _savedSettings = widget.initialSettings ?? AppSettings.defaults();
     _settings = _savedSettings;
     _loadControllers(_settings);
+    _pricingRefreshInterval.addListener(_pricingIntervalChanged);
+  }
+
+  /// UTC slots exist only for the six-hour cadence, so the switch follows an
+  /// interval edit immediately instead of only after saving.
+  void _pricingIntervalChanged() {
+    final hours = int.tryParse(_pricingRefreshInterval.text.trim());
+    final pricing = _settings.pricing;
+    if (hours == null || hours == 6 || !pricing.refreshUtcSlots) return;
+    setState(() {
+      _settings = _settings.copyWith(
+        pricing: PricingSettings(
+          provider: pricing.provider,
+          useExternalPricing: pricing.useExternalPricing,
+          automaticRefreshEnabled: pricing.automaticRefreshEnabled,
+          refreshIntervalHours: hours,
+          refreshUtcSlots: false,
+          fallbackToOverrides: pricing.fallbackToOverrides,
+          openRouter: pricing.openRouter,
+          overrides: pricing.overrides,
+        ),
+      );
+    });
   }
 
   @override
@@ -223,9 +246,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       pricing: PricingSettings(
         provider: _settings.pricing.provider,
-        hubUrl: _settings.pricing.hubUrl,
-        hubToken: _settings.pricing.hubToken,
-        hubMachineId: _settings.pricing.hubMachineId,
         useExternalPricing: _settings.pricing.useExternalPricing,
         refreshIntervalHours:
             int.tryParse(_pricingRefreshInterval.text) ??
@@ -524,9 +544,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               _settings = _settings.copyWith(
                                 pricing: PricingSettings(
                                   provider: _settings.pricing.provider,
-                                  hubUrl: _settings.pricing.hubUrl,
-                                  hubToken: _settings.pricing.hubToken,
-                                  hubMachineId: _settings.pricing.hubMachineId,
                                   useExternalPricing: value,
                                   refreshUtcSlots:
                                       _settings.pricing.refreshUtcSlots,
@@ -551,9 +568,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             _settings = _settings.copyWith(
                               pricing: PricingSettings(
                                 provider: pricing.provider,
-                                hubUrl: pricing.hubUrl,
-                                hubToken: pricing.hubToken,
-                                hubMachineId: pricing.hubMachineId,
                                 useExternalPricing: pricing.useExternalPricing,
                                 automaticRefreshEnabled: value,
                                 refreshUtcSlots: pricing.refreshUtcSlots,
@@ -576,9 +590,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             _settings = _settings.copyWith(
                               pricing: PricingSettings(
                                 provider: pricing.provider,
-                                hubUrl: pricing.hubUrl,
-                                hubToken: pricing.hubToken,
-                                hubMachineId: pricing.hubMachineId,
                                 useExternalPricing: pricing.useExternalPricing,
                                 automaticRefreshEnabled:
                                     pricing.automaticRefreshEnabled,
@@ -767,6 +778,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         Text('Last success: ${date(schedule?.lastSuccessAtUtc, 'Never')}'),
         Text('Next due: $nextDue'),
         Text('Last error: ${schedule?.lastError ?? 'None'}'),
+        if (schedule?.lastWarning != null)
+          Text('Hub price sync: ${schedule!.lastWarning}'),
         if (jobType == 'openrouter_price_refresh')
           Text(
             schedule?.lastSuccessAtUtc == null

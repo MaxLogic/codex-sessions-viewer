@@ -42,17 +42,32 @@ Relative roots and database paths are resolved before hook registration.
 ### What setup changes
 
 - Codex: updates only top-level `notify`, preserving TOML comments and other
-  values. An existing notify command is retained through `--previous-notify`.
-- Claude: adds command hooks to `Stop` and `SessionEnd`, preserving existing
+  values. Another notify command is retained through `--previous-notify`.
+- Claude: adds command hooks to `Stop` and `SessionEnd`, preserving other
   hook entries and unrelated JSON values. JSON formatting can change.
+- Setup recognizes its own managed hook by the executable name
+  `codex-sessions-collector.exe` (any folder, any letter case) followed by
+  `codex notify` or `claude hook`. A managed hook with other arguments, for
+  example after moving the executable or changing `--root` or `--db`, is
+  replaced rather than chained or duplicated. A replaced Codex notify keeps the
+  `--previous-notify` command it already carried, and earlier chains in which
+  the collector wrapped itself are unwrapped.
+- Before replacing an existing file, setup keeps the previous version beside it
+  as `<name>.<UTC time>.collector-backup` and reports that path as `backup`.
+  The backup can contain the same secrets as the configuration. Delete it once
+  the new configuration works.
 - Files are staged and replaced atomically. Existing Windows file ACLs are
-  preserved with `ReplaceFileW`. Malformed configurations and symbolic links
-  are refused. Concurrent edits detected before replacement abort setup.
+  preserved with `ReplaceFileW`, which also gives the backup the original ACL.
+  A UTF-8 byte order mark is accepted and kept. Malformed configurations and
+  symbolic links are refused. Concurrent edits detected before replacement
+  abort setup.
+- Claude runs hook commands through a shell. On Windows, setup refuses paths
+  containing `"`, `%`, `!`, `$`, a backtick or a line break, which `cmd.exe` or
+  Git Bash would expand inside double quotes. Choose another executable, root
+  or database path instead.
 
 Hooks queue local work and start a detached drain. Setup does not install a
 scheduled job. Periodic full scans remain useful to reconcile missed hooks.
-After moving the executable, inspect and remove obsolete Claude collector hook
-entries before registering its new path; setup preserves existing hook commands.
 
 ## Verify the right layer
 
@@ -68,7 +83,7 @@ the harness executable is on PATH or currently running.
 
 | Check | Behavior |
 | --- | --- |
-| Configuration | Readable roots, parseable harness configuration, expected hook registration |
+| Configuration | Readable roots, parseable harness configuration, expected hook registration. `hook_state` is `registered`, `different_arguments` (a managed hook exists with another executable path, roots or database) or `absent` |
 | Database | Read-only schema, ownership and parser/cost writer-version agreement |
 | Queue/status | Pending and claimed work for the selected harness, last collection time, global pending uploads |
 | `--local-proof` | Ingest one synthetic session and message through the actual collector into a temporary standalone database, verify rows, then clean up |
@@ -113,6 +128,7 @@ cargo test --manifest-path collector/Cargo.toml --test collector_diagnostics
 ```
 
 The actual CLI tests cover preview/apply parity, repeatability, retained hooks
-and secrets, synthetic ingestion for both harnesses, unavailable roots,
+and secrets, managed-hook replacement after a move or option change, backups,
+byte order marks, refused shell expansion characters, hook states, synthetic ingestion for both harnesses, unavailable roots,
 configuration errors, pending work/uploads, text/JSON output and exit codes,
 and accepted/rejected authentication against a real isolated local hub.

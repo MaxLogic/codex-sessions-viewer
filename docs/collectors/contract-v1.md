@@ -10,14 +10,15 @@ viewer database directly.
 ```powershell
 python samples/collector-contract/example_collector.py samples/collector-contract/session.json > example.jsonl
 collector/target/debug/codex-sessions-collector.exe apply --standalone example.sqlite --input example.jsonl
-collector/target/debug/codex-sessions-collector.exe query search --standalone example.sqlite --query searchable
+collector/target/debug/codex-sessions-collector.exe query search --db example.sqlite --query searchable
 ```
 
 The example reads a small fictional transcript. Its `--harness` option shows
 how another harness can keep the same native session ID without colliding.
-Use `--db PATH` for a viewer-owned database that the viewer has already
-migrated. `--standalone PATH` creates a collector-owned local database. Neither
-mode requires a hub or network access.
+Use `apply --db PATH` for a viewer-owned database that the viewer has already
+migrated. `apply --standalone PATH` creates a collector-owned local database.
+`query` reads either kind through `--db PATH`. Neither mode requires a hub or
+network access.
 
 ## Envelope and compatibility
 
@@ -27,10 +28,11 @@ Each nonempty line has this form:
 {"contract":"codex-sessions-viewer.ingest","version":1,"kind":"session_snapshot","record":{}}
 ```
 
-The concrete shape is defined in `collector/src/contract.rs`. The four kinds
-are `session_snapshot`, `source_status`, `thread_name`, and `project_hints`.
-The empty snapshot above illustrates the envelope only; it is not a valid
-record. Version 1 accepts unknown object fields so an adapter can retain new
+`contract`, `version` and `kind` are required. The four kinds are
+`session_snapshot`, `source_status`, `thread_name`, and `project_hints`; the
+[record reference](#record-reference) lists the fields of each. The empty
+snapshot above illustrates the envelope only; it is not a valid record.
+Version 1 accepts unknown object fields so an adapter can retain new
 source evidence. It rejects another contract name, version, kind, malformed
 JSON, invalid harness names, invalid states and status values, and invalid
 usage-event derivations. A new required field or changed meaning requires a
@@ -40,11 +42,13 @@ stream being one transaction if an I/O or database error occurs after
 validation.
 
 Run `python scripts/verify_collector_examples.py` from the repository root.
-It builds the Rust executable if needed and uses an isolated temporary
-database. `cargo test --manifest-path collector/Cargo.toml --test
-collector_contract` additionally checks the separately run Python process,
-duplicate delivery, changed revisions, search, rejected records, and identity
-isolation.
+It always rebuilds the Rust executable, runs the commands above against an
+isolated temporary database, and checks duplicate delivery, search, a changed
+revision, unknown optional fields, malformed and unsupported envelopes, a
+native session ID shared by two harnesses, a refused foreign machine ID, and an
+empty message. It exits non-zero on the first failed check. `cargo test
+--manifest-path collector/Cargo.toml --test collector_contract` runs the same
+example from the Rust test suite.
 
 ## Session snapshots
 
@@ -125,6 +129,154 @@ same viewer release. Have the adapter write a temporary JSONL file, then run
 `apply --db <viewer-database> --input <file>` only after the adapter exits
 successfully. Keep the JSONL until `apply` succeeds so a failed delivery can
 be retried. Test the package with the verifier above on a clean temporary
-database before installing hooks. The example's `parser_version` is pinned to
-the current viewer projection version 4; update and retest an adapter when
-that version changes.
+database before installing hooks.
+
+## Versions
+
+Three version numbers are independent:
+
+- The envelope `version` is the contract version, `1` for this document.
+- `session.parser_version` is the adapter's own parser version. The example
+  uses `1`. Increase it when the adapter would emit different records for an
+  unchanged source file, so stored sessions are parsed again. Do not copy
+  another harness's value: `4` is the built-in Codex parser version and `1` is
+  the built-in Claude Code parser version, each meaningful only for its own
+  harness.
+- The viewer's cost projection version (currently `1`) belongs to the
+  viewer's pricing maintenance. Adapters never write or depend on it.
+
+## Record reference
+
+Types are JSON types. *Required* fields must be present. Optional fields may
+be omitted or `null`, unless a default is given; arrays default to empty and
+booleans to `false`. Timestamps are UTC ISO-8601 strings such as
+`2026-01-01T00:00:00Z`. Integers are signed 64-bit unless noted. Unknown fields
+are accepted and ignored at every level.
+
+### `session_snapshot`
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `harness` | string | yes | Lowercase ASCII letters, digits or `-`. Namespaces `session.session_id`. |
+| `machine_id` | string | no | Omit or `null` for the local machine; any other value is refused locally. |
+| `source` | object | yes | See `source` below. |
+| `session` | object | yes | See `session` below. |
+| `messages` | array of message | no | The complete message list of this revision. |
+| `tool_calls` | array of tool call | no | The complete tool-call list of this revision. |
+| `usage_events` | array of usage event | no | Source records that reported token counters. |
+| `project_hints` | array of project hint | no | Project names resolved on the source machine. |
+| `extra` | any JSON | no | Unmodelled source evidence, stored as-is. |
+
+`source`:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `path` | string | yes | Source identity for rescans; keep it stable. |
+| `environment` | string | yes | `windows` or `wsl`. |
+| `state` | string | yes | `active`, `codex_archived` or `missing`. |
+| `status` | string | yes | `available`, or `changed_pending_parse` if the file changed while read. |
+| `size` | unsigned integer | yes | Byte size of the parsed revision. |
+| `modified_utc` | timestamp | yes | Modification time of the parsed revision. |
+| `display_path` | string | yes | Path shown to the user. |
+| `mapped_source_file_path` | string | yes | Path in the viewer's address form. |
+| `platform_path` | string | yes | Path in the harness's own address form. |
+| `unc_path` | string | no | UNC form of a WSL path. |
+| `normalized_path_keys` | array of string | no | Alternate keys that identify the same file. |
+
+`session`:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `usage_projection_status` | string | yes | `complete` or `ambiguous`; see below. |
+| `parser_version` | integer | yes | The adapter's own parser version. |
+| `session_id` | string | no | The harness's native ID, unchanged. Omit when the source has none. |
+| `thread_name`, `thread_source` | string | no | Display name and its origin. |
+| `parent_thread_id`, `forked_from_id`, `history_base_thread_id` | string | no | Lineage of subagents and forks. |
+| `history_base_end_ordinal_exclusive`, `history_base_end_byte_offset`, `subagent_history_start_ordinal` | integer | no | Where inherited history ends. |
+| `agent_nickname`, `agent_role` | string | no | Subagent labels. |
+| `subagent_depth` | integer | no | Nesting depth of a subagent. |
+| `working_directory_display`, `working_directory_platform`, `working_directory_unc` | string | no | Working-directory address forms. |
+| `title`, `summary` | string | no | Short descriptions. |
+| `started_at_utc`, `last_message_at_utc` | timestamp | no | Activity range. |
+| `models` | array of string | no | Models in first-use order. |
+| `usage` | usage | no | Session totals; omitted buckets are unknown. |
+
+Send `usage_projection_status` `complete` when the reported usage is fully
+described by `usage_events`, including a session that reports no usage at
+all; its token counts stay `null`. Send `ambiguous` when the source reports
+usage totals that cannot be attributed to usage events. The store may later
+set `ambiguous`, `missing_parent` or `legacy_pending` itself while resolving
+fork and subagent lineage; adapters do not send those two last values.
+
+A usage object has the optional integer fields `input_tokens`,
+`cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`,
+`reasoning_output_tokens` and `total_tokens`.
+
+Message:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `index` | integer | yes | Stable, unique position within the session. |
+| `author_type` | string | yes | `user`, `assistant`, `system`, `tool`, `reasoning` or `unknown`. |
+| `first_line` | string | yes | First line of the text; `""` for an empty message. |
+| `content_plain` | string | yes | Searchable plain text; may be `""`. |
+| `content_preview` | string | yes | Short preview; may be `""`. |
+| `raw_type` | string | no | Source-specific type. |
+| `created_at_utc` | timestamp | no | Message time. |
+| `content_truncated` | boolean | no | The adapter shortened `content_plain`. |
+| `usage` | usage | no | Usage reported on this message. |
+| `model` | string | no | Model that produced the message. |
+| `has_tool_calls`, `has_error` | boolean | no | Message flags. |
+
+Tool call:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `tool_index` | integer | yes | Stable, unique position within the session. |
+| `tool_name` | string | yes | Tool name. |
+| `status` | string | yes | Source-reported outcome, such as `completed` or `failed`. |
+| `started_at_utc`, `finished_at_utc` | timestamp | no | Call duration. |
+| `input_preview`, `output_preview` | string | no | Default `""`. |
+| `output_truncated` | boolean | no | The adapter shortened the output preview. |
+| `error_message` | string | no | Error reported by the tool. |
+
+Usage event:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `source_record_ordinal` | integer, at least 0 | yes | Position of the reporting record; unique per session. |
+| `usage` | usage | yes | Counters attributed to this event. |
+| `derivation` | string | yes | `last_token_usage`, `cumulative_delta` or `counter_reset`. |
+| `branch_scope` | string | yes | `local`, `inherited` or `ambiguous`. |
+| `event_fingerprint` | string | yes | 64 hexadecimal characters, stable for the same event. |
+| `rollout_ordinal`, `turn_ordinal` | integer | no | Source ordering hints. |
+| `counter_epoch` | integer | no | Default `0`; increases after a counter reset. |
+| `occurred_at_utc` | timestamp | no | Event time. |
+| `model`, `provider` | string | no | Pricing inputs. |
+| `working_directory`, `working_directory_unc` | string | no | Where the request ran. |
+| `request_input_tokens`, `model_context_window` | integer | no | Conditional-pricing inputs. |
+| `billable_units` | object of integers | no | Non-token units such as `{"web_search_calls": 2}`. |
+
+Project hint: `working_directory` and `project_name`, both required strings.
+
+### `source_status`
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `harness` | string | yes | As for snapshots. |
+| `path` | string | yes | The source path. |
+| `status` | string | yes | `available`, `missing`, `path_unreachable`, `parse_error`, `permission_denied`, `unsupported_format` or `changed_pending_parse`. |
+| `state` | string | yes | `active`, `codex_archived` or `missing`. |
+| `message` | string | no | Short diagnostic; never include transcript content. |
+
+### `thread_name`
+
+`harness`, `session_id` and `thread_name`, all required strings.
+
+### `project_hints`
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `harness` | string | yes | As for snapshots. |
+| `sessions` | array | yes | Each item has `source_path` (string, required) and `session_id` (string, optional). |
+| `hints` | array of project hint | yes | Resolved project names by working directory. |

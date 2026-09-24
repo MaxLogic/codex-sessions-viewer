@@ -1,8 +1,27 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
+
+/// Writes an evaluation [result] and returns the file written.
+///
+/// Only a `measured` result replaces [output], through a temporary file and
+/// rename, so retained evidence is never truncated or overwritten by an
+/// unavailable or failed run. Other results go to `<output>.unavailable.json`.
+File writeEvaluationResult(File output, Map<String, dynamic> result) {
+  final target = result['status'] == 'measured'
+      ? output
+      : File('${output.path}.unavailable.json');
+  target.parent.createSync(recursive: true);
+  final staging = File('${target.path}.tmp');
+  staging.writeAsStringSync(
+    '${const JsonEncoder.withIndent('  ').convert(result)}\n',
+    flush: true,
+  );
+  return staging.renameSync(target.path);
+}
 
 typedef Embed = Future<List<List<double>>> Function(List<String> texts);
 

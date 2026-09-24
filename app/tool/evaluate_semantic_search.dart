@@ -171,10 +171,7 @@ Future<void> main(List<String> args) async {
   } finally {
     db.close();
     temp.deleteSync(recursive: true);
-    output.parent.createSync(recursive: true);
-    output.writeAsStringSync(
-      '${const JsonEncoder.withIndent('  ').convert(result)}\n',
-    );
-    stdout.writeln('Semantic evaluation: ${result['status']}; ${output.path}');
+    final written = writeEvaluationResult(output, result);
+    stdout.writeln('Semantic evaluation: ${result['status']}; ${written.path}');
   }
 }

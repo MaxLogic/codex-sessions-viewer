@@ -23,15 +23,21 @@ try {
     Get-ChildItem -LiteralPath $release | Where-Object { $_.Name -notin @('settings.toml', 'logs') } | Copy-Item -Destination $appDirectory -Recurse
     $emptySource = Join-Path $runRoot 'empty-sessions'
     New-Item -ItemType Directory -Path $emptySource | Out-Null
+    # A TOML basic string: escape backslashes and quotes so any temp path,
+    # including one with an apostrophe, stays a valid value.
+    $sourceToml = '"' + ($emptySource -replace '\\', '\\' -replace '"', '\"') + '"'
+    # External pricing stays off so the smoke test never depends on the network.
     $settings = @"
 [app]
 first_run = false
 start_with_windows = false
 [paths]
-windows_codex_path = '$emptySource'
-wsl_codex_unc_path = '$emptySource'
+windows_codex_path = $sourceToml
+wsl_codex_unc_path = $sourceToml
 [scanner]
 background_rescan_enabled = false
+[pricing]
+use_external_pricing = false
 [voice_over]
 enabled = false
 "@

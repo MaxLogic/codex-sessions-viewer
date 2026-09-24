@@ -8,6 +8,15 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+# This adapter's own parser version. Bump it whenever the records it emits
+# for an unchanged source change, so stored sessions are reparsed. It is not
+# the Codex parser version and not the viewer's cost projection version.
+PARSER_VERSION = 1
+
+
+def first_line(text: str) -> str:
+    return text.splitlines()[0] if text.strip() else ""
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -25,7 +34,7 @@ def main() -> None:
         {
             "index": index,
             "author_type": message["role"],
-            "first_line": message["text"].splitlines()[0],
+            "first_line": first_line(message["text"]),
             "content_plain": message["text"],
             "content_preview": message["text"][:240],
         }
@@ -47,13 +56,17 @@ def main() -> None:
         },
         "session": {
             "session_id": transcript["session_id"],
+            # No usage events and no parent/fork lineage: nothing is left to
+            # resolve, so the projection is complete. Omitted `usage` keeps
+            # every token count null ("not reported"), never zero.
             "usage_projection_status": "complete",
-            "title": records[0]["first_line"] if records else None,
-            "summary": records[-1]["first_line"] if records else None,
+            "title": next((r["first_line"] for r in records if r["first_line"]), None),
+            "summary": next(
+                (r["first_line"] for r in reversed(records) if r["first_line"]), None
+            ),
             "started_at_utc": timestamp,
             "last_message_at_utc": timestamp,
-            "parser_version": 4,
-            "usage": {},
+            "parser_version": PARSER_VERSION,
         },
         "messages": records,
         "tool_calls": [],

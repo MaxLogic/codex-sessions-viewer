@@ -1,16 +1,17 @@
 import 'dart:ui' show SemanticsAction, SemanticsFlag, Tristate;
 
-import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
 import 'package:codex_sessions_viewer/src/ui/app_shell.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../helpers/isolated_app.dart';
+
 void main() {
   testWidgets('main navigation exposes required areas and switches screens', (
     tester,
   ) async {
-    await tester.pumpWidget(CodexSessionsViewerApp());
+    await tester.pumpWidget(await createIsolatedApp(tester));
     await tester.pump();
 
     expect(find.byType(NavigationRail), findsOneWidget);
@@ -29,13 +30,6 @@ void main() {
     expect(find.text('Usage'), findsWidgets);
     expect(find.text('Usage summary'), findsOneWidget);
     expect(find.bySemanticsLabel('Usage screen'), findsOneWidget);
-    expect(
-      tester
-          .getSemantics(find.bySemanticsLabel('Usage screen'))
-          .flagsCollection
-          .isLiveRegion,
-      isTrue,
-    );
 
     await tester.tap(
       find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
@@ -48,6 +42,46 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Logs'), findsWidgets);
     expect(find.text('Log table'), findsOneWidget);
+  });
+
+  testWidgets('navigation announces the new screen once', (tester) async {
+    final semantics = tester.ensureSemantics();
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: CodexAppShell(
+            sessionsScreenBuilder: (_, _) => const Text('Sessions content'),
+            evalsScreen: const Text('Evals content'),
+            contextScreen: const Text('Context content'),
+            usageScreen: const Text('Usage content'),
+            settingsScreen: const Text('Settings content'),
+            logsScreen: const Text('Logs content'),
+            projectsScreen: const Text('Projects content'),
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(tester.takeAnnouncements(), isEmpty);
+
+      await tester.tap(
+        find.bySemanticsLabel(RegExp('^Usage navigation\nTab ')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(tester.takeAnnouncements().map((a) => a.message), [
+        'Usage screen',
+      ]);
+      expect(
+        tester
+            .getSemantics(find.bySemanticsLabel('Usage screen'))
+            .flagsCollection
+            .isLiveRegion,
+        isFalse,
+        reason: 'The whole screen must not be a live region.',
+      );
+    } finally {
+      semantics.dispose();
+    }
   });
 
   testWidgets('navigation rail is keyboard reachable', (tester) async {

@@ -78,8 +78,11 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(21, "migration", "021_session_change_journal.sql"),
     migration!(22, "migration", "022_collector_upload_outbox.sql"),
     migration!(23, "migration", "023_price_history_sync.sql"),
-    // 024 is reserved for a migration developed in parallel; list it here
-    // when it lands so the versions are contiguous again.
+    migration!(
+        24,
+        "migration",
+        "024_hub_delivery_and_price_confirmation.sql"
+    ),
     migration!(25, "migration", "025_session_change_journal_precision.sql"),
 ];
 
@@ -566,11 +569,40 @@ fn apply_migration_in_transaction(conn: &Connection, migration: &Migration) -> S
     Ok(())
 }
 
+thread_local! {
+    /// Set while `in_write_transaction` owns an outer transaction on this
+    /// thread; nested writers then use a savepoint inside it.
+    static OUTER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs several writers in one transaction: either all of their changes
+/// commit together or none do. Used by hub ingestion so that the applied
+/// records and the received-batch row are atomic.
+pub fn in_write_transaction<T>(
+    conn: &Connection,
+    body: impl FnOnce() -> StoreResult<T>,
+) -> StoreResult<T> {
+    begin_write(conn)?;
+    OUTER_WRITE.with(|outer| outer.set(true));
+    let result = body();
+    OUTER_WRITE.with(|outer| outer.set(false));
+    finish(conn, result)
+}
+
+fn nested_write() -> bool {
+    OUTER_WRITE.with(std::cell::Cell::get)
+}
+
 /// Start a write and re-check, under the write lock, that the database is
 /// still at this collector's schema with no viewer migration pending. The
 /// check at open is not enough: a newer viewer can migrate the database
-/// between two batches of a long scan.
+/// between two batches of a long scan. Inside `in_write_transaction` (same
+/// thread and connection) it opens a savepoint in the outer transaction.
 pub fn begin_write(conn: &Connection) -> StoreResult<()> {
+    if nested_write() {
+        conn.execute_batch("savepoint nested_write")?;
+        return Ok(());
+    }
     conn.execute_batch("begin immediate")?;
     let check = (|| -> StoreResult<()> {
         let version = last_applied_version(conn)?;
@@ -591,6 +623,18 @@ pub fn begin_write(conn: &Connection) -> StoreResult<()> {
 
 /// Commit on success, roll back on failure, keeping the first error.
 pub fn finish<T>(conn: &Connection, result: StoreResult<T>) -> StoreResult<T> {
+    if nested_write() {
+        return match result {
+            Ok(value) => {
+                conn.execute_batch("release nested_write")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("rollback to nested_write; release nested_write");
+                Err(error)
+            }
+        };
+    }
     match result {
         Ok(value) => match conn.execute_batch("commit") {
             Ok(()) => Ok(value),
@@ -627,12 +671,8 @@ mod tests {
         let listed: Vec<String> = MIGRATIONS.iter().map(|m| m.filename.to_owned()).collect();
         assert_eq!(listed, files);
         assert_eq!(MIGRATIONS.last().unwrap().version, SUPPORTED_SCHEMA_VERSION);
-        // Versions strictly increase from 1; 024 is reserved (see MIGRATIONS).
-        assert_eq!(MIGRATIONS[0].version, 1);
-        for pair in MIGRATIONS.windows(2) {
-            assert!(pair[0].version < pair[1].version);
-        }
-        for migration in MIGRATIONS {
+        for (index, migration) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(migration.version, index as i64 + 1);
             assert!(
                 migration
                     .filename

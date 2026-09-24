@@ -25,7 +25,8 @@ describes a 384-dimensional English sentence encoder and a 256-word-piece limit.
 The worker rejects overlong chunks rather than silently truncating them. It uses
 `local_files_only=True`, disables telemetry, and disallows remote model code.
 Unavailable Python packages or weights produce `status: unavailable` and exit 2;
-that result is not a successful semantic comparison.
+that result is not a successful semantic comparison. It is written to
+`<out>.unavailable.json`, so the retained measured JSON is never overwritten.
 
 ## Method and results
 

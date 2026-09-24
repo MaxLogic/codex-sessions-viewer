@@ -88,6 +88,39 @@ fn independent_example_is_searchable_idempotent_and_revisable() {
 }
 
 #[test]
+fn example_handles_empty_messages_and_uses_its_own_versions() {
+    let temp = TempDir::new("contract_empty_message");
+    let db = temp.path().join("example.sqlite");
+    let source = temp.path().join("session.json");
+    std::fs::write(
+        &source,
+        json!({"session_id":"empty-001","messages":[
+            {"role":"user","text":""},
+            {"role":"assistant","text":"Answer after an empty prompt."}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let envelope = example(&source, &[]);
+    let session = &envelope["record"]["session"];
+    // The adapter's own parser version, not the Codex parser's.
+    assert_eq!(session["parser_version"], 1);
+    assert_eq!(envelope["record"]["messages"][0]["first_line"], "");
+    let output = apply(&temp, &db, &envelope);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(count(&db, "messages"), 2);
+    let tokens: Option<i64> = Connection::open(&db)
+        .unwrap()
+        .query_row("select input_tokens from sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tokens, None, "missing usage must stay unknown, not zero");
+}
+
+#[test]
 fn contract_rejects_bad_envelopes_without_writing_and_scopes_harness_identity() {
     let temp = TempDir::new("contract_rejections");
     let db = temp.path().join("example.sqlite");

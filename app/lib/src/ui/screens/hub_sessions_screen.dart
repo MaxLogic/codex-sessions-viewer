@@ -234,8 +234,12 @@ class _HubSessionsScreenState extends State<HubSessionsScreen> {
     }
   }
 
+  /// One hub request sequence runs at a time: a tap delivered after a poll
+  /// started (before the disabled row was rebuilt) is ignored rather than
+  /// overlapping it, and the poll cannot clear this request's busy state.
   Future<void> _select(Map<String, dynamic> row) async {
-    if (!await _discardEdits() || !mounted) return;
+    if (_busy || _source == null || _machine == null) return;
+    if (!await _discardEdits() || !mounted || _busy) return;
     final reference = _reference(row);
     final generation = ++_generation;
     setState(() {
@@ -271,7 +275,7 @@ class _HubSessionsScreenState extends State<HubSessionsScreen> {
     } catch (error) {
       if (mounted) setState(() => _error = 'Hub details: $error');
     } finally {
-      if (mounted && generation == _generation) setState(() => _busy = false);
+      if (mounted) setState(() => _busy = false);
     }
   }
 

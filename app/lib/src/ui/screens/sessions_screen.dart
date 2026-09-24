@@ -15,6 +15,7 @@ import '../copy_shortcut.dart';
 import '../../usage/usage_summary.dart';
 import '../motion.dart';
 import '../models/conversation_message_view_model.dart';
+import '../models/session_label_formatter.dart';
 import '../models/session_row_view_model.dart';
 import '../number_formatting.dart';
 import '../widgets/command_preview.dart';
@@ -22,6 +23,7 @@ import '../widgets/conversation_view.dart';
 import '../widgets/session_detail_pane.dart';
 import '../widgets/svg_icon.dart';
 import '../widgets/app_button.dart';
+import '../widgets/menu_header_entry.dart';
 
 export '../models/session_row_view_model.dart';
 
@@ -226,6 +228,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   static const _minimumTablePaneWidth = 520.0;
   static const _splitDividerWidth = 9.0;
   static const _filterDebounceDuration = Duration(milliseconds: 220);
+  static const _tableStateEmitDebounce = Duration(milliseconds: 500);
   static const _synchronousTextFilterRowLimit = 200;
 
   final _searchController = TextEditingController();
@@ -268,6 +271,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _isCancellingRefresh = false;
   var _scanAnnouncement = '';
   var _hasRefreshOwnedRows = false;
+
+  /// The external revision current when this screen's refresh last replaced
+  /// the rows; parent rows apply again only after a newer revision.
+  var _refreshOwnedExternalRevision = 0;
   String? _selectedId;
   var _detailTab = SessionDetailTab.conversation;
 
@@ -297,6 +304,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   Timer? _relativeDateTimer;
   Timer? _backgroundRescanTimer;
   Timer? _filterDebounceTimer;
+  Timer? _tableStateEmitTimer;
   SessionsRefreshOperation? _activeRefreshOperation;
   var _textFilterGeneration = 0;
   var _appliedSearch = '';
@@ -348,25 +356,28 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _pricingInvalidated = true;
       _queuePersistedCostRefresh();
     }
-    if ((!_hasRefreshOwnedRows || widget.externalRevision > 0) &&
-        oldWidget.initialRows != widget.initialRows) {
+    // After this screen's own refresh, parent rows are stale snapshots until
+    // a newer external (collector) revision arrives. External rows are loaded
+    // asynchronously, so they can arrive in a later update than the revision.
+    final acceptsParentRows =
+        !_hasRefreshOwnedRows ||
+        widget.externalRevision > _refreshOwnedExternalRevision;
+    if (acceptsParentRows && oldWidget.initialRows != widget.initialRows) {
       final previouslySelectedId = _selectedId;
-      final selectedChanged =
-          previouslySelectedId != null &&
-          !identical(
-            oldWidget.initialRows
-                .where((row) => row.id == previouslySelectedId)
-                .firstOrNull,
-            widget.initialRows
-                .where((row) => row.id == previouslySelectedId)
-                .firstOrNull,
-          );
+      final previousSelected = previouslySelectedId == null
+          ? null
+          : _rows.where((row) => row.id == previouslySelectedId).firstOrNull;
       _replaceRows(widget.initialRows, external: widget.externalRevision > 0);
       _retainSelection();
       _tryApplyPendingOpenTarget();
+      final nextSelected = previouslySelectedId == null
+          ? null
+          : _rows.where((row) => row.id == previouslySelectedId).firstOrNull;
       if (widget.externalRevision > 0 &&
-          selectedChanged &&
-          _selectedId == previouslySelectedId) {
+          previousSelected != null &&
+          nextSelected != null &&
+          _selectedId == previouslySelectedId &&
+          _sessionContentChanged(previousSelected, nextSelected)) {
         unawaited(_loadSelectedDetail(_selectedId!, force: true));
       }
     }
@@ -400,6 +411,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
 
   @override
   void dispose() {
+    if (_tableStateEmitTimer?.isActive ?? false) {
+      _emitTableState();
+    }
     _requestRefreshCancel(updateUi: false);
     _backgroundRescanTimer?.cancel();
     _filterDebounceTimer?.cancel();
@@ -641,6 +655,11 @@ class _SessionsScreenState extends State<SessionsScreen> {
                             width / (constraints.maxWidth - _splitDividerWidth);
                       }),
                       onDragEnd: _emitTableState,
+                      onNudgeEnd: _scheduleTableStateEmit,
+                      tablePercent: constraints.maxWidth <= 0
+                          ? 0
+                          : (tablePaneWidth * 100 / constraints.maxWidth)
+                                .round(),
                       onReset: () {
                         setState(() => _tablePaneFraction = null);
                         _emitTableState();
@@ -1931,7 +1950,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     setState(() {
       _isScanning = true;
       _isCancellingRefresh = false;
-      _hasRefreshOwnedRows = true;
+      _takeRowOwnership();
       _scanAnnouncement = 'Scanning started';
     });
     SessionsRefreshOperation? operation;
@@ -1943,7 +1962,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         return;
       }
       setState(() {
-        _hasRefreshOwnedRows = true;
+        _takeRowOwnership();
         _replaceRows(refreshResult.rows);
         _scanAnnouncement = refreshResult.statusMessage;
         _retainSelection();
@@ -2000,7 +2019,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     setState(() {
       final rows = progress.rows;
       if (rows != null) {
-        _hasRefreshOwnedRows = true;
+        _takeRowOwnership();
         _replaceRows(rows);
       }
       _scanAnnouncement = progress.statusMessage;
@@ -2478,7 +2497,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     setState(() {
       _columnWidths[column] = width.clamp(64, 520).toDouble();
     });
-    _emitTableState();
+    // Drags and arrow keys resize many times a second; save once they settle.
+    _scheduleTableStateEmit();
   }
 
   void _handleSortGesture(String column, _SortGesture gesture) {
@@ -2557,7 +2577,16 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _emitTableState();
   }
 
+  /// Saves the table layout after a burst of resize steps settles, so arrow
+  /// keys and drags do not write settings on every step.
+  void _scheduleTableStateEmit() {
+    _tableStateEmitTimer?.cancel();
+    _tableStateEmitTimer = Timer(_tableStateEmitDebounce, _emitTableState);
+  }
+
   void _emitTableState() {
+    _tableStateEmitTimer?.cancel();
+    _tableStateEmitTimer = null;
     widget.onTableStateChanged?.call(
       SessionTableSettings(
         columnWidths: Map.unmodifiable(_columnWidths),
@@ -2836,6 +2865,30 @@ class _SessionsScreenState extends State<SessionsScreen> {
     return candidate.id.compareTo(current.id) > 0;
   }
 
+  void _takeRowOwnership() {
+    _hasRefreshOwnedRows = true;
+    _refreshOwnedExternalRevision = widget.externalRevision;
+  }
+
+  /// Whether a new snapshot of the same session changes what its detail pane
+  /// shows. Collector commits replace every row object, so identity is not a
+  /// revision.
+  bool _sessionContentChanged(
+    SessionRowViewModel previous,
+    SessionRowViewModel next,
+  ) {
+    return previous.lastMessageAtUtc != next.lastMessageAtUtc ||
+        previous.messageCount != next.messageCount ||
+        previous.totalTokens != next.totalTokens ||
+        previous.userMessageCount != next.userMessageCount ||
+        previous.assistantMessageCount != next.assistantMessageCount ||
+        previous.toolCallCount != next.toolCallCount ||
+        previous.sourceFilePath != next.sourceFilePath ||
+        previous.sourceState != next.sourceState ||
+        previous.hasError != next.hasError ||
+        previous.status != next.status;
+  }
+
   bool _rowChangedForMotion(
     SessionRowViewModel? previous,
     SessionRowViewModel next,
@@ -2899,19 +2952,23 @@ class _SessionTextFilterRequest {
 class _SessionTextFilterRowData {
   const _SessionTextFilterRowData({
     required this.id,
+    required this.idKey,
+    required this.idNamespaceLength,
     required this.path,
     required this.threadName,
     required this.searchFields,
   });
 
   factory _SessionTextFilterRowData.from(SessionRowViewModel row) {
+    final idKey = row.id.toLowerCase();
     return _SessionTextFilterRowData(
       id: row.id,
+      idKey: idKey,
+      idNamespaceLength: _internalIdNamespace.matchAsPrefix(idKey)?.end ?? 0,
       path: row.path.replaceAll(r'\', '/').toLowerCase(),
       threadName: row.threadName.toLowerCase(),
       searchFields: [
         row.sessionId,
-        row.id,
         row.title,
         row.summary,
         row.project,
@@ -2927,10 +2984,26 @@ class _SessionTextFilterRowData {
   }
 
   final String id;
+
+  /// Lower-case internal ID such as `session:<id>` or `claude:session:<id>`.
+  final String idKey;
+
+  /// Length of the `session:` / `claude:session:` namespace in [idKey].
+  final int idNamespaceLength;
   final String path;
   final String threadName;
   final List<String> searchFields;
+
+  /// Internal IDs match by prefix, and only once the query reaches past the
+  /// namespace, so words such as "session" or "claude" do not match every
+  /// row. The ID without its namespace also matches by prefix.
+  bool matchesInternalId(String search) =>
+      (search.length > idNamespaceLength && idKey.startsWith(search)) ||
+      (idNamespaceLength > 0 && idKey.startsWith(search, idNamespaceLength));
 }
+
+/// The namespace that prefixes internal session IDs.
+final _internalIdNamespace = RegExp(r'(?:[a-z0-9_-]+:)?session:');
 
 class _SessionTextFilterResult {
   const _SessionTextFilterResult({
@@ -2952,7 +3025,8 @@ _SessionTextFilterResult _matchSessionTextFilters(
   final threadNameIds = <String>{};
   for (final row in request.rows) {
     if (request.search.isNotEmpty &&
-        row.searchFields.any((value) => value.contains(request.search))) {
+        (row.matchesInternalId(request.search) ||
+            row.searchFields.any((value) => value.contains(request.search)))) {
       searchIds.add(row.id);
     }
     if (request.path.isNotEmpty && row.path.contains(request.path)) {
@@ -3511,10 +3585,10 @@ class _FilterBarState extends State<_FilterBar> {
           label: 'Harness',
           value: widget.harnessFilter ?? '',
           isActive: widget.harnessFilter != null,
-          options: const [
+          options: [
             ('', 'All harnesses'),
-            ('codex', 'Codex'),
-            ('claude', 'Claude Code'),
+            for (final harness in const ['codex', 'claude'])
+              (harness, SessionLabelFormatter.harness(harness)),
           ],
           onSelected: (value) =>
               widget.onHarnessChanged(value.isEmpty ? null : value),
@@ -3773,9 +3847,9 @@ class _FilterBarState extends State<_FilterBar> {
           widget.platformFilter.label,
           () => widget.onPlatformChanged(SessionsPlatformFilter.both),
         ),
-      if (widget.harnessFilter != null)
+      if (widget.harnessFilter case final harness?)
         _ActiveFilterChip(
-          widget.harnessFilter == 'claude' ? 'Claude Code' : 'Codex',
+          SessionLabelFormatter.harness(harness),
           () => widget.onHarnessChanged(null),
         ),
       if (widget.originFilter != _defaultOriginFilter)
@@ -3888,7 +3962,10 @@ class _FilterMenuButton<T> extends StatefulWidget {
 }
 
 class _FilterMenuButtonState<T> extends State<_FilterMenuButton<T>> {
-  final _menuKey = GlobalKey<PopupMenuButtonState<int>>();
+  // Items carry the option value itself (wrapped so a null "All" value is a
+  // real selection). The menu can stay open while rows change the options,
+  // so an index into the current options could pick the wrong filter.
+  final _menuKey = GlobalKey<PopupMenuButtonState<(T,)>>();
 
   @override
   Widget build(BuildContext context) {
@@ -3901,9 +3978,6 @@ class _FilterMenuButtonState<T> extends State<_FilterMenuButton<T>> {
         break;
       }
     }
-    final selectedIndex = widget.options.indexWhere(
-      (option) => option.$1 == widget.value,
-    );
     return Semantics(
       label: widget.semanticsLabel,
       value: valueLabel,
@@ -3911,16 +3985,16 @@ class _FilterMenuButtonState<T> extends State<_FilterMenuButton<T>> {
       container: true,
       excludeSemantics: true,
       onTap: () => _menuKey.currentState?.showButtonMenu(),
-      child: PopupMenuButton<int>(
+      child: PopupMenuButton<(T,)>(
         key: _menuKey,
         tooltip: widget.tooltip ?? '${widget.label}: $valueLabel',
-        initialValue: selectedIndex < 0 ? null : selectedIndex,
-        onSelected: (index) => widget.onSelected(widget.options[index].$1),
+        initialValue: (widget.value,),
+        onSelected: (choice) => widget.onSelected(choice.$1),
         constraints: const BoxConstraints(maxHeight: 420, minWidth: 180),
         itemBuilder: (context) => [
-          for (final (index, option) in widget.options.indexed)
-            CheckedPopupMenuItem<int>(
-              value: index,
+          for (final option in widget.options)
+            CheckedPopupMenuItem<(T,)>(
+              value: (option.$1,),
               checked: option.$1 == widget.value,
               child: Text(option.$2),
             ),
@@ -4009,7 +4083,7 @@ class _ToggleFilterChip extends StatelessWidget {
   }
 }
 
-class _SessionsHeading extends StatelessWidget {
+class _SessionsHeading extends StatefulWidget {
   const _SessionsHeading({
     required this.visibleCount,
     this.onAction,
@@ -4021,10 +4095,21 @@ class _SessionsHeading extends StatelessWidget {
   final bool canSaveCsv;
 
   @override
+  State<_SessionsHeading> createState() => _SessionsHeadingState();
+}
+
+class _SessionsHeadingState extends State<_SessionsHeading> {
+  // Held in State: a key created in build would replace the menu button, and
+  // its keyboard focus, on every rebuild.
+  final _actionsMenuKey = GlobalKey<PopupMenuButtonState<_SessionListAction>>();
+
+  @override
   Widget build(BuildContext context) {
+    final visibleCount = widget.visibleCount;
+    final onAction = widget.onAction;
+    final canSaveCsv = widget.canSaveCsv;
     final countStyle = Theme.of(context).textTheme.bodySmall;
-    final actionsMenuKey =
-        GlobalKey<PopupMenuButtonState<_SessionListAction>>();
+    final actionsMenuKey = _actionsMenuKey;
     return Row(
       children: [
         Semantics(
@@ -4543,8 +4628,9 @@ class _SessionsTable extends StatelessWidget {
     final color = _rowColor(context, row, selected: selected);
     final child = Semantics(
       label: 'Session ${displayRow.accessibleLabel}. Status ${_rowState(row)}.',
+      // A selectable row, not a button: a button role would hide the nested
+      // row controls from screen readers. Tab and Enter still select it.
       selected: selected,
-      button: true,
       container: true,
       onTap: () => onSelect(row.id),
       child: InkWell(
@@ -5006,7 +5092,7 @@ class _TagsCell extends StatelessWidget {
   }
 }
 
-class _ActionsMenu extends StatelessWidget {
+class _ActionsMenu extends StatefulWidget {
   const _ActionsMenu({
     required this.row,
     required this.onAction,
@@ -5018,10 +5104,23 @@ class _ActionsMenu extends StatelessWidget {
   final AppSettings settings;
 
   @override
+  State<_ActionsMenu> createState() => _ActionsMenuState();
+}
+
+class _ActionsMenuState extends State<_ActionsMenu> {
+  // Held in State so collector commits that rebuild the row keep the menu
+  // button, and its keyboard focus.
+  final _actionsMenuKey = GlobalKey<PopupMenuButtonState<SessionRowAction>>();
+
+  SessionRowViewModel get row => widget.row;
+  SessionActionCallback get onAction => widget.onAction;
+  AppSettings get settings => widget.settings;
+
+  @override
   Widget build(BuildContext context) {
     final commandSet = _commandSet(row);
     final rowLabel = _rowAccessibleLabel(row);
-    final actionsMenuKey = GlobalKey<PopupMenuButtonState<SessionRowAction>>();
+    final actionsMenuKey = _actionsMenuKey;
     final resumeReason =
         commandSet.terminalDisabledReason ??
         commandSet.disabledReason ??
@@ -5044,6 +5143,7 @@ class _ActionsMenu extends StatelessWidget {
               ? 'Open terminal and resume unavailable for $rowLabel: $resumeReason'
               : 'Open terminal and resume for $rowLabel',
           button: true,
+          enabled: openTerminalResume != null,
           onTap: openTerminalResume,
           child: ExcludeSemantics(
             child: IconButton(
@@ -5074,11 +5174,7 @@ class _ActionsMenu extends StatelessWidget {
               ),
             ),
             itemBuilder: (context) => [
-              PopupMenuItem<SessionRowAction>(
-                enabled: false,
-                height: 36,
-                child: Text(row.harnessLabel),
-              ),
+              MenuHeaderEntry<SessionRowAction>(row.harnessLabel),
               if (_canOpenContainingFolder(row))
                 _item(
                   SessionRowAction.openPath,
@@ -5284,11 +5380,20 @@ class _SplitHandle extends StatefulWidget {
   const _SplitHandle({
     required this.onDrag,
     required this.onDragEnd,
+    required this.onNudgeEnd,
+    required this.tablePercent,
     required this.onReset,
   });
 
+  /// The session table's share of the width, announced as the value.
+  final int tablePercent;
+
   final ValueChanged<double> onDrag;
   final VoidCallback onDragEnd;
+
+  /// Called after each keyboard or accessibility nudge; the owner saves the
+  /// layout once the nudges settle.
+  final VoidCallback onNudgeEnd;
   final VoidCallback onReset;
 
   @override
@@ -5304,12 +5409,13 @@ class _SplitHandleState extends State<_SplitHandle> {
     final focusColor = scheme.primary;
     void nudge(double delta) {
       widget.onDrag(delta);
-      widget.onDragEnd();
+      widget.onNudgeEnd();
     }
 
     return Semantics(
       label: 'Resize session table and detail panes',
-      value: 'Use Left and Right Arrow to resize. Press Enter to reset.',
+      value: 'Session table ${widget.tablePercent} percent',
+      hint: 'Use Left and Right Arrow to resize. Press Enter to reset.',
       increasedValue: 'Wider session table',
       decreasedValue: 'Narrower session table',
       focusable: true,

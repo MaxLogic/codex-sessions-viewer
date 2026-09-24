@@ -131,6 +131,139 @@ fn hub_wins_only_same_instant_and_same_model_preserving_intraslot_changes() {
 }
 
 #[test]
+fn hub_evidence_wins_across_its_confirmed_coverage_not_only_the_same_instant() {
+    let at = |hour: u32| {
+        chrono::DateTime::parse_from_rfc3339(&format!("2026-09-01T{hour:02}:00:00Z"))
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    let hub_observation = Observation::parse(&observation(0, "0.3", "hub")).unwrap();
+    let values = [
+        observation(0, "0.3", "hub"),
+        // Inside hub coverage (confirmed unchanged at 12:00): superseded.
+        observation(6, "9", "local"),
+        observation(12, "8", "local"),
+        // After the last confirmation, a missed hub fetch: retained gap.
+        observation(18, "0.4", "local"),
+    ];
+    let history = History::new(values.iter().map(|v| Observation::parse(v).unwrap()))
+        .with_confirmations([(hub_observation.fingerprint.clone(), at(12))]);
+    let prompts = |history: &History| {
+        history
+            .winners()
+            .iter()
+            .map(|o| {
+                o.value["model"]["pricing"]["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(prompts(&history), vec!["0.3", "0.4"]);
+    // Without a confirmation the hub observation covers only its instant.
+    let unconfirmed = History::new(values.iter().map(|v| Observation::parse(v).unwrap()));
+    assert_eq!(prompts(&unconfirmed), vec!["0.3", "9", "8", "0.4"]);
+    // Coverage is per model: another model's local evidence is unaffected.
+    let mut other = observation(6, "5", "local");
+    other["model_id"] = json!("provider/other");
+    other["model"]["id"] = json!("provider/other");
+    let mixed = History::new(
+        [values[0].clone(), other]
+            .iter()
+            .map(|v| Observation::parse(v).unwrap()),
+    )
+    .with_confirmations([(hub_observation.fingerprint.clone(), at(12))]);
+    assert_eq!(mixed.winners().len(), 2);
+}
+
+#[test]
+fn hub_rejects_observations_later_than_its_clock_allows() {
+    let hub = hub();
+    let mut future = observation(0, "0.1", "local");
+    future["observed_at_utc"] = json!(
+        (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    );
+    assert!(matches!(
+        sync(&hub, TOKEN, vec![future]),
+        Err(ureq::Error::StatusCode(400))
+    ));
+    let mut skewed = observation(0, "0.1", "local");
+    skewed["observed_at_utc"] = json!(
+        (chrono::Utc::now() + chrono::Duration::seconds(60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    );
+    assert!(sync(&hub, TOKEN, vec![skewed]).is_ok());
+}
+
+#[test]
+fn unchanged_hub_catalog_confirms_instead_of_storing_new_observations() {
+    let temp = TempDir::new("price-confirm");
+    let first = observation(0, "0.1", "local")["model"].clone();
+    let second = json!({"id":"provider/second","pricing":{"prompt":"0.2"}});
+    let catalog = json!({"data":[first.clone(), second.clone()],"total_count":2});
+    let fetch = |page: Value| {
+        let (url, server) = provider(vec![page]);
+        let config = FetchConfig {
+            enabled: true,
+            endpoint: url,
+            interval_hours: 6,
+        };
+        let count = price_history::fetch_once(temp.path(), &config).unwrap();
+        server.join().unwrap();
+        count
+    };
+    let conn =
+        || rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap();
+    let count = |sql: &str| conn().query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(fetch(catalog.clone()), 2);
+    let revisions = count("select count(*) from price_history_revisions");
+    let initial = price_history::synchronize(
+        temp.path(),
+        "machine-a",
+        json!({"protocol":1,"observations":[],"after":0,"confirmations_after":0}),
+    )
+    .unwrap();
+    let confirmed_after = chrono::Utc::now();
+    assert_eq!(fetch(catalog.clone()), 2);
+    assert_eq!(fetch(catalog), 2);
+    assert_eq!(count("select count(*) from price_observations"), 2);
+    assert_eq!(
+        count("select count(*) from price_history_revisions"),
+        revisions
+    );
+    assert_eq!(
+        count("select count(*) from price_observation_confirmations"),
+        2
+    );
+    // An incremental download returns only the confirmations.
+    let delta = price_history::synchronize(
+        temp.path(),
+        "machine-a",
+        json!({"protocol":1,"observations":[],"after":initial["through"],
+            "confirmations_after":initial["confirmations_after"]}),
+    )
+    .unwrap();
+    assert_eq!(delta["observations"], json!([]));
+    assert_eq!(delta["revision"], initial["revision"]);
+    assert_eq!(delta["complete"], true);
+    let confirmations = delta["confirmations"].as_array().unwrap();
+    assert_eq!(confirmations.len(), 2);
+    for confirmation in confirmations {
+        let at = chrono::DateTime::parse_from_rfc3339(
+            confirmation["confirmed_at_utc"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(at >= confirmed_after);
+    }
+    // A changed price is new evidence.
+    let changed = json!({"id":"provider/second","pricing":{"prompt":"0.3"}});
+    assert_eq!(fetch(json!({"data":[first, changed],"total_count":2})), 2);
+    assert_eq!(count("select count(*) from price_observations"), 3);
+}
+
+#[test]
 fn full_conditional_rules_and_exact_decimal_dart_fixture_survive_http_roundtrip() {
     let fixture: Value =
         serde_json::from_str(include_str!("../../samples/pricing/hub-parity.json")).unwrap();

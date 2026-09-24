@@ -128,14 +128,49 @@ class PriceObservation {
   int get slot => observedAtUtc.millisecondsSinceEpoch ~/ 21600000;
 }
 
+/// Hub evidence wins where it covers the same provider/model: from a hub
+/// observation's time through the last complete hub catalog that confirmed it
+/// unchanged ([confirmations], by fingerprint). Local evidence inside that
+/// coverage is superseded; local evidence outside it, such as during a missed
+/// hub fetch, remains. At one exact instant hub evidence wins, and equal
+/// authorities use the fingerprint tie break.
 class CanonicalPriceHistory {
-  CanonicalPriceHistory(Iterable<PriceObservation> input)
-    : observations = {for (final item in input) item.fingerprint: item} {
+  CanonicalPriceHistory(
+    Iterable<PriceObservation> input, {
+    Map<String, DateTime> confirmations = const {},
+  }) : observations = {for (final item in input) item.fingerprint: item} {
     final ids = observations.keys.toList()..sort();
     revision = priceFingerprint(ids);
+    final coverage = <String, List<(DateTime, DateTime)>>{};
+    String modelKey(PriceObservation item) =>
+        canonicalPriceJson([item.provider, item.modelId]);
+    for (final item in observations.values) {
+      if (item.authority != 'hub') continue;
+      final confirmed = confirmations[item.fingerprint]?.toUtc();
+      final end = confirmed != null && confirmed.isAfter(item.observedAtUtc)
+          ? confirmed
+          : item.observedAtUtc;
+      coverage.putIfAbsent(modelKey(item), () => []).add((
+        item.observedAtUtc,
+        end,
+      ));
+    }
+    final superseded = <String>[];
     final slots = <String, PriceObservation>{};
     for (final id in ids) {
       final item = observations[id]!;
+      final at = item.observedAtUtc;
+      final intervals = coverage[modelKey(item)] ?? const [];
+      // The same-instant conflict is resolved by rank below, as before
+      // coverage existed; only a confirmed interval supersedes by coverage.
+      if (item.authority != 'hub' &&
+          intervals.any(
+            (interval) => !at.isBefore(interval.$1) && !at.isAfter(interval.$2),
+          ) &&
+          !intervals.any((interval) => interval.$1 == at)) {
+        superseded.add(id);
+        continue;
+      }
       final key = canonicalPriceJson([
         item.provider,
         item.modelId,
@@ -150,9 +185,18 @@ class CanonicalPriceHistory {
         if (model != 0) return model;
         return a.observedAtUtc.compareTo(b.observedAtUtc);
       });
+    materializedRevision = superseded.isEmpty
+        ? revision
+        : priceFingerprint({'revision': revision, 'superseded': superseded});
   }
   final Map<String, PriceObservation> observations;
+
+  /// Identifies the observation set; verified against the hub.
   late final String revision;
+
+  /// Identifies the winning evidence. It differs from [revision] only when
+  /// hub coverage supersedes local evidence.
+  late final String materializedRevision;
   late final List<PriceObservation> winners;
 
   static int _compare(PriceObservation a, PriceObservation b) {
@@ -206,14 +250,118 @@ class PriceObservationStore {
       canonicalPriceJson(observation.toJson()),
     ],
   );
+
+  bool get confirmationsAvailable => db
+      .select(
+        "select 1 from sqlite_schema where name = 'price_observation_confirmations'",
+      )
+      .isNotEmpty;
+
+  Map<String, DateTime> readConfirmations() => !confirmationsAvailable
+      ? const {}
+      : {
+          for (final row in db.select(
+            'select fingerprint, confirmed_at_utc from price_observation_confirmations',
+          ))
+            row['fingerprint'] as String: DateTime.parse(
+              row['confirmed_at_utc'] as String,
+            ).toUtc(),
+        };
+
+  /// Records a later hub confirmation of a stored observation. Returns false
+  /// when the observation is unknown or already confirmed as late.
+  bool confirm(String fingerprint, DateTime confirmedAtUtc) {
+    if (!confirmationsAvailable ||
+        db.select('select 1 from price_observations where fingerprint = ?', [
+          fingerprint,
+        ]).isEmpty) {
+      return false;
+    }
+    final text = priceObservationTimestamp(confirmedAtUtc);
+    final existing = db.select(
+      'select confirmed_at_utc from price_observation_confirmations where fingerprint = ?',
+      [fingerprint],
+    );
+    if (existing.isNotEmpty &&
+        !DateTime.parse(
+          existing.single['confirmed_at_utc'] as String,
+        ).isBefore(confirmedAtUtc)) {
+      return false;
+    }
+    db.execute(
+      '''insert into price_observation_confirmations(fingerprint, confirmed_at_utc, change_seq)
+      values (?, ?, (select coalesce(max(change_seq), 0) + 1 from price_observation_confirmations))
+      on conflict(fingerprint) do update set confirmed_at_utc = excluded.confirmed_at_utc,
+        change_seq = excluded.change_seq''',
+      [fingerprint, text],
+    );
+    return true;
+  }
 }
 
 class HubPriceSyncResult {
-  const HubPriceSyncResult(this.observations, this.through, this.revision);
+  const HubPriceSyncResult(
+    this.observations,
+    this.through,
+    this.revision, {
+    this.confirmations = const {},
+    this.confirmationSeq = 0,
+  });
   final List<PriceObservation> observations;
   final int through;
   final String revision;
+
+  /// Hub confirmations received by this synchronization, by fingerprint.
+  final Map<String, DateTime> confirmations;
+
+  /// The hub's confirmation watermark acknowledged with [through].
+  final int confirmationSeq;
 }
+
+/// A hub price request failed. [message] is the hub's own error text; the
+/// credential is never included.
+class HubPriceSyncException implements Exception {
+  const HubPriceSyncException(this.message, {this.statusCode});
+  final String message;
+  final int? statusCode;
+  @override
+  String toString() => statusCode == null
+      ? 'Hub price sync failed: $message'
+      : 'Hub price sync failed (HTTP $statusCode): $message';
+}
+
+/// Fixed text for a failed hub price sync, safe to store and show: never the
+/// credential, a URL, or transport details.
+String hubPriceSyncWarning(Object error) {
+  if (error is HubPriceSyncException) {
+    final status = error.statusCode;
+    return switch (status) {
+      401 || 403 =>
+        'The hub rejected this machine credential (HTTP $status). Check CODEX_SESSIONS_HUB_MACHINE_TOKEN and the hub machine ID.',
+      404 =>
+        'The hub URL has no price sync endpoint (HTTP 404). Check the hub URL and any proxy path.',
+      null => 'The hub price sync failed.',
+      _ when status >= 500 =>
+        'The hub could not process price sync (HTTP $status); retrying later.',
+      _ => 'The hub rejected the price sync request (HTTP $status).',
+    };
+  }
+  if (error is FormatException) {
+    return 'The hub returned an invalid price history response.';
+  }
+  if (error is SocketException ||
+      error is HttpException ||
+      error is TimeoutException) {
+    return 'The hub could not be reached; local price observation was used.';
+  }
+  return 'The hub price sync failed.';
+}
+
+/// Joins the sync route to the configured hub URL, keeping any path prefix
+/// of a reverse proxy (`https://host/hub` becomes `https://host/hub/v1/...`).
+Uri hubPriceSyncUri(Uri endpoint) => endpoint.replace(
+  path: '${endpoint.path.replaceFirst(RegExp(r'/+$'), '')}/v1/prices/sync',
+);
 
 /// Bounded pages use a stable server rowid watermark. A retained membership
 /// snapshot validates deltas independently of the viewer's local-only evidence.
@@ -236,16 +384,20 @@ class HubPriceHistoryClient {
     required List<PriceObservation> observations,
     List<PriceObservation> known = const [],
     int after = 0,
+    int confirmationsAfter = 0,
     Future<void>? cancellation,
   }) async {
     final loopback = ['localhost', '127.0.0.1', '::1'].contains(endpoint.host);
     if (endpoint.userInfo.isNotEmpty ||
+        endpoint.query.isNotEmpty ||
+        endpoint.fragment.isNotEmpty ||
         (endpoint.scheme != 'https' &&
             !(endpoint.scheme == 'http' && loopback))) {
       throw const FormatException(
         'Price hub requires HTTPS or loopback without URL credentials.',
       );
     }
+    final syncUri = hubPriceSyncUri(endpoint);
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15);
     var active = true;
@@ -260,23 +412,34 @@ class HubPriceHistoryClient {
         () => client.close(force: true),
       );
       try {
-        final request = await client.postUrl(
-          endpoint.resolve('/v1/prices/sync'),
-        );
+        final request = await client.postUrl(syncUri);
         request.followRedirects = false;
         request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
         request.headers.contentType = ContentType.json;
         request.write(jsonEncode({'protocol': 1, ...body}));
         final response = await request.close();
-        if (response.statusCode != 200) {
-          throw const HttpException('Price hub request failed.');
-        }
         final bytes = <int>[];
         await for (final chunk in response) {
           bytes.addAll(chunk);
           if (bytes.length > 8 * 1024 * 1024) {
             throw const FormatException('Price history page exceeds 8 MiB.');
           }
+        }
+        if (response.statusCode != 200) {
+          var message = 'the hub did not accept the request';
+          try {
+            final error = jsonDecode(utf8.decode(bytes, allowMalformed: true));
+            if (error is Map && error['error'] is String) {
+              message = error['error'] as String;
+            }
+          } on FormatException {
+            // A proxy error page is not the hub's message.
+          }
+          if (token.isNotEmpty) {
+            message = message.replaceAll(token, '[credential]');
+          }
+          if (message.length > 300) message = message.substring(0, 300);
+          throw HubPriceSyncException(message, statusCode: response.statusCode);
         }
         final decoded = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
         if (decoded['protocol'] != 1) {
@@ -314,11 +477,14 @@ class HubPriceHistoryClient {
     Future<HubPriceSyncResult> download(
       List<PriceObservation> previous,
       int cursor,
+      int confirmationCursor,
     ) async {
       final collected = <String, PriceObservation>{
         for (final item in previous) item.fingerprint: item,
       };
+      final confirmations = <String, DateTime>{};
       int? through;
+      int? confirmationsThrough;
       String? revision;
       while (true) {
         final body = await send({
@@ -326,6 +492,8 @@ class HubPriceHistoryClient {
           'observations': <Object?>[],
           'after': cursor,
           'through': ?through,
+          'confirmations_after': confirmationCursor,
+          'confirmations_through': ?confirmationsThrough,
         });
         if (revision != null && revision != body['revision']) {
           throw const FormatException('Price snapshot changed during paging.');
@@ -337,20 +505,41 @@ class HubPriceHistoryClient {
           );
           collected[observation.fingerprint] = observation;
         }
+        for (final item in body['confirmations'] as List? ?? const []) {
+          final value = (item as Map).cast<String, dynamic>();
+          final at = DateTime.parse(value['confirmed_at_utc'] as String);
+          if (!at.isUtc) {
+            throw const FormatException('Confirmation must use UTC.');
+          }
+          confirmations[value['fingerprint'] as String] = at;
+        }
         // Small legacy v1 responses remain interoperable.
         if (!body.containsKey('complete')) {
           through = 0;
         } else {
           final next = body['after'] as int;
           final upper = body['through'] as int;
+          // Hubs without confirmations keep the cursor where it is.
+          final confirmationNext =
+              body['confirmations_after'] as int? ?? confirmationCursor;
+          final confirmationUpper =
+              body['confirmations_through'] as int? ?? confirmationCursor;
           if (through != null && through != upper ||
+              confirmationsThrough != null &&
+                  confirmationsThrough != confirmationUpper ||
               next < cursor ||
               next > upper ||
-              (body['complete'] != true && next == cursor)) {
+              confirmationNext < confirmationCursor ||
+              confirmationNext > confirmationUpper ||
+              (body['complete'] != true &&
+                  next == cursor &&
+                  confirmationNext == confirmationCursor)) {
             throw const FormatException('Invalid price history cursor.');
           }
           through = upper;
+          confirmationsThrough = confirmationUpper;
           cursor = next;
+          confirmationCursor = confirmationNext;
           if (body['complete'] != true) continue;
         }
         final history = CanonicalPriceHistory(collected.values);
@@ -361,6 +550,12 @@ class HubPriceHistoryClient {
           history.observations.values.toList(),
           through,
           revision,
+          confirmations: {
+            for (final entry in confirmations.entries)
+              if (history.observations.containsKey(entry.key))
+                entry.key: entry.value,
+          },
+          confirmationSeq: confirmationCursor,
         );
       }
     }
@@ -371,13 +566,19 @@ class HubPriceHistoryClient {
         observations.where((item) => !knownIds.contains(item.fingerprint)),
       );
       try {
-        return await download(known, after);
-      } on Object {
+        return await download(known, after, confirmationsAfter);
+      } on HubPriceSyncException catch (error) {
+        // A rejected credential or request is not a replaced hub.
+        if (error.statusCode != 409) rethrow;
+        if (after == 0 && known.isEmpty) rethrow;
+        await upload(observations);
+        return await download(const [], 0, 0);
+      } on FormatException {
         if (after == 0 && known.isEmpty) rethrow;
         // A restored/replaced hub can have a different rowid history. Restore
         // this machine's evidence, then verify one complete fresh snapshot.
         await upload(observations);
-        return await download(const [], 0);
+        return await download(const [], 0, 0);
       }
     } finally {
       active = false;

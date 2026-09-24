@@ -117,7 +117,12 @@ refresh_utc_slots = true
 fallback_to_overrides = true
 ```
 
-New installations observe public prices at 00:00, 06:00, 12:00 and 18:00 UTC.
+New installations observe public prices at 00:00, 06:00, 12:00 and 18:00 UTC;
+the packaged `settings.sample.toml` enables this refresh of the public OpenRouter
+catalog, which needs no API key. With a [personal hub](docs/hub-price-history.md)
+configured in `[hub] url`, the viewer shares price history with it, reading the
+machine credential only from `CODEX_SESSIONS_HUB_MACHINE_TOKEN`; Settings shows
+why a hub price sync failed.
 Missed slots coalesce into one catch-up attempt when the app next runs. Existing
 explicit intervals (including the legacy `cache_pricing_hours` key) retain their
 interval cadence. Set `refresh_utc_slots = false` for an interval measured from

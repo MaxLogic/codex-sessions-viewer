@@ -14,7 +14,7 @@ path = "src/main.rs"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order", "unbounded_depth"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value", "unbounded_depth"] }
 serde_stacker = "0.1.14"
 sha2 = "0.11.0"
 toml = "1.1.6"

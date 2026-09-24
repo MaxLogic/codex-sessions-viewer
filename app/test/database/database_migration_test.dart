@@ -543,6 +543,12 @@ void main() {
     expect(versionRows[22]['version'], 23);
     expect(versionRows[22]['filename'], '023_price_history_sync.sql');
     expect(versionRows[22]['success'], 1);
+    expect(versionRows[23]['version'], 24);
+    expect(
+      versionRows[23]['filename'],
+      '024_hub_delivery_and_price_confirmation.sql',
+    );
+    expect(versionRows[23]['success'], 1);
     expect(versionRows.last['version'], latestSchemaVersion);
     expect(
       versionRows.last['filename'],

@@ -490,6 +490,8 @@ class PricingRepository {
     String? hubUrl,
     int? through,
     String? hubRevision,
+    Map<String, DateTime> confirmations = const {},
+    int? confirmationSeq,
   }) {
     final store = PriceObservationStore(db);
     if (!store.available) {
@@ -514,6 +516,16 @@ class PricingRepository {
         }
       }
       _importLegacyPriceObservations();
+      final hubFingerprints = {
+        for (final item in validated)
+          if (item.authority == 'hub') item.fingerprint,
+      };
+      for (final entry in confirmations.entries) {
+        // Only hub evidence can be confirmed by a hub catalog.
+        if (hubFingerprints.contains(entry.key)) {
+          store.confirm(entry.key, entry.value);
+        }
+      }
       final revision = _materializeCanonicalHistory();
       if (hubUrl != null) {
         if (through == null ||
@@ -548,6 +560,12 @@ class PricingRepository {
           on conflict(hub_url) do update set through_rowid=excluded.through_rowid,revision=excluded.revision''',
           [hubUrl, through, hubRevision],
         );
+        if (confirmationSeq != null && store.confirmationsAvailable) {
+          db.execute(
+            'update price_hub_sync_state set confirmation_seq = ? where hub_url = ?',
+            [confirmationSeq, hubUrl],
+          );
+        }
       }
       db.execute('commit');
       return revision;
@@ -575,10 +593,18 @@ class PricingRepository {
           ),
         )
         .toList();
+    final confirmationSeq = PriceObservationStore(db).confirmationsAvailable
+        ? db.select(
+                'select confirmation_seq from price_hub_sync_state where hub_url = ?',
+                [url],
+              ).single['confirmation_seq']
+              as int
+        : 0;
     return HubPriceSyncResult(
       observations,
       state.single['through_rowid'] as int,
       state.single['revision'] as String,
+      confirmationSeq: confirmationSeq,
     );
   }
 
@@ -688,16 +714,22 @@ class PricingRepository {
   }
 
   String _materializeCanonicalHistory() {
-    final history = CanonicalPriceHistory(PriceObservationStore(db).read());
+    final store = PriceObservationStore(db);
+    final history = CanonicalPriceHistory(
+      store.read(),
+      confirmations: store.readConfirmations(),
+    );
     final previous = db
         .select('select revision from price_history_state where id = 1')
         .single['revision'];
-    if (previous == history.revision) return history.revision;
+    if (previous == history.materializedRevision) {
+      return history.materializedRevision;
+    }
     db.execute(
       '''insert or ignore into price_history_revisions
       (revision, observations_json, created_at_utc) values (?, ?, ?)''',
       [
-        history.revision,
+        history.materializedRevision,
         canonicalPriceJson({
           'through_rowid': db
               .select('select coalesce(max(rowid),0) n from price_observations')
@@ -742,7 +774,7 @@ class PricingRepository {
             started: observation.observedAtUtc,
             observed: observation.observedAtUtc,
             source: source,
-            canonicalRevision: history.revision,
+            canonicalRevision: history.materializedRevision,
             markDirty: false,
           );
         }
@@ -750,7 +782,7 @@ class PricingRepository {
       db.execute(
         '''insert or ignore into price_history_model_sources
         (revision, model_id, source) values (?, ?, ?)''',
-        [history.revision, entry.key, source],
+        [history.materializedRevision, entry.key, source],
       );
       if (prior.isEmpty || prior.single['source'] != source) {
         _markChangedPriceIntervals(
@@ -773,9 +805,9 @@ class PricingRepository {
       }
     }
     db.execute('update price_history_state set revision = ? where id = 1', [
-      history.revision,
+      history.materializedRevision,
     ]);
-    return history.revision;
+    return history.materializedRevision;
   }
 
   void _markChangedPriceIntervals(

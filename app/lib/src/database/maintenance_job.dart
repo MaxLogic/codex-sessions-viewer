@@ -85,9 +85,10 @@ final class MaintenanceScheduleRecord {
     this.nextDueAtUtc,
     this.retryCount = 0,
     this.lastError,
+    this.lastWarning,
   });
 
-  MaintenanceScheduleRecord._(Row row)
+  MaintenanceScheduleRecord._(Row row, {String? warning})
     : jobType = row['job_type'] as String,
       enabled = row['enabled'] == 1,
       intervalSeconds = row['interval_seconds'] as int,
@@ -95,7 +96,8 @@ final class MaintenanceScheduleRecord {
       lastSuccessAtUtc = _date(row['last_success_at_utc']),
       nextDueAtUtc = _date(row['next_due_at_utc']),
       retryCount = row['retry_count'] as int,
-      lastError = row['last_error'] as String?;
+      lastError = row['last_error'] as String?,
+      lastWarning = warning;
 
   final String jobType;
   final bool enabled;
@@ -105,6 +107,10 @@ final class MaintenanceScheduleRecord {
   final DateTime? nextDueAtUtc;
   final int retryCount;
   final String? lastError;
+
+  /// A problem that did not fail the job, such as an unreachable optional
+  /// hub while the local OpenRouter fallback succeeded. Fixed text only.
+  final String? lastWarning;
 }
 
 final class StaleMaintenanceLeaseException implements Exception {
@@ -144,14 +150,19 @@ final class MaintenanceJobRepository {
       'select * from maintenance_schedules where job_type = ?',
       [jobType],
     );
-    return rows.isEmpty ? null : MaintenanceScheduleRecord._(rows.single);
+    return rows.isEmpty
+        ? null
+        : MaintenanceScheduleRecord._(rows.single, warning: _warning(jobType));
   }
 
   List<MaintenanceScheduleRecord> schedules() => [
     for (final row in db.select(
       "select * from maintenance_schedules where job_type in ('openrouter_price_refresh', 'database_optimize') order by job_type",
     ))
-      MaintenanceScheduleRecord._(row),
+      MaintenanceScheduleRecord._(
+        row,
+        warning: _warning(row['job_type'] as String),
+      ),
   ];
 
   MaintenanceScheduleRecord configureSchedule({
@@ -233,11 +244,13 @@ final class MaintenanceJobRepository {
 
   /// Arbitrary [errorMessage] text is deliberately discarded: transport errors
   /// may contain credentials or local paths. Only fixed job-specific text is stored.
+  /// [warning] must likewise be fixed text chosen by the caller.
   /// The caller serializes completion with configuration and the next attempt.
   MaintenanceScheduleRecord completeScheduleAttempt(
     String jobType, {
     required bool succeeded,
     String? errorMessage,
+    String? warning,
     Duration? retryAfter,
     bool utcSlots = false,
     DateTime? successfulObservationAtUtc,
@@ -293,8 +306,28 @@ final class MaintenanceJobRepository {
         jobType,
       ],
     );
+    final key = _warningKey(jobType);
+    if (warning == null) {
+      db.execute('delete from app_metadata where key = ?', [key]);
+    } else {
+      db.execute(
+        '''insert into app_metadata(key, value, updated_at_utc) values (?, ?, ?)
+        on conflict(key) do update set value = excluded.value,
+          updated_at_utc = excluded.updated_at_utc''',
+        [key, warning, _timestamp(now)],
+      );
+    }
     return readSchedule(jobType)!;
   });
+
+  static String _warningKey(String jobType) => 'schedule_warning.$jobType';
+
+  String? _warning(String jobType) {
+    final rows = db.select('select value from app_metadata where key = ?', [
+      _warningKey(jobType),
+    ]);
+    return rows.isEmpty ? null : rows.single['value'] as String;
+  }
 
   MaintenanceJobRecord enqueue({
     required String jobType,

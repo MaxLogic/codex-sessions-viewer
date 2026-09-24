@@ -338,7 +338,7 @@ class AppSettings {
         defaults.pricing,
       ),
       maintenance: MaintenanceSettings.fromMap(_table(map, 'maintenance')),
-      hub: HubSettings.fromMap(_table(map, 'hub')),
+      hub: HubSettings.fromMap(_table(map, 'hub'), _table(map, 'pricing')),
       logging: LoggingSettings.fromMap(
         _table(map, 'logging'),
         defaults.logging,
@@ -422,14 +422,31 @@ class AppSettings {
   );
 }
 
+/// The one optional hub. [url] is used both to browse hub sessions and to
+/// share public price history; [machine] is the hub machine selected for
+/// browsing. Credentials are never stored here: the owner token is entered
+/// per window (or `CODEX_SESSIONS_HUB_OWNER_TOKEN`), and price sync reads
+/// `CODEX_SESSIONS_HUB_MACHINE_TOKEN`. Price sync identifies this machine by
+/// the database's machine identity, like the collector.
 class HubSettings {
   const HubSettings({this.url = '', this.machine = ''});
   final String url;
   final String machine;
-  factory HubSettings.fromMap(Map<String, dynamic> map) => HubSettings(
-    url: _string(map, 'url', '', 'hub.url'),
-    machine: _string(map, 'machine', '', 'hub.machine'),
-  );
+
+  /// [legacyPricing] adopts the former `pricing.hub_url` when `[hub] url` is
+  /// empty. The former `pricing.hub_token` is not read or written back.
+  factory HubSettings.fromMap(
+    Map<String, dynamic> map, [
+    Map<String, dynamic> legacyPricing = const {},
+  ]) {
+    final url = _string(map, 'url', '', 'hub.url');
+    return HubSettings(
+      url: url.isNotEmpty
+          ? url
+          : _string(legacyPricing, 'hub_url', '', 'pricing.hub_url'),
+      machine: _string(map, 'machine', '', 'hub.machine'),
+    );
+  }
   Map<String, Object?> toTomlMap() => {'url': url, 'machine': machine};
   @override
   bool operator ==(Object other) =>
@@ -1226,9 +1243,6 @@ class PricingSettings {
     required this.fallbackToOverrides,
     required this.openRouter,
     required this.overrides,
-    this.hubUrl = '',
-    this.hubToken = '',
-    this.hubMachineId = '',
   }) : refreshIntervalHours = refreshIntervalHours ?? cachePricingHours ?? 6,
        refreshUtcSlots =
            (refreshUtcSlots ??
@@ -1245,10 +1259,11 @@ class PricingSettings {
   final bool fallbackToOverrides;
   final OpenRouterSettings openRouter;
   final Map<String, PricingOverrideSettings> overrides;
-  final String hubUrl;
-  final String hubToken;
-  final String hubMachineId;
 
+  /// Hub price sync uses the shared `[hub] url` and this database's machine
+  /// identity. The machine credential comes only from the
+  /// `CODEX_SESSIONS_HUB_MACHINE_TOKEN` environment variable; legacy
+  /// `pricing.hub_*` keys are migrated by [AppSettings.fromTomlMap] or ignored.
   factory PricingSettings.fromMap(
     Map<String, dynamic> map,
     PricingSettings defaults,
@@ -1273,19 +1288,6 @@ class PricingSettings {
       }
     }
     return PricingSettings(
-      hubUrl: _string(map, 'hub_url', defaults.hubUrl, 'pricing.hub_url'),
-      hubToken: _string(
-        map,
-        'hub_token',
-        defaults.hubToken,
-        'pricing.hub_token',
-      ),
-      hubMachineId: _string(
-        map,
-        'hub_machine_id',
-        defaults.hubMachineId,
-        'pricing.hub_machine_id',
-      ),
       provider: _string(map, 'provider', defaults.provider, 'pricing.provider'),
       useExternalPricing: _bool(
         map,
@@ -1333,9 +1335,6 @@ class PricingSettings {
   }
 
   Map<String, Object?> toTomlMap() => {
-    'hub_url': hubUrl,
-    'hub_token': hubToken,
-    'hub_machine_id': hubMachineId,
     'provider': provider,
     'use_external_pricing': useExternalPricing,
     'refresh_interval_hours': refreshIntervalHours,
@@ -1351,9 +1350,6 @@ class PricingSettings {
   @override
   bool operator ==(Object other) =>
       other is PricingSettings &&
-      hubUrl == other.hubUrl &&
-      hubToken == other.hubToken &&
-      hubMachineId == other.hubMachineId &&
       provider == other.provider &&
       useExternalPricing == other.useExternalPricing &&
       cachePricingHours == other.cachePricingHours &&
@@ -1365,9 +1361,6 @@ class PricingSettings {
 
   @override
   int get hashCode => Object.hash(
-    hubUrl,
-    hubToken,
-    hubMachineId,
     provider,
     useExternalPricing,
     cachePricingHours,
