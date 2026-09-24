@@ -5,10 +5,13 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 class HubFixture {
-  HubFixture._(this.root, this.executable, this.port);
+  HubFixture._(this.root, this.executable);
   final Directory root;
   final String executable;
-  final int port;
+
+  /// Chosen by the hub itself on first start (port 0), so parallel tests
+  /// cannot race for the same free port; restarts reuse it.
+  int port = 0;
   Process? _process;
   int _sequence = 0;
   static const ownerToken = 'gui-owner-token-1234567890123456789';
@@ -17,9 +20,6 @@ class HubFixture {
 
   static Future<HubFixture> start() async {
     final root = await Directory.systemTemp.createTemp('csv-hub-gui-');
-    final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-    final port = socket.port;
-    await socket.close();
     final collector = Platform.environment['CODEX_SESSIONS_COLLECTOR_EXE'];
     final executable =
         Platform.environment['CODEX_SESSIONS_HUB_EXE'] ??
@@ -38,7 +38,7 @@ class HubFixture {
         'machines': {'gui-machine': machineToken},
       }),
     );
-    final fixture = HubFixture._(root, executable, port);
+    final fixture = HubFixture._(root, executable);
     try {
       await fixture.restart();
       return fixture;
@@ -56,10 +56,25 @@ class HubFixture {
     ]);
     final errors = StringBuffer();
     _process!.stderr.transform(utf8.decoder).listen(errors.write);
-    _process!.stdout.drain<void>();
+    final bound = Completer<int>();
+    _process!.stdout
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen((line) {
+          final match = RegExp(
+            r'listening on http://[^:]+:(\d+)',
+          ).firstMatch(line);
+          if (match != null && !bound.isCompleted) {
+            bound.complete(int.parse(match.group(1)!));
+          }
+        });
     var exited = false;
     unawaited(_process!.exitCode.then((_) => exited = true));
     final deadline = DateTime.now().add(const Duration(seconds: 10));
+    port = await bound.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () => throw StateError('Hub failed to start: $errors'),
+    );
     while (true) {
       try {
         await request('/v1/health');

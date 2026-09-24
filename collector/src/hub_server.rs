@@ -136,7 +136,11 @@ pub fn serve(listen: &str, data_root: &Path, config_path: &Path) -> Result<(), S
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("cannot start hub listener: {error}"))?;
     let _price_worker = crate::price_history::Worker::start(data_root, config.pricing.clone())?;
-    println!("hub listening on http://{address}");
+    // Report the bound address, so a caller that asked for port 0 learns
+    // which port it got.
+    let bound = listener.local_addr().unwrap_or(address);
+    println!("hub listening on http://{bound}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     let config = Arc::new(config);
     let data_root = Arc::new(data_root.to_owned());
     let active = Arc::new(AtomicUsize::new(0));

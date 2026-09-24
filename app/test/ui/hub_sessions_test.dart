@@ -45,7 +45,17 @@ void main() {
         final deadline = DateTime.now().add(const Duration(seconds: 30));
         while (find.text(value).evaluate().isEmpty) {
           if (DateTime.now().isAfter(deadline)) {
-            fail('Timed out waiting for hub UI text: $value');
+            final visible = find
+                .byType(Text)
+                .evaluate()
+                .map((element) => (element.widget as Text).data)
+                .whereType<String>()
+                .where((text) => text.trim().isNotEmpty)
+                .take(40)
+                .join(' | ');
+            fail(
+              'Timed out waiting for hub UI text: $value. Visible: $visible',
+            );
           }
           await tester.runAsync(
             () => Future<void>.delayed(const Duration(milliseconds: 50)),
