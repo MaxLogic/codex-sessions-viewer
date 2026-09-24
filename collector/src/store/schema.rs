@@ -570,9 +570,39 @@ fn apply_migration_in_transaction(conn: &Connection, migration: &Migration) -> S
 }
 
 thread_local! {
-    /// Set while `in_write_transaction` owns an outer transaction on this
-    /// thread; nested writers then use a savepoint inside it.
-    static OUTER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The connection whose outer transaction `in_write_transaction` owns on
+    /// this thread (its address, 0 for none). Writers on that connection use
+    /// a savepoint inside it; any other connection starts its own checked
+    /// transaction.
+    static OUTER_WRITE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn connection_key(conn: &Connection) -> usize {
+    std::ptr::from_ref(conn) as usize
+}
+
+/// Marks `conn` as owning the outer write for its lifetime. Dropping it
+/// restores the previous owner, also when the body panics; a panic rolls the
+/// outer transaction back, since `finish` never runs.
+struct OuterWrite<'a> {
+    conn: &'a Connection,
+    previous: usize,
+}
+
+impl<'a> OuterWrite<'a> {
+    fn enter(conn: &'a Connection) -> Self {
+        let previous = OUTER_WRITE.with(|outer| outer.replace(connection_key(conn)));
+        Self { conn, previous }
+    }
+}
+
+impl Drop for OuterWrite<'_> {
+    fn drop(&mut self) {
+        OUTER_WRITE.with(|outer| outer.set(self.previous));
+        if std::thread::panicking() {
+            let _ = self.conn.execute_batch("rollback");
+        }
+    }
 }
 
 /// Runs several writers in one transaction: either all of their changes
@@ -583,14 +613,14 @@ pub fn in_write_transaction<T>(
     body: impl FnOnce() -> StoreResult<T>,
 ) -> StoreResult<T> {
     begin_write(conn)?;
-    OUTER_WRITE.with(|outer| outer.set(true));
+    let outer = OuterWrite::enter(conn);
     let result = body();
-    OUTER_WRITE.with(|outer| outer.set(false));
+    drop(outer);
     finish(conn, result)
 }
 
-fn nested_write() -> bool {
-    OUTER_WRITE.with(std::cell::Cell::get)
+fn nested_write(conn: &Connection) -> bool {
+    OUTER_WRITE.with(std::cell::Cell::get) == connection_key(conn)
 }
 
 /// Start a write and re-check, under the write lock, that the database is
@@ -599,7 +629,7 @@ fn nested_write() -> bool {
 /// between two batches of a long scan. Inside `in_write_transaction` (same
 /// thread and connection) it opens a savepoint in the outer transaction.
 pub fn begin_write(conn: &Connection) -> StoreResult<()> {
-    if nested_write() {
+    if nested_write(conn) {
         conn.execute_batch("savepoint nested_write")?;
         return Ok(());
     }
@@ -623,7 +653,7 @@ pub fn begin_write(conn: &Connection) -> StoreResult<()> {
 
 /// Commit on success, roll back on failure, keeping the first error.
 pub fn finish<T>(conn: &Connection, result: StoreResult<T>) -> StoreResult<T> {
-    if nested_write() {
+    if nested_write(conn) {
         return match result {
             Ok(value) => {
                 conn.execute_batch("release nested_write")?;
@@ -733,5 +763,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(job, "succeeded");
+    }
+
+    /// A standalone database that a newer release has moved past this
+    /// collector's schema: `begin_write` must refuse it.
+    fn migrated_past_this_release() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        prepare_standalone(&conn, ":memory:").unwrap();
+        conn.execute(
+            "insert into schema_version (version, filename, checksum, applied_at_utc, success)
+             values (?, 'future.sql', 'x', 'now', 1)",
+            [SUPPORTED_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_write_on_another_connection_inside_a_write_transaction_is_checked() {
+        let outer = Connection::open_in_memory().unwrap();
+        prepare_standalone(&outer, ":memory:").unwrap();
+        let other = migrated_past_this_release();
+        let nested = in_write_transaction(&outer, || {
+            let result = begin_write(&other);
+            if result.is_ok() {
+                let _ = other.execute_batch("rollback");
+            }
+            Ok(result)
+        })
+        .unwrap();
+        assert!(matches!(nested, Err(StoreError::Refused(_))), "{nested:?}");
+        assert!(other.is_autocommit());
+    }
+
+    #[test]
+    fn a_panic_inside_a_write_transaction_does_not_leave_writes_nested() {
+        let outer = Connection::open_in_memory().unwrap();
+        prepare_standalone(&outer, ":memory:").unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = in_write_transaction(&outer, || -> StoreResult<()> { panic!("synthetic") });
+        }));
+        assert!(panicked.is_err());
+        // The outer transaction is rolled back, and the next write on this
+        // thread is a real, checked transaction again.
+        assert!(outer.is_autocommit());
+        let other = migrated_past_this_release();
+        let result = begin_write(&other);
+        if result.is_ok() {
+            let _ = other.execute_batch("rollback");
+        }
+        assert!(matches!(result, Err(StoreError::Refused(_))), "{result:?}");
     }
 }

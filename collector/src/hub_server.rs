@@ -65,8 +65,8 @@ pub struct HubConfig {
     pub machines: BTreeMap<String, String>,
     #[serde(default)]
     pub pricing: crate::price_history::FetchConfig,
-    /// Each socket read or write must progress within this time, and a whole
-    /// request must arrive within ten times it.
+    /// Each socket read or write must progress within this time, the request
+    /// head must arrive within it, and a whole request within ten times it.
     #[serde(default = "default_request_timeout")]
     pub request_timeout_seconds: u64,
 }
@@ -142,30 +142,46 @@ pub fn serve(listen: &str, data_root: &Path, config_path: &Path) -> Result<(), S
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
+            // For example, out of file handles: do not spin on the error.
+            std::thread::sleep(Duration::from_millis(50));
             continue;
         };
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::SeqCst);
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-            write_response(
-                &stream,
-                503,
-                &json!({"error":"hub is busy; retry later","code":"busy"}),
-            );
+            write_busy(&stream);
             continue;
         }
-        let (config, data_root, guard) = (config.clone(), data_root.clone(), active.clone());
-        let spawned = std::thread::Builder::new()
-            .name("hub-connection".into())
-            .spawn(move || {
-                serve_connection(stream, &data_root, &config);
-                guard.fetch_sub(1, Ordering::SeqCst);
-            });
-        if spawned.is_err() {
-            active.fetch_sub(1, Ordering::SeqCst);
-        }
+        let (config, data_root) = (config.clone(), data_root.clone());
+        spawn_with_slot(&active, move || {
+            serve_connection(stream, &data_root, &config);
+        });
     }
     Ok(())
+}
+
+/// Releases one counted connection slot when dropped, also when the
+/// connection thread panics or never starts.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Runs `work` on a connection thread that holds one already counted slot.
+fn spawn_with_slot(
+    active: &Arc<AtomicUsize>,
+    work: impl FnOnce() + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    let slot = Slot(active.clone());
+    std::thread::Builder::new()
+        .name("hub-connection".into())
+        .spawn(move || {
+            let _slot = slot;
+            work();
+        })
+        .ok()
 }
 
 fn valid_machine_id(value: &str) -> bool {
@@ -203,16 +219,34 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn write_response(mut stream: &TcpStream, status: u16, value: &Value) {
+fn response_bytes(status: u16, value: &Value) -> Vec<u8> {
     let body = value.to_string();
-    let head = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         reason(status),
         body.len()
-    );
+    )
+    .into_bytes()
+}
+
+/// Answers a client above the connection limit on the accept thread. The
+/// short response fits the socket buffer, so it is written without blocking
+/// and without draining the request: a silent client cannot hold the
+/// listener.
+fn write_busy(mut stream: &TcpStream) {
+    if stream.set_nonblocking(true).is_err() {
+        return;
+    }
+    let _ = stream.write_all(&response_bytes(
+        503,
+        &json!({"error":"hub is busy; retry later","code":"busy"}),
+    ));
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+}
+
+fn write_response(mut stream: &TcpStream, status: u16, value: &Value) {
     let _ = stream
-        .write_all(head.as_bytes())
-        .and_then(|()| stream.write_all(body.as_bytes()))
+        .write_all(&response_bytes(status, value))
         .and_then(|()| stream.flush());
     let _ = stream.shutdown(std::net::Shutdown::Write);
     // Closing with unread request bytes resets the connection, which can
@@ -251,14 +285,18 @@ impl Read for DeadlineReader {
 type HttpError = (u16, String);
 type Connection = BufReader<DeadlineReader>;
 
+/// A request that stops early (timeout, end of stream, or a reset
+/// connection) is a transient failure: the client may send it again. It is
+/// never reported as a rejected request.
 fn io_error(error: &std::io::Error) -> HttpError {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ) {
-        (408, "request timed out".to_owned())
-    } else {
-        (400, "cannot read request".to_owned())
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => (408, "request timed out".to_owned()),
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe => (408, "request ended before it was complete".to_owned()),
+        _ => (400, "cannot read request".to_owned()),
     }
 }
 
@@ -273,7 +311,8 @@ fn read_line(reader: &mut Connection, budget: &mut usize) -> Result<String, Http
         return Err((431, "request header is too large".to_owned()));
     }
     if !line.ends_with(b"\n") {
-        return Err((400, "incomplete request header".to_owned()));
+        // The stream ended inside the line.
+        return Err((408, "request ended before it was complete".to_owned()));
     }
     *budget -= line.len();
     let text =
@@ -315,16 +354,23 @@ fn read_head(reader: &mut Connection) -> Result<Head, HttpError> {
         if line.is_empty() {
             return Ok(head);
         }
+        // Obsolete line folding and whitespace before the colon are refused
+        // (RFC 9112 5.1 and 5.2): proxies may read such a header differently.
         let Some((name, value)) = line.split_once(':') else {
             return Err((400, "invalid request header".to_owned()));
         };
-        let value = value.trim();
-        match name.trim().to_ascii_lowercase().as_str() {
+        if name.is_empty() || name.bytes().any(|byte| byte == b' ' || byte == b'\t') {
+            return Err((400, "invalid request header".to_owned()));
+        }
+        let value = value.trim_matches([' ', '\t']);
+        match name.to_ascii_lowercase().as_str() {
             "authorization" => head.authorization = value.to_owned(),
             "content-length" => {
-                let length = value
-                    .parse::<usize>()
-                    .map_err(|_| (400, "invalid Content-Length".to_owned()))?;
+                // Digits only: `+5` is not a valid length.
+                let length = Some(value)
+                    .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .ok_or_else(|| (400, "invalid Content-Length".to_owned()))?;
                 if head
                     .content_length
                     .is_some_and(|previous| previous != length)
@@ -417,12 +463,18 @@ fn serve_connection(stream: TcpStream, data_root: &Path, config: &HubConfig) {
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
+    // The request head must arrive within one timeout; only a body may use
+    // the longer whole-request deadline.
+    let started = Instant::now();
     let mut reader = BufReader::new(DeadlineReader {
         inner: read_half,
-        deadline: Instant::now() + timeout * 10,
+        deadline: started + timeout,
     });
     let (status, value) = match read_head(&mut reader) {
-        Ok(head) => handle(&head, &mut reader, &stream, data_root, config),
+        Ok(head) => {
+            reader.get_mut().deadline = started + timeout * 10;
+            handle(&head, &mut reader, &stream, data_root, config)
+        }
         Err((status, message)) => (status, json!({"error": message})),
     };
     write_response(&stream, status, &value);
@@ -861,5 +913,19 @@ fn handle(
             )
         }
         _ => (404, json!({"error":"unknown route"})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_connection_releases_its_slot() {
+        let active = Arc::new(AtomicUsize::new(1));
+        let handle = spawn_with_slot(&active, || panic!("synthetic connection failure"))
+            .expect("connection thread starts");
+        assert!(handle.join().is_err());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 }

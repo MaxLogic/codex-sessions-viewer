@@ -283,8 +283,11 @@ impl History {
     }
     /// Hub evidence wins where it covers the same provider/model: from a hub
     /// observation's time through the last complete catalog that confirmed
-    /// it. Local evidence inside that coverage is superseded; local evidence
-    /// outside it (for example during a missed hub fetch) remains. At one
+    /// it. The hub confirms only contiguous fetches; after a missed fetch
+    /// slot it stores the unchanged price as a new observation, so coverage
+    /// never spans the gap. Local evidence inside that coverage is
+    /// superseded; local evidence outside it (for example during a missed
+    /// hub fetch) remains. At one
     /// exact instant hub evidence wins, and equal authorities use the
     /// fingerprint tie break. Six-hour fetch slots never erase chronology.
     pub fn winners(&self) -> Vec<&Observation> {
@@ -698,25 +701,36 @@ pub fn fetch_due(
     Ok(last.is_none_or(|last| last < current) && retry.is_none_or(|retry| now >= retry))
 }
 
-/// The newest hub observation of each provider/model. SQLite returns the
-/// row holding the maximum for the bare columns of a `max()` aggregate.
-fn latest_hub_observations(
-    conn: &Connection,
-) -> Result<BTreeMap<(String, String), Observation>, Error> {
+/// The newest hub observation of each provider/model, with the end of its
+/// confirmed coverage (its last confirmation, or its own time). SQLite
+/// returns the row holding the maximum for the bare columns of a `max()`
+/// aggregate.
+type LatestHubObservations = BTreeMap<(String, String), (Observation, DateTime<Utc>)>;
+
+fn latest_hub_observations(conn: &Connection) -> Result<LatestHubObservations, Error> {
     let mut stmt = conn
         .prepare(
-            "select payload_json, max(observed_at_utc) from price_observations
-             where authority = 'hub' group by provider, model_id",
+            "select o.payload_json, max(o.observed_at_utc), c.confirmed_at_utc
+             from price_observations o
+             left join price_observation_confirmations c on c.fingerprint = o.fingerprint
+             where o.authority = 'hub' group by o.provider, o.model_id",
         )
         .map_err(database_error)?;
     let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(2)?))
+        })
         .map_err(database_error)?;
     let mut latest = BTreeMap::new();
     for row in rows {
-        let observation = Observation::parse(
-            &serde_json::from_str(&row.map_err(database_error)?).map_err(database_error)?,
-        )?;
+        let (payload, confirmed) = row.map_err(database_error)?;
+        let observation =
+            Observation::parse(&serde_json::from_str(&payload).map_err(database_error)?)?;
+        let covered_until = confirmed
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .filter(|value| *value > observation.at)
+            .unwrap_or(observation.at);
         latest.insert(
             (
                 observation.value["provider"]
@@ -728,7 +742,7 @@ fn latest_hub_observations(
                     .unwrap_or_default()
                     .to_owned(),
             ),
-            observation,
+            (observation, covered_until),
         );
     }
     Ok(latest)
@@ -779,13 +793,20 @@ pub fn fetch_once(data_root: &Path, config: &FetchConfig) -> Result<usize, Error
             // models. Unrelated local-only models remain useful gap evidence.
             // Reads only the latest hub observation of each model.
             let latest = latest_hub_observations(&store.conn)?;
-            for ((provider, id), prior) in &latest {
-                if !current_ids.contains(id) && prior.value["model"]["removed"] != true {
+            // An absent model gets a tombstone; a still-absent withdrawn
+            // model's tombstone is confirmed like an unchanged price below.
+            for (provider, id) in latest.keys() {
+                if !current_ids.contains(id) {
                     observations.push(Observation::parse(&json!({"origin":"hub","authority":"hub","observed_at_utc":completed.to_rfc3339_opts(SecondsFormat::Micros,true),"provider":provider,"model_id":id,"model":{"id":id,"pricing":{},"removed":true}}))?);
                 }
             }
             // An unchanged price confirms the latest observation instead of
-            // storing another copy of the same evidence.
+            // storing another copy of the same evidence, while its coverage
+            // is contiguous: confirmed no more than one fetch slot ago. After
+            // a missed slot the price is stored as new evidence, so that the
+            // earlier coverage ends at its last contiguous confirmation and
+            // local evidence from the missed fetches remains.
+            let completed_slot = slot_at(completed, config.interval_hours);
             let mut fresh = Vec::with_capacity(observations.len());
             let mut confirmed = Vec::new();
             for observation in observations {
@@ -800,19 +821,15 @@ pub fn fetch_once(data_root: &Path, config: &FetchConfig) -> Result<usize, Error
                         .to_owned(),
                 );
                 match latest.get(&key) {
-                    Some(prior)
+                    Some((prior, covered_until))
                         if prior.content_fingerprint() == observation.content_fingerprint()
-                            && prior.at < observation.at =>
+                            && prior.at < observation.at
+                            && completed_slot - slot_at(*covered_until, config.interval_hours)
+                                <= 1 =>
                     {
                         confirmed.push(prior.fingerprint.clone());
                     }
                     _ => fresh.push(observation),
-                }
-            }
-            // A still-absent withdrawn model keeps its tombstone confirmed.
-            for ((_, id), prior) in &latest {
-                if !current_ids.contains(id) && prior.value["model"]["removed"] == true {
-                    confirmed.push(prior.fingerprint.clone());
                 }
             }
             merge_conn(&store.conn, &fresh)?;

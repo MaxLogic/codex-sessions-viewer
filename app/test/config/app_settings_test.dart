@@ -414,7 +414,7 @@ prompt = '0.5'
   });
 
   test(
-    'one hub setting: legacy pricing hub URL migrates and no token is kept',
+    'one hub setting: legacy pricing hub URL migrates and a legacy token is kept untouched',
     () async {
       final legacy = AppSettings.fromTomlMap({
         'pricing': {
@@ -424,12 +424,30 @@ prompt = '0.5'
         },
       });
       expect(legacy.hub.url, 'https://hub.example.test/base');
+      expect(legacy.hasLegacyHubToken, isTrue);
+      expect(AppSettings.defaults().hasLegacyHubToken, isFalse);
       final encoded = legacy.toTomlMap();
       final pricing = encoded['pricing'] as Map;
       expect(pricing.keys, isNot(contains('hub_url')));
-      expect(pricing.keys, isNot(contains('hub_token')));
-      expect(pricing.keys, isNot(contains('hub_machine_id')));
+      // Price sync no longer reads them, but secrets are never rewritten or
+      // dropped without an explicit request.
+      expect(pricing['hub_token'], 'legacy-machine-secret');
+      expect(pricing['hub_machine_id'], 'laptop-1');
       expect((encoded['hub'] as Map)['url'], 'https://hub.example.test/base');
+      // Edits made through copyWith keep the legacy keys.
+      final edited = legacy.copyWith(
+        pricing: PricingSettings(
+          provider: legacy.pricing.provider,
+          useExternalPricing: false,
+          fallbackToOverrides: legacy.pricing.fallbackToOverrides,
+          openRouter: legacy.pricing.openRouter,
+          overrides: legacy.pricing.overrides,
+        ),
+      );
+      expect(
+        (edited.toTomlMap()['pricing'] as Map)['hub_token'],
+        'legacy-machine-secret',
+      );
       // An explicit [hub] URL wins over the legacy key.
       expect(
         AppSettings.fromTomlMap({
@@ -443,8 +461,20 @@ prompt = '0.5'
       final file = File('${temp.path}/settings.toml');
       await SettingsRepository(file).save(legacy);
       final saved = await file.readAsString();
-      expect(saved, isNot(contains('legacy-machine-secret')));
       expect(saved, contains('https://hub.example.test/base'));
+      final reloaded = await SettingsRepository(file).loadOrCreate();
+      expect(reloaded.hasLegacyHubToken, isTrue);
+      // A later load-modify-save through the repository keeps them too.
+      await SettingsRepository(file).update(
+        (current) => current.copyWith(
+          app: current.app.copyWith(startWithWindows: false),
+        ),
+      );
+      final stored =
+          TomlDocument.parse(await file.readAsString()).toMap()['pricing']
+              as Map;
+      expect(stored['hub_token'], 'legacy-machine-secret');
+      expect(stored['hub_machine_id'], 'laptop-1');
     },
   );
 }
