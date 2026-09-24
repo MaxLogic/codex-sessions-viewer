@@ -1,0 +1,35 @@
+# Distribution defaults. Configure your session folders in Settings after launch.
+# Omitted options use application defaults. This file must never contain secrets.
+
+[app]
+first_run = true
+start_with_windows = false
+
+[paths]
+windows_codex_path = ''
+wsl_codex_unc_path = ''
+
+[wsl]
+distro = ''
+linux_home = ''
+linux_root_unc = ''
+
+[scanner]
+background_rescan_enabled = false
+
+[terminal]
+default_terminal = 'windows_terminal'
+
+[pricing]
+use_external_pricing = false
+automatic_refresh_enabled = false
+hub_url = ''
+hub_token = ''
+hub_machine_id = ''
+
+[pricing.openrouter]
+api_key = ''
+
+[hub]
+url = ''
+machine = ''

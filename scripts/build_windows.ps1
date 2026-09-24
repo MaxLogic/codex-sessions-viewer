@@ -10,9 +10,10 @@ $appRoot = Join-Path $repoRoot 'app'
 $collectorRoot = Join-Path $repoRoot 'collector'
 $collectorManifest = Join-Path $collectorRoot 'Cargo.toml'
 $collectorExeName = 'codex-sessions-collector.exe'
+$hubExeName = 'codex-sessions-hub.exe'
 $sqlRoot = Join-Path $repoRoot 'sql'
 $assetsRoot = Join-Path $repoRoot 'assets'
-$settingsFile = Join-Path $repoRoot 'settings.toml'
+$settingsFile = Join-Path $repoRoot 'settings.sample.toml'
 $readmeFile = Join-Path $repoRoot 'README.md'
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -117,7 +118,7 @@ try {
     Invoke-Step 'Check collector formatting' { & $cargo fmt --check }
     Invoke-Step 'Lint collector' { & $cargo clippy --locked --all-targets -- -D warnings }
     Invoke-Step 'Test collector' { & $cargo test --locked --no-fail-fast }
-    Invoke-Step 'Build collector release' { & $cargo build --locked --release }
+    Invoke-Step 'Build collector and hub release' { & $cargo build --locked --release --bins }
 }
 finally {
     Pop-Location
@@ -126,13 +127,28 @@ $collectorBuildExe = Join-Path $collectorRoot "target\release\$collectorExeName"
 if (-not (Test-Path -LiteralPath $collectorBuildExe -PathType Leaf)) {
     throw "Expected collector build output not found at '$collectorBuildExe'."
 }
+$hubBuildExe = Join-Path $collectorRoot "target\release\$hubExeName"
+if (-not (Test-Path -LiteralPath $hubBuildExe -PathType Leaf)) {
+    throw "Expected hub build output not found at '$hubBuildExe'."
+}
 
 Push-Location $appRoot
 try {
     Invoke-Step 'Install Flutter dependencies' { & $flutter pub get }
     Invoke-Step 'Check Dart formatting' { & $dart format --set-exit-if-changed . }
     Invoke-Step 'Analyze Flutter app' { & $flutter analyze }
-    Invoke-Step 'Run Flutter tests' { & $flutter test }
+    $previousCollectorExe = [Environment]::GetEnvironmentVariable('CODEX_SESSIONS_COLLECTOR_EXE', 'Process')
+    $previousHubExe = [Environment]::GetEnvironmentVariable('CODEX_SESSIONS_HUB_EXE', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CODEX_SESSIONS_COLLECTOR_EXE', $collectorBuildExe, 'Process')
+        [Environment]::SetEnvironmentVariable('CODEX_SESSIONS_HUB_EXE', $hubBuildExe, 'Process')
+        Invoke-Step 'Run Flutter tests' { & $flutter test }
+        Invoke-Step 'Run Flutter integration tests' { & $flutter test integration_test }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('CODEX_SESSIONS_COLLECTOR_EXE', $previousCollectorExe, 'Process')
+        [Environment]::SetEnvironmentVariable('CODEX_SESSIONS_HUB_EXE', $previousHubExe, 'Process')
+    }
     Invoke-Step 'Build Windows release' { & $flutter build windows }
 }
 finally {
@@ -157,6 +173,8 @@ if (Test-Path -LiteralPath $originalReleaseExe -PathType Leaf) {
 
 $releaseCollector = Join-Path $OutputDirectory $collectorExeName
 Copy-Item -LiteralPath $collectorBuildExe -Destination $releaseCollector -Force
+$releaseHub = Join-Path $OutputDirectory $hubExeName
+Copy-Item -LiteralPath $hubBuildExe -Destination $releaseHub -Force
 
 $releaseReadme = Join-Path $OutputDirectory 'README.md'
 if (Test-Path -LiteralPath $readmeFile -PathType Leaf) {
@@ -179,6 +197,7 @@ Copy-DirectoryClean -Source $assetsRoot -Destination (Join-Path $OutputDirectory
 foreach ($requiredOutput in @(
         $releaseExe,
         $releaseCollector,
+        $releaseHub,
         (Join-Path $OutputDirectory 'flutter_windows.dll'),
         (Join-Path $OutputDirectory 'data'),
         $releaseReadme,

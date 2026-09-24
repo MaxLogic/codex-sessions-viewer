@@ -11,17 +11,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_release.ps1
 
 `scripts/build_windows.ps1` performs the normal release build path:
 
-1. Checks Flutter, using `C:\tools\flutter\bin` as a fallback location.
-2. Runs `flutter pub get`.
-3. Runs `dart format --set-exit-if-changed .`.
-4. Runs `flutter analyze`.
-5. Runs `flutter test`.
-6. Runs `flutter build windows`.
-7. Prepares `release\windows`.
+1. Checks Flutter and Rust, using `C:\tools\flutter\bin` as a Flutter fallback.
+2. Checks Rust formatting and Clippy, runs the Rust tests, and builds the collector and hub executables.
+3. Runs `flutter pub get`, `dart format --set-exit-if-changed .`, and `flutter analyze`.
+4. Runs `flutter test` and `flutter test integration_test` with the just-built collector and hub.
+5. Runs `flutter build windows` and prepares `release\windows`.
 
 The release folder contains:
 
 - `codex_session_viewer.exe`
+- `codex-sessions-collector.exe`
+- `codex-sessions-hub.exe`
 - Flutter runtime files, including `flutter_windows.dll`, `sqlite3.dll`,
   `native_assets.json`, and `data`
 - `README.md`
@@ -30,7 +30,8 @@ The release folder contains:
 - `assets`
 
 If root `README.md` is not present, the script writes a short packaged fallback.
-The default settings file is copied only when missing from the output folder.
+The build preserves an existing local `release\windows\settings.toml`; when it
+is missing, the script starts it from `settings.sample.toml`.
 
 ## Package Script
 
@@ -41,9 +42,20 @@ The default settings file is copied only when missing from the output folder.
 release\codex_session_viewer_windows.zip
 ```
 
-The package must include the same release payload as `release\windows`,
-including the Flutter runtime files. A package that contains only the executable
-is incomplete.
+The package includes the built executable and Flutter runtime files. It always
+replaces the copied `settings.toml` with `settings.sample.toml`. Before sharing
+the ZIP, verify that both `release\package\settings.toml` and the archived
+`settings.toml` match the sample, while `release\windows\settings.toml` retains
+its local contents. A package that contains only the executable is incomplete.
+
+Run the native UI Automation filter smoke check against the packaged executable
+and complete the separate NVDA keyboard and speech pass in
+[accessibility release checks](accessibility-release-check.md). Flutter widget
+semantics, Windows UI Automation, and NVDA speech are distinct evidence.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_release_filter_uia.ps1
+```
 
 ## Additional Checks
 

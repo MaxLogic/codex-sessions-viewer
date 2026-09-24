@@ -1,13 +1,13 @@
 # Codex Session Viewer
 
-Codex Session Viewer is a local-only Flutter Windows app for browsing,
+Codex Session Viewer is a local-first Flutter Windows app for browsing,
 searching, reviewing, exporting, and resuming Codex session history. It indexes
 session metadata and searchable text into SQLite with FTS5 while leaving the
 original Codex JSONL files as the source of truth.
 
-The app does not send prompts, paths, messages, token data, or private session
-content to external services. OpenRouter pricing is optional and used only for
-model pricing metadata when enabled.
+The app runs locally without a hub. If you explicitly configure a personal hub,
+the collector sends normalized session records to it for browsing across machines.
+OpenRouter pricing is optional and sends no session content to the pricing provider.
 
 ## Run
 
@@ -30,13 +30,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_windows.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_release.ps1
 ```
 
-`build_windows.ps1` checks Flutter, runs formatting, analysis, tests, and the
+`build_windows.ps1` checks Flutter and Rust, runs formatting, analysis, unit and integration tests, and the
 Windows release build. It prepares `release\windows` with
-`codex_session_viewer.exe`, Flutter runtime files, `README.md`, `settings.toml`,
+`codex_session_viewer.exe`, `codex-sessions-collector.exe`, `codex-sessions-hub.exe`, Flutter runtime files, `README.md`, `settings.toml`,
 `sql`, and `assets`.
+
+Independent harness collectors can emit the [version 1 ingestion contract](docs/collectors/contract-v1.md).
+The runnable [Python example](samples/collector-contract/example_collector.py)
+and `python scripts/verify_collector_examples.py` show local integration.
+An explicitly configured [personal hub](docs/hub-setup.md) can receive
+normalized records while local collection and browsing remain available.
 
 `package_release.ps1` rebuilds through the build script, creates
 `release\package`, and writes `release\codex_session_viewer_windows.zip`.
+The local `release\windows\settings.toml` is preserved across builds. The
+package and ZIP always contain `settings.sample.toml` as `settings.toml`, so
+local paths and credentials are not distributed.
 
 Refresh local benchmark results with:
 
@@ -59,8 +68,9 @@ contain aggregate timings and counts only.
 
 ## Configuration
 
-Configuration lives in `settings.toml`. The packaged copy is a starting point;
-adjust paths for each machine.
+Configuration lives in `settings.toml`. The package starts with safe sample
+settings; configure paths for each machine after installation. Keep the local
+runtime file out of any package you share.
 
 Windows Codex sessions:
 
@@ -103,7 +113,8 @@ Scanner and pricing durations use explicit units:
 background_rescan_interval_seconds = 300
 
 [pricing]
-cache_pricing_hours = 24
+refresh_interval_hours = 6
+refresh_utc_slots = true
 ```
 
 OpenRouter pricing:
@@ -112,9 +123,18 @@ OpenRouter pricing:
 [pricing]
 provider = 'openrouter'
 use_external_pricing = true
-cache_pricing_hours = 24
+refresh_interval_hours = 6
+refresh_utc_slots = true
 fallback_to_overrides = true
 ```
+
+New installations observe public prices at 00:00, 06:00, 12:00 and 18:00 UTC.
+Missed slots coalesce into one catch-up attempt when the app next runs. Existing
+explicit intervals (including the legacy `cache_pricing_hours` key) retain their
+interval cadence. Set `refresh_utc_slots = false` for an interval measured from
+the last successful observation; intervals other than six hours also select this
+mode. Failed downloads keep existing observations and retry with bounded backoff.
+Observation time is the actual download time, so history is never backdated.
 
 Keep the OpenRouter API key in local private configuration. Do not commit real
 keys.

@@ -127,8 +127,9 @@ Codex JSONL records.
 
 ## Recommended Scanner Direction
 
-- Use cache invalidation before parsing: size, modified UTC, content hash, and
-  parser version should skip unchanged files.
+- Use cache invalidation before parsing. The implemented scanner compares file
+  size, modified UTC within a tolerance, parser version, and cached status. It
+  does not hash source content during routine scans.
 - Parse changed files concurrently with a bounded worker pool or Dart isolates.
 - Aggregate results deterministically so UI counts and logs are stable.
 
@@ -175,6 +176,6 @@ therefore keep these guardrails:
   payload keys should be counted and surfaced through warnings or diagnostics.
 - Token usage parsing should remain tolerant of partial data and should treat
   `total_token_usage` as authoritative when present.
-- Cache invalidation details are the next scanner slice: source size, modified
-  UTC, content hash, parser version, and forced reparse state belong in the
-  T-008 implementation.
+- The scanner slice now uses source size, modified UTC, parser version, and
+  forced reparse state. Same-size rewrites with timestamps inside the tolerance
+  need a forced reparse to refresh the index.

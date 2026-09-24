@@ -75,7 +75,8 @@ wav = 'assets\voice\database_error.wav'
 provider = 'openrouter'
 use_external_pricing = true
 automatic_refresh_enabled = true
-refresh_interval_hours = 24
+refresh_interval_hours = 6
+refresh_utc_slots = true
 fallback_to_overrides = true
 
 [pricing.openrouter]

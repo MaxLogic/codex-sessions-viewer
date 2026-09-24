@@ -21,3 +21,8 @@ The suite covers:
 When adding a new UI surface, prefer a focused accessibility regression test in
 `app/test/accessibility/` for any new navigation, action, chart, table, or
 conversation rendering behavior.
+
+For Windows releases, also run the packaged-app UI Automation check and the
+manual NVDA pass in [accessibility release checks](accessibility-release-check.md).
+Flutter semantics tests verify the widget tree; they do not establish what the
+Windows accessibility bridge exposes or what NVDA speaks.
