@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
@@ -8,9 +10,84 @@ import 'package:flutter_test/flutter_test.dart';
 import '../helpers/test_sessions_screen.dart';
 
 void main() {
+  testWidgets('Project, Model, and Tag filters can return to All', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TestSessionsScreen(
+          initialRows: [_row(id: 'one', title: 'Only session')],
+        ),
+      ),
+    );
+
+    Future<void> choose(
+      String filter,
+      String option,
+      String expectedValue,
+    ) async {
+      await tester.tap(find.bySemanticsLabel('$filter filter'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(CheckedPopupMenuItem<int>, option));
+      await tester.pumpAndSettle();
+      final control = tester.widget<Semantics>(
+        find.bySemanticsLabel('$filter filter'),
+      );
+      expect(control.properties.value, expectedValue);
+    }
+
+    await choose('Project', 'Codex Viewer', 'Codex Viewer');
+    await choose('Project', 'All projects', 'All projects');
+    final modelLabel = _row(id: 'sample', title: 'Sample').modelLabel;
+    await choose('Model', modelLabel, modelLabel);
+    await choose('Model', 'All models', 'All models');
+    await choose('Tag', 'parser', 'parser');
+    await choose('Tag', 'All tags', 'All tags');
+    expect(find.text('Only session'), findsWidgets);
+  });
+
+  testWidgets('session search matches provider and internal session IDs', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TestSessionsScreen(
+          initialRows: [
+            _row(
+              id: 'session:cached-row-id',
+              sessionId: '01a0c847-6277-7652-8ac0-b67bd2253042',
+              title: 'Direct DeepSeek session',
+            ),
+            _row(id: 'session:other-row', title: 'Other session'),
+          ],
+        ),
+      ),
+    );
+
+    Future<void> searchFor(String value) async {
+      await tester.enterText(find.bySemanticsLabel('Session search'), value);
+      await tester.pump(const Duration(milliseconds: 221));
+      await tester.pumpAndSettle();
+    }
+
+    await searchFor('01a0c847-6277-7652-8ac0-b67bd2253042');
+    expect(find.text('Direct DeepSeek session'), findsWidgets);
+    expect(find.text('Other session'), findsNothing);
+
+    await searchFor('session:cached-row-id');
+    expect(find.text('Direct DeepSeek session'), findsWidgets);
+    expect(find.text('Other session'), findsNothing);
+  });
+
   testWidgets(
     'shows required filters, table columns, row states, and actions',
     (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1600, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(
         MaterialApp(
           home: TestSessionsScreen(
@@ -183,13 +260,43 @@ void main() {
   });
 
   testWidgets(
+    'shows export progress after two seconds and removes it on copy',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final copyGate = Completer<void>();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TestSessionsScreen(
+              initialRows: [_row(id: 'visible', title: 'Visible session')],
+              onCopyText: (_) => copyGate.future,
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.bySemanticsLabel('Session list actions'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Copy visible list as Markdown'));
+      await tester.pump(const Duration(milliseconds: 1999));
+      expect(find.text('Copying Markdown'), findsNothing);
+      await tester.pump(const Duration(milliseconds: 1));
+      await tester.pump();
+      expect(find.text('Copying Markdown'), findsOneWidget);
+      expect(find.byType(LinearProgressIndicator), findsOneWidget);
+      copyGate.complete();
+      await tester.pumpAndSettle();
+      expect(find.text('Copying Markdown'), findsNothing);
+    },
+  );
+
+  testWidgets(
     'copies extended Markdown with first and last messages selected by default',
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(1800, 900));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       String? copied;
-      var detailLoads = 0;
-      var pageLoads = 0;
+      var batchLoads = 0;
       final row = _row(id: 'visible', title: 'Visible session');
       await tester.pumpWidget(
         MaterialApp(
@@ -199,50 +306,36 @@ void main() {
               onCopyText: (text) async {
                 copied = text;
               },
-              onLoadSessionDetail: (id) async {
-                detailLoads++;
-                return row.copyWithConversationMessages([
-                  _message(
-                    id: '$id:start',
-                    number: 0,
-                    author: ConversationAuthor.system,
-                    body: '',
-                    preview: 'System instructions.',
-                    isBodyLoaded: false,
-                  ),
-                  _message(
-                    id: '$id:first',
-                    number: 1,
-                    author: ConversationAuthor.user,
-                    body: '',
-                    preview: 'Explain the failing parser test.',
-                    isBodyLoaded: false,
-                  ),
-                  _message(
-                    id: '$id:last',
-                    number: 2,
-                    author: ConversationAuthor.tool,
-                    body:
-                        '{"type":"task_complete","turn_id":"hidden",'
-                        '"last_agent_message":"The parser now accepts the fixture."}',
-                  ),
-                ]);
-              },
-              onLoadMessagePage: (id, anchor) async {
-                pageLoads++;
-                return [
-                  _message(
-                    id: '$id:first',
-                    number: anchor,
-                    author: anchor == 0
-                        ? ConversationAuthor.tool
-                        : ConversationAuthor.user,
-                    body: anchor == 0
-                        ? '{"type":"task_started","turn_id":"hidden"}'
-                        : 'Explain the failing parser test in full.',
-                  ),
-                ];
-              },
+              onLoadSessionDetail: (_) => throw StateError('per-row load used'),
+              onLoadSessionListExportMessages:
+                  (
+                    ids, {
+                    required includeFirstMessage,
+                    required includeLastMessage,
+                  }) async {
+                    batchLoads++;
+                    expect(ids, ['visible']);
+                    expect(includeFirstMessage, isTrue);
+                    expect(includeLastMessage, isTrue);
+                    return {
+                      'visible': [
+                        _message(
+                          id: 'visible:first',
+                          number: 1,
+                          author: ConversationAuthor.user,
+                          body: 'Explain the failing parser test in full.',
+                        ),
+                        _message(
+                          id: 'visible:last',
+                          number: 2,
+                          author: ConversationAuthor.tool,
+                          body:
+                              '{"type":"task_complete","turn_id":"hidden",'
+                              '"last_agent_message":"The parser now accepts the fixture."}',
+                        ),
+                      ],
+                    };
+                  },
             ),
           ),
         ),
@@ -273,8 +366,7 @@ void main() {
       await tester.tap(find.widgetWithText(FilledButton, 'Copy'));
       await tester.pumpAndSettle();
 
-      expect(detailLoads, 1);
-      expect(pageLoads, 1);
+      expect(batchLoads, 1);
       expect(copied, contains('### First message 👤'));
       expect(copied, contains('Explain the failing parser test in full.'));
       expect(copied, contains('### Last message 🤖'));
@@ -457,6 +549,7 @@ void main() {
 SessionRowViewModel _row({
   required String id,
   required String title,
+  String sessionId = '',
   SessionRowPlatform platform = SessionRowPlatform.windows,
   bool isPinned = false,
   bool isArchived = false,
@@ -469,6 +562,7 @@ SessionRowViewModel _row({
 }) {
   return SessionRowViewModel(
     id: id,
+    sessionId: sessionId,
     startedAtUtc: DateTime.utc(2026, 6, 12, 9),
     lastMessageAtUtc: lastMessageAtUtc ?? DateTime.utc(2026, 6, 12, 10),
     platform: platform,

@@ -161,15 +161,18 @@ class AppWindowStateController with wm.WindowListener {
 
   Future<void> restoreAndTrack() async {
     await windowManager.ensureInitialized();
-    final state = await store.load();
-    if (state != null) {
-      final placement = await _validatedPlacement(state);
-      await windowManager.setSize(Size(placement.width, placement.height));
-      await windowManager.setPosition(Offset(placement.x, placement.y));
-      if (state.isMaximized) {
-        await windowManager.maximize();
+    try {
+      final state = await store.load();
+      if (state != null) {
+        final placement = await _validatedPlacement(state);
+        await windowManager.setSize(Size(placement.width, placement.height));
+        await windowManager.setPosition(Offset(placement.x, placement.y));
       }
+    } on Object {
+      // A damaged saved placement must not prevent the startup maximize.
+      // Normal settings startup reports configuration problems separately.
     }
+    await windowManager.maximize();
     windowManager.addListener(this);
   }
 

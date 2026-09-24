@@ -9,7 +9,6 @@ import 'package:sqlite3/sqlite3.dart' show sqlite3, OpenMode;
 
 import '../config/app_settings.dart';
 import '../database/database_connection.dart';
-import '../database/database_generation.dart';
 import '../database/database_maintenance.dart';
 import '../database/project_tag_state.dart';
 import '../database/session_cache_repair.dart';
@@ -19,7 +18,7 @@ import '../parser/codex_session_parser.dart';
 import '../path_mapping/path_mapper.dart';
 import '../pricing/pricing_repository.dart';
 import '../scanner/scan_batching.dart';
-import '../scanner/session_index_reader.dart';
+import '../scanner/collector_process.dart';
 import '../scanner/session_scanner.dart';
 import '../search/message_search.dart';
 import '../search/session_search.dart';
@@ -33,6 +32,32 @@ import '../utils/profiling.dart';
 
 const _conversationTailBodyPageSize = 50;
 const _conversationMessagePageRadius = 25;
+
+/// A snapshot or a journal delta; omitted changed IDs are tombstones or rows
+/// that no longer match the cached list's availability predicate.
+class ExternalSessionRows {
+  const ExternalSessionRows({
+    required this.revision,
+    required this.rows,
+    this.reset = false,
+    this.changedIds = const {},
+  });
+  final int? revision;
+  final List<SessionRowViewModel> rows;
+  final bool reset;
+  final Set<String> changedIds;
+
+  List<SessionRowViewModel> merge(List<SessionRowViewModel> previous) {
+    if (reset) return rows;
+    if (changedIds.isEmpty) return previous;
+    final replacements = {for (final row in rows) row.id: row};
+    return [
+      for (final row in previous)
+        if (!changedIds.contains(row.id)) row else ?replacements.remove(row.id),
+      ...replacements.values,
+    ];
+  }
+}
 
 class RuntimeSessionController implements ProjectsRepository {
   RuntimeSessionController({
@@ -149,6 +174,76 @@ class RuntimeSessionController implements ProjectsRepository {
         }
       }),
     );
+  }
+
+  /// Read collector commits without metadata repair, scanning, or another writer.
+  Future<SessionsRefreshResult> loadExternalRows() async {
+    final snapshot = await loadExternalRowChanges();
+    return SessionsRefreshResult(rows: snapshot.rows, statusMessage: '');
+  }
+
+  Future<ExternalSessionRows> loadExternalRowChanges({int? afterRevision}) {
+    final path = databaseFile.path;
+    return Isolate.run(() {
+      final db = sqlite3.open(path, mode: OpenMode.readOnly);
+      try {
+        db.execute('pragma busy_timeout = $defaultSqliteBusyTimeoutMs');
+        db.execute('begin');
+        final journalExists = db
+            .select(
+              "select 1 from sqlite_schema where name = 'session_change_state'",
+            )
+            .isNotEmpty;
+        final revision = journalExists
+            ? db
+                      .select(
+                        'select revision from session_change_state where id = 1',
+                      )
+                      .single['revision']
+                  as int
+            : null;
+        if (afterRevision == null ||
+            revision == null ||
+            revision < afterRevision) {
+          return ExternalSessionRows(
+            revision: revision,
+            rows: _loadRowsProfiled(db),
+            reset: true,
+          );
+        }
+        if (revision == afterRevision) {
+          return ExternalSessionRows(revision: revision, rows: const []);
+        }
+        final ids = db
+            .select(
+              'select session_id from session_changes where revision > ?',
+              [afterRevision],
+            )
+            .map((row) => row['session_id'] as String)
+            .toSet();
+        final rows = <SessionRowViewModel>[];
+        final orderedIds = ids.toList(growable: false);
+        for (var offset = 0; offset < orderedIds.length; offset += 400) {
+          rows.addAll(
+            _loadRows(
+              db,
+              sessionIds: orderedIds
+                  .skip(offset)
+                  .take(400)
+                  .toList(growable: false),
+            ),
+          );
+        }
+        return ExternalSessionRows(
+          revision: revision,
+          rows: rows,
+          changedIds: ids,
+        );
+      } finally {
+        // Closing a read transaction releases its snapshot without writes.
+        db.close();
+      }
+    });
   }
 
   Future<SessionsRefreshResult> loadCachedRowsInBackground({
@@ -448,118 +543,32 @@ class RuntimeSessionController implements ProjectsRepository {
     required File settingsFile,
     required File databaseFile,
     required String sessionId,
-  }) {
-    return Profiling.spanAsync(
-      'scan.runtime.reload_session_detail.worker',
-      () async {
-        final settings = await Profiling.spanAsync(
-          'scan.runtime.reload_session_detail.settings',
-          () => SettingsRepository(settingsFile).loadOrCreate(),
-        );
-        final db = Profiling.spanSync(
-          'scan.runtime.reload_session_detail.open_db',
-          () => openFileBackedDatabase(databaseFile),
-        );
-        try {
-          final sourceRow = Profiling.spanSync(
-            'scan.runtime.reload_session_detail.source_row',
-            () => db.select(
-              '''
-            select
-              id,
-              source_type,
-              source_state,
-              source_file_path,
-              source_file_unc_path,
-              display_path,
-              platform_path
-            from sessions
-            where id = ?
-            limit 1
-            ''',
-              [sessionId],
-            ),
-          );
-          if (sourceRow.isEmpty) {
-            return null;
-          }
-          final row = sourceRow.single;
-          final sourcePath = row['source_file_path'] as String? ?? '';
-          if (sourcePath.trim().isEmpty || !File(sourcePath).existsSync()) {
-            return null;
-          }
-          final parseResult = await Profiling.spanAsync(
-            'scan.runtime.reload_session_detail.parse_file',
-            () => CodexSessionParser().parseFile(File(sourcePath)),
-          );
-          if (!parseResult.isSuccess) {
-            return null;
-          }
-          final sourceType = row['source_type'] == 'wsl'
-              ? SessionSourceType.wsl
-              : SessionSourceType.windows;
-          final mappedPath = MappedSessionPath(
-            sourceType: sourceType,
-            displayPath: row['display_path'] as String? ?? sourcePath,
-            sourceFilePath: sourcePath,
-            sourceFileUncPath: row['source_file_unc_path'] as String?,
-            platformPath: row['platform_path'] as String? ?? sourcePath,
-            normalizedPathKeys: {
-              normalizePathKey(sourcePath),
-              normalizePathKey(row['display_path'] as String? ?? sourcePath),
-              normalizePathKey(row['platform_path'] as String? ?? sourcePath),
-              if ((row['source_file_unc_path'] as String?) case final unc?)
-                normalizePathKey(unc),
-            },
-          );
-          final scannedSession = ScannedSessionFile.fromParseResult(
-            sourcePath: sourcePath,
-            sourceType: sourceType,
-            sourceState: _sourceState(row['source_state'] as String?),
-            mappedPath: mappedPath,
-            parseResult: parseResult,
-          );
-          final projectResolver = await Profiling.spanAsync(
-            'scan.runtime.reload_session_detail.project_resolver',
-            () => _ProjectPathResolver.create(
-              _projectPathCandidatesForSessions([scannedSession]),
-              wslProjects: _WslProjectResolutionCache(
-                const ProcessWslProjectResolver(),
-              ),
-            ),
-          );
-          final now = DateTime.now().toUtc().toIso8601String();
-          Profiling.spanSync('scan.runtime.reload_session_detail.upsert', () {
-            db.execute('begin');
-            try {
-              _upsertParsedSession(db, scannedSession, now, projectResolver);
-              db.execute('commit');
-            } on Object {
-              db.execute('rollback');
-              rethrow;
-            }
-          });
-          final pricing = Profiling.spanSync(
-            'scan.runtime.reload_session_detail.pricing',
-            () => PricingRepository(db).loadCached(settings.pricing),
-          );
-          final rows = Profiling.spanSync(
-            'scan.runtime.reload_session_detail.row_and_messages',
-            () => _loadRowsProfiled(
-              db,
-              sessionId: sessionId,
-              includeMessages: true,
-              pricing: pricing,
-            ),
-          );
-          if (rows.isEmpty) {
-            return null;
-          }
-          return rows.single;
-        } finally {
-          db.close();
-        }
-      },
+  }) async {
+    final db = openFileBackedDatabase(databaseFile);
+    late String path;
+    late String harness;
+    try {
+      final rows = db.select(
+        'select source_file_path, harness from sessions where id = ?',
+        [sessionId],
+      );
+      if (rows.isEmpty) return null;
+      path = rows.single['source_file_path'] as String? ?? '';
+      harness = rows.single['harness'] as String? ?? 'codex';
+    } finally {
+      db.close();
+    }
+    if (path.isEmpty || !File(path).existsSync()) return null;
+    await CollectorProcess().ingest(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      sourcePath: path,
+      harness: harness,
+    );
+    return _loadSessionDetailOnWorker(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      sessionId: sessionId,
     );
   }
 
@@ -894,103 +903,10 @@ class RuntimeSessionController implements ProjectsRepository {
         );
         logger = activeLogger;
         final pricing = PricingRepository(db).loadCached(settings.pricing);
-        final pendingParsedSessions = <ScannedSessionFile>[];
-        var pendingParsedSourceBytes = 0;
-        final parsedProjectCandidates = <_ParsedProjectCandidate>[];
-        var persistenceFlushCount = 0;
         var fullRowSnapshotCount = 0;
-        var lastFullRowSnapshotParsedCount = 0;
-        var persistenceFlushQueue = Future<void>.value();
-        final threadNamesBySessionId = await _readSessionIndexThreadNames(
-          settings.paths,
-        );
-        final projectResolutionCache = _WslProjectResolutionCache(
-          wslProjectResolver,
-        );
-        final activeScanRunId = await _writeScan(() async {
-          _cleanSessionMetadataPlaceholders(db);
-          return _startScanRun(db);
-        });
+        var lastSnapshotCommitted = 0;
+        final activeScanRunId = await _writeScan(() async => _startScanRun(db));
         scanRunId = activeScanRunId;
-
-        Future<void> persistParsedBatch(List<ScannedSessionFile> batch) async {
-          if (batch.isEmpty) {
-            return;
-          }
-          final currentFlush = persistenceFlushQueue.then((_) {
-            return Profiling.spanAsync('scan.runtime.persist_flush', () {
-              return _writeScan(() async {
-                await _persistParsedSessions(
-                  db,
-                  batch,
-                  threadNamesBySessionId: threadNamesBySessionId,
-                  wslProjects: projectResolutionCache,
-                  resolveWslProjects: false,
-                );
-                _updateScanRun(
-                  db,
-                  activeScanRunId,
-                  latestProgress,
-                  status: _ScanRunStatus.running,
-                );
-              });
-            });
-          });
-          persistenceFlushQueue = currentFlush;
-          await currentFlush;
-          persistenceFlushCount++;
-        }
-
-        Future<void> flushParsedSessions(
-          ScanProgress progress, {
-          bool forceFullRowSnapshot = false,
-          Future<void> Function()? beforeFullRowSnapshot,
-        }) async {
-          if (pendingParsedSessions.isNotEmpty) {
-            final batch = List<ScannedSessionFile>.of(pendingParsedSessions);
-            pendingParsedSessions.clear();
-            pendingParsedSourceBytes = 0;
-            await persistParsedBatch(batch);
-          } else if (forceFullRowSnapshot) {
-            await persistenceFlushQueue;
-          }
-
-          if (forceFullRowSnapshot) {
-            await persistenceFlushQueue;
-          }
-          if (forceFullRowSnapshot && pendingParsedSessions.isNotEmpty) {
-            final finalBatch = List<ScannedSessionFile>.of(
-              pendingParsedSessions,
-            );
-            pendingParsedSessions.clear();
-            pendingParsedSourceBytes = 0;
-            await persistParsedBatch(finalBatch);
-          }
-          if (forceFullRowSnapshot) {
-            await persistenceFlushQueue;
-          }
-
-          if (forceFullRowSnapshot) {
-            await beforeFullRowSnapshot?.call();
-          }
-
-          if (onProgress != null &&
-              scanBatchingPolicy.shouldEmitFullRowSnapshot(
-                parsedCount: progress.filesParsed,
-                lastSnapshotParsedCount: lastFullRowSnapshotParsedCount,
-                force: forceFullRowSnapshot,
-              )) {
-            fullRowSnapshotCount++;
-            lastFullRowSnapshotParsedCount = progress.filesParsed;
-            onProgress(
-              SessionsRefreshProgress(
-                statusMessage: _progressStatusMessage(progress),
-                rows: _loadRowsProfiled(db, pricing: pricing),
-              ),
-            );
-          }
-        }
-
         final cachedRows = emitCachedRowsAtScanStart
             ? _loadRowsProfiled(db, pricing: pricing)
             : const <SessionRowViewModel>[];
@@ -1011,23 +927,13 @@ class RuntimeSessionController implements ProjectsRepository {
               category: LogCategory.scanner,
               message: 'Session scan started.',
               details: {
-                'directory_workers': _defaultDirectoryWorkerCount(),
-                'metadata_workers': _defaultMetadataWorkerCount(),
-                'parser_workers': _defaultParserWorkerCount(),
-                'parser_isolates': true,
+                'collector_process': true,
+                'parser_workers':
+                    parserWorkerCountOverride ?? _defaultParserWorkerCount(),
               },
             ),
           ),
         );
-        final mapper = CodexPathMapper(
-          wslDistro: settings.wsl.distro,
-          wslLinuxHome: settings.wsl.linuxHome,
-          wslUncRoot: settings.wsl.linuxRootUnc,
-        );
-        final parserWorkerCount =
-            parserWorkerCountOverride ?? _defaultParserWorkerCount();
-        final directoryWorkerCount = _defaultDirectoryWorkerCount();
-        final metadataWorkerCount = _defaultMetadataWorkerCount();
         final scanRoots = [
           ..._sessionScanRoots(
             settings.paths.windowsCodexPath,
@@ -1038,86 +944,77 @@ class RuntimeSessionController implements ProjectsRepository {
             SessionSourceType.wsl,
           ),
         ];
-        final scanner = SessionScanner(
-          parser: CodexSessionParser(
-            maxToolOutputPreviewChars:
-                settings.toolOutput.maxToolOutputPreviewChars,
-          ),
-          pathMapper: mapper,
-          maxConcurrentParses: parserWorkerCount,
-          maxConcurrentDirectoryScans: directoryWorkerCount,
-          maxConcurrentMetadataChecks: metadataWorkerCount,
-          retainParsedSessions: false,
-          onProgress: onProgress == null
-              ? null
-              : (progress) {
-                  latestProgress = progress;
-                  onProgress(
-                    SessionsRefreshProgress(
-                      statusMessage: _progressStatusMessage(progress),
-                    ),
-                  );
-                },
-          onSessionParsed: (session, progress) async {
-            pendingParsedSessions.add(session);
-            pendingParsedSourceBytes += session.sourceSnapshotSize ?? 0;
-            parsedProjectCandidates.add((
-              sessionId: session.parsedSession.internalId,
-              workingDirectory: session.parsedSession.workingDirectoryDisplay,
-              sourceType: session.sourceType,
-            ));
-            if (scanBatchingPolicy.shouldFlushParsedSessions(
-              pendingCount: pendingParsedSessions.length,
-              pendingSourceBytes: pendingParsedSourceBytes,
-            )) {
-              await flushParsedSessions(progress);
-            }
-          },
-        );
+        final collector = CollectorProcess();
         final result = await Profiling.spanAsync(
-          'scan.runtime.scanner_scan',
-          () {
-            return scanner.scan(
-              SessionScanRequest(
-                roots: scanRoots,
-                cachedSessions: _cachedSessions(db),
-                cancellationToken: cancellationToken,
-              ),
-            );
-          },
+          'scan.runtime.collector',
+          () => collector.scan(
+            settingsFile: settingsFile,
+            databaseFile: databaseFile,
+            cancellation: cancellationToken,
+            parserWorkers: parserWorkerCountOverride,
+            flushSessions: scanBatchingPolicy.parsedSessionFlushBatchSize,
+            flushBytes: scanBatchingPolicy.parsedSessionFlushSourceBytes,
+            write: (work) => Profiling.spanAsync(
+              'scan.runtime.collector_write',
+              () => _writeScan(work),
+            ),
+            onProgress: (progress, committed) {
+              latestProgress = progress;
+              final emitRows =
+                  committed > lastSnapshotCommitted &&
+                  (committed - lastSnapshotCommitted >=
+                          scanBatchingPolicy.fullRowSnapshotBatchSize ||
+                      progress.finishedAtUtc != null);
+              if (emitRows) {
+                fullRowSnapshotCount++;
+                lastSnapshotCommitted = committed;
+              }
+              onProgress?.call(
+                SessionsRefreshProgress(
+                  statusMessage: _progressStatusMessage(progress),
+                  rows: emitRows
+                      ? _loadRowsProfiled(db, pricing: pricing)
+                      : null,
+                ),
+              );
+            },
+          ),
+        );
+        // Alternate resolvers are explicit dependencies (for example an
+        // embedded host without wsl.exe). The collector still owns persistence.
+        if (wslProjectResolver is! ProcessWslProjectResolver) {
+          final candidates = db.select(
+            "select session_id, source_file_path, working_directory_display from sessions where source_type = 'wsl' and harness = 'codex'",
+          );
+          final hints = await wslProjectResolver.resolveProjectNames(
+            candidates
+                .map((row) => row['working_directory_display'] as String? ?? '')
+                .where((path) => path.isNotEmpty)
+                .toSet(),
+          );
+          await _writeScan(
+            () => collector.applyProjectHints(databaseFile, [
+              for (final row in candidates)
+                {
+                  'session_id': row['session_id'],
+                  'source_path': row['source_file_path'],
+                },
+            ], hints),
+          );
+        }
+        await _writeScan(
+          () async => _updateScanRun(
+            db,
+            activeScanRunId,
+            result.progress,
+            status:
+                (result.cancelled || cancellationToken.isCancellationRequested)
+                ? _ScanRunStatus.cancelled
+                : _ScanRunStatus.succeeded,
+          ),
         );
         onProgress?.call(
           const SessionsRefreshProgress(statusMessage: 'Finalizing scan...'),
-        );
-        await Profiling.spanAsync('scan.runtime.final_flush', () {
-          return flushParsedSessions(
-            result.progress,
-            forceFullRowSnapshot: true,
-            beforeFullRowSnapshot: () => Profiling.spanAsync(
-              'scan.runtime.apply_resolved_projects',
-              () => _applyResolvedProjectsForParsedCandidates(
-                db,
-                parsedProjectCandidates,
-                wslProjects: projectResolutionCache,
-                write: _writeScan,
-              ),
-            ),
-          );
-        });
-        await Profiling.spanAsync('scan.runtime.persist_scan', () {
-          return _writeScan(
-            () => _persistScan(
-              db,
-              result,
-              scanRunId: activeScanRunId,
-              persistSessions: false,
-              threadNamesBySessionId: threadNamesBySessionId,
-              wslProjects: projectResolutionCache,
-            ),
-          );
-        });
-        await _writeScan(
-          () async => _applySessionIndexThreadNames(db, threadNamesBySessionId),
         );
         try {
           final repair = await _writeScan(
@@ -1197,9 +1094,7 @@ class RuntimeSessionController implements ProjectsRepository {
                   ..._progressLogDetails(result.progress),
                   'cancelled': refreshCancelled,
                   'visible_sessions': rows.length,
-                  'directory_workers': directoryWorkerCount,
-                  'metadata_workers': metadataWorkerCount,
-                  'parser_workers': parserWorkerCount,
+                  'collector': true,
                 },
               ),
             ),
@@ -1213,7 +1108,7 @@ class RuntimeSessionController implements ProjectsRepository {
             cancelled: refreshCancelled,
           ),
           cancelled: refreshCancelled,
-          persistenceFlushCount: persistenceFlushCount,
+          persistenceFlushCount: collector.persistenceFlushCount,
           fullRowSnapshotCount: fullRowSnapshotCount,
         );
       } on Object catch (error) {
@@ -1888,39 +1783,6 @@ class _BackgroundRefreshCancel {
   const _BackgroundRefreshCancel();
 }
 
-Future<void> _persistParsedSessions(
-  Database db,
-  List<ScannedSessionFile> sessions, {
-  required Map<String, CodexThreadNameEntry> threadNamesBySessionId,
-  required _WslProjectResolutionCache wslProjects,
-  bool resolveWslProjects = true,
-}) async {
-  final canonicalSessions = _canonicalScannedSessions(sessions);
-  final resolver = resolveWslProjects
-      ? await _ProjectPathResolver.create(
-          _projectPathCandidatesForSessions(canonicalSessions),
-          wslProjects: wslProjects,
-        )
-      : _ProjectPathResolver();
-  db.execute('begin immediate');
-  try {
-    final now = DateTime.now().toUtc().toIso8601String();
-    for (final session in canonicalSessions) {
-      _upsertParsedSession(
-        db,
-        session,
-        now,
-        resolver,
-        threadNamesBySessionId: threadNamesBySessionId,
-      );
-    }
-    db.execute('commit');
-  } on Object {
-    db.execute('rollback');
-    rethrow;
-  }
-}
-
 int _startScanRun(Database db) {
   db.execute(
     '''
@@ -1979,1564 +1841,26 @@ void _updateScanRun(
 
 enum _ScanRunStatus { running, succeeded, cancelled, failed }
 
-List<CachedSessionSnapshot> _cachedSessions(Database db) {
-  final rows = db.select('''
-    select
-      source_file_path,
-      source_file_unc_path,
-      scan_status,
-      source_state,
-      file_size,
-      modified_utc,
-      content_hash,
-      parser_version,
-      last_scanned_utc,
-      last_parsed_utc
-    from sessions
-    ''');
-  return [
-    for (final row in rows)
-      CachedSessionSnapshot(
-        sourcePath: row['source_file_path'] as String,
-        sourceFileUncPath: row['source_file_unc_path'] as String?,
-        status: _scanStatus(row['scan_status'] as String?),
-        sourceState: _sourceState(row['source_state'] as String?),
-        sourceFileSize: row['file_size'] as int?,
-        sourceModifiedUtc: _dateTime(row['modified_utc'] as String?),
-        sourceContentHash: row['content_hash'] as String?,
-        parserVersion: row['parser_version'] as int?,
-        lastScannedUtc: _dateTime(row['last_scanned_utc'] as String?),
-        lastParsedUtc: _dateTime(row['last_parsed_utc'] as String?),
-      ),
-  ];
-}
-
-Future<void> _persistScan(
-  Database db,
-  SessionScanResult result, {
-  required int scanRunId,
-  required bool persistSessions,
-  required Map<String, CodexThreadNameEntry> threadNamesBySessionId,
-  required _WslProjectResolutionCache wslProjects,
-}) async {
-  final canonicalSessions = _canonicalScannedSessions(result.sessions);
-  final resolver = persistSessions
-      ? await _ProjectPathResolver.create(
-          _projectPathCandidatesForSessions(canonicalSessions),
-          wslProjects: wslProjects,
-        )
-      : null;
-  db.execute('begin immediate');
-  try {
-    final now = DateTime.now().toUtc().toIso8601String();
-    _updateScanRun(
-      db,
-      scanRunId,
-      result.progress,
-      status: result.cancelled
-          ? _ScanRunStatus.cancelled
-          : _ScanRunStatus.succeeded,
-    );
-    for (final error in result.errors) {
-      db.execute(
-        '''
-        insert into scan_errors (
-          scan_run_id,
-          source_path,
-          status,
-          message,
-          created_at_utc
-        ) values (?, ?, ?, ?, ?)
-        ''',
-        [
-          scanRunId,
-          error.sourcePath,
-          error.status.wireName,
-          error.message,
-          now,
-        ],
-      );
-    }
-    if (persistSessions) {
-      for (final session in canonicalSessions) {
-        _upsertParsedSession(
-          db,
-          session,
-          now,
-          resolver!,
-          threadNamesBySessionId: threadNamesBySessionId,
-        );
-      }
-    }
-    _upsertScanStatusesOnly(db, result.fileStatuses, now);
-    db.execute('commit');
-  } on Object {
-    db.execute('rollback');
-    rethrow;
-  }
-}
-
-void _upsertParsedSession(
-  Database db,
-  ScannedSessionFile scannedSession,
-  String now,
-  _ProjectPathResolver projectResolver, {
-  Map<String, CodexThreadNameEntry> threadNamesBySessionId = const {},
-}) {
-  final parsed = scannedSession.parsedSession;
-  final identityMerge = _captureIdentityMergeState(db, scannedSession);
-  if (!_candidateShouldReplacePersistedSession(db, scannedSession)) {
-    if (identityMerge != null) {
-      _applyIdentityMerge(db, parsed.internalId, identityMerge);
-      final affected = _reconcileAffectedLegacyUsage(
-        db,
-        replacedSessionRowId: parsed.internalId,
-        replacedLogicalSessionId: parsed.sessionId,
-      );
-      UsageSummaryRepository(
-        db,
-      ).replaceDailyProjectionsInCurrentTransaction(affected);
-    }
-    return;
-  }
-  final resolvedThreadName =
-      threadNamesBySessionId[parsed.sessionId]?.threadName.trim().isNotEmpty ==
-          true
-      ? threadNamesBySessionId[parsed.sessionId]!.threadName.trim()
-      : parsed.threadName?.trim() ?? '';
-  final sourceType = scannedSession.sourceType == SessionSourceType.windows
-      ? SessionSearchSourceType.windows
-      : SessionSearchSourceType.wsl;
-  final needsCurrentStat =
-      scannedSession.sourceSnapshotSize == null ||
-      scannedSession.sourceSnapshotModifiedUtc == null;
-  final stat = needsCurrentStat
-      ? File(scannedSession.sourcePath).statSync()
-      : null;
-  final sourceSnapshotSize = scannedSession.sourceSnapshotSize ?? stat!.size;
-  final sourceSnapshotModifiedUtc =
-      scannedSession.sourceSnapshotModifiedUtc ?? stat!.modified.toUtc();
-  final hasErrors =
-      parsed.messages.any((message) => message.hasError) ||
-      parsed.toolCalls.any((tool) => tool.hasError);
-  final autoProject = projectResolver.resolve(
-    parsed.workingDirectoryDisplay,
-    sourceType: scannedSession.sourceType,
-  );
-  final detectedProjectId = autoProject == null
-      ? null
-      : _upsertAutoProject(db, autoProject.name, now);
-  final tokenBuckets = _messageTokenBuckets(parsed);
-  SessionSearchIndex(db).upsert(
-    SessionSearchDocument(
-      id: parsed.internalId,
-      sourceType: sourceType,
-      sourceFilePath: scannedSession.sourcePath,
-      displayPath: scannedSession.mappedPath.displayPath,
-      platformPath: scannedSession.mappedPath.platformPath,
-      title: _cleanDisplayTitle(parsed.title),
-      summary: _cleanDisplaySummary(parsed.summary),
-      threadName: resolvedThreadName,
-      toolNames: parsed.toolCalls.map((tool) => tool.toolName).join(' '),
-      normalizedPathKeys: scannedSession.mappedPath.normalizedPathKeys.join(
-        ' ',
-      ),
-      startedAtUtc: parsed.startedAtUtc,
-      lastMessageAtUtc: parsed.lastMessageAtUtc,
-      modelsUsed: parsed.modelIds.toList(growable: false),
-      scanStatus: scannedSession.status.wireName,
-      parseStatus: 'available',
-      hasCodeBlocks: parsed.messages.any(
-        (message) => message.contentPlain.contains('```'),
-      ),
-      hasToolCalls: parsed.toolCalls.isNotEmpty,
-      hasErrors: hasErrors,
-      totalTokens: parsed.usage.totalTokens,
-      projectName: autoProject?.name ?? '',
-    ),
-  );
-  db.execute(
-    '''
-    update sessions
-    set
-      session_id = ?,
-      thread_name = ?,
-      thread_source = ?,
-      parent_thread_id = ?,
-      forked_from_id = ?,
-      history_base_thread_id = ?,
-      history_base_end_ordinal = ?,
-      history_base_end_byte_offset = ?,
-      subagent_history_start_ordinal = ?,
-      usage_projection_status = ?,
-      agent_nickname = ?,
-      agent_role = ?,
-      subagent_depth = ?,
-      source_file_unc_path = ?,
-      source_state = ?,
-      working_directory_display = ?,
-      working_directory_platform = ?,
-      working_directory_unc = ?,
-      file_size = ?,
-      modified_utc = ?,
-      content_hash = ?,
-      parser_version = ?,
-      message_count = ?,
-      user_message_count = ?,
-      assistant_message_count = ?,
-      tool_call_count = ?,
-      input_tokens = ?,
-      output_tokens = ?,
-      cached_input_tokens = ?,
-      user_message_tokens = ?,
-      assistant_response_tokens = ?,
-      tool_call_tokens = ?,
-      detected_project_id = ?,
-      last_scanned_utc = ?,
-      last_parsed_utc = ?
-    where id = ?
-    ''',
-    [
-      parsed.sessionId,
-      resolvedThreadName,
-      parsed.threadSource,
-      parsed.parentThreadId,
-      parsed.forkedFromId,
-      parsed.historyBaseThreadId,
-      parsed.historyBaseEndOrdinalExclusive,
-      parsed.historyBaseEndByteOffset,
-      parsed.subagentHistoryStartOrdinal,
-      parsed.usageProjectionStatus,
-      parsed.agentNickname,
-      parsed.agentRole,
-      parsed.subagentDepth,
-      scannedSession.mappedPath.sourceFileUncPath,
-      scannedSession.sourceState.wireName,
-      parsed.workingDirectoryDisplay,
-      parsed.workingDirectoryPlatform,
-      parsed.workingDirectoryUnc,
-      sourceSnapshotSize,
-      sourceSnapshotModifiedUtc.toIso8601String(),
-      null,
-      CodexSessionParser.currentVersion,
-      parsed.messages.length,
-      parsed.messages
-          .where((message) => message.authorType == CodexMessageAuthorType.user)
-          .length,
-      parsed.messages
-          .where(
-            (message) => message.authorType == CodexMessageAuthorType.assistant,
-          )
-          .length,
-      parsed.toolCalls.length,
-      parsed.usage.inputTokens,
-      parsed.usage.outputTokens,
-      parsed.usage.cachedInputTokens,
-      tokenBuckets.user,
-      tokenBuckets.assistant,
-      tokenBuckets.tool,
-      detectedProjectId,
-      now,
-      now,
-      parsed.internalId,
-    ],
-  );
-  _replaceMessages(db, parsed, now);
-  _replaceToolCalls(db, parsed);
-  _replaceUsageEvents(
-    db,
-    parsed,
-    now,
-    projectResolver,
-    sourceType: scannedSession.sourceType,
-  );
-  if (identityMerge != null) {
-    _applyIdentityMerge(db, parsed.internalId, identityMerge);
-  }
-  ProjectTagStateStore(db).refreshSessionProject(parsed.internalId);
-  final affected = _reconcileAffectedLegacyUsage(
-    db,
-    replacedSessionRowId: parsed.internalId,
-    replacedLogicalSessionId: parsed.sessionId,
-  );
-  UsageSummaryRepository(
-    db,
-  ).replaceDailyProjectionsInCurrentTransaction(affected);
-}
-
-_IdentityMergeState? _captureIdentityMergeState(
-  Database db,
-  ScannedSessionFile candidate,
-) {
-  final stableSessionId = candidate.parsedSession.sessionId?.trim() ?? '';
-  if (stableSessionId.isEmpty) {
-    return null;
-  }
-  final canonicalId = candidate.parsedSession.internalId;
-  final caseSensitivePaths = candidate.sourceType == SessionSourceType.wsl;
-  final pathKeys =
-      <String>{
-            candidate.sourcePath,
-            candidate.mappedPath.sourceFilePath,
-            candidate.mappedPath.displayPath,
-            candidate.mappedPath.platformPath,
-            if (!caseSensitivePaths) ...candidate.mappedPath.normalizedPathKeys,
-            ?candidate.mappedPath.sourceFileUncPath,
-          }
-          .map(
-            (path) =>
-                _normalizeIdentityPath(path, caseSensitive: caseSensitivePaths),
-          )
-          .where((path) => path.isNotEmpty)
-          .toList();
-  final pathParameters = List.filled(pathKeys.length, '?').join(', ');
-  String normalizedSqlPath(String column) => caseSensitivePaths
-      ? "replace(coalesce($column, ''), '\\', '/')"
-      : "replace(lower(coalesce($column, '')), '\\', '/')";
-  final rows = db.select(
-    '''
-    select rowid as session_rowid, *
-    from sessions
-    where id = ?
-       or (
-         id <> ?
-         ${_codexRowsOnly(db)}
-         and (
-           trim(coalesce(session_id, '')) = ?
-           or (
-             trim(coalesce(session_id, '')) = ''
-             and source_type = ?
-             and (
-               ${normalizedSqlPath('source_file_path')}
-                 in ($pathParameters)
-               or ${normalizedSqlPath('source_file_unc_path')}
-                 in ($pathParameters)
-               or ${normalizedSqlPath('display_path')}
-                 in ($pathParameters)
-               or ${normalizedSqlPath('platform_path')}
-                 in ($pathParameters)
-               or (
-                 id like 'source:%'
-                 and source_type = 'windows'
-                 and ${caseSensitivePaths ? "replace(substr(id, 8), '\\', '/')" : "replace(lower(substr(id, 8)), '\\', '/')"}
-                   in ($pathParameters)
-               )
-               or (
-                 id like 'source-status:%'
-                 and source_type = 'windows'
-                 and ${caseSensitivePaths ? "replace(substr(id, 15), '\\', '/')" : "replace(lower(substr(id, 15)), '\\', '/')"}
-                   in ($pathParameters)
-               )
-             )
-           )
-         )
-       )
-    ''',
-    [
-      canonicalId,
-      canonicalId,
-      stableSessionId,
-      candidate.sourceType == SessionSourceType.wsl ? 'wsl' : 'windows',
-      for (var repeat = 0; repeat < 6; repeat++) ...pathKeys,
-    ],
-  );
-  final alternateRows = rows
-      .where((row) => row['id'] != canonicalId)
-      .toList(growable: false);
-  if (alternateRows.isEmpty) {
-    return null;
-  }
-  final snapshots = [
-    for (final row in rows) _SessionMetadataSnapshot.fromRow(row),
-  ];
-  _SessionMetadataSnapshot? canonical;
-  for (final snapshot in snapshots) {
-    if (snapshot.id == canonicalId) {
-      canonical = snapshot;
-      break;
-    }
-  }
-  final project = _latestMetadataSnapshot(
-    snapshots,
-    canonical: canonical,
-    timestamp: (snapshot) => snapshot.updatedAtUtc,
-  );
-  final archive = _latestMetadataSnapshot(
-    snapshots,
-    canonical: canonical,
-    timestamp: (snapshot) => snapshot.archivedAtUtc,
-  );
-  final evaluation = _latestMetadataSnapshot(
-    snapshots,
-    canonical: canonical,
-    timestamp: (snapshot) => snapshot.evalUpdatedAtUtc,
-  );
-  final ownerIds = snapshots.map((snapshot) => snapshot.id).toList();
-  final ownerParameters = List.filled(ownerIds.length, '?').join(', ');
-  final tagCreatedAtById = <int, String>{};
-  for (final row in db.select('''
-    select tag_id, created_at_utc
-    from session_tags
-    where session_id in ($ownerParameters)
-    ''', ownerIds)) {
-    final tagId = row['tag_id'] as int;
-    final createdAt = row['created_at_utc'] as String;
-    final existing = tagCreatedAtById[tagId];
-    if (existing == null || createdAt.compareTo(existing) < 0) {
-      tagCreatedAtById[tagId] = createdAt;
-    }
-  }
-  final pathAliases = <String>{
-    for (final row in db.select('''
-      select path_key
-      from session_path_keys
-      where session_id in ($ownerParameters)
-      ''', ownerIds))
-      row['path_key'] as String,
-  };
-  return _IdentityMergeState(
-    alternateIds: [for (final row in alternateRows) row['id'] as String],
-    alternateRowIds: [
-      for (final row in alternateRows) row['session_rowid'] as int,
-    ],
-    isPinned: snapshots.any((snapshot) => snapshot.isPinned),
-    project: project,
-    archive: archive,
-    evaluation: evaluation,
-    tagCreatedAtById: tagCreatedAtById,
-    pathAliases: pathAliases,
-  );
-}
-
-_SessionMetadataSnapshot _latestMetadataSnapshot(
-  List<_SessionMetadataSnapshot> snapshots, {
-  required _SessionMetadataSnapshot? canonical,
-  required DateTime? Function(_SessionMetadataSnapshot snapshot) timestamp,
-}) {
-  var winner = canonical ?? snapshots.first;
-  for (final snapshot in snapshots) {
-    if (identical(snapshot, winner)) {
-      continue;
-    }
-    final candidateTime = timestamp(snapshot);
-    final winnerTime = timestamp(winner);
-    final timestampCompare = _compareNullableDateTime(
-      candidateTime,
-      winnerTime,
-    );
-    if (timestampCompare > 0 ||
-        (canonical == null &&
-            timestampCompare == 0 &&
-            _compareMetadataTieBreak(snapshot, winner) > 0)) {
-      winner = snapshot;
-    }
-  }
-  return winner;
-}
-
-int _compareMetadataTieBreak(
-  _SessionMetadataSnapshot left,
-  _SessionMetadataSnapshot right,
-) {
-  int identityPreference(String id) {
-    if (id.startsWith('source:')) {
-      return 2;
-    }
-    if (id.startsWith('source-status:')) {
-      return 1;
-    }
-    return 0;
-  }
-
-  final identityCompare = identityPreference(
-    left.id,
-  ).compareTo(identityPreference(right.id));
-  if (identityCompare != 0) {
-    return identityCompare;
-  }
-  final idCompare = right.id.compareTo(left.id);
-  if (idCompare != 0) {
-    return idCompare;
-  }
-  return right.rowId.compareTo(left.rowId);
-}
-
-void _applyIdentityMerge(
-  Database db,
-  String canonicalId,
-  _IdentityMergeState merge,
-) {
-  db.execute(
-    '''
-    update sessions
-    set is_pinned = ?,
-        project_override = ?,
-        project_id = ?,
-        project_name_snapshot = ?,
-        is_archived = ?,
-        archived_at_utc = ?,
-        archive_reason = ?,
-        eval_ready = ?,
-        eval_status = ?,
-        eval_notes = ?,
-        eval_expected_output = ?,
-        eval_reviewed_at_utc = ?,
-        eval_updated_at_utc = ?,
-        updated_at_utc = case
-          when julianday(?) > julianday(updated_at_utc) then ?
-          else updated_at_utc
-        end
-    where id = ?
-    ''',
-    [
-      merge.isPinned ? 1 : 0,
-      merge.project.projectOverride ? 1 : 0,
-      merge.project.projectId,
-      merge.project.projectName,
-      merge.archive.isArchived ? 1 : 0,
-      merge.archive.archivedAtValue,
-      merge.archive.archiveReason,
-      merge.evaluation.evalReady ? 1 : 0,
-      merge.evaluation.evalStatus,
-      merge.evaluation.evalNotes,
-      merge.evaluation.evalExpectedOutput,
-      merge.evaluation.evalReviewedAtValue,
-      merge.evaluation.evalUpdatedAtValue,
-      merge.project.updatedAtValue,
-      merge.project.updatedAtValue,
-      canonicalId,
-    ],
-  );
-
-  for (final alternateId in merge.alternateIds) {
-    db.execute('delete from usage_events where session_row_id = ?', [
-      alternateId,
-    ]);
-    db.execute('delete from tool_calls where session_id = ?', [alternateId]);
-    db.execute('delete from messages where session_id = ?', [alternateId]);
-    db.execute('delete from session_tags where session_id = ?', [alternateId]);
-    db.execute('delete from session_path_keys where session_id = ?', [
-      alternateId,
-    ]);
-  }
-  for (final rowId in merge.alternateRowIds) {
-    db.execute('delete from session_search where rowid = ?', [rowId]);
-  }
-  for (final alternateId in merge.alternateIds) {
-    db.execute('delete from sessions where id = ?', [alternateId]);
-  }
-  for (final entry in merge.tagCreatedAtById.entries) {
-    db.execute(
-      '''
-      insert or ignore into session_tags (session_id, tag_id, created_at_utc)
-      values (?, ?, ?)
-      ''',
-      [canonicalId, entry.key, entry.value],
-    );
-  }
-  for (final pathAlias in merge.pathAliases) {
-    db.execute(
-      '''
-      insert or ignore into session_path_keys (session_id, path_key)
-      values (?, ?)
-      ''',
-      [canonicalId, pathAlias],
-    );
-  }
-  _refreshSessionSearchRow(db, canonicalId);
-  final foreignKeyErrors = db.select('pragma foreign_key_check');
-  if (foreignKeyErrors.isNotEmpty) {
-    throw StateError(
-      'Session identity reconciliation left foreign-key violations.',
-    );
-  }
-}
-
-void _refreshSessionSearchRow(Database db, String sessionId) {
-  final rows = db.select(
-    '''
-    select
-      s.rowid as session_rowid,
-      coalesce(s.title, '') as title,
-      coalesce(s.summary, '') as summary,
-      coalesce((
-        select group_concat(tc.tool_name, ' ')
-        from tool_calls tc where tc.session_id = s.id
-      ), '') as tool_names,
-      coalesce(s.display_path, '') as display_path,
-      coalesce((
-        select group_concat(pk.path_key, ' ')
-        from session_path_keys pk where pk.session_id = s.id
-      ), '') as normalized_path_keys,
-      coalesce(s.project_name_snapshot, p.name, '') as project_name,
-      coalesce((
-        select group_concat(t.name, ' ')
-        from session_tags st
-        join tags t on t.id = st.tag_id
-        where st.session_id = s.id
-      ), '') as tags
-    from sessions s
-    left join projects p on p.id = s.project_id
-    where s.id = ?
-    ''',
-    [sessionId],
-  );
-  if (rows.isEmpty) {
-    return;
-  }
-  final row = rows.single;
-  final rowId = row['session_rowid'] as int;
-  db.execute('delete from session_search where rowid = ?', [rowId]);
-  db.execute(
-    '''
-    insert into session_search (
-      rowid, title, summary, tool_names, display_path,
-      normalized_path_keys, project_name, tags
-    ) values (?, ?, ?, ?, ?, ?, ?, ?)
-    ''',
-    [
-      rowId,
-      row['title'],
-      row['summary'],
-      row['tool_names'],
-      row['display_path'],
-      row['normalized_path_keys'],
-      row['project_name'],
-      row['tags'],
-    ],
-  );
-}
-
-String _normalizeIdentityPath(String path, {required bool caseSensitive}) {
-  final normalized = path.trim().replaceAll(r'\', '/');
-  return caseSensitive ? normalized : normalized.toLowerCase();
-}
-
-class _IdentityMergeState {
-  const _IdentityMergeState({
-    required this.alternateIds,
-    required this.alternateRowIds,
-    required this.isPinned,
-    required this.project,
-    required this.archive,
-    required this.evaluation,
-    required this.tagCreatedAtById,
-    required this.pathAliases,
-  });
-
-  final List<String> alternateIds;
-  final List<int> alternateRowIds;
-  final bool isPinned;
-  final _SessionMetadataSnapshot project;
-  final _SessionMetadataSnapshot archive;
-  final _SessionMetadataSnapshot evaluation;
-  final Map<int, String> tagCreatedAtById;
-  final Set<String> pathAliases;
-}
-
-class _SessionMetadataSnapshot {
-  const _SessionMetadataSnapshot({
-    required this.rowId,
-    required this.id,
-    required this.isPinned,
-    required this.projectOverride,
-    required this.projectId,
-    required this.projectName,
-    required this.updatedAtValue,
-    required this.isArchived,
-    required this.archivedAtValue,
-    required this.archiveReason,
-    required this.evalReady,
-    required this.evalStatus,
-    required this.evalNotes,
-    required this.evalExpectedOutput,
-    required this.evalReviewedAtValue,
-    required this.evalUpdatedAtValue,
-  });
-
-  factory _SessionMetadataSnapshot.fromRow(Row row) => _SessionMetadataSnapshot(
-    rowId: row['session_rowid'] as int,
-    id: row['id'] as String,
-    isPinned: (row['is_pinned'] as int? ?? 0) == 1,
-    projectOverride: (row['project_override'] as int? ?? 0) == 1,
-    projectId: row['project_id'] as int?,
-    projectName: row['project_name_snapshot'] as String?,
-    updatedAtValue: row['updated_at_utc'] as String?,
-    isArchived: (row['is_archived'] as int? ?? 0) == 1,
-    archivedAtValue: row['archived_at_utc'] as String?,
-    archiveReason: row['archive_reason'] as String?,
-    evalReady: (row['eval_ready'] as int? ?? 0) == 1,
-    evalStatus: row['eval_status'] as String?,
-    evalNotes: row['eval_notes'] as String?,
-    evalExpectedOutput: row['eval_expected_output'] as String?,
-    evalReviewedAtValue: row['eval_reviewed_at_utc'] as String?,
-    evalUpdatedAtValue: row['eval_updated_at_utc'] as String?,
-  );
-
-  final int rowId;
-  final String id;
-  final bool isPinned;
-  final bool projectOverride;
-  final int? projectId;
-  final String? projectName;
-  final String? updatedAtValue;
-  final bool isArchived;
-  final String? archivedAtValue;
-  final String? archiveReason;
-  final bool evalReady;
-  final String? evalStatus;
-  final String? evalNotes;
-  final String? evalExpectedOutput;
-  final String? evalReviewedAtValue;
-  final String? evalUpdatedAtValue;
-
-  DateTime? get updatedAtUtc => _dateTime(updatedAtValue);
-  DateTime? get archivedAtUtc => _dateTime(archivedAtValue);
-  DateTime? get evalUpdatedAtUtc => _dateTime(evalUpdatedAtValue);
-}
-
-List<ScannedSessionFile> _canonicalScannedSessions(
-  Iterable<ScannedSessionFile> sessions,
-) {
-  final winners = <String, _SessionCandidateEvidence>{};
-  for (final session in sessions) {
-    final evidence = _SessionCandidateEvidence.fromScanned(session);
-    final existing = winners[session.parsedSession.internalId];
-    if (existing == null || _compareSessionCandidates(evidence, existing) > 0) {
-      winners[session.parsedSession.internalId] = evidence;
-    }
-  }
-  final result = winners.values
-      .map((evidence) => evidence.scannedSession!)
-      .toList(growable: false);
-  result.sort(
-    (left, right) =>
-        left.parsedSession.internalId.compareTo(right.parsedSession.internalId),
-  );
-  return result;
-}
-
-bool _candidateShouldReplacePersistedSession(
-  Database db,
-  ScannedSessionFile candidate,
-) {
-  final rows = db.select(
-    '''
-    select source_type, source_file_path, source_state, parse_status,
-           coalesce(last_message_at_utc, started_at_utc) as last_evidence_utc,
-           modified_utc, file_size
-    from sessions
-    where id = ?
-    ''',
-    [candidate.parsedSession.internalId],
-  );
-  if (rows.isEmpty) {
-    return true;
-  }
-  final row = rows.single;
-  final existing = _SessionCandidateEvidence(
-    sourcePath: row['source_file_path'] as String,
-    sourceType: row['source_type'] == 'wsl'
-        ? SessionSourceType.wsl
-        : SessionSourceType.windows,
-    sourceState: _sourceState(row['source_state'] as String?),
-    isValidParse: row['parse_status'] == 'available',
-    lastEvidenceUtc: _dateTime(row['last_evidence_utc'] as String?),
-    modifiedUtc: _dateTime(row['modified_utc'] as String?),
-    fileSize: row['file_size'] as int? ?? 0,
-  );
-  return _compareSessionCandidates(
-        _SessionCandidateEvidence.fromScanned(candidate),
-        existing,
-      ) >=
-      0;
-}
-
-int _compareSessionCandidates(
-  _SessionCandidateEvidence left,
-  _SessionCandidateEvidence right,
-) {
-  final validityCompare = (left.isValidParse ? 1 : 0).compareTo(
-    right.isValidParse ? 1 : 0,
-  );
-  if (validityCompare != 0) {
-    return validityCompare;
-  }
-  final evidenceCompare = _compareNullableDateTime(
-    left.lastEvidenceUtc,
-    right.lastEvidenceUtc,
-  );
-  if (evidenceCompare != 0) {
-    return evidenceCompare;
-  }
-  final modifiedCompare = _compareNullableDateTime(
-    left.modifiedUtc,
-    right.modifiedUtc,
-  );
-  if (modifiedCompare != 0) {
-    return modifiedCompare;
-  }
-  final sizeCompare = left.fileSize.compareTo(right.fileSize);
-  if (sizeCompare != 0) {
-    return sizeCompare;
-  }
-  final lifecycleCompare = _sourceLifecyclePreference(
-    left.sourceState,
-  ).compareTo(_sourceLifecyclePreference(right.sourceState));
-  if (lifecycleCompare != 0) {
-    return lifecycleCompare;
-  }
-  final caseSensitivePaths =
-      left.sourceType == SessionSourceType.wsl ||
-      right.sourceType == SessionSourceType.wsl;
-  final leftPath = caseSensitivePaths
-      ? left.sourcePath
-      : left.sourcePath.toLowerCase();
-  final rightPath = caseSensitivePaths
-      ? right.sourcePath
-      : right.sourcePath.toLowerCase();
-  return rightPath.compareTo(leftPath);
-}
-
-int _compareNullableDateTime(DateTime? left, DateTime? right) {
-  if (left == null) {
-    return right == null ? 0 : -1;
-  }
-  if (right == null) {
-    return 1;
-  }
-  return left.compareTo(right);
-}
-
-int _sourceLifecyclePreference(SessionSourceState state) => switch (state) {
-  SessionSourceState.active => 2,
-  SessionSourceState.codexArchived => 1,
-  SessionSourceState.missing => 0,
-};
-
-class _SessionCandidateEvidence {
-  const _SessionCandidateEvidence({
-    required this.sourcePath,
-    required this.sourceType,
-    required this.sourceState,
-    required this.isValidParse,
-    required this.lastEvidenceUtc,
-    required this.modifiedUtc,
-    required this.fileSize,
-    this.scannedSession,
-  });
-
-  factory _SessionCandidateEvidence.fromScanned(ScannedSessionFile session) {
-    FileStat? liveStat;
-    if (session.sourceSnapshotSize == null ||
-        session.sourceSnapshotModifiedUtc == null) {
-      try {
-        liveStat = File(session.sourcePath).statSync();
-      } on FileSystemException {
-        liveStat = null;
-      }
-    }
-    return _SessionCandidateEvidence(
-      sourcePath: session.sourcePath,
-      sourceType: session.sourceType,
-      sourceState: session.sourceState,
-      isValidParse: true,
-      lastEvidenceUtc:
-          session.parsedSession.lastMessageAtUtc ??
-          session.parsedSession.startedAtUtc,
-      modifiedUtc:
-          session.sourceSnapshotModifiedUtc ?? liveStat?.modified.toUtc(),
-      fileSize: session.sourceSnapshotSize ?? liveStat?.size ?? 0,
-      scannedSession: session,
-    );
-  }
-
-  final String sourcePath;
-  final SessionSourceType sourceType;
-  final SessionSourceState sourceState;
-  final bool isValidParse;
-  final DateTime? lastEvidenceUtc;
-  final DateTime? modifiedUtc;
-  final int fileSize;
-  final ScannedSessionFile? scannedSession;
-}
-
-({int user, int assistant, int tool}) _messageTokenBuckets(
-  CodexParsedSession parsed,
-) {
-  var user = 0;
-  var assistant = 0;
-  var tool = 0;
-  for (final message in parsed.messages) {
-    final totalTokens = message.usage.totalTokens ?? 0;
-    switch (message.authorType) {
-      case CodexMessageAuthorType.user:
-        user += totalTokens;
-      case CodexMessageAuthorType.assistant:
-        assistant += totalTokens;
-      case CodexMessageAuthorType.tool:
-        tool += totalTokens;
-      case CodexMessageAuthorType.system:
-      case CodexMessageAuthorType.reasoning:
-      case CodexMessageAuthorType.unknown:
-        break;
-    }
-  }
-  if (user + assistant + tool == 0) {
-    return (
-      user: parsed.usage.inputTokens ?? 0,
-      assistant: parsed.usage.outputTokens ?? 0,
-      tool: 0,
-    );
-  }
-  return (user: user, assistant: assistant, tool: tool);
-}
-
-void _replaceMessages(Database db, CodexParsedSession parsed, String now) {
-  db.execute('delete from messages where session_id = ?', [parsed.internalId]);
-  for (final message in parsed.messages) {
-    db.execute(
-      '''
-      insert into messages (
-        session_id,
-        message_index,
-        author_type,
-        created_at_utc,
-        first_line,
-        content_plain,
-        content_preview,
-        content_truncated,
-        token_input,
-        token_output,
-        token_cached,
-        token_total,
-        model,
-        has_tool_calls,
-        has_error,
-        raw_type,
-        created_at_db_utc,
-        updated_at_db_utc
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ''',
-      [
-        parsed.internalId,
-        message.index,
-        message.authorType.name,
-        message.createdAtUtc?.toIso8601String(),
-        message.firstLine,
-        message.contentPlain,
-        message.contentPreview,
-        message.contentTruncated ? 1 : 0,
-        message.usage.inputTokens,
-        message.usage.outputTokens,
-        message.usage.cachedInputTokens,
-        message.usage.totalTokens,
-        message.model,
-        message.hasToolCalls ? 1 : 0,
-        message.hasError ? 1 : 0,
-        message.rawType,
-        now,
-        now,
-      ],
-    );
-  }
-}
-
-void _replaceToolCalls(Database db, CodexParsedSession parsed) {
-  db.execute('delete from tool_calls where session_id = ?', [
-    parsed.internalId,
-  ]);
-  for (final tool in parsed.toolCalls) {
-    db.execute(
-      '''
-      insert into tool_calls (
-        session_id,
-        tool_index,
-        tool_name,
-        status,
-        started_at_utc,
-        finished_at_utc,
-        input_preview,
-        output_preview,
-        output_truncated,
-        error_message
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ''',
-      [
-        parsed.internalId,
-        tool.toolIndex,
-        tool.toolName,
-        tool.status,
-        tool.startedAtUtc?.toIso8601String(),
-        tool.finishedAtUtc?.toIso8601String(),
-        tool.inputPreview,
-        tool.outputPreview,
-        tool.outputTruncated ? 1 : 0,
-        tool.errorMessage,
-      ],
-    );
-  }
-}
-
-void _replaceUsageEvents(
-  Database db,
-  CodexParsedSession parsed,
-  String now,
-  _ProjectPathResolver projectResolver, {
-  required SessionSourceType sourceType,
-}) {
-  db.execute('delete from usage_events where session_row_id = ?', [
-    parsed.internalId,
-  ]);
-  final recordsInputs = db
-      .select(
-        "select 1 from sqlite_schema where type = 'table' and name = 'usage_event_inputs'",
-      )
-      .isNotEmpty;
-  if (recordsInputs) {
-    db.execute('delete from usage_event_inputs where session_row_id = ?', [
-      parsed.internalId,
-    ]);
-  }
-  if (parsed.usageEvents.isEmpty) {
-    return;
-  }
-
-  final projectIdsByName = <String, int>{};
-  final contextIdsByPaths = <(String?, String?), int>{};
-  final projectStore = ProjectTagStateStore(db);
-  final contextBased =
-      DatabaseGenerationRepository(db).activeGeneration().targetSchemaVersion >=
-      16;
-  final insert = db.prepare('''
-    insert into usage_events (
-      session_row_id,
-      source_record_ordinal,
-      rollout_ordinal,
-      turn_ordinal,
-      epoch,
-      occurred_at_utc,
-      model,
-      ${contextBased ? 'path_context_id,' : '''
-      working_directory_display, working_directory_platform, working_directory_unc, project_id,
-      '''}
-      input_tokens,
-      cached_input_tokens,
-      cache_write_input_tokens,
-      output_tokens,
-      reasoning_output_tokens,
-      total_tokens,
-      branch_scope,
-      derivation,
-      event_fingerprint
-    ) values (${List.filled(contextBased ? 17 : 20, '?').join(', ')})
-    ''');
-  final insertInputs = recordsInputs
-      ? db.prepare('''
-          insert into usage_event_inputs (
-            session_row_id, source_record_ordinal, provider,
-            request_input_tokens, model_context_window
-          ) values (?, ?, ?, ?, ?)
-          ''')
-      : null;
-  try {
-    for (final event in parsed.usageEvents) {
-      final autoProject = projectResolver.resolve(
-        event.workingDirectory,
-        sourceType: sourceType,
-      );
-      final projectId = autoProject == null
-          ? null
-          : projectIdsByName.putIfAbsent(
-              autoProject.name,
-              () => _upsertAutoProject(db, autoProject.name, now),
-            );
-      final usage = event.usage;
-      final contextId = contextIdsByPaths.putIfAbsent(
-        (event.workingDirectory, event.workingDirectoryUnc),
-        () => projectStore.resolveUsagePathContext(
-          displayPath: event.workingDirectory,
-          platformPath: event.workingDirectory,
-          uncPath: event.workingDirectoryUnc,
-          detectedProjectId: projectId,
-        ),
-      );
-      insert.execute([
-        parsed.internalId,
-        event.sourceRecordOrdinal,
-        event.rolloutOrdinal,
-        event.turnOrdinal,
-        event.counterEpoch,
-        event.occurredAtUtc?.toIso8601String(),
-        event.model,
-        if (contextBased)
-          contextId
-        else ...[
-          event.workingDirectory,
-          event.workingDirectory,
-          event.workingDirectoryUnc,
-          projectId,
-        ],
-        usage.inputTokens ?? 0,
-        usage.cachedInputTokens ?? 0,
-        usage.cacheWriteInputTokens ?? 0,
-        usage.outputTokens ?? 0,
-        usage.reasoningOutputTokens ?? 0,
-        usage.totalTokens ?? 0,
-        event.branchScope,
-        event.derivation,
-        event.eventFingerprint,
-      ]);
-      if (event.provider != null ||
-          event.requestInputTokens != null ||
-          event.modelContextWindow != null) {
-        insertInputs?.execute([
-          parsed.internalId,
-          event.sourceRecordOrdinal,
-          event.provider,
-          event.requestInputTokens,
-          event.modelContextWindow,
-        ]);
-      }
-    }
-  } finally {
-    insert.close();
-    insertInputs?.close();
-  }
-}
-
-Set<String> _reconcileAffectedLegacyUsage(
-  Database db, {
-  required String replacedSessionRowId,
-  required String? replacedLogicalSessionId,
-}) {
-  const legacyColumns = '''
-    id,
-    session_id,
-    forked_from_id,
-    parent_thread_id,
-    parser_version,
-    usage_projection_status,
-    input_tokens,
-    output_tokens,
-    cached_input_tokens,
-    total_tokens
-    ''';
-  const legacyPredicate = '''
-    history_base_thread_id is null
-    and subagent_history_start_ordinal is null
-    and (
-      (forked_from_id is not null and forked_from_id <> '')
-      or (parent_thread_id is not null and parent_thread_id <> '')
-    )
-    ''';
-  final affected = <String, _LegacyUsageSession>{};
-  for (final row in db.select(
-    'select $legacyColumns from sessions '
-    'where id = ? and $legacyPredicate',
-    [replacedSessionRowId],
-  )) {
-    final session = _LegacyUsageSession.fromRow(row);
-    affected[session.rowId] = session;
-  }
-  final logicalId = replacedLogicalSessionId?.trim() ?? '';
-  final pending = <String>[if (logicalId.isNotEmpty) logicalId];
-  final visited = <String>{};
-  while (pending.isNotEmpty) {
-    final parentId = pending.removeLast();
-    if (!visited.add(parentId)) continue;
-    for (final row in db.select(
-      '''
-      select $legacyColumns, ($legacyPredicate) as needs_reconciliation
-      from sessions
-      where true ${_codexRowsOnly(db)} and (
-          forked_from_id = ?
-          or (
-            (forked_from_id is null or forked_from_id = '')
-            and parent_thread_id = ?
-          )
-        )
-      ''',
-      [parentId, parentId],
-    )) {
-      // Traverse provenance-known nodes too: their own scopes are authoritative,
-      // but a legacy descendant can still depend on their ancestry/cycle state.
-      if (row['needs_reconciliation'] == 1) {
-        final session = _LegacyUsageSession.fromRow(row);
-        affected[session.rowId] = session;
-      }
-      final descendantId = (row['session_id'] as String?)?.trim() ?? '';
-      if (descendantId.isNotEmpty && !visited.contains(descendantId)) {
-        pending.add(descendantId);
-      }
-    }
-  }
-
-  final parentCache = <String, List<_LegacyUsageSession>>{};
-  final fingerprintCache = <String, List<String>>{};
-  List<_LegacyUsageSession> parentsFor(String parentLogicalId) {
-    return parentCache.putIfAbsent(parentLogicalId, () {
-      return db
-          .select(
-            '''
-            select $legacyColumns
-            from sessions
-            where session_id = ? ${_codexRowsOnly(db)}
-            order by id
-            ''',
-            [parentLogicalId],
-          )
-          .map(_LegacyUsageSession.fromRow)
-          .toList(growable: false);
-    });
-  }
-
-  List<String> fingerprintsFor(String rowId) {
-    return fingerprintCache.putIfAbsent(rowId, () {
-      return db
-          .select(
-            '''
-            select event_fingerprint
-            from usage_events
-            where session_row_id = ?
-            order by source_record_ordinal
-            ''',
-            [rowId],
-          )
-          .map((row) => row['event_fingerprint'] as String)
-          .toList(growable: false);
-    });
-  }
-
-  bool hasCycle(_LegacyUsageSession child) {
-    final visited = <String>{child.rowId};
-    var current = child;
-    while (current.parentLogicalId.isNotEmpty) {
-      final parents = parentsFor(current.parentLogicalId);
-      if (parents.length != 1) {
-        return false;
-      }
-      final parent = parents.single;
-      if (!visited.add(parent.rowId)) {
-        return true;
-      }
-      current = parent;
-    }
-    return false;
-  }
-
-  for (final child in affected.values) {
-    if (child.parserVersion != CodexSessionParser.currentVersion) {
-      _markUsageProjectionUnresolved(db, child.rowId, 'legacy_pending');
-      continue;
-    }
-    if (hasCycle(child)) {
-      _markUsageProjectionAmbiguous(db, child.rowId);
-      continue;
-    }
-    final childFingerprints = fingerprintsFor(child.rowId);
-    if (childFingerprints.isEmpty) {
-      if (!child.hasAggregateUsage) {
-        _setUsageProjectionStatus(db, child.rowId, 'complete');
-      } else {
-        _markUsageProjectionAmbiguous(db, child.rowId);
-      }
-      continue;
-    }
-    final parents = parentsFor(child.parentLogicalId);
-    if (parents.isEmpty) {
-      _markUsageProjectionUnresolved(db, child.rowId, 'missing_parent');
-      continue;
-    }
-    if (parents.length != 1) {
-      _markUsageProjectionAmbiguous(db, child.rowId);
-      continue;
-    }
-    final parent = parents.single;
-    if (parent.parserVersion != CodexSessionParser.currentVersion) {
-      _markUsageProjectionUnresolved(db, child.rowId, 'legacy_pending');
-      continue;
-    }
-
-    final parentFingerprints = fingerprintsFor(parent.rowId);
-    if (parentFingerprints.isEmpty &&
-        (parent.projectionStatus != 'complete' || parent.hasAggregateUsage)) {
-      _markUsageProjectionAmbiguous(db, child.rowId);
-      continue;
-    }
-    var prefixLength = 0;
-    final comparableLength = math.min(
-      parentFingerprints.length,
-      childFingerprints.length,
-    );
-    while (prefixLength < comparableLength &&
-        parentFingerprints[prefixLength] == childFingerprints[prefixLength]) {
-      prefixLength++;
-    }
-    if (parentFingerprints.isNotEmpty && prefixLength == 0) {
-      _markUsageProjectionAmbiguous(db, child.rowId);
-      continue;
-    }
-
-    if (prefixLength == 0) {
-      db.execute(
-        "update usage_events set branch_scope = 'local' "
-        'where session_row_id = ?',
-        [child.rowId],
-      );
-    } else {
-      final inheritedEndOrdinal =
-          db
-                  .select(
-                    '''
-            select source_record_ordinal
-            from usage_events
-            where session_row_id = ?
-            order by source_record_ordinal
-            limit 1 offset ?
-            ''',
-                    [child.rowId, prefixLength - 1],
-                  )
-                  .single['source_record_ordinal']
-              as int;
-      db.execute(
-        '''
-        update usage_events
-        set branch_scope = case
-          when source_record_ordinal <= ? then 'inherited'
-          else 'local'
-        end
-        where session_row_id = ?
-        ''',
-        [inheritedEndOrdinal, child.rowId],
-      );
-    }
-    _setUsageProjectionStatus(db, child.rowId, 'complete');
-  }
-  return {replacedSessionRowId, ...affected.keys};
-}
-
-void _setUsageProjectionStatus(Database db, String rowId, String status) {
-  db.execute('update sessions set usage_projection_status = ? where id = ?', [
-    status,
-    rowId,
-  ]);
-}
-
-void _markUsageProjectionAmbiguous(Database db, String rowId) {
-  _markUsageProjectionUnresolved(db, rowId, 'ambiguous');
-}
-
-void _markUsageProjectionUnresolved(Database db, String rowId, String status) {
-  db.execute(
-    "update usage_events set branch_scope = 'ambiguous' "
-    'where session_row_id = ?',
-    [rowId],
-  );
-  _setUsageProjectionStatus(db, rowId, status);
-}
-
-class _LegacyUsageSession {
-  const _LegacyUsageSession({
-    required this.rowId,
-    required this.parentLogicalId,
-    required this.parserVersion,
-    required this.projectionStatus,
-    required this.hasAggregateUsage,
-  });
-
-  factory _LegacyUsageSession.fromRow(Row row) {
-    final forkedFromId = (row['forked_from_id'] as String?)?.trim() ?? '';
-    final parentThreadId = (row['parent_thread_id'] as String?)?.trim() ?? '';
-    return _LegacyUsageSession(
-      rowId: row['id'] as String,
-      parentLogicalId: forkedFromId.isNotEmpty ? forkedFromId : parentThreadId,
-      parserVersion: row['parser_version'] as int,
-      projectionStatus: row['usage_projection_status'] as String,
-      hasAggregateUsage:
-          (row['input_tokens'] as int? ?? 0) > 0 ||
-          (row['output_tokens'] as int? ?? 0) > 0 ||
-          (row['cached_input_tokens'] as int? ?? 0) > 0 ||
-          (row['total_tokens'] as int? ?? 0) > 0,
-    );
-  }
-
-  final String rowId;
-  final String parentLogicalId;
-  final int parserVersion;
-  final String projectionStatus;
-  final bool hasAggregateUsage;
-}
-
-void _upsertScanStatusesOnly(
-  Database db,
-  List<ScannedFileStatus> statuses,
-  String now,
-) {
-  if (statuses.isEmpty) {
-    return;
-  }
-
-  db.execute('drop table if exists temp_scan_statuses');
-  db.execute('''
-    create temp table temp_scan_statuses (
-      source_path text primary key,
-      status text not null,
-      source_state text not null
-    )
-    ''');
-
-  final insertStatus = db.prepare('''
-    insert or replace into temp_scan_statuses (source_path, status, source_state)
-    values (?, ?, ?)
-    ''');
-  try {
-    for (final status in statuses) {
-      insertStatus.execute([
-        status.sourcePath,
-        status.status.wireName,
-        status.sourceState.wireName,
-      ]);
-    }
-  } finally {
-    insertStatus.close();
-  }
-
-  db.execute(
-    '''
-    update sessions
-    set
-      scan_status = (
-        select t.status
-        from temp_scan_statuses t
-        where t.source_path = sessions.source_file_path
-           or t.source_path = sessions.source_file_unc_path
-        limit 1
-      ),
-      source_state = (
-        select t.source_state
-        from temp_scan_statuses t
-        where t.source_path = sessions.source_file_path
-           or t.source_path = sessions.source_file_unc_path
-        limit 1
-      ),
-      parse_status = case
-        when (
-          select t.status
-          from temp_scan_statuses t
-          where t.source_path = sessions.source_file_path
-             or t.source_path = sessions.source_file_unc_path
-          limit 1
-        ) = 'parse_error' then 'parse_error'
-        else parse_status
-      end,
-      updated_at_utc = case
-        when (
-          select t.status
-          from temp_scan_statuses t
-          where t.source_path = sessions.source_file_path
-             or t.source_path = sessions.source_file_unc_path
-          limit 1
-        ) = 'available' then updated_at_utc
-        else ?
-      end,
-      last_scanned_utc = case
-        when (
-          select t.status
-          from temp_scan_statuses t
-          where t.source_path = sessions.source_file_path
-             or t.source_path = sessions.source_file_unc_path
-          limit 1
-        ) = 'available' then last_scanned_utc
-        else ?
-      end
-    where exists (
-      select 1
-      from temp_scan_statuses t
-      where t.source_path = sessions.source_file_path
-         or t.source_path = sessions.source_file_unc_path
-    )
-    ''',
-    [now, now],
-  );
-
-  final missingStatuses = db.select('''
-    select t.source_path, t.status, t.source_state
-    from temp_scan_statuses t
-    where t.status not in ('available', 'missing', 'path_unreachable')
-      and
-      not exists (
-      select 1
-      from sessions s
-      where s.source_file_path = t.source_path
-         or s.source_file_unc_path = t.source_path
-    )
-    ''');
-  final insertMissing = db.prepare('''
-    insert into sessions (
-      id,
-      source_type,
-      source_file_path,
-      display_path,
-      platform_path,
-      scan_status,
-      source_state,
-      parse_status,
-      created_at_utc,
-      updated_at_utc,
-      last_scanned_utc
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    on conflict(id) do update set
-      scan_status = excluded.scan_status,
-      source_state = excluded.source_state,
-      updated_at_utc = excluded.updated_at_utc,
-      last_scanned_utc = excluded.last_scanned_utc
-    ''');
-  try {
-    for (final row in missingStatuses) {
-      final sourcePath = row['source_path'] as String;
-      final status = row['status'] as String;
-      final sourceState = row['source_state'] as String;
-      insertMissing.execute([
-        _sourceStatusId(sourcePath),
-        _sourceTypeLabel(sourcePath),
-        sourcePath,
-        sourcePath,
-        sourcePath,
-        status,
-        sourceState,
-        status == SessionFileStatus.parseError.wireName
-            ? 'parse_error'
-            : 'available',
-        now,
-        now,
-        now,
-      ]);
-    }
-  } finally {
-    insertMissing.close();
-    db.execute('delete from temp_scan_statuses');
-  }
-}
-
 List<SessionRowViewModel> _loadRows(
   Database db, {
   bool includeMessages = false,
   String? sessionId,
+  List<String>? sessionIds,
   int? limit,
   int offset = 0,
   UsagePricingCatalog pricing = const UsagePricingCatalog({}),
 }) {
   final query = sessionListQuery(
     sessionId: sessionId,
+    sessionIds: sessionIds,
     limit: limit,
     offset: offset,
   );
   final rows = db.select(query.sql, query.parameters);
-  final sessionIds = [for (final row in rows) row['id'] as String];
-  final tagsBySessionId = _loadTagsBySessionId(db, sessionIds);
+  final loadedSessionIds = [for (final row in rows) row['id'] as String];
+  final tagsBySessionId = _loadTagsBySessionId(db, loadedSessionIds);
   final persistedCosts = UsageSummaryRepository(db).loadPersistedSessionCosts(
-    sessionIds,
+    loadedSessionIds,
     projectionVersion: CodexSessionParser.currentVersion,
   );
   return [
@@ -3944,96 +2268,6 @@ String _cleanDisplaySummary(String? value) {
   return trimmed;
 }
 
-Future<Map<String, CodexThreadNameEntry>> _readSessionIndexThreadNames(
-  PathSettings paths,
-) {
-  return Profiling.spanAsync('scan.runtime.read_session_index_names', () async {
-    final reader = CodexSessionIndexReader();
-    final results = await Future.wait([
-      reader.read(File(p.join(paths.windowsCodexPath, 'session_index.jsonl'))),
-      reader.read(File(p.join(paths.wslCodexUncPath, 'session_index.jsonl'))),
-    ]);
-    final merged = <String, CodexThreadNameEntry>{};
-    for (final result in results) {
-      for (final entry in result.entriesById.values) {
-        final previous = merged[entry.id];
-        if (previous == null ||
-            _isNewerThreadNameEntry(
-              entry.updatedAtUtc,
-              previous.updatedAtUtc,
-            )) {
-          merged[entry.id] = entry;
-        }
-      }
-    }
-    return merged;
-  });
-}
-
-bool _isNewerThreadNameEntry(DateTime? candidate, DateTime? previous) {
-  if (candidate == null) {
-    return previous == null;
-  }
-  if (previous == null) {
-    return true;
-  }
-  return candidate.isAfter(previous);
-}
-
-Set<String> _applySessionIndexThreadNames(
-  Database db,
-  Map<String, CodexThreadNameEntry> threadNamesBySessionId,
-) {
-  if (threadNamesBySessionId.isEmpty) {
-    return const {};
-  }
-  final changedIds = <String>{};
-  db.execute('begin immediate');
-  try {
-    for (final entry in threadNamesBySessionId.values) {
-      final threadName = entry.threadName.trim();
-      if (threadName.isEmpty) {
-        continue;
-      }
-      final rows = db.select(
-        '''
-        select rowid, id, thread_name
-        from sessions
-        where session_id = ? ${_codexRowsOnly(db)}
-        ''',
-        [entry.id],
-      );
-      for (final row in rows) {
-        if ((row['thread_name'] as String? ?? '') == threadName) {
-          continue;
-        }
-        final rowid = row['rowid'] as int;
-        db.execute('update sessions set thread_name = ? where rowid = ?', [
-          threadName,
-          rowid,
-        ]);
-        changedIds.add(row['id'] as String);
-      }
-    }
-    db.execute('commit');
-  } on Object {
-    db.execute('rollback');
-    rethrow;
-  }
-  return changedIds;
-}
-
-/// `and harness = 'codex'` once schema 18 records the harness; session IDs
-/// are only unique per harness, and this writer owns Codex sessions.
-String _codexRowsOnly(Database db) {
-  final hasHarness = db
-      .select(
-        "select 1 from pragma_table_info('sessions') where name = 'harness'",
-      )
-      .isNotEmpty;
-  return hasHarness ? "and harness = 'codex'" : '';
-}
-
 void _cleanSessionMetadataPlaceholders(Database db) {
   final rows = db.select('''
     select
@@ -4135,69 +2369,6 @@ Future<void> _backfillAutomaticProjects(
   _applyResolvedProjectRows(db, resolvedRows);
 }
 
-typedef _ParsedProjectCandidate = ({
-  String sessionId,
-  String? workingDirectory,
-  SessionSourceType sourceType,
-});
-
-Future<void> _applyResolvedProjectsForParsedCandidates(
-  Database db,
-  Iterable<_ParsedProjectCandidate> parsedCandidates, {
-  required _WslProjectResolutionCache wslProjects,
-  required Future<void> Function(Future<void> Function()) write,
-}) async {
-  final sessionIds = parsedCandidates
-      .map((candidate) => candidate.sessionId)
-      .toSet()
-      .toList(growable: false);
-  if (sessionIds.isEmpty) {
-    return;
-  }
-  final candidates = <_ParsedProjectCandidate>[];
-  const queryBatchSize = 500;
-  for (var offset = 0; offset < sessionIds.length; offset += queryBatchSize) {
-    final end = math.min(offset + queryBatchSize, sessionIds.length);
-    final batch = sessionIds.sublist(offset, end);
-    final parameters = List.filled(batch.length, '?').join(', ');
-    for (final row in db.select('''
-      select id, working_directory_display, source_type
-      from sessions
-      where id in ($parameters)
-      ''', batch)) {
-      candidates.add((
-        sessionId: row['id'] as String,
-        workingDirectory: row['working_directory_display'] as String?,
-        sourceType: row['source_type'] == 'wsl'
-            ? SessionSourceType.wsl
-            : SessionSourceType.windows,
-      ));
-    }
-  }
-  final resolver = await _ProjectPathResolver.create([
-    for (final candidate in candidates)
-      _ProjectPathCandidate(candidate.workingDirectory, candidate.sourceType),
-  ], wslProjects: wslProjects);
-  final resolvedRows = <({String sessionId, String projectName})>[];
-  for (final candidate in candidates) {
-    final autoProject = resolver.resolve(
-      candidate.workingDirectory,
-      sourceType: candidate.sourceType,
-    );
-    final projectName = autoProject?.name.trim() ?? '';
-    if (projectName.isNotEmpty) {
-      resolvedRows.add((
-        sessionId: candidate.sessionId,
-        projectName: projectName,
-      ));
-    }
-  }
-  if (resolvedRows.isEmpty) {
-    return;
-  }
-  await write(() async => _applyResolvedProjectRows(db, resolvedRows));
-}
-
 void _applyResolvedProjectRows(
   Database db,
   List<({String sessionId, String projectName})> resolvedRows,
@@ -4238,20 +2409,6 @@ class _ProjectPathCandidate {
 
   final String? workingDirectory;
   final SessionSourceType sourceType;
-}
-
-Iterable<_ProjectPathCandidate> _projectPathCandidatesForSessions(
-  Iterable<ScannedSessionFile> sessions,
-) sync* {
-  for (final session in sessions) {
-    yield _ProjectPathCandidate(
-      session.parsedSession.workingDirectoryDisplay,
-      session.sourceType,
-    );
-    for (final event in session.parsedSession.usageEvents) {
-      yield _ProjectPathCandidate(event.workingDirectory, session.sourceType);
-    }
-  }
 }
 
 class _WslProjectResolutionCache {
@@ -4511,16 +2668,6 @@ int _defaultParserWorkerCount() {
   return math.min(8, processors - 1);
 }
 
-int _defaultDirectoryWorkerCount() {
-  final processors = Platform.numberOfProcessors;
-  return math.min(8, math.max(2, processors ~/ 2));
-}
-
-int _defaultMetadataWorkerCount() {
-  final processors = Platform.numberOfProcessors;
-  return math.min(64, math.max(16, processors * 4));
-}
-
 String _estimatedEta(ScanProgress progress) {
   final percent = _estimatedProgressPercent(progress);
   if (percent >= 100) {
@@ -4546,36 +2693,8 @@ String _estimatedEta(ScanProgress progress) {
 String _plural(int count, String label) =>
     '$count $label${count == 1 ? '' : 's'}';
 
-SessionFileStatus _scanStatus(String? value) {
-  for (final status in SessionFileStatus.values) {
-    if (status.wireName == value) {
-      return status;
-    }
-  }
-  return SessionFileStatus.available;
-}
-
-SessionSourceState _sourceState(String? value) {
-  for (final state in SessionSourceState.values) {
-    if (state.wireName == value) {
-      return state;
-    }
-  }
-  return SessionSourceState.active;
-}
-
 DateTime? _dateTime(String? value) =>
     value == null ? null : DateTime.tryParse(value)?.toUtc();
-
-String _sourceStatusId(String sourcePath) =>
-    'source-status:${p.normalize(sourcePath).toLowerCase()}';
-
-String _sourceTypeLabel(String sourcePath) {
-  if (sourcePath.startsWith(r'\\wsl') || sourcePath.contains('/home/')) {
-    return 'wsl';
-  }
-  return 'windows';
-}
 
 List<String> _decodeMembership(String? encoded) {
   if (encoded == null || encoded.isEmpty) {

@@ -9,6 +9,7 @@ import '../../commands/resume_command_generator.dart';
 import '../../commands/windows_command_line.dart';
 import '../../config/app_settings.dart';
 import '../../export/session_list_exporter.dart';
+import '../dialogs/delayed_export_progress.dart';
 import '../../voice_over/voice_over_service.dart';
 import '../copy_shortcut.dart';
 import '../../usage/usage_summary.dart';
@@ -102,6 +103,12 @@ typedef SessionTableStateChanged = void Function(SessionTableSettings);
 typedef SessionMarkdownExportCallback =
     Future<void> Function(SessionRowViewModel row, String markdown);
 typedef SessionListCsvExportCallback = Future<void> Function(String csv);
+typedef SessionListExportMessageLoader =
+    Future<Map<String, List<ConversationMessageViewModel>>> Function(
+      List<String> sessionIds, {
+      required bool includeFirstMessage,
+      required bool includeLastMessage,
+    });
 typedef SessionMessagePageLoader =
     Future<List<ConversationMessageViewModel>> Function(
       String sessionId,
@@ -146,6 +153,7 @@ class SessionsScreen extends StatefulWidget {
     this.onCopyText,
     this.onExportMarkdown,
     this.onSaveSessionListCsv,
+    this.onLoadSessionListExportMessages,
     this.onLoadSessionDetail,
     this.onReloadSessionDetailFromSource,
     this.onLoadMessagePage,
@@ -158,6 +166,7 @@ class SessionsScreen extends StatefulWidget {
     this.initialStatusMessage = '',
     this.autoRefreshToken = 0,
     this.pricingRevision = 0,
+    this.externalRevision = 0,
     this.pricingUpdating = false,
     this.onLoadPersistedCosts,
     this.openTarget,
@@ -178,6 +187,7 @@ class SessionsScreen extends StatefulWidget {
   final DetailCopyCallback? onCopyText;
   final SessionMarkdownExportCallback? onExportMarkdown;
   final SessionListCsvExportCallback? onSaveSessionListCsv;
+  final SessionListExportMessageLoader? onLoadSessionListExportMessages;
   final SessionDetailLoader? onLoadSessionDetail;
   final SessionDetailLoader? onReloadSessionDetailFromSource;
   final SessionMessagePageLoader? onLoadMessagePage;
@@ -194,6 +204,7 @@ class SessionsScreen extends StatefulWidget {
   final String initialStatusMessage;
   final int autoRefreshToken;
   final int pricingRevision;
+  final int externalRevision;
   final bool pricingUpdating;
   final Future<Map<String, UsageCostEstimate>?> Function(Iterable<String>)?
   onLoadPersistedCosts;
@@ -213,7 +224,7 @@ class SessionsScreen extends StatefulWidget {
 class _SessionsScreenState extends State<SessionsScreen> {
   static const _detailPaneMinWidth = 360.0;
   static const _minimumTablePaneWidth = 520.0;
-  static const _splitDividerWidth = 7.0;
+  static const _splitDividerWidth = 9.0;
   static const _filterDebounceDuration = Duration(milliseconds: 220);
   static const _synchronousTextFilterRowLimit = 200;
 
@@ -229,6 +240,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _platformFilter = SessionsPlatformFilter.both;
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
   var _originFilter = _defaultOriginFilter;
+  String? _harnessFilter;
   var _timeFilter = _defaultTimeFilter;
   ({int start, int? end})? _timeWindowCache;
   SessionsTimeFilter? _timeWindowCacheFilter;
@@ -259,10 +271,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
   String? _selectedId;
   var _detailTab = SessionDetailTab.conversation;
 
-  /// Width of the table pane chosen by dragging the split, or null for the
-  /// default split.
-  double? _tablePaneWidthOverride;
+  /// Saved share of the available width, or null for the default split.
+  double? _tablePaneFraction;
   String? _loadingDetailId;
+  String? _pendingExternalDetailId;
   var _rowMotionIds = <String>{};
   var _rowMotionGeneration = 0;
   final _expandedParentIds = <String>{};
@@ -303,6 +315,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         (widget.settings ?? AppSettings.defaults()).ui.sessionTable;
     _columnWidths = Map.of(tableState.columnWidths);
     _sorts = _normalizedSorts(tableState.sorts);
+    _tablePaneFraction = tableState.paneFraction;
     _newestPerProjectOnly = tableState.newestPerProjectOnly;
     _scanAnnouncement = widget.initialStatusMessage;
     _handledAutoRefreshToken = widget.autoRefreshToken;
@@ -335,10 +348,27 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _pricingInvalidated = true;
       _queuePersistedCostRefresh();
     }
-    if (!_hasRefreshOwnedRows && oldWidget.initialRows != widget.initialRows) {
-      _replaceRows(widget.initialRows);
+    if ((!_hasRefreshOwnedRows || widget.externalRevision > 0) &&
+        oldWidget.initialRows != widget.initialRows) {
+      final previouslySelectedId = _selectedId;
+      final selectedChanged =
+          previouslySelectedId != null &&
+          !identical(
+            oldWidget.initialRows
+                .where((row) => row.id == previouslySelectedId)
+                .firstOrNull,
+            widget.initialRows
+                .where((row) => row.id == previouslySelectedId)
+                .firstOrNull,
+          );
+      _replaceRows(widget.initialRows, external: widget.externalRevision > 0);
       _retainSelection();
       _tryApplyPendingOpenTarget();
+      if (widget.externalRevision > 0 &&
+          selectedChanged &&
+          _selectedId == previouslySelectedId) {
+        unawaited(_loadSelectedDetail(_selectedId!, force: true));
+      }
     }
     if (!_isScanning &&
         oldWidget.initialStatusMessage != widget.initialStatusMessage) {
@@ -483,6 +513,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
                             timeFilter: _timeFilter,
                             archivedFilter: _archivedFilter,
                             originFilter: _originFilter,
+                            harnessFilter: _harnessFilter,
+                            onHarnessChanged: (value) =>
+                                _updateFilter(() => _harnessFilter = value),
                             newestPerProjectOnly: _newestPerProjectOnly,
                             namedOnly: _namedOnly,
                             projectFilter: _projectFilter,
@@ -600,13 +633,18 @@ class _SessionsScreenState extends State<SessionsScreen> {
                     ),
                     _SplitHandle(
                       onDrag: (delta) => setState(() {
-                        _tablePaneWidthOverride = _clampTablePaneWidth(
+                        final width = _clampTablePaneWidth(
                           tablePaneWidth + delta,
                           constraints.maxWidth,
                         );
+                        _tablePaneFraction =
+                            width / (constraints.maxWidth - _splitDividerWidth);
                       }),
-                      onReset: () =>
-                          setState(() => _tablePaneWidthOverride = null),
+                      onDragEnd: _emitTableState,
+                      onReset: () {
+                        setState(() => _tablePaneFraction = null);
+                        _emitTableState();
+                      },
                     ),
                     Expanded(
                       child: _SessionDetailPlaceholder(
@@ -677,9 +715,12 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (!availableWidth.isFinite) {
       return tableWidth;
     }
-    final override = _tablePaneWidthOverride;
-    if (override != null) {
-      return _clampTablePaneWidth(override, availableWidth);
+    final fraction = _tablePaneFraction;
+    if (fraction != null) {
+      return _clampTablePaneWidth(
+        fraction * (availableWidth - _splitDividerWidth),
+        availableWidth,
+      );
     }
     // By default the detail pane gets at least 45% of the width, so the
     // conversation and stats stay readable next to a wide table.
@@ -724,6 +765,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final inputs = <Object?>[
       _rows,
       _platformFilter,
+      _harnessFilter,
       _archivedFilter,
       _originFilter,
       _timeFilter,
@@ -1118,6 +1160,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   bool _matchesFacets(SessionRowViewModel row) {
+    if (_harnessFilter != null && row.harness != _harnessFilter) return false;
     final project = _projectFilter;
     if (project != null && row.project.trim() != project) {
       return false;
@@ -1366,6 +1409,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _pathController.text.trim().isNotEmpty ||
         _threadNameController.text.trim().isNotEmpty ||
         _platformFilter != SessionsPlatformFilter.both ||
+        _harnessFilter != null ||
         _timeFilter != _defaultTimeFilter ||
         _archivedFilter != SessionsArchivedFilter.activeOnly ||
         _originFilter != _defaultOriginFilter ||
@@ -1523,6 +1567,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _threadNameController.clear();
         _applyClearedTextFilters();
         _platformFilter = SessionsPlatformFilter.both;
+        _harnessFilter = null;
         _timeFilter = SessionsTimeFilter.allTime;
         _archivedFilter = SessionsArchivedFilter.all;
         _originFilter = SessionsOriginFilter.all;
@@ -1564,15 +1609,17 @@ class _SessionsScreenState extends State<SessionsScreen> {
     });
   }
 
-  Future<void> _loadSelectedDetail(String id) async {
+  Future<void> _loadSelectedDetail(String id, {bool force = false}) async {
     final loader = widget.onLoadSessionDetail;
-    if (loader == null || _loadingDetailId == id) {
+    if (loader == null) return;
+    if (_loadingDetailId == id) {
+      if (force) _pendingExternalDetailId = id;
       return;
     }
     final row = _rowById(id);
     if (row == null ||
         row.messageCount == 0 ||
-        row.conversationMessages.isNotEmpty) {
+        (!force && row.conversationMessages.isNotEmpty)) {
       return;
     }
     setState(() {
@@ -1598,6 +1645,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
         setState(() {
           _loadingDetailId = null;
         });
+        if (_pendingExternalDetailId == id && _selectedId == id) {
+          _pendingExternalDetailId = null;
+          unawaited(_loadSelectedDetail(id, force: true));
+        }
       }
     }
   }
@@ -1642,7 +1693,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
   void _watchSelectedSessionFile(SessionRowViewModel? row) {
     _selectedDetailWatchGeneration++;
     final path = row?.sourceFilePath.trim() ?? '';
-    if (path.isEmpty ||
+    // Source-file reparsing is the Codex parser path. Other harnesses refresh
+    // through collector commits and the external-ingestion snapshot watcher.
+    if (row?.harness != 'codex' ||
+        path.isEmpty ||
         widget.onReloadSessionDetailFromSource == null &&
             widget.onLoadSessionDetail == null) {
       _stopSelectedSessionFileWatch(incrementGeneration: false);
@@ -1776,6 +1830,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _threadNameController.clear();
         _applyClearedTextFilters();
         _platformFilter = SessionsPlatformFilter.both;
+        _harnessFilter = null;
         _timeFilter = _defaultTimeFilter;
         _archivedFilter = SessionsArchivedFilter.activeOnly;
         _originFilter = _defaultOriginFilter;
@@ -1816,6 +1871,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _threadNameController.clear();
       _applyClearedTextFilters();
       _platformFilter = SessionsPlatformFilter.both;
+      _harnessFilter = null;
       _timeFilter = SessionsTimeFilter.allTime;
       _archivedFilter = SessionsArchivedFilter.all;
       _originFilter = SessionsOriginFilter.all;
@@ -1994,13 +2050,20 @@ class _SessionsScreenState extends State<SessionsScreen> {
         );
       return;
     }
-    final loadAll = widget.onLoadAllMessages;
-    final messages =
-        loadAll != null &&
-            row.conversationMessages.any((message) => !message.isBodyLoaded)
-        ? await loadAll(row.id)
-        : row.conversationMessages;
-    await export(row, sessionConversationMarkdown(row, messages));
+    final markdown = await runWithDelayedExportProgress(
+      context,
+      label: 'Preparing Markdown',
+      operation: () async {
+        final loadAll = widget.onLoadAllMessages;
+        final messages =
+            loadAll != null &&
+                row.conversationMessages.any((message) => !message.isBodyLoaded)
+            ? await loadAll(row.id)
+            : row.conversationMessages;
+        return sessionConversationMarkdown(row, messages);
+      },
+    );
+    await export(row, markdown);
   }
 
   /// Runs a terminal command shown in the detail pane, possibly edited by
@@ -2074,13 +2137,22 @@ class _SessionsScreenState extends State<SessionsScreen> {
     );
     switch (action) {
       case _SessionListAction.copyMarkdown:
-        final markdown = exporter.exportMarkdown(rows);
-        final copy = widget.onCopyText;
-        if (copy == null) {
-          await Clipboard.setData(ClipboardData(text: markdown));
-        } else {
-          await copy(markdown);
-        }
+        await runWithDelayedExportProgress(
+          context,
+          label: 'Copying Markdown',
+          operation: () async {
+            final markdown = await formatSessionListMarkdown(
+              exporter.settings,
+              rows,
+            );
+            final copy = widget.onCopyText;
+            if (copy == null) {
+              await Clipboard.setData(ClipboardData(text: markdown));
+            } else {
+              await copy(markdown);
+            }
+          },
+        );
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -2098,18 +2170,25 @@ class _SessionsScreenState extends State<SessionsScreen> {
           return;
         }
         try {
-          final exportRows = await _loadExtendedMarkdownRows(rows, options);
-          final markdown = exporter.exportMarkdown(
-            exportRows,
-            includeFirstMessage: options.includeFirstMessage,
-            includeLastMessage: options.includeLastMessage,
+          await runWithDelayedExportProgress(
+            context,
+            label: 'Copying extended Markdown',
+            operation: () async {
+              final exportRows = await _loadExtendedMarkdownRows(rows, options);
+              final markdown = await formatSessionListMarkdown(
+                exporter.settings,
+                exportRows,
+                includeFirstMessage: options.includeFirstMessage,
+                includeLastMessage: options.includeLastMessage,
+              );
+              final copy = widget.onCopyText;
+              if (copy == null) {
+                await Clipboard.setData(ClipboardData(text: markdown));
+              } else {
+                await copy(markdown);
+              }
+            },
           );
-          final copy = widget.onCopyText;
-          if (copy == null) {
-            await Clipboard.setData(ClipboardData(text: markdown));
-          } else {
-            await copy(markdown);
-          }
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -2206,54 +2285,16 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (!options.includeFirstMessage && !options.includeLastMessage) {
       return rows;
     }
-    final loadedRows = <SessionRowViewModel>[];
-    for (final row in rows) {
-      var messages = row.conversationMessages;
-      if (messages.isEmpty && widget.onLoadSessionDetail != null) {
-        final detail = await widget.onLoadSessionDetail!(row.id);
-        messages = detail?.conversationMessages ?? const [];
-      }
-      if (messages.isNotEmpty && widget.onLoadMessagePage != null) {
-        messages = await _loadRequestedMessageBodies(row.id, messages, options);
-      }
-      loadedRows.add(row.copyWithConversationMessages(messages));
-    }
-    return loadedRows;
-  }
-
-  Future<List<ConversationMessageViewModel>> _loadRequestedMessageBodies(
-    String sessionId,
-    List<ConversationMessageViewModel> messages,
-    _SessionListMarkdownOptions options,
-  ) async {
-    final ordered = [...messages]
-      ..sort((left, right) => left.number.compareTo(right.number));
-    final replacements = <int, ConversationMessageViewModel>{};
-    for (final candidates in [
-      if (options.includeFirstMessage)
-        ordered.where((message) => message.author == ConversationAuthor.user),
-      if (options.includeLastMessage) ordered.reversed,
-    ]) {
-      for (final candidate in candidates) {
-        var message = replacements[candidate.number] ?? candidate;
-        if (!message.isBodyLoaded) {
-          final page = await widget.onLoadMessagePage!(
-            sessionId,
-            message.number,
-          );
-          for (final loaded in page) {
-            replacements[loaded.number] = loaded;
-          }
-          message = replacements[candidate.number] ?? candidate;
-        }
-        if (SessionListExporter.messageContent(message) != null) break;
-      }
-    }
-    if (replacements.isEmpty) {
-      return messages;
-    }
+    final endpointLoader = widget.onLoadSessionListExportMessages;
+    if (endpointLoader == null) return rows;
+    final endpoints = await endpointLoader(
+      [for (final row in rows) row.id],
+      includeFirstMessage: options.includeFirstMessage,
+      includeLastMessage: options.includeLastMessage,
+    );
     return [
-      for (final message in messages) replacements[message.number] ?? message,
+      for (final row in rows)
+        row.copyWithConversationMessages(endpoints[row.id] ?? const []),
     ];
   }
 
@@ -2288,6 +2329,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         ).build(
           ResumeCommandSession(
             sessionId: row.sessionId,
+            harness: row.harness,
             sourceType: row.platform == SessionRowPlatform.wsl
                 ? ResumeSessionSourceType.wsl
                 : ResumeSessionSourceType.windows,
@@ -2521,6 +2563,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         columnWidths: Map.unmodifiable(_columnWidths),
         sorts: List.unmodifiable(_sorts),
         newestPerProjectOnly: _newestPerProjectOnly,
+        paneFraction: _tablePaneFraction,
       ),
     );
   }
@@ -2696,7 +2739,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     }
   }
 
-  void _replaceRows(List<SessionRowViewModel> rows) {
+  void _replaceRows(List<SessionRowViewModel> rows, {bool external = false}) {
     final previousById = {for (final row in _rows) row.id: row};
     final loadedMessagesById = {
       for (final row in _rows)
@@ -2706,6 +2749,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final nextRows = _dedupeSessionSnapshots([
       for (final row in rows)
         if (row.conversationMessages.isEmpty &&
+            row.messageCount > 0 &&
+            (!external || row.id == _selectedId) &&
             loadedMessagesById.containsKey(row.id))
           row.copyWithConversationMessages(loadedMessagesById[row.id]!)
         else
@@ -2860,6 +2905,8 @@ class _SessionTextFilterRowData {
       path: row.path.replaceAll(r'\', '/').toLowerCase(),
       threadName: row.threadName.toLowerCase(),
       searchFields: [
+        row.sessionId,
+        row.id,
         row.title,
         row.summary,
         row.project,
@@ -3253,6 +3300,8 @@ class _FilterBar extends StatefulWidget {
     required this.timeFilter,
     required this.archivedFilter,
     required this.originFilter,
+    required this.harnessFilter,
+    required this.onHarnessChanged,
     required this.newestPerProjectOnly,
     required this.namedOnly,
     required this.projectFilter,
@@ -3287,6 +3336,8 @@ class _FilterBar extends StatefulWidget {
   final SessionsTimeFilter timeFilter;
   final SessionsArchivedFilter archivedFilter;
   final SessionsOriginFilter originFilter;
+  final String? harnessFilter;
+  final ValueChanged<String?> onHarnessChanged;
   final bool newestPerProjectOnly;
   final bool namedOnly;
   final String? projectFilter;
@@ -3395,18 +3446,16 @@ class _FilterBarState extends State<_FilterBar> {
         ),
       ),
     );
-    final time = _FilterSemantics(
-      label: 'Time range filter',
-      child: _FilterMenuButton<SessionsTimeFilter>(
-        key: ValueKey('time-filter-${widget.timeFilter.name}'),
-        label: 'Time',
-        value: widget.timeFilter,
-        isActive: widget.timeFilter != _defaultTimeFilter,
-        options: [
-          for (final value in SessionsTimeFilter.values) (value, value.label),
-        ],
-        onSelected: widget.onTimeChanged,
-      ),
+    final time = _FilterMenuButton<SessionsTimeFilter>(
+      semanticsLabel: 'Time range filter',
+      key: ValueKey('time-filter-${widget.timeFilter.name}'),
+      label: 'Time',
+      value: widget.timeFilter,
+      isActive: widget.timeFilter != _defaultTimeFilter,
+      options: [
+        for (final value in SessionsTimeFilter.values) (value, value.label),
+      ],
+      onSelected: widget.onTimeChanged,
     );
     final refresh = AppButton.elevated(
       onPressed: widget.isCancellingRefresh ? null : widget.onRefresh,
@@ -3418,75 +3467,78 @@ class _FilterBarState extends State<_FilterBar> {
       runSpacing: 6,
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
-        _FilterSemantics(
-          label: 'Project filter',
-          child: _FilterMenuButton<String?>(
-            label: 'Project',
-            value: widget.projectFilter,
-            isActive: widget.projectFilter != null,
-            options: [
-              (null, 'All projects'),
-              for (final project in widget.projectOptions) (project, project),
-            ],
-            onSelected: widget.onProjectChanged,
-          ),
+        _FilterMenuButton<String?>(
+          semanticsLabel: 'Project filter',
+          label: 'Project',
+          value: widget.projectFilter,
+          isActive: widget.projectFilter != null,
+          options: [
+            (null, 'All projects'),
+            for (final project in widget.projectOptions) (project, project),
+          ],
+          onSelected: widget.onProjectChanged,
         ),
-        _FilterSemantics(
-          label: 'Model filter',
-          child: _FilterMenuButton<String?>(
-            label: 'Model',
-            value: widget.modelFilter,
-            isActive: widget.modelFilter != null,
-            options: [
-              (null, 'All models'),
-              for (final model in widget.modelOptions) (model, model),
-            ],
-            onSelected: widget.onModelChanged,
-          ),
+        _FilterMenuButton<String?>(
+          semanticsLabel: 'Model filter',
+          label: 'Model',
+          value: widget.modelFilter,
+          isActive: widget.modelFilter != null,
+          options: [
+            (null, 'All models'),
+            for (final model in widget.modelOptions) (model, model),
+          ],
+          onSelected: widget.onModelChanged,
         ),
         if (widget.tagOptions.isNotEmpty || widget.tagFilter != null)
-          _FilterSemantics(
-            label: 'Tag filter',
-            child: _FilterMenuButton<String?>(
-              label: 'Tag',
-              value: widget.tagFilter,
-              isActive: widget.tagFilter != null,
-              options: [
-                (null, 'All tags'),
-                for (final tag in widget.tagOptions) (tag, tag),
-              ],
-              onSelected: widget.onTagChanged,
-            ),
-          ),
-        _FilterSemantics(
-          label: 'Platform filter',
-          child: _FilterMenuButton<SessionsPlatformFilter>(
-            key: ValueKey(widget.platformFilter),
-            label: 'Platform',
-            value: widget.platformFilter,
-            isActive: widget.platformFilter != SessionsPlatformFilter.both,
+          _FilterMenuButton<String?>(
+            semanticsLabel: 'Tag filter',
+            label: 'Tag',
+            value: widget.tagFilter,
+            isActive: widget.tagFilter != null,
             options: [
-              for (final value in SessionsPlatformFilter.values)
-                (value, value.label),
+              (null, 'All tags'),
+              for (final tag in widget.tagOptions) (tag, tag),
             ],
-            onSelected: widget.onPlatformChanged,
+            onSelected: widget.onTagChanged,
           ),
+        _FilterMenuButton<String>(
+          semanticsLabel: 'Harness filter',
+          label: 'Harness',
+          value: widget.harnessFilter ?? '',
+          isActive: widget.harnessFilter != null,
+          options: const [
+            ('', 'All harnesses'),
+            ('codex', 'Codex'),
+            ('claude', 'Claude Code'),
+          ],
+          onSelected: (value) =>
+              widget.onHarnessChanged(value.isEmpty ? null : value),
         ),
-        _FilterSemantics(
-          label: 'Origin filter',
-          child: _FilterMenuButton<SessionsOriginFilter>(
-            key: ValueKey('origin-filter-${widget.originFilter.name}'),
-            label: 'Show',
-            value: widget.originFilter,
-            isActive: widget.originFilter != _defaultOriginFilter,
-            tooltip:
-                'Main sessions group their subagents under an expandable row.',
-            options: [
-              for (final value in SessionsOriginFilter.values)
-                (value, value.label),
-            ],
-            onSelected: widget.onOriginChanged,
-          ),
+        _FilterMenuButton<SessionsPlatformFilter>(
+          semanticsLabel: 'Platform filter',
+          key: ValueKey(widget.platformFilter),
+          label: 'Platform',
+          value: widget.platformFilter,
+          isActive: widget.platformFilter != SessionsPlatformFilter.both,
+          options: [
+            for (final value in SessionsPlatformFilter.values)
+              (value, value.label),
+          ],
+          onSelected: widget.onPlatformChanged,
+        ),
+        _FilterMenuButton<SessionsOriginFilter>(
+          semanticsLabel: 'Origin filter',
+          key: ValueKey('origin-filter-${widget.originFilter.name}'),
+          label: 'Show',
+          value: widget.originFilter,
+          isActive: widget.originFilter != _defaultOriginFilter,
+          tooltip:
+              'Main sessions group their subagents under an expandable row.',
+          options: [
+            for (final value in SessionsOriginFilter.values)
+              (value, value.label),
+          ],
+          onSelected: widget.onOriginChanged,
         ),
         Semantics(
           button: true,
@@ -3494,6 +3546,7 @@ class _FilterBarState extends State<_FilterBar> {
           label: hiddenActiveCount == 0
               ? 'More filters'
               : 'More filters, $hiddenActiveCount active',
+          onTap: () => setState(() => _showMore = !showMore),
           child: ExcludeSemantics(
             child: AppButton.text(
               onPressed: () => setState(() => _showMore = !showMore),
@@ -3526,23 +3579,20 @@ class _FilterBarState extends State<_FilterBar> {
             runSpacing: 6,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              _FilterSemantics(
-                label: 'Viewer archive filter',
-                child: _FilterMenuButton<SessionsArchivedFilter>(
-                  key: ValueKey(widget.archivedFilter),
-                  label: 'Archived in viewer',
-                  value: widget.archivedFilter,
-                  isActive:
-                      widget.archivedFilter !=
-                      SessionsArchivedFilter.activeOnly,
-                  tooltip:
-                      'Sessions you archived in this viewer. Codex files are not changed.',
-                  options: [
-                    for (final value in SessionsArchivedFilter.values)
-                      (value, value.label),
-                  ],
-                  onSelected: widget.onArchivedChanged,
-                ),
+              _FilterMenuButton<SessionsArchivedFilter>(
+                semanticsLabel: 'Viewer archive filter',
+                key: ValueKey(widget.archivedFilter),
+                label: 'Archived in viewer',
+                value: widget.archivedFilter,
+                isActive:
+                    widget.archivedFilter != SessionsArchivedFilter.activeOnly,
+                tooltip:
+                    'Sessions you archived in this viewer. Codex files are not changed.',
+                options: [
+                  for (final value in SessionsArchivedFilter.values)
+                    (value, value.label),
+                ],
+                onSelected: widget.onArchivedChanged,
               ),
               _ToggleFilterChip(
                 semanticsLabel: 'Named sessions only filter',
@@ -3718,6 +3768,11 @@ class _FilterBarState extends State<_FilterBar> {
           widget.platformFilter.label,
           () => widget.onPlatformChanged(SessionsPlatformFilter.both),
         ),
+      if (widget.harnessFilter != null)
+        _ActiveFilterChip(
+          widget.harnessFilter == 'claude' ? 'Claude Code' : 'Codex',
+          () => widget.onHarnessChanged(null),
+        ),
       if (widget.originFilter != _defaultOriginFilter)
         _ActiveFilterChip(
           widget.originFilter.label,
@@ -3803,9 +3858,10 @@ extension on SessionsArchivedFilter {
 
 /// A compact dropdown that shows its label and current value, and highlights
 /// itself when set to a non-default value.
-class _FilterMenuButton<T> extends StatelessWidget {
+class _FilterMenuButton<T> extends StatefulWidget {
   const _FilterMenuButton({
     super.key,
+    required this.semanticsLabel,
     required this.label,
     required this.value,
     required this.options,
@@ -3814,6 +3870,7 @@ class _FilterMenuButton<T> extends StatelessWidget {
     this.tooltip,
   });
 
+  final String semanticsLabel;
   final String label;
   final T value;
   final List<(T, String)> options;
@@ -3822,70 +3879,89 @@ class _FilterMenuButton<T> extends StatelessWidget {
   final String? tooltip;
 
   @override
+  State<_FilterMenuButton<T>> createState() => _FilterMenuButtonState<T>();
+}
+
+class _FilterMenuButtonState<T> extends State<_FilterMenuButton<T>> {
+  final _menuKey = GlobalKey<PopupMenuButtonState<int>>();
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    var valueLabel = '$value';
-    for (final option in options) {
-      if (option.$1 == value) {
+    var valueLabel = '${widget.value}';
+    for (final option in widget.options) {
+      if (option.$1 == widget.value) {
         valueLabel = option.$2;
         break;
       }
     }
-    return PopupMenuButton<T>(
-      tooltip: tooltip ?? '$label: $valueLabel',
-      initialValue: value,
-      onSelected: onSelected,
-      constraints: const BoxConstraints(maxHeight: 420, minWidth: 180),
-      itemBuilder: (context) => [
-        for (final option in options)
-          CheckedPopupMenuItem<T>(
-            value: option.$1,
-            checked: option.$1 == value,
-            child: Text(option.$2),
+    final selectedIndex = widget.options.indexWhere(
+      (option) => option.$1 == widget.value,
+    );
+    return Semantics(
+      label: widget.semanticsLabel,
+      value: valueLabel,
+      button: true,
+      container: true,
+      excludeSemantics: true,
+      onTap: () => _menuKey.currentState?.showButtonMenu(),
+      child: PopupMenuButton<int>(
+        key: _menuKey,
+        tooltip: widget.tooltip ?? '${widget.label}: $valueLabel',
+        initialValue: selectedIndex < 0 ? null : selectedIndex,
+        onSelected: (index) => widget.onSelected(widget.options[index].$1),
+        constraints: const BoxConstraints(maxHeight: 420, minWidth: 180),
+        itemBuilder: (context) => [
+          for (final (index, option) in widget.options.indexed)
+            CheckedPopupMenuItem<int>(
+              value: index,
+              checked: option.$1 == widget.value,
+              child: Text(option.$2),
+            ),
+        ],
+        child: Container(
+          height: 32,
+          padding: const EdgeInsets.only(left: 10, right: 4),
+          decoration: BoxDecoration(
+            color: widget.isActive ? scheme.secondaryContainer : null,
+            border: Border.all(
+              color: widget.isActive ? scheme.secondary : scheme.outlineVariant,
+            ),
+            borderRadius: BorderRadius.circular(6),
           ),
-      ],
-      child: Container(
-        height: 32,
-        padding: const EdgeInsets.only(left: 10, right: 4),
-        decoration: BoxDecoration(
-          color: isActive ? scheme.secondaryContainer : null,
-          border: Border.all(
-            color: isActive ? scheme.secondary : scheme.outlineVariant,
-          ),
-          borderRadius: BorderRadius.circular(6),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              '$label: ',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: isActive
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '${widget.label}: ',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: widget.isActive
+                      ? scheme.onSecondaryContainer
+                      : scheme.onSurfaceVariant,
+                ),
+              ),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 180),
+                child: Text(
+                  valueLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    fontWeight: widget.isActive ? FontWeight.w600 : null,
+                    color: widget.isActive ? scheme.onSecondaryContainer : null,
+                  ),
+                ),
+              ),
+              Icon(
+                Icons.arrow_drop_down,
+                size: 18,
+                color: widget.isActive
                     ? scheme.onSecondaryContainer
                     : scheme.onSurfaceVariant,
               ),
-            ),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 180),
-              child: Text(
-                valueLabel,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  fontWeight: isActive ? FontWeight.w600 : null,
-                  color: isActive ? scheme.onSecondaryContainer : null,
-                ),
-              ),
-            ),
-            Icon(
-              Icons.arrow_drop_down,
-              size: 18,
-              color: isActive
-                  ? scheme.onSecondaryContainer
-                  : scheme.onSurfaceVariant,
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -3913,6 +3989,8 @@ class _ToggleFilterChip extends StatelessWidget {
       label: semanticsLabel,
       toggled: value,
       container: true,
+      excludeSemantics: true,
+      onTap: () => onChanged(!value),
       child: FilterChip(
         label: Text(label),
         tooltip: tooltip,
@@ -3922,23 +4000,6 @@ class _ToggleFilterChip extends StatelessWidget {
         labelStyle: Theme.of(context).textTheme.bodySmall,
         onSelected: onChanged,
       ),
-    );
-  }
-}
-
-class _FilterSemantics extends StatelessWidget {
-  const _FilterSemantics({required this.label, required this.child});
-
-  final String label;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    return Semantics(
-      label: label,
-      container: true,
-      explicitChildNodes: true,
-      child: child,
     );
   }
 }
@@ -3957,6 +4018,8 @@ class _SessionsHeading extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final countStyle = Theme.of(context).textTheme.bodySmall;
+    final actionsMenuKey =
+        GlobalKey<PopupMenuButtonState<_SessionListAction>>();
     return Row(
       children: [
         Semantics(
@@ -3980,7 +4043,10 @@ class _SessionsHeading extends StatelessWidget {
             label: 'Session list actions',
             button: true,
             container: true,
+            excludeSemantics: true,
+            onTap: () => actionsMenuKey.currentState?.showButtonMenu(),
             child: PopupMenuButton<_SessionListAction>(
+              key: actionsMenuKey,
               tooltip: 'Session list actions',
               onSelected: onAction,
               itemBuilder: (context) => [
@@ -4122,8 +4188,9 @@ class _HeaderCell extends StatelessWidget {
             child: Semantics(
               label: '${column.label} column$sortLabel',
               button: column.key != 'actions',
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
+              onTap: column.key == 'actions' ? null : _handleTap,
+              excludeSemantics: true,
+              child: InkWell(
                 onTap: column.key == 'actions' ? null : _handleTap,
                 onSecondaryTapDown: (_) => onShowSortOptions(context),
                 child: ExcludeSemantics(
@@ -4150,14 +4217,11 @@ class _HeaderCell extends StatelessWidget {
               ),
             ),
           ),
-          MouseRegion(
-            cursor: SystemMouseCursors.resizeLeftRight,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onHorizontalDragUpdate: (details) =>
-                  onResize(width + details.delta.dx),
-              child: const SizedBox(width: 8, height: double.infinity),
-            ),
+          _ColumnResizeHandle(
+            label: column.label,
+            width: width,
+            defaultWidth: column.defaultWidth,
+            onResize: onResize,
           ),
         ],
       ),
@@ -4177,6 +4241,75 @@ class _HeaderCell extends StatelessWidget {
       return;
     }
     onSortGesture(column.key, _SortGesture.replace);
+  }
+}
+
+class _ColumnResizeHandle extends StatefulWidget {
+  const _ColumnResizeHandle({
+    required this.label,
+    required this.width,
+    required this.defaultWidth,
+    required this.onResize,
+  });
+
+  final String label;
+  final double width;
+  final double defaultWidth;
+  final ValueChanged<double> onResize;
+
+  @override
+  State<_ColumnResizeHandle> createState() => _ColumnResizeHandleState();
+}
+
+class _ColumnResizeHandleState extends State<_ColumnResizeHandle> {
+  var _focused = false;
+
+  void _resize(double delta) => widget.onResize(widget.width + delta);
+
+  @override
+  Widget build(BuildContext context) {
+    final focusColor = Theme.of(context).focusColor;
+    return Semantics(
+      label: 'Resize ${widget.label} column',
+      value: '${widget.width.round()} pixels',
+      increasedValue: 'Wider ${widget.label} column',
+      decreasedValue: 'Narrower ${widget.label} column',
+      focusable: true,
+      button: true,
+      onIncrease: () => _resize(16),
+      onDecrease: () => _resize(-16),
+      onTap: () => widget.onResize(widget.defaultWidth),
+      child: ExcludeSemantics(
+        child: CallbackShortcuts(
+          bindings: {
+            const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
+                _resize(-16),
+            const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
+                _resize(16),
+            const SingleActivator(LogicalKeyboardKey.enter): () =>
+                widget.onResize(widget.defaultWidth),
+            const SingleActivator(LogicalKeyboardKey.space): () =>
+                widget.onResize(widget.defaultWidth),
+          },
+          child: Focus(
+            onFocusChange: (focused) => setState(() => _focused = focused),
+            child: MouseRegion(
+              cursor: SystemMouseCursors.resizeLeftRight,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onHorizontalDragUpdate: (details) => _resize(details.delta.dx),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: _focused ? focusColor : Colors.transparent,
+                  ),
+                  child: const SizedBox(width: 8, height: double.infinity),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -4406,7 +4539,9 @@ class _SessionsTable extends StatelessWidget {
     final child = Semantics(
       label: 'Session ${displayRow.accessibleLabel}. Status ${_rowState(row)}.',
       selected: selected,
+      button: true,
       container: true,
+      onTap: () => onSelect(row.id),
       child: InkWell(
         excludeFromSemantics: true,
         onTap: () => onSelect(row.id),
@@ -4517,7 +4652,7 @@ class _SessionsTable extends StatelessWidget {
       label,
       display,
       width: width,
-      semanticsText: exact,
+      semanticsText: display,
       tooltip: exact,
     );
   }
@@ -4554,6 +4689,8 @@ class _SessionsTable extends StatelessWidget {
               Semantics(
                 label: label,
                 button: true,
+                excludeSemantics: true,
+                onTap: () => onToggleSubagents(row.id),
                 child: IconButton(
                   key: Key('subagent-toggle-${row.id}'),
                   tooltip: label,
@@ -4572,6 +4709,7 @@ class _SessionsTable extends StatelessWidget {
                 label:
                     'Session identity $identity'
                     '${showProject ? ', project $project' : ''}',
+                value: 'Harness ${row.harnessLabel}',
                 container: true,
                 child: ExcludeSemantics(
                   child: Tooltip(
@@ -4583,10 +4721,25 @@ class _SessionsTable extends StatelessWidget {
                       mainAxisAlignment: MainAxisAlignment.center,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          identity,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                identity,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                row.harnessLabel,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.labelSmall,
+                              ),
+                            ),
+                          ],
                         ),
                         if (showProject)
                           Text(
@@ -4740,6 +4893,8 @@ class _PathCell extends StatelessWidget {
             Semantics(
               label: 'Copy path for $rowLabel',
               button: true,
+              excludeSemantics: true,
+              onTap: onCopy,
               child: IconButton(
                 tooltip: 'Copy path',
                 icon: const AppSvgIcon(AppIcons.copy),
@@ -4826,12 +4981,18 @@ class _TagsCell extends StatelessWidget {
           Semantics(
             label: 'Add tag to $rowLabel',
             button: true,
-            child: IconButton(
-              tooltip: 'Add tag',
-              icon: const Icon(Icons.add, size: 18),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints.tightFor(width: 30, height: 30),
-              onPressed: onAddTag,
+            onTap: onAddTag,
+            child: ExcludeSemantics(
+              child: IconButton(
+                tooltip: 'Add tag to $rowLabel',
+                icon: const Icon(Icons.add, size: 18),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints.tightFor(
+                  width: 30,
+                  height: 30,
+                ),
+                onPressed: onAddTag,
+              ),
             ),
           ),
         ],
@@ -4855,10 +5016,21 @@ class _ActionsMenu extends StatelessWidget {
   Widget build(BuildContext context) {
     final commandSet = _commandSet(row);
     final rowLabel = _rowAccessibleLabel(row);
+    final actionsMenuKey = GlobalKey<PopupMenuButtonState<SessionRowAction>>();
     final resumeReason =
         commandSet.terminalDisabledReason ??
         commandSet.disabledReason ??
         'Resume command unavailable.';
+    final openTerminalResume = commandSet.terminalLaunchCommand == null
+        ? null
+        : () => onAction(
+            SessionActionRequest(
+              row: row,
+              action: SessionRowAction.openTerminalResume,
+              payload: commandSet.terminalLaunchCommand,
+              launchSpec: commandSet.terminalLaunchSpec,
+            ),
+          );
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
@@ -4867,29 +5039,26 @@ class _ActionsMenu extends StatelessWidget {
               ? 'Open terminal and resume unavailable for $rowLabel: $resumeReason'
               : 'Open terminal and resume for $rowLabel',
           button: true,
-          child: IconButton(
-            tooltip: commandSet.terminalLaunchCommand == null
-                ? 'Resume unavailable: $resumeReason'
-                : 'Open terminal and resume',
-            icon: const AppSvgIcon(AppIcons.terminal),
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints.tightFor(width: 32, height: 32),
-            onPressed: commandSet.terminalLaunchCommand == null
-                ? null
-                : () => onAction(
-                    SessionActionRequest(
-                      row: row,
-                      action: SessionRowAction.openTerminalResume,
-                      payload: commandSet.terminalLaunchCommand,
-                      launchSpec: commandSet.terminalLaunchSpec,
-                    ),
-                  ),
+          onTap: openTerminalResume,
+          child: ExcludeSemantics(
+            child: IconButton(
+              tooltip: commandSet.terminalLaunchCommand == null
+                  ? 'Resume unavailable: $resumeReason'
+                  : 'Open terminal and resume for $rowLabel',
+              icon: const AppSvgIcon(AppIcons.terminal),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+              onPressed: openTerminalResume,
+            ),
           ),
         ),
         Semantics(
           label: 'More actions for $rowLabel',
           button: true,
+          excludeSemantics: true,
+          onTap: () => actionsMenuKey.currentState?.showButtonMenu(),
           child: PopupMenuButton<SessionRowAction>(
+            key: actionsMenuKey,
             tooltip: 'More actions',
             onSelected: (action) => onAction(
               SessionActionRequest(
@@ -4900,6 +5069,11 @@ class _ActionsMenu extends StatelessWidget {
               ),
             ),
             itemBuilder: (context) => [
+              PopupMenuItem<SessionRowAction>(
+                enabled: false,
+                height: 36,
+                child: Text(row.harnessLabel),
+              ),
               if (_canOpenContainingFolder(row))
                 _item(
                   SessionRowAction.openPath,
@@ -4929,15 +5103,16 @@ class _ActionsMenu extends StatelessWidget {
                 enabled: commandSet.platformResumeCommand != null,
                 disabledReason: commandSet.disabledReason,
               ),
-              _item(
-                SessionRowAction.openTerminalFork,
-                'Open terminal and fork',
-                iconAsset: AppIcons.fork,
-                enabled: commandSet.terminalForkCommand != null,
-                disabledReason:
-                    commandSet.terminalDisabledReason ??
-                    commandSet.disabledReason,
-              ),
+              if (row.harness == 'codex')
+                _item(
+                  SessionRowAction.openTerminalFork,
+                  'Open terminal and fork',
+                  iconAsset: AppIcons.fork,
+                  enabled: commandSet.terminalForkCommand != null,
+                  disabledReason:
+                      commandSet.terminalDisabledReason ??
+                      commandSet.disabledReason,
+                ),
               _item(
                 SessionRowAction.copyTerminalCommand,
                 'Copy terminal command',
@@ -4973,11 +5148,12 @@ class _ActionsMenu extends StatelessWidget {
                 row.isArchived ? 'Unarchive session' : 'Archive session',
                 iconAsset: AppIcons.archive,
               ),
-              _item(
-                SessionRowAction.reparse,
-                'Re-parse session',
-                iconAsset: AppIcons.reparse,
-              ),
+              if (row.harness == 'codex')
+                _item(
+                  SessionRowAction.reparse,
+                  'Re-parse session',
+                  iconAsset: AppIcons.reparse,
+                ),
             ],
           ),
         ),
@@ -5022,6 +5198,7 @@ class _ActionsMenu extends StatelessWidget {
     return ResumeCommandGenerator(settings: settings).build(
       ResumeCommandSession(
         sessionId: row.sessionId,
+        harness: row.harness,
         sourceType: row.platform == SessionRowPlatform.wsl
             ? ResumeSessionSourceType.wsl
             : ResumeSessionSourceType.windows,
@@ -5098,25 +5275,86 @@ String? _blankToNull(String value) {
 
 /// Draggable divider between the session table and the detail pane.
 /// Double-click restores the default split.
-class _SplitHandle extends StatelessWidget {
-  const _SplitHandle({required this.onDrag, required this.onReset});
+class _SplitHandle extends StatefulWidget {
+  const _SplitHandle({
+    required this.onDrag,
+    required this.onDragEnd,
+    required this.onReset,
+  });
 
   final ValueChanged<double> onDrag;
+  final VoidCallback onDragEnd;
   final VoidCallback onReset;
 
   @override
+  State<_SplitHandle> createState() => _SplitHandleState();
+}
+
+class _SplitHandleState extends State<_SplitHandle> {
+  var _focused = false;
+
+  @override
   Widget build(BuildContext context) {
-    final color = Theme.of(context).colorScheme.outlineVariant;
-    return ExcludeSemantics(
-      child: MouseRegion(
-        cursor: SystemMouseCursors.resizeColumn,
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onHorizontalDragUpdate: (details) => onDrag(details.delta.dx),
-          onDoubleTap: onReset,
-          child: SizedBox(
-            width: 7,
-            child: Center(child: Container(width: 1, color: color)),
+    final scheme = Theme.of(context).colorScheme;
+    final focusColor = scheme.primary;
+    void nudge(double delta) {
+      widget.onDrag(delta);
+      widget.onDragEnd();
+    }
+
+    return Semantics(
+      label: 'Resize session table and detail panes',
+      value: 'Use Left and Right Arrow to resize. Press Enter to reset.',
+      increasedValue: 'Wider session table',
+      decreasedValue: 'Narrower session table',
+      focusable: true,
+      button: true,
+      onIncrease: () => nudge(24),
+      onDecrease: () => nudge(-24),
+      onTap: widget.onReset,
+      child: ExcludeSemantics(
+        child: CallbackShortcuts(
+          bindings: {
+            const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
+                nudge(-24),
+            const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
+                nudge(24),
+            const SingleActivator(LogicalKeyboardKey.enter): widget.onReset,
+            const SingleActivator(LogicalKeyboardKey.space): widget.onReset,
+          },
+          child: Focus(
+            onFocusChange: (focused) => setState(() => _focused = focused),
+            child: MouseRegion(
+              cursor: SystemMouseCursors.resizeColumn,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onHorizontalDragUpdate: (details) =>
+                    widget.onDrag(details.delta.dx),
+                onHorizontalDragEnd: (_) => widget.onDragEnd(),
+                onDoubleTap: widget.onReset,
+                child: DecoratedBox(
+                  key: const Key('sessions-pane-splitter'),
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHigh,
+                    border: _focused
+                        ? Border.all(color: focusColor, width: 2)
+                        : Border(
+                            left: BorderSide(color: scheme.outlineVariant),
+                            right: BorderSide(color: scheme.outline),
+                          ),
+                  ),
+                  child: SizedBox(
+                    width: _SessionsScreenState._splitDividerWidth,
+                    child: Center(
+                      child: Container(
+                        width: 1,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
           ),
         ),
       ),

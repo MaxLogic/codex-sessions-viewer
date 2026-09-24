@@ -7,6 +7,7 @@ import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -749,7 +750,7 @@ void main() {
     expect(find.text('Subagent: Pascal'), findsWidgets);
   });
 
-  testWidgets('formats large session counts with exact accessible values', (
+  testWidgets('formats large session counts consistently for accessibility', (
     tester,
   ) async {
     await tester.binding.setSurfaceSize(const Size(1800, 900));
@@ -775,8 +776,8 @@ void main() {
 
     expect(find.text('12.3K'), findsOneWidget);
     expect(find.text('72.2M'), findsOneWidget);
-    expect(find.bySemanticsLabel('Messages 12,345'), findsOneWidget);
-    expect(find.bySemanticsLabel('Tokens 72,151,861'), findsOneWidget);
+    expect(find.bySemanticsLabel('Messages 12.3K'), findsOneWidget);
+    expect(find.bySemanticsLabel('Tokens 72.2M'), findsOneWidget);
     expect(
       find.byWidgetPredicate(
         (widget) => widget is Tooltip && widget.message == '12,345',
@@ -1281,8 +1282,25 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.bySemanticsLabel('Viewer archive filter'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Archived only').last);
+    final archiveItem = find.ancestor(
+      of: find.text('Archived only').last,
+      matching: find.byType(CheckedPopupMenuItem<int>),
+    );
+    expect(archiveItem, findsOneWidget);
+    await tester.ensureVisible(archiveItem);
     await tester.pumpAndSettle();
+    final previousFatalSetting = WidgetController.hitTestWarningShouldBeFatal;
+    WidgetController.hitTestWarningShouldBeFatal = true;
+    addTearDown(
+      () => WidgetController.hitTestWarningShouldBeFatal = previousFatalSetting,
+    );
+    await tester.tap(archiveItem);
+    await tester.pumpAndSettle();
+
+    expect(
+      tester.getSemantics(find.bySemanticsLabel('Viewer archive filter')).value,
+      'Archived only',
+    );
 
     expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
     expect(find.text('Archived older session'), findsWidgets);
@@ -1942,6 +1960,78 @@ void main() {
       tester.getSize(find.byKey(const Key('sessions-left-panel'))).width,
       closeTo(1800 * 0.55, 1),
     );
+  });
+
+  testWidgets('split resize persists and restores as a window fraction', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final semantics = tester.ensureSemantics();
+    final saved = <SessionTableSettings>[];
+    Future<void> show(SessionTableSettings? state) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TestSessionsScreen(
+            key: ValueKey(state),
+            initialRows: [
+              _row(id: 'sized', title: 'Sized panel', project: 'Viewer'),
+            ],
+            initialTableState: state,
+            onTableStateChanged: saved.add,
+          ),
+        ),
+      );
+    }
+
+    await show(null);
+    final bevel = tester.widget<DecoratedBox>(
+      find.byKey(const Key('sessions-pane-splitter')),
+    );
+    final border = (bevel.decoration as BoxDecoration).border! as Border;
+    expect(border.left.width, greaterThan(0));
+    expect(border.right.width, greaterThan(0));
+    final divider = find.bySemanticsLabel(
+      'Resize session table and detail panes',
+    );
+    final before = tester
+        .getSize(find.byKey(const Key('sessions-left-panel')))
+        .width;
+    await tester.drag(divider, const Offset(120, 0));
+    await tester.pump();
+    final after = tester
+        .getSize(find.byKey(const Key('sessions-left-panel')))
+        .width;
+    expect(after, greaterThan(before + 80));
+    expect(saved, isNotEmpty);
+    expect(saved.last.paneFraction, closeTo(after / (1800 - 9), 0.01));
+
+    await show(saved.last);
+    expect(
+      tester.getSize(find.byKey(const Key('sessions-left-panel'))).width,
+      closeTo(after, 1),
+    );
+    await tester.binding.setSurfaceSize(const Size(1600, 1000));
+    await tester.pump();
+    expect(
+      tester.getSize(find.byKey(const Key('sessions-left-panel'))).width,
+      closeTo(saved.last.paneFraction! * (1600 - 9), 1),
+    );
+    final savedCount = saved.length;
+    tester.semantics.increase(
+      find.semantics.byLabel('Resize session table and detail panes'),
+    );
+    await tester.pumpAndSettle();
+    expect(saved.length, greaterThan(savedCount));
+    expect(saved.last.paneFraction, greaterThan(after / (1800 - 9)));
+    tester.semantics.performAction(
+      find.semantics.byLabel('Resize session table and detail panes'),
+      SemanticsAction.tap,
+    );
+    await tester.pumpAndSettle();
+    expect(saved.last.paneFraction, isNull);
+    await tester.pumpAndSettle();
+    semantics.dispose();
   });
 
   testWidgets('loads selected conversation on demand', (tester) async {
@@ -2753,27 +2843,45 @@ List<ConversationMessageViewModel> _messages(
 }
 
 Future<void> _setOriginFilter(WidgetTester tester, String label) async {
-  Finder originDropdown() {
-    return find.byWidgetPredicate((widget) {
-      final key = widget.key;
-      return key is ValueKey<String> && key.value.startsWith('origin-filter-');
-    });
-  }
+  final previousFatalSetting = WidgetController.hitTestWarningShouldBeFatal;
+  WidgetController.hitTestWarningShouldBeFatal = true;
+  try {
+    Finder originDropdown() {
+      return find.byWidgetPredicate((widget) {
+        final key = widget.key;
+        return key is ValueKey<String> &&
+            key.value.startsWith('origin-filter-');
+      });
+    }
 
-  if (originDropdown().evaluate().isEmpty) {
-    await tester.tap(find.text('More filters'));
+    if (originDropdown().evaluate().isEmpty) {
+      await tester.tap(find.text('More filters'));
+      await tester.pumpAndSettle();
+    }
+    await tester.tap(originDropdown());
     await tester.pumpAndSettle();
+    final menuLabel = switch (label) {
+      'User' => 'Main sessions',
+      'Subagent' => 'Subagents only',
+      'All' => 'All sessions',
+      _ => label,
+    };
+    final menuItem = find.ancestor(
+      of: find.text(menuLabel).last,
+      matching: find.byType(CheckedPopupMenuItem<int>),
+    );
+    expect(menuItem, findsOneWidget);
+    await tester.ensureVisible(menuItem);
+    await tester.pumpAndSettle();
+    await tester.tap(menuItem);
+    await tester.pumpAndSettle();
+    expect(
+      tester.getSemantics(find.bySemanticsLabel('Origin filter')).value,
+      menuLabel,
+    );
+  } finally {
+    WidgetController.hitTestWarningShouldBeFatal = previousFatalSetting;
   }
-  await tester.tap(originDropdown());
-  await tester.pumpAndSettle();
-  final menuLabel = switch (label) {
-    'User' => 'Main sessions',
-    'Subagent' => 'Subagents only',
-    'All' => 'All sessions',
-    _ => label,
-  };
-  await tester.tap(find.text(menuLabel).last);
-  await tester.pumpAndSettle();
 }
 
 Future<void> _setTimeFilter(
@@ -2781,22 +2889,38 @@ Future<void> _setTimeFilter(
   String currentLabel,
   String label,
 ) async {
-  await tester.tap(find.text(currentLabel).first);
-  await tester.pumpAndSettle();
-  for (final option in [
-    'Today',
-    'Yesterday',
-    'This week',
-    'Last week',
-    'This month',
-    'Last month',
-    'Last 30 days',
-    'All time',
-  ]) {
-    expect(find.text(option), findsWidgets);
+  final previousFatalSetting = WidgetController.hitTestWarningShouldBeFatal;
+  WidgetController.hitTestWarningShouldBeFatal = true;
+  try {
+    final control = find.bySemanticsLabel('Time range filter');
+    expect(tester.getSemantics(control).value, currentLabel);
+    await tester.tap(control);
+    await tester.pumpAndSettle();
+    for (final option in [
+      'Today',
+      'Yesterday',
+      'This week',
+      'Last week',
+      'This month',
+      'Last month',
+      'Last 30 days',
+      'All time',
+    ]) {
+      expect(find.text(option), findsWidgets);
+    }
+    final menuItem = find.ancestor(
+      of: find.text(label).last,
+      matching: find.byType(CheckedPopupMenuItem<int>),
+    );
+    expect(menuItem, findsOneWidget);
+    await tester.ensureVisible(menuItem);
+    await tester.pumpAndSettle();
+    await tester.tap(menuItem);
+    await tester.pumpAndSettle();
+    expect(tester.getSemantics(control).value, label);
+  } finally {
+    WidgetController.hitTestWarningShouldBeFatal = previousFatalSetting;
   }
-  await tester.tap(find.text(label).last);
-  await tester.pumpAndSettle();
 }
 
 Finder _rowMotionKeyFor(String id) {

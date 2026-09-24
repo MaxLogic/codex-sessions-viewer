@@ -108,6 +108,7 @@ void main() {
           MaterialApp(
             home: SettingsScreen(
               maintenanceSchedules: schedules,
+              clock: () => DateTime.utc(2026, 9, 7, 14),
               onSave: (_) async => saves++,
             ),
           ),
@@ -139,6 +140,10 @@ void main() {
     expect(find.text('Last attempt: 2026-09-07 12:00:00 UTC'), findsOneWidget);
     expect(find.text('Last success: 2026-09-06 11:00:00 UTC'), findsOneWidget);
     expect(find.text('Next due: 2026-09-07 13:00:00 UTC'), findsOneWidget);
+    expect(
+      find.text('Observation state: Stale; prices may have changed'),
+      findsOneWidget,
+    );
     expect(
       find.text('Last error: OpenRouter price refresh failed.'),
       findsOneWidget,
@@ -172,6 +177,12 @@ void main() {
       findsNothing,
     );
     expect(find.text('Next due: 2026-09-08 13:00:00 UTC'), findsOneWidget);
+    expect(
+      find.text(
+        'Observation state: Last observation within cadence; not a live price',
+      ),
+      findsOneWidget,
+    );
     expect(saves, 0);
     expect(tester.takeException(), isNull);
     semantics.dispose();
@@ -216,6 +227,7 @@ void main() {
       expect(saved!.pricing.automaticRefreshEnabled, isFalse);
       expect(saved!.pricing.useExternalPricing, isFalse);
       expect(saved!.pricing.refreshIntervalHours, 720);
+      expect(saved!.pricing.refreshUtcSlots, isFalse);
       expect(saved!.maintenance.databaseOptimizeEnabled, isFalse);
       expect(saved!.maintenance.databaseOptimizeIntervalDays, 365);
       expect(saved!.pricing.openRouter, initial.pricing.openRouter);
@@ -230,7 +242,18 @@ void main() {
       await tester.tap(find.text('Save settings'));
       await tester.pump();
       expect(saved!.pricing.automaticRefreshEnabled, isTrue);
-      expect(saved!.pricing.refreshIntervalHours, 24);
+      expect(saved!.pricing.refreshIntervalHours, 6);
+      expect(saved!.pricing.refreshUtcSlots, isTrue);
+      await toggle('Use fixed UTC pricing slots');
+      await tester.tap(find.text('Save settings'));
+      await tester.pump();
+      expect(saved!.pricing.refreshUtcSlots, isFalse);
+      expect(saved!.pricing.refreshIntervalHours, 6);
+      await toggle('Use fixed UTC pricing slots');
+      await tester.tap(find.text('Save settings'));
+      await tester.pump();
+      expect(saved!.pricing.refreshUtcSlots, isTrue);
+      expect(find.textContaining('Cadence: 00:00, 06:00'), findsOneWidget);
       expect(saved!.maintenance, const MaintenanceSettings());
     },
   );

@@ -176,6 +176,7 @@ class AppSettings {
     required this.pricing,
     required this.logging,
     this.maintenance = const MaintenanceSettings(),
+    this.hub = const HubSettings(),
   });
 
   final GeneralAppSettings app;
@@ -189,6 +190,7 @@ class AppSettings {
   final PricingSettings pricing;
   final LoggingSettings logging;
   final MaintenanceSettings maintenance;
+  final HubSettings hub;
 
   factory AppSettings.defaults() => const AppSettings(
     app: GeneralAppSettings(firstRun: false, startWithWindows: true),
@@ -283,7 +285,8 @@ class AppSettings {
     pricing: PricingSettings(
       provider: 'openrouter',
       useExternalPricing: true,
-      cachePricingHours: 24,
+      refreshIntervalHours: 6,
+      refreshUtcSlots: true,
       fallbackToOverrides: true,
       openRouter: OpenRouterSettings(
         modelsEndpoint: 'https://openrouter.ai/api/v1/models',
@@ -335,6 +338,7 @@ class AppSettings {
         defaults.pricing,
       ),
       maintenance: MaintenanceSettings.fromMap(_table(map, 'maintenance')),
+      hub: HubSettings.fromMap(_table(map, 'hub')),
       logging: LoggingSettings.fromMap(
         _table(map, 'logging'),
         defaults.logging,
@@ -354,6 +358,7 @@ class AppSettings {
     PricingSettings? pricing,
     LoggingSettings? logging,
     MaintenanceSettings? maintenance,
+    HubSettings? hub,
   }) => AppSettings(
     app: app ?? this.app,
     paths: paths ?? this.paths,
@@ -366,6 +371,7 @@ class AppSettings {
     pricing: pricing ?? this.pricing,
     logging: logging ?? this.logging,
     maintenance: maintenance ?? this.maintenance,
+    hub: hub ?? this.hub,
   );
 
   Map<String, Object?> toTomlMap() => {
@@ -380,6 +386,7 @@ class AppSettings {
     'pricing': pricing.toTomlMap(),
     'logging': logging.toTomlMap(),
     'maintenance': maintenance.toTomlMap(),
+    'hub': hub.toTomlMap(),
   };
 
   @override
@@ -395,6 +402,7 @@ class AppSettings {
       voiceOver == other.voiceOver &&
       pricing == other.pricing &&
       maintenance == other.maintenance &&
+      hub == other.hub &&
       logging == other.logging;
 
   @override
@@ -408,9 +416,26 @@ class AppSettings {
     toolOutput,
     voiceOver,
     maintenance,
+    hub,
     pricing,
     logging,
   );
+}
+
+class HubSettings {
+  const HubSettings({this.url = '', this.machine = ''});
+  final String url;
+  final String machine;
+  factory HubSettings.fromMap(Map<String, dynamic> map) => HubSettings(
+    url: _string(map, 'url', '', 'hub.url'),
+    machine: _string(map, 'machine', '', 'hub.machine'),
+  );
+  Map<String, Object?> toTomlMap() => {'url': url, 'machine': machine};
+  @override
+  bool operator ==(Object other) =>
+      other is HubSettings && url == other.url && machine == other.machine;
+  @override
+  int get hashCode => Object.hash(url, machine);
 }
 
 class GeneralAppSettings {
@@ -713,11 +738,15 @@ class SessionTableSettings {
     required this.columnWidths,
     required this.sorts,
     this.newestPerProjectOnly = false,
+    this.paneFraction,
   });
 
   final Map<String, double> columnWidths;
   final List<SessionTableSortSettings> sorts;
   final bool newestPerProjectOnly;
+
+  /// Table share of the space beside the detail pane. Null uses the default.
+  final double? paneFraction;
 
   factory SessionTableSettings.fromMap(
     Map<String, dynamic> map,
@@ -739,6 +768,10 @@ class SessionTableSettings {
     return SessionTableSettings(
       columnWidths: Map.unmodifiable(widths),
       sorts: sorts.isEmpty ? defaults.sorts : List.unmodifiable(sorts),
+      paneFraction: switch (map['pane_fraction']) {
+        final num value when value > 0 && value < 1 => value.toDouble(),
+        _ => null,
+      },
       newestPerProjectOnly: _bool(
         map,
         'newest_per_project_only',
@@ -751,6 +784,7 @@ class SessionTableSettings {
   Map<String, Object?> toTomlMap() => {
     'column_widths': columnWidths,
     'newest_per_project_only': newestPerProjectOnly,
+    if (paneFraction != null) 'pane_fraction': paneFraction,
     'sorts': [for (final sort in sorts) sort.toTomlMap()],
   };
 
@@ -759,13 +793,15 @@ class SessionTableSettings {
       other is SessionTableSettings &&
       _mapEquals(columnWidths, other.columnWidths) &&
       _listEquals(sorts, other.sorts) &&
-      newestPerProjectOnly == other.newestPerProjectOnly;
+      newestPerProjectOnly == other.newestPerProjectOnly &&
+      paneFraction == other.paneFraction;
 
   @override
   int get hashCode => Object.hash(
     _mapHash(columnWidths),
     Object.hashAll(sorts),
     newestPerProjectOnly,
+    paneFraction,
   );
 }
 
@@ -1185,21 +1221,33 @@ class PricingSettings {
     required this.useExternalPricing,
     int? cachePricingHours,
     int? refreshIntervalHours,
+    bool? refreshUtcSlots,
     this.automaticRefreshEnabled = true,
     required this.fallbackToOverrides,
     required this.openRouter,
     required this.overrides,
-  }) : refreshIntervalHours = refreshIntervalHours ?? cachePricingHours ?? 24;
+    this.hubUrl = '',
+    this.hubToken = '',
+    this.hubMachineId = '',
+  }) : refreshIntervalHours = refreshIntervalHours ?? cachePricingHours ?? 6,
+       refreshUtcSlots =
+           (refreshUtcSlots ??
+               (refreshIntervalHours == null && cachePricingHours == null)) &&
+           (refreshIntervalHours ?? cachePricingHours ?? 6) == 6;
 
   final String provider;
   final bool useExternalPricing;
   final int refreshIntervalHours;
+  final bool refreshUtcSlots;
   final bool automaticRefreshEnabled;
   // Legacy callers share the canonical refresh interval; TOML writes only the new key.
   int get cachePricingHours => refreshIntervalHours;
   final bool fallbackToOverrides;
   final OpenRouterSettings openRouter;
   final Map<String, PricingOverrideSettings> overrides;
+  final String hubUrl;
+  final String hubToken;
+  final String hubMachineId;
 
   factory PricingSettings.fromMap(
     Map<String, dynamic> map,
@@ -1225,6 +1273,19 @@ class PricingSettings {
       }
     }
     return PricingSettings(
+      hubUrl: _string(map, 'hub_url', defaults.hubUrl, 'pricing.hub_url'),
+      hubToken: _string(
+        map,
+        'hub_token',
+        defaults.hubToken,
+        'pricing.hub_token',
+      ),
+      hubMachineId: _string(
+        map,
+        'hub_machine_id',
+        defaults.hubMachineId,
+        'pricing.hub_machine_id',
+      ),
       provider: _string(map, 'provider', defaults.provider, 'pricing.provider'),
       useExternalPricing: _bool(
         map,
@@ -1237,6 +1298,14 @@ class PricingSettings {
         'automatic_refresh_enabled',
         defaults.automaticRefreshEnabled,
         'pricing.automatic_refresh_enabled',
+      ),
+      refreshUtcSlots: _bool(
+        map,
+        'refresh_utc_slots',
+        !map.containsKey('refresh_interval_hours') &&
+            !map.containsKey('cache_pricing_hours') &&
+            defaults.refreshUtcSlots,
+        'pricing.refresh_utc_slots',
       ),
       refreshIntervalHours: _boundedPositiveInt(
         map,
@@ -1264,9 +1333,13 @@ class PricingSettings {
   }
 
   Map<String, Object?> toTomlMap() => {
+    'hub_url': hubUrl,
+    'hub_token': hubToken,
+    'hub_machine_id': hubMachineId,
     'provider': provider,
     'use_external_pricing': useExternalPricing,
     'refresh_interval_hours': refreshIntervalHours,
+    'refresh_utc_slots': refreshUtcSlots,
     'automatic_refresh_enabled': automaticRefreshEnabled,
     'fallback_to_overrides': fallbackToOverrides,
     'openrouter': openRouter.toTomlMap(),
@@ -1278,9 +1351,13 @@ class PricingSettings {
   @override
   bool operator ==(Object other) =>
       other is PricingSettings &&
+      hubUrl == other.hubUrl &&
+      hubToken == other.hubToken &&
+      hubMachineId == other.hubMachineId &&
       provider == other.provider &&
       useExternalPricing == other.useExternalPricing &&
       cachePricingHours == other.cachePricingHours &&
+      refreshUtcSlots == other.refreshUtcSlots &&
       automaticRefreshEnabled == other.automaticRefreshEnabled &&
       fallbackToOverrides == other.fallbackToOverrides &&
       openRouter == other.openRouter &&
@@ -1288,9 +1365,13 @@ class PricingSettings {
 
   @override
   int get hashCode => Object.hash(
+    hubUrl,
+    hubToken,
+    hubMachineId,
     provider,
     useExternalPricing,
     cachePricingHours,
+    refreshUtcSlots,
     automaticRefreshEnabled,
     fallbackToOverrides,
     openRouter,

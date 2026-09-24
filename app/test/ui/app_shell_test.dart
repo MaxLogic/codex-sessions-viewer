@@ -28,6 +28,14 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Usage'), findsWidgets);
     expect(find.text('Usage summary'), findsOneWidget);
+    expect(find.bySemanticsLabel('Usage screen'), findsOneWidget);
+    expect(
+      tester
+          .getSemantics(find.bySemanticsLabel('Usage screen'))
+          .flagsCollection
+          .isLiveRegion,
+      isTrue,
+    );
 
     await tester.tap(
       find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),

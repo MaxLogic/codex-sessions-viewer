@@ -9,11 +9,13 @@ class ResumeCommandSession {
     required this.sessionId,
     required this.sourceType,
     required this.workingDirectory,
+    this.harness = 'codex',
   });
 
   final String sessionId;
   final ResumeSessionSourceType sourceType;
   final String workingDirectory;
+  final String harness;
 }
 
 class ResumeCommandGenerator {
@@ -22,23 +24,35 @@ class ResumeCommandGenerator {
   final AppSettings settings;
 
   ResumeCommandSet build(ResumeCommandSession session) {
+    final harness = session.harness.trim().toLowerCase();
+    final harnessLabel = harness == 'claude' ? 'Claude Code' : 'Codex';
+    if (harness != 'codex' && harness != 'claude') {
+      return ResumeCommandSet.unavailable(
+        disabledReason:
+            'Resume unavailable: unsupported harness ${session.harness}.',
+      );
+    }
     final sessionId = session.sessionId.trim();
     if (sessionId.isEmpty) {
-      return const ResumeCommandSet.unavailable(
+      return ResumeCommandSet.unavailable(
         disabledReason:
-            'Resume unavailable: this session has no parsed Codex session ID.',
+            'Resume unavailable: this session has no parsed $harnessLabel session ID.',
       );
     }
     if (!_isSafeSessionId(sessionId)) {
-      return const ResumeCommandSet.unavailable(
+      return ResumeCommandSet.unavailable(
         disabledReason:
-            'Resume unavailable: invalid Codex session ID for command generation.',
+            'Resume unavailable: invalid $harnessLabel session ID for command generation.',
       );
     }
 
-    final plainCommand = _plainCodexCommand('resume', sessionId);
+    final plainCommand = harness == 'claude'
+        ? 'claude --resume $sessionId'
+        : _plainCodexCommand('resume', sessionId);
     final plainForkCommand = _plainCodexCommand('fork', sessionId);
-    final bashResumeCommand = _bashCodexCommand('resume', sessionId);
+    final bashResumeCommand = harness == 'claude'
+        ? _bashCommand(['claude', '--resume', sessionId])
+        : _bashCodexCommand('resume', sessionId);
     final bashForkCommand = _bashCodexCommand('fork', sessionId);
     final platformCommand = _platformCommand(
       session,
@@ -65,14 +79,18 @@ class ResumeCommandGenerator {
 
     return ResumeCommandSet(
       plainResumeCommand: plainCommand,
-      plainForkCommand: plainForkCommand,
+      plainForkCommand: harness == 'codex' ? plainForkCommand : null,
       platformResumeCommand: platformCommand,
-      platformForkCommand: platformForkCommand,
+      platformForkCommand: harness == 'codex' ? platformForkCommand : null,
       defaultTerminalProfile: settings.terminal.defaultTerminal,
       terminalLaunchCommand: terminalCommand.command,
-      terminalForkCommand: terminalForkCommand.command,
+      terminalForkCommand: harness == 'codex'
+          ? terminalForkCommand.command
+          : null,
       terminalLaunchSpec: terminalCommand.launchSpec,
-      terminalForkLaunchSpec: terminalForkCommand.launchSpec,
+      terminalForkLaunchSpec: harness == 'codex'
+          ? terminalForkCommand.launchSpec
+          : null,
       terminalDisabledReason: terminalCommand.disabledReason,
       terminalLaunchCommandFor: (profileName) => _terminalCommand(
         profileName,

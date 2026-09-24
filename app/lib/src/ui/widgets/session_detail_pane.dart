@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../../commands/resume_command_generator.dart';
 import '../../config/app_settings.dart';
 import '../../utils/injected_context_filter.dart';
+import '../dialogs/delayed_export_progress.dart';
 import '../models/conversation_message_view_model.dart';
 import '../models/session_row_view_model.dart';
 import '../number_formatting.dart';
@@ -99,6 +100,7 @@ class SessionDetailPane extends StatelessWidget {
         .build(
           ResumeCommandSession(
             sessionId: row.sessionId,
+            harness: row.harness,
             sourceType: switch (row.platform) {
               SessionRowPlatform.windows => ResumeSessionSourceType.windows,
               SessionRowPlatform.wsl => ResumeSessionSourceType.wsl,
@@ -238,6 +240,7 @@ class _SelectedSessionHeader extends StatelessWidget {
       if (row.project.trim().isNotEmpty && row.project.trim() != title)
         row.project.trim(),
       row.platformLabel,
+      row.harnessLabel,
       row.modelLabel,
       '${formatCompactInt(row.messageCount)} messages',
       '${formatCompactInt(row.displayTotalTokens)} tokens',
@@ -522,6 +525,7 @@ class _DetailsTab extends StatelessWidget {
         const _DetailsHeading('Session'),
         _DetailGrid(
           children: [
+            _DetailText('Harness', row.harnessLabel),
             _DetailText('Platform', row.platformLabel),
             _DetailText('Origin', row.originLabel),
             _DetailText('Project', row.project),
@@ -897,6 +901,10 @@ class _ActionArea extends StatelessWidget {
           tooltip: 'More actions for selected session',
           onSelected: (value) => _handleMoreAction(context, value),
           itemBuilder: (context) => [
+            PopupMenuItem<String>(
+              enabled: false,
+              child: Text(row.harnessLabel),
+            ),
             _moreItem(
               'open-folder',
               'Open containing folder',
@@ -905,14 +913,15 @@ class _ActionArea extends StatelessWidget {
               disabledReason:
                   'This WSL path cannot be opened from Windows Explorer.',
             ),
-            _moreItem(
-              'fork',
-              'Open in terminal and fork',
-              AppIcons.fork,
-              enabled:
-                  commandSet.terminalForkCommand != null &&
-                  onSessionAction != null,
-            ),
+            if (row.harness == 'codex')
+              _moreItem(
+                'fork',
+                'Open in terminal and fork',
+                AppIcons.fork,
+                enabled:
+                    commandSet.terminalForkCommand != null &&
+                    onSessionAction != null,
+              ),
             _moreItem(
               'edit-run',
               'Edit and run terminal command…',
@@ -974,7 +983,8 @@ class _ActionArea extends StatelessWidget {
               null,
             ),
             _moreItem('edit-eval', 'Edit eval details…', AppIcons.edit),
-            _moreItem('reparse', 'Re-parse this session', AppIcons.reparse),
+            if (row.harness == 'codex')
+              _moreItem('reparse', 'Re-parse this session', AppIcons.reparse),
           ],
           child: const Tooltip(
             message: 'More actions for selected session',
@@ -1034,7 +1044,7 @@ class _ActionArea extends StatelessWidget {
           onEditTerminalCommand ?? onRunTerminalCommand,
         );
       case 'export-markdown':
-        await _invokeAction(SessionDetailAction.exportMarkdown);
+        await _exportMarkdown(context);
       case 'copy-session-path':
         await _copyWithFeedback(
           context,
@@ -1050,15 +1060,19 @@ class _ActionArea extends StatelessWidget {
           'Copied working directory.',
         );
       case 'copy-conversation-markdown':
-        final markdown = await _conversationMarkdown(row);
-        if (!context.mounted) {
-          return;
-        }
-        await _copyWithFeedback(
+        await runWithDelayedExportProgress(
           context,
-          onCopyText,
-          markdown,
-          'Copied conversation Markdown.',
+          label: 'Copying Markdown',
+          operation: () async {
+            final markdown = await _conversationMarkdown(row);
+            if (!context.mounted) return;
+            await _copyWithFeedback(
+              context,
+              onCopyText,
+              markdown,
+              'Copied conversation Markdown.',
+            );
+          },
         );
       case 'copy-plain-resume':
         if (commandSet.plainResumeCommand case final command?) {
@@ -1134,20 +1148,21 @@ class _ActionArea extends StatelessWidget {
   }
 
   Future<void> _invokeAction(SessionDetailAction action) async {
-    if (action == SessionDetailAction.exportMarkdown) {
-      await _exportMarkdown();
-      return;
-    }
     final callback = onSessionAction;
     if (callback != null) {
       await callback(action);
     }
   }
 
-  Future<void> _exportMarkdown() async {
+  Future<void> _exportMarkdown(BuildContext context) async {
     final callback = onExportMarkdown;
     if (callback != null) {
-      await callback(row, await _conversationMarkdown(row));
+      final markdown = await runWithDelayedExportProgress(
+        context,
+        label: 'Preparing Markdown',
+        operation: () => _conversationMarkdown(row),
+      );
+      await callback(row, markdown);
     }
   }
 
@@ -1236,13 +1251,14 @@ class _CommandActionPanel extends StatelessWidget {
           icon: const AppSvgIcon(AppIcons.edit),
           label: const Text('Edit and run'),
         ),
-        AppButton.outlined(
-          onPressed: terminalForkEnabled && onSessionAction != null
-              ? () => onSessionAction!(SessionDetailAction.openTerminalFork)
-              : null,
-          icon: const AppSvgIcon(AppIcons.fork),
-          label: const Text('Open in terminal and fork'),
-        ),
+        if (commandSet.plainForkCommand != null)
+          AppButton.outlined(
+            onPressed: terminalForkEnabled && onSessionAction != null
+                ? () => onSessionAction!(SessionDetailAction.openTerminalFork)
+                : null,
+            icon: const AppSvgIcon(AppIcons.fork),
+            label: const Text('Open in terminal and fork'),
+          ),
       ],
     );
   }
@@ -1354,6 +1370,8 @@ String sessionConversationMarkdown(
 ) {
   return [
     if (row.title.trim().isNotEmpty) ...['# ${row.title}', ''],
+    '**Harness:** ${row.harnessLabel}',
+    '',
     for (final message in messages)
       if (!_isInjectedContextMessage(message)) ...[
         '## Message ${message.number} - ${message.authorLabel}',

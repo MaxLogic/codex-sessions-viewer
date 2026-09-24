@@ -165,7 +165,11 @@ class _EvalsScreenState extends State<EvalsScreen> {
               _buildExportBar(visibleRows),
               if (widget.statusMessage.trim().isNotEmpty) ...[
                 const SizedBox(height: 8),
-                Text(widget.statusMessage),
+                Semantics(
+                  liveRegion: true,
+                  label: widget.statusMessage,
+                  child: ExcludeSemantics(child: Text(widget.statusMessage)),
+                ),
               ],
               const SizedBox(height: 12),
               Expanded(
@@ -369,6 +373,8 @@ class _EvalsScreenState extends State<EvalsScreen> {
         Semantics(
           label: 'Anonymize paths in eval export',
           toggled: _anonymizePaths,
+          excludeSemantics: true,
+          onTap: () => setState(() => _anonymizePaths = !_anonymizePaths),
           child: CheckboxMenuButton(
             value: _anonymizePaths,
             onChanged: (value) =>
@@ -380,6 +386,10 @@ class _EvalsScreenState extends State<EvalsScreen> {
           label: 'Export selected eval sessions',
           button: true,
           enabled: hasSelected,
+          excludeSemantics: true,
+          onTap: hasSelected
+              ? () => _export(EvalsScreenExportScope.selected, selectedRows)
+              : null,
           child: FilledButton(
             onPressed: hasSelected
                 ? () => _export(EvalsScreenExportScope.selected, selectedRows)
@@ -391,6 +401,10 @@ class _EvalsScreenState extends State<EvalsScreen> {
           label: 'Export all filtered eval sessions',
           button: true,
           enabled: hasFiltered,
+          excludeSemantics: true,
+          onTap: hasFiltered
+              ? () => _export(EvalsScreenExportScope.filtered, visibleRows)
+              : null,
           child: OutlinedButton(
             onPressed: hasFiltered
                 ? () => _export(EvalsScreenExportScope.filtered, visibleRows)

@@ -23,12 +23,40 @@ import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
+import 'package:codex_sessions_viewer/src/usage/usage_cost_projection.dart';
 import 'package:codex_sessions_viewer/src/utils/profiling.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
+late Directory _collectorTemplateFolder;
+late File _collectorTemplate;
+
 void main() {
+  setUpAll(() async {
+    _collectorTemplateFolder = await Directory.systemTemp.createTemp(
+      'csv_runtime_template_',
+    );
+    _collectorTemplate = File(
+      p.join(_collectorTemplateFolder.path, 'template.sqlite'),
+    );
+    final sqlRoot = Directory('../sql');
+    final startup = await DatabaseMigrator(
+      sqlRoot: sqlRoot,
+    ).openAndMigrate(_collectorTemplate, deferUsageMigration: true);
+    expect(startup.canStartNormalUi, isTrue);
+    final migration = await startPendingDatabaseMigration(
+      _collectorTemplate,
+      sqlRoot: sqlRoot,
+    );
+    if (migration != null) {
+      expect((await migration.result).succeeded, isTrue);
+    }
+    final db = openFileBackedDatabase(_collectorTemplate);
+    db.execute('pragma wal_checkpoint(TRUNCATE)');
+    db.close();
+  });
+  tearDownAll(() async => _collectorTemplateFolder.delete(recursive: true));
   test(
     'concurrent refresh requests keep one scan owner without blocking other writers',
     () async {
@@ -49,12 +77,7 @@ void main() {
           logging: _testLogging(temp),
         ),
       );
-      expect(
-        (await DatabaseMigrator(
-          sqlRoot: Directory('../sql'),
-        ).openAndMigrate(file)).canStartNormalUi,
-        isTrue,
-      );
+      expect((await _migrateCollectorFixture(file)).canStartNormalUi, isTrue);
       final coordinator = DatabaseMaintenanceCoordinator(file);
       final controller = RuntimeSessionController(
         settingsFile: settingsFile,
@@ -124,12 +147,7 @@ void main() {
         logging: _testLogging(temp),
       );
       await SettingsRepository(settingsFile).save(settings);
-      expect(
-        (await DatabaseMigrator(
-          sqlRoot: Directory('../sql'),
-        ).openAndMigrate(file)).canStartNormalUi,
-        isTrue,
-      );
+      expect((await _migrateCollectorFixture(file)).canStartNormalUi, isTrue);
       final coordinator = DatabaseMaintenanceCoordinator(file);
       final maintenance = ApplicationMaintenance(
         databaseFile: file,
@@ -215,9 +233,7 @@ void main() {
       settingsFile,
     ).save(AppSettings.defaults().copyWith(pricing: _testPricing()));
     expect(
-      (await DatabaseMigrator(
-        sqlRoot: Directory('../sql'),
-      ).openAndMigrate(databaseFile)).canStartNormalUi,
+      (await _migrateCollectorFixture(databaseFile)).canStartNormalUi,
       isTrue,
     );
     final db = openFileBackedDatabase(databaseFile);
@@ -394,9 +410,7 @@ void main() {
       );
 
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -459,9 +473,8 @@ void main() {
       };
       expect(spanNames, contains('scan.runtime.refresh'));
       expect(spanNames, contains('scan.runtime.load_rows'));
-      expect(spanNames, contains('scan.runtime.persist_flush'));
-      expect(spanNames, contains('scan.runtime.persist_scan'));
-      expect(spanNames, contains('scan.runtime.resolve_wsl_project'));
+      expect(spanNames, contains('scan.runtime.collector'));
+      expect(spanNames, contains('scan.runtime.collector_write'));
     },
   );
 
@@ -978,9 +991,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final progressEvents = <SessionsRefreshProgress>[];
@@ -1039,9 +1050,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -1108,9 +1117,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -1162,9 +1169,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final progressEvents = <SessionsRefreshProgress>[];
@@ -1221,9 +1226,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final progressEvents = <SessionsRefreshProgress>[];
@@ -1278,9 +1281,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final progressEvents = <SessionsRefreshProgress>[];
@@ -1338,9 +1339,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -1398,9 +1397,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final result = await RuntimeSessionController(
@@ -1452,9 +1449,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -1566,9 +1561,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final result = await RuntimeSessionController(
@@ -1647,9 +1640,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final db = openFileBackedDatabase(databaseFile);
@@ -1751,14 +1742,15 @@ void main() {
       ''',
       [fallbackId],
     );
+    _seedIdentityUsageContext(db);
     db.execute(
       '''
       insert into usage_events (
-        session_row_id, source_record_ordinal, epoch, input_tokens,
+        session_row_id, source_record_ordinal, epoch, path_context_id, input_tokens,
         cached_input_tokens, cache_write_input_tokens, output_tokens,
         reasoning_output_tokens, total_tokens, branch_scope, derivation,
         event_fingerprint
-      ) values (?, 1, 0, 1, 0, 0, 1, 0, 2, 'local',
+      ) values (?, 1, 0, 1, 1, 0, 0, 1, 0, 2, 'local',
         'cumulative_delta', ?)
       ''',
       [fallbackId, 'c' * 64],
@@ -1943,9 +1935,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final fallbackId = 'source:${sourceFile.path}';
@@ -2009,14 +1999,15 @@ void main() {
       'insert into session_path_keys (session_id, path_key) values (?, ?)',
       [fallbackId, 'c:/old/fallback-rollback.jsonl'],
     );
+    _seedIdentityUsageContext(db);
     db.execute(
       '''
       insert into usage_events (
-        session_row_id, source_record_ordinal, epoch, input_tokens,
+        session_row_id, source_record_ordinal, epoch, path_context_id, input_tokens,
         cached_input_tokens, cache_write_input_tokens, output_tokens,
         reasoning_output_tokens, total_tokens, branch_scope, derivation,
         event_fingerprint
-      ) values ('session:fallback-rollback', 9, 0, 4, 0, 0, 2, 0, 6,
+      ) values ('session:fallback-rollback', 9, 0, 1, 4, 0, 0, 2, 0, 6,
         'local', 'cumulative_delta', ?)
       ''',
       ['d' * 64],
@@ -2294,9 +2285,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final caseDistinctPath =
@@ -2369,9 +2358,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
     final db = openFileBackedDatabase(databaseFile);
     db.execute(
@@ -2466,9 +2453,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
     final db = openFileBackedDatabase(databaseFile);
     db.execute('''
@@ -2536,9 +2521,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -2595,9 +2578,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -2662,9 +2643,7 @@ void main() {
       );
       await SettingsRepository(settingsFile).save(disabledSettings);
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
       final controller = RuntimeSessionController(
         settingsFile: settingsFile,
@@ -2727,9 +2706,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -2881,9 +2858,7 @@ void main() {
     final dbFile = File(p.join(tempDir.path, 'viewer.sqlite'));
     final settingsFile = File(p.join(tempDir.path, 'settings.toml'));
     await SettingsRepository(settingsFile).save(AppSettings.defaults());
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory('../sql'),
-    ).openAndMigrate(dbFile);
+    final startup = await _migrateCollectorFixture(dbFile);
     expect(startup.canStartNormalUi, isTrue);
     final db = openFileBackedDatabase(dbFile);
     _insertBackfillSession(db);
@@ -3013,9 +2988,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final result = await RuntimeSessionController(
@@ -3054,9 +3027,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final result = await RuntimeSessionController(
@@ -3101,9 +3072,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final result = await RuntimeSessionController(
@@ -3443,9 +3412,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     await RuntimeSessionController(
@@ -3472,7 +3439,9 @@ void main() {
       databaseFile: databaseFile,
     ).loadSessionDetail(cached.rows.single.id);
 
-    expect(detail?.estimatedCostDisplay, '\$0.0545');
+    // No usage events were recorded in this JSON fixture. Persisted pricing
+    // deliberately leaves the estimate unknown instead of inventing costs.
+    expect(detail?.estimatedCostDisplay, 'Cost unknown');
     expect(detail?.userMessageTokens, 12);
     expect(detail?.assistantResponseTokens, 28);
     expect(detail?.modelsUsedForDetail, ['gpt-5.5-thinking']);
@@ -3659,9 +3628,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -3722,9 +3689,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -3797,9 +3762,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final resolver = _RecordingWslProjectResolver({
@@ -3885,9 +3848,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -3932,9 +3893,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -3990,9 +3949,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -4024,7 +3981,7 @@ void main() {
     final wslRoot = Directory(p.join(temp.path, 'wsl'));
     await windowsRoot.create();
     await wslRoot.create();
-    for (var i = 0; i < 5; i++) {
+    for (var i = 0; i < 80; i++) {
       await _writeJsonFixture(windowsRoot, 'cancel-$i');
     }
 
@@ -4039,9 +3996,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -4068,7 +4023,7 @@ void main() {
     expect(result.cancelled, isTrue);
     expect(result.statusMessage, contains('cancelled'));
     expect(result.rows, isNotEmpty);
-    expect(result.rows.length, lessThan(5));
+    expect(result.rows.length, lessThan(80));
 
     final cached = await controller.loadCachedRows();
     expect(cached.rows, hasLength(result.rows.length));
@@ -4106,9 +4061,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final controller = RuntimeSessionController(
@@ -4187,9 +4140,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -4254,9 +4205,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final coordinator = DatabaseMaintenanceCoordinator(databaseFile);
@@ -4310,9 +4259,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -4392,9 +4339,7 @@ void main() {
           ),
         );
         final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-        final startup = await DatabaseMigrator(
-          sqlRoot: Directory('../sql'),
-        ).openAndMigrate(databaseFile);
+        final startup = await _migrateCollectorFixture(databaseFile);
         expect(startup.canStartNormalUi, isTrue);
         final controller = RuntimeSessionController(
           settingsFile: settingsFile,
@@ -4812,9 +4757,7 @@ void main() {
         ),
       );
       final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await DatabaseMigrator(
-        sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-      ).openAndMigrate(databaseFile);
+      final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
       final result = await RuntimeSessionController(
@@ -4827,7 +4770,13 @@ void main() {
       expect(row.assistantResponseTokens, 21);
       expect(row.toolCallTokens, 0);
       expect(row.totalTokens, 63);
-      expect(row.estimatedCostDisplay, '\$0.0805');
+      expect(row.estimatedCostDisplay, 'Pricing update in progress');
+      _repriceFixture(databaseFile, _testPricing());
+      final repriced = await RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      ).loadSessionDetail(row.id);
+      expect(repriced?.estimatedCostDisplay, '\$0.0805');
 
       final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
@@ -4877,9 +4826,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -4930,9 +4877,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -4978,9 +4923,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -5023,9 +4966,7 @@ void main() {
       ),
     );
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await DatabaseMigrator(
-      sqlRoot: Directory(p.normalize(p.join('..', 'sql'))),
-    ).openAndMigrate(databaseFile);
+    final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
     final controller = RuntimeSessionController(
@@ -5504,9 +5445,7 @@ Future<File> _prepareBackfillDatabase(
   required int count,
 }) async {
   final file = File(p.join(temp.path, 'viewer.sqlite'));
-  final startup = await DatabaseMigrator(
-    sqlRoot: Directory('../sql'),
-  ).openAndMigrate(file);
+  final startup = await _migrateCollectorFixture(file);
   expect(startup.canStartNormalUi, isTrue);
   final db = openFileBackedDatabase(file);
   try {
@@ -5683,4 +5622,51 @@ SessionRowViewModel _resumableRow(String title) {
     tags: const [],
     status: 'available',
   );
+}
+
+// Use the production startup migration once, then isolate every scan fixture.
+Future<DatabaseStartupResult> _migrateCollectorFixture(File target) async {
+  await target.parent.create(recursive: true);
+  await _collectorTemplate.copy(target.path);
+  return DatabaseMigrator(sqlRoot: Directory('../sql')).openAndMigrate(target);
+}
+
+void _seedIdentityUsageContext(Database db) {
+  db.execute(
+    "insert or ignore into usage_path_contexts (id, display_path_raw, platform_path_raw, unc_path_raw, display_path_key, platform_path_key, unc_path_key, normalization_version, resolution_source, project_rules_version, created_at_utc, updated_at_utc) values (1, '', '', '', '', '', '', 1, 'unassigned', 0, '2026-09-24', '2026-09-24')",
+  );
+}
+
+void _repriceFixture(File file, PricingSettings settings) {
+  final db = openFileBackedDatabase(file, maintenanceWriter: true);
+  try {
+    // Fixture price evidence predates the June usage events.
+    db.execute('delete from local_price_override_periods');
+    PricingRepository(
+      db,
+    ).synchronizeSettings(settings, nowUtc: DateTime.utc(2026, 1, 1));
+    final jobs = MaintenanceJobRepository(db);
+    final job = jobs.enqueue(
+      jobType: 'usage_cost_repricing',
+      phase: 'reprice_costs',
+    );
+    final lease = jobs.claim(
+      jobType: job.jobType,
+      leaseDuration: const Duration(minutes: 5),
+    )!;
+    final costs = UsageCostProjectionRepository(db);
+    while (costs.repriceNextBatch(
+          jobs: jobs,
+          lease: lease,
+          settings: settings,
+        ) !=
+        0) {}
+    jobs.markSucceeded(
+      lease,
+      phase: 'complete',
+      statusMessage: 'Fixture repriced.',
+    );
+  } finally {
+    db.close();
+  }
 }

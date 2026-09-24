@@ -95,7 +95,13 @@ class _LogsScreenState extends State<LogsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Logs', style: Theme.of(context).textTheme.titleLarge),
+            Semantics(
+              header: true,
+              child: Text(
+                'Logs',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+            ),
             const SizedBox(height: 12),
             _Filters(
               errorsOnly: _errorsOnly,
@@ -116,7 +122,13 @@ class _LogsScreenState extends State<LogsScreen> {
               },
             ),
             const SizedBox(height: 12),
-            Text('Log table', style: Theme.of(context).textTheme.titleSmall),
+            Semantics(
+              header: true,
+              child: Text(
+                'Log table',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+            ),
             const SizedBox(height: 8),
             Expanded(
               flex: 3,
@@ -271,37 +283,53 @@ class _LogsRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final background = selected ? scheme.secondaryContainer : null;
-    return Material(
-      color: background,
-      child: InkWell(
-        onTap: () => onSelected(entry),
-        child: Row(
-          children: [
-            _LogCell(width: columns[0].width, text: _formatTime(entry.timeUtc)),
-            _LogCell(width: columns[1].width, text: entry.level.name),
-            _LogCell(
-              width: columns[2].width,
-              text: entry.category.displayLabel,
-            ),
-            SizedBox(
-              width: columns[3].width,
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton(
-                  onPressed: () => onSelected(entry),
-                  child: Text(
-                    entry.message,
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
+    final label = [
+      'Log ${_formatTime(entry.timeUtc)}',
+      entry.level.name,
+      entry.category.displayLabel,
+      entry.message,
+      entry.details == null ? 'no details' : 'details available',
+    ].join(', ');
+    return Semantics(
+      label: label,
+      button: true,
+      selected: selected,
+      onTap: () => onSelected(entry),
+      child: ExcludeSemantics(
+        child: Material(
+          color: background,
+          child: InkWell(
+            excludeFromSemantics: true,
+            onTap: () => onSelected(entry),
+            child: Row(
+              children: [
+                _LogCell(
+                  width: columns[0].width,
+                  text: _formatTime(entry.timeUtc),
+                ),
+                _LogCell(width: columns[1].width, text: entry.level.name),
+                _LogCell(
+                  width: columns[2].width,
+                  text: entry.category.displayLabel,
+                ),
+                SizedBox(
+                  width: columns[3].width,
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      entry.message,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
                   ),
                 ),
-              ),
+                _LogCell(
+                  width: columns[4].width,
+                  text: entry.details == null ? 'No' : 'Yes',
+                ),
+              ],
             ),
-            _LogCell(
-              width: columns[4].width,
-              text: entry.details == null ? 'No' : 'Yes',
-            ),
-          ],
+          ),
         ),
       ),
     );

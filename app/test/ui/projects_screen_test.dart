@@ -225,6 +225,12 @@ void main() {
       findsOneWidget,
     );
     expect(find.text(r'F:\projects\viewer'), findsOneWidget);
+    await tester.ensureVisible(find.text('Merge into…').last);
+    await tester.pumpAndSettle();
+    expect(
+      find.bySemanticsLabel(r'Merge F:\projects\viewer into another project'),
+      findsOneWidget,
+    );
     expect(find.text('Set by hand'), findsNothing);
   });
 

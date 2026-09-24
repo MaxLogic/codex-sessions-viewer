@@ -131,6 +131,26 @@ void main() {
     expect(opened.single.sessionId, 'parser');
     expect(opened.single.messageIndex, isNull);
   });
+
+  testWidgets('announces search failures as a live status', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ContextSearchScreen(
+          initialSessionRows: const [],
+          onSearchMessages: (_) => throw StateError('index unavailable'),
+        ),
+      ),
+    );
+
+    await tester.enterText(find.bySemanticsLabel('Context query'), 'cache');
+    await tester.tap(find.bySemanticsLabel('Search context'));
+    await tester.pumpAndSettle();
+
+    final status = tester.getSemantics(
+      find.bySemanticsLabel(RegExp(r'^Context search failed\.')),
+    );
+    expect(status.flagsCollection.isLiveRegion, isTrue);
+  });
 }
 
 SessionRowViewModel _row({

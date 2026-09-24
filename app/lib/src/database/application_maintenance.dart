@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import '../config/app_settings.dart';
 import '../pricing/pricing_repository.dart';
+import '../pricing/hub_price_history.dart';
 import '../usage/usage_cost_projection.dart';
 import 'database_connection.dart';
 import 'database_maintenance.dart';
@@ -66,6 +67,7 @@ class ApplicationMaintenance extends ChangeNotifier {
               settings.pricing.useExternalPricing &&
               settings.pricing.automaticRefreshEnabled,
           intervalSeconds: settings.pricing.refreshIntervalHours * 3600,
+          utcSlots: settings.pricing.refreshUtcSlots,
         );
         jobs.configureSchedule(
           jobType: 'database_optimize',
@@ -252,6 +254,8 @@ class ApplicationMaintenance extends ChangeNotifier {
   Future<void> _refreshPrices({bool manual = false}) async {
     const type = 'openrouter_price_refresh';
     PricingSettings? requestSettings;
+    var localObservations = <PriceObservation>[];
+    var knownHub = const HubPriceSyncResult([], 0, '');
     final started = clock().toUtc();
     _lastPricingSucceeded = false;
     await coordinator.runWriter(() async {
@@ -268,13 +272,25 @@ class ApplicationMaintenance extends ChangeNotifier {
         ).recordScheduleAttempt(type, manual: manual),
       );
       requestSettings = settings;
+      if (settings.hubUrl.isNotEmpty && settings.hubMachineId.isNotEmpty) {
+        final prepared = await _prepareHubHistory(
+          databaseFile.path,
+          settings.hubMachineId,
+          settings.hubUrl,
+        );
+        localObservations = prepared.$1;
+        knownHub = prepared.$2;
+      }
     }, priority: DatabaseWriterPriority.pricing);
     final settings = requestSettings;
     if (_stopped || settings == null) return;
     bool requestIsCurrent() =>
         !_stopped &&
         _settings!.pricing.useExternalPricing &&
-        _settings!.pricing.openRouter == settings.openRouter;
+        _settings!.pricing.openRouter == settings.openRouter &&
+        _settings!.pricing.hubUrl == settings.hubUrl &&
+        _settings!.pricing.hubToken == settings.hubToken &&
+        _settings!.pricing.hubMachineId == settings.hubMachineId;
     _readStatus();
     _report(
       'catalog_download',
@@ -284,44 +300,95 @@ class ApplicationMaintenance extends ChangeNotifier {
     var succeeded = false;
     var superseded = false;
     Duration? retryAfter;
+    DateTime? successfulObservationAtUtc;
     final cancelled = Completer<OpenRouterModelsResponse?>();
     final cancellation = _stopSignal.future.asStream().listen(
       (_) => cancelled.complete(null),
     );
     try {
-      final response = await Future.any<OpenRouterModelsResponse?>([
-        client.fetchModels(
-          OpenRouterModelsRequest(
-            endpoint: Uri.parse(settings.openRouter.modelsEndpoint),
-            apiKey: settings.openRouter.apiKey,
+      List<PriceObservation>? hubObservations;
+      HubPriceSyncResult? hubResult;
+      if (settings.hubUrl.isNotEmpty &&
+          settings.hubToken.isNotEmpty &&
+          settings.hubMachineId.isNotEmpty) {
+        try {
+          hubResult = await HubPriceHistoryClient().synchronizeIncremental(
+            endpoint: Uri.parse(settings.hubUrl),
+            token: settings.hubToken,
             cancellation: _stopSignal.future,
-          ),
-        ),
-        cancelled.future,
-      ]);
-      if (response == null || _stopped) return;
-      final observed = clock().toUtc();
-      _report(
-        'catalog_waiting_writer',
-        'Prices downloaded; waiting for the database writer.',
-        started: started,
-      );
-      await coordinator.runWriter(() async {
-        if (!requestIsCurrent()) {
-          superseded = true;
-          return;
+            observations: localObservations,
+            known: knownHub.observations,
+            after: knownHub.through,
+          );
+          hubObservations = hubResult.observations;
+        } on Object {
+          // A disconnected optional hub must not disable local observations.
         }
+      }
+      if (hubObservations != null && hubObservations.isNotEmpty) {
+        await coordinator.runWriter(() async {
+          if (!requestIsCurrent()) {
+            superseded = true;
+            return;
+          }
+          await _mergeHubHistory(
+            databaseFile.path,
+            hubResult!,
+            settings.hubUrl,
+          );
+          successfulObservationAtUtc = hubObservations!
+              .map((item) => item.observedAtUtc)
+              .reduce((a, b) => a.isAfter(b) ? a : b);
+          final currentSlot = started.millisecondsSinceEpoch ~/ 21600000;
+          succeeded = hubObservations.any(
+            (item) => item.authority == 'hub' && item.slot >= currentSlot,
+          );
+          _dataRevision++;
+          if (!_disposed) notifyListeners();
+        }, priority: DatabaseWriterPriority.pricing);
+      }
+      if (!succeeded && !superseded && !_stopped) {
+        final response = await Future.any<OpenRouterModelsResponse?>([
+          client.fetchModels(
+            OpenRouterModelsRequest(
+              endpoint: Uri.parse(settings.openRouter.modelsEndpoint),
+              apiKey: settings.openRouter.apiKey,
+              cancellation: _stopSignal.future,
+            ),
+          ),
+          cancelled.future,
+        ]);
+        if (response == null || _stopped) return;
+        final observed = clock().toUtc();
         _report(
-          'catalog_apply',
-          'Storing observed model prices.',
+          'catalog_waiting_writer',
+          'Prices downloaded; waiting for the database writer.',
           started: started,
         );
-        // Only bounded public catalog data crosses into this isolate.
-        await _applyCatalog(databaseFile.path, response, started, observed);
-        succeeded = true;
-        _dataRevision++;
-        if (!_disposed) notifyListeners();
-      }, priority: DatabaseWriterPriority.pricing);
+        await coordinator.runWriter(() async {
+          if (!requestIsCurrent()) {
+            superseded = true;
+            return;
+          }
+          _report(
+            'catalog_apply',
+            'Storing observed model prices.',
+            started: started,
+          );
+          // Only bounded public catalog data crosses into this isolate.
+          await _applyCatalog(
+            databaseFile.path,
+            response,
+            started,
+            observed,
+            settings.hubMachineId.isEmpty ? 'local' : settings.hubMachineId,
+          );
+          succeeded = true;
+          successfulObservationAtUtc = observed;
+          _dataRevision++;
+          if (!_disposed) notifyListeners();
+        }, priority: DatabaseWriterPriority.pricing);
+      }
     } on Object catch (error) {
       retryAfter = error is PricingFetchException ? error.retryAfter : null;
     } finally {
@@ -343,6 +410,8 @@ class ApplicationMaintenance extends ChangeNotifier {
           type,
           succeeded: succeeded,
           retryAfter: retryAfter,
+          utcSlots: _settings!.pricing.refreshUtcSlots,
+          successfulObservationAtUtc: successfulObservationAtUtc,
         );
       });
     }, priority: DatabaseWriterPriority.pricing);
@@ -360,8 +429,8 @@ class ApplicationMaintenance extends ChangeNotifier {
     _report(
       succeeded ? 'complete' : 'catalog_failed',
       succeeded
-          ? 'OpenRouter model prices refreshed.'
-          : 'OpenRouter price refresh failed.',
+          ? 'Observed model price history refreshed.'
+          : 'Model price refresh failed; retained observations remain available.',
       started: started,
       state: succeeded
           ? DatabaseMaintenanceState.succeeded
@@ -464,12 +533,51 @@ Future<void> _applyCatalog(
   OpenRouterModelsResponse response,
   DateTime started,
   DateTime observed,
+  String origin,
 ) => Isolate.run(() {
   final db = openFileBackedDatabase(File(path));
   try {
-    PricingRepository(
-      db,
-    ).applyCatalog(response, startedAtUtc: started, observedAtUtc: observed);
+    PricingRepository(db).applyCatalog(
+      response,
+      startedAtUtc: started,
+      observedAtUtc: observed,
+      origin: origin,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+Future<void> _mergeHubHistory(
+  String path,
+  HubPriceSyncResult snapshot,
+  String url,
+) => Isolate.run(() {
+  final db = openFileBackedDatabase(File(path));
+  try {
+    PricingRepository(db).mergePriceObservations(
+      snapshot.observations,
+      hubUrl: url,
+      through: snapshot.through,
+      hubRevision: snapshot.revision,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+Future<(List<PriceObservation>, HubPriceSyncResult)> _prepareHubHistory(
+  String path,
+  String origin,
+  String url,
+) => Isolate.run(() {
+  final db = openFileBackedDatabase(File(path));
+  try {
+    final repository = PricingRepository(db);
+    return (
+      repository.localPriceObservationsForHub(origin),
+      repository.hubSyncSnapshot(url),
+    );
   } finally {
     db.close();
   }

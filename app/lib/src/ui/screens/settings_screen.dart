@@ -23,8 +23,10 @@ class SettingsScreen extends StatefulWidget {
     this.diagnostics = const DefaultSettingsDiagnostics(),
     this.maintenanceSchedules = const [],
     this.maintenanceProgress,
-  });
+    DateTime Function()? clock,
+  }) : clock = clock ?? DateTime.now;
 
+  final DateTime Function() clock;
   final AppSettings? initialSettings;
   final SettingsSaveCallback? onSave;
   final SettingsReloadCallback? onReload;
@@ -221,10 +223,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       pricing: PricingSettings(
         provider: _settings.pricing.provider,
+        hubUrl: _settings.pricing.hubUrl,
+        hubToken: _settings.pricing.hubToken,
+        hubMachineId: _settings.pricing.hubMachineId,
         useExternalPricing: _settings.pricing.useExternalPricing,
         refreshIntervalHours:
             int.tryParse(_pricingRefreshInterval.text) ??
             _settings.pricing.refreshIntervalHours,
+        refreshUtcSlots: _settings.pricing.refreshUtcSlots,
         automaticRefreshEnabled: _settings.pricing.automaticRefreshEnabled,
         fallbackToOverrides: _settings.pricing.fallbackToOverrides,
         openRouter: _settings.pricing.openRouter,
@@ -265,7 +271,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Settings', style: Theme.of(context).textTheme.titleLarge),
+            Semantics(
+              header: true,
+              child: Text(
+                'Settings',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+            ),
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
@@ -512,7 +524,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               _settings = _settings.copyWith(
                                 pricing: PricingSettings(
                                   provider: _settings.pricing.provider,
+                                  hubUrl: _settings.pricing.hubUrl,
+                                  hubToken: _settings.pricing.hubToken,
+                                  hubMachineId: _settings.pricing.hubMachineId,
                                   useExternalPricing: value,
+                                  refreshUtcSlots:
+                                      _settings.pricing.refreshUtcSlots,
                                   cachePricingHours:
                                       _settings.pricing.cachePricingHours,
                                   automaticRefreshEnabled:
@@ -534,8 +551,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             _settings = _settings.copyWith(
                               pricing: PricingSettings(
                                 provider: pricing.provider,
+                                hubUrl: pricing.hubUrl,
+                                hubToken: pricing.hubToken,
+                                hubMachineId: pricing.hubMachineId,
                                 useExternalPricing: pricing.useExternalPricing,
                                 automaticRefreshEnabled: value,
+                                refreshUtcSlots: pricing.refreshUtcSlots,
                                 refreshIntervalHours:
                                     pricing.refreshIntervalHours,
                                 fallbackToOverrides:
@@ -545,6 +566,44 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               ),
                             );
                           }),
+                        ),
+                        _SwitchSetting(
+                          label: 'Use fixed UTC pricing slots',
+                          value: _settings.pricing.refreshUtcSlots,
+                          onChanged: (value) => setState(() {
+                            final pricing = _settings.pricing;
+                            if (value) _pricingRefreshInterval.text = '6';
+                            _settings = _settings.copyWith(
+                              pricing: PricingSettings(
+                                provider: pricing.provider,
+                                hubUrl: pricing.hubUrl,
+                                hubToken: pricing.hubToken,
+                                hubMachineId: pricing.hubMachineId,
+                                useExternalPricing: pricing.useExternalPricing,
+                                automaticRefreshEnabled:
+                                    pricing.automaticRefreshEnabled,
+                                refreshIntervalHours: value
+                                    ? 6
+                                    : pricing.refreshIntervalHours,
+                                refreshUtcSlots: value,
+                                fallbackToOverrides:
+                                    pricing.fallbackToOverrides,
+                                openRouter: pricing.openRouter,
+                                overrides: pricing.overrides,
+                              ),
+                            );
+                          }),
+                        ),
+                        Text(
+                          _settings.pricing.refreshUtcSlots
+                              ? 'Cadence: 00:00, 06:00, 12:00 and 18:00 UTC. Missed slots use one catch-up observation.'
+                              : 'Cadence: interval after the last successful observation.',
+                        ),
+                        const Text(
+                          'Changing the interval from 6 hours selects an interval schedule.',
+                        ),
+                        const Text(
+                          'Observations record download time; prices between observations may be unknown. Conditional rules use each usage event time and context.',
                         ),
                         _TextSetting(
                           label: 'Price refresh interval (hours)',
@@ -708,6 +767,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
         Text('Last success: ${date(schedule?.lastSuccessAtUtc, 'Never')}'),
         Text('Next due: $nextDue'),
         Text('Last error: ${schedule?.lastError ?? 'None'}'),
+        if (jobType == 'openrouter_price_refresh')
+          Text(
+            schedule?.lastSuccessAtUtc == null
+                ? 'Observation state: No successful observation'
+                : schedule!.lastError != null ||
+                      !(_settings.pricing.refreshUtcSlots
+                              ? nextPricingUtcSlot(schedule.lastSuccessAtUtc!)
+                              : schedule.lastSuccessAtUtc!.add(
+                                  Duration(seconds: schedule.intervalSeconds),
+                                ))
+                          .isAfter(widget.clock().toUtc())
+                ? 'Observation state: Stale; prices may have changed'
+                : 'Observation state: Last observation within cadence; not a live price',
+          ),
       ],
     );
   }
@@ -745,7 +818,10 @@ class _Section extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: Theme.of(context).textTheme.titleMedium),
+          Semantics(
+            header: true,
+            child: Text(title, style: Theme.of(context).textTheme.titleMedium),
+          ),
           const SizedBox(height: 8),
           ...children,
         ],
@@ -841,6 +917,8 @@ class _SwitchSetting extends StatelessWidget {
           Semantics(
             label: '$label setting',
             toggled: value,
+            excludeSemantics: true,
+            onTap: () => onChanged(!value),
             child: Switch(value: value, onChanged: onChanged),
           ),
         ],

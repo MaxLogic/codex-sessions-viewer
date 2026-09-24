@@ -40,6 +40,7 @@ class CodexAppShell extends StatefulWidget {
     this.requestedSection,
     this.sectionRequestSerial = 0,
     this.motionMode = AppMotionMode.system,
+    this.onSectionChanged,
   });
 
   final String title;
@@ -53,6 +54,7 @@ class CodexAppShell extends StatefulWidget {
   final CodexAppSection? requestedSection;
   final int sectionRequestSerial;
   final AppMotionMode motionMode;
+  final ValueChanged<CodexAppSection>? onSectionChanged;
 
   @override
   State<CodexAppShell> createState() => _CodexAppShellState();
@@ -106,7 +108,15 @@ class _CodexAppShellState extends State<CodexAppShell> {
       _handledSectionRequestSerial = widget.sectionRequestSerial;
       _previousIndex = _selectedIndex;
       _selectedIndex = requested.index;
+      _reportSection();
     }
+  }
+
+  void _reportSection() {
+    final section = CodexAppSection.values[_selectedIndex];
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) widget.onSectionChanged?.call(section);
+    });
   }
 
   @override
@@ -145,6 +155,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
                     _previousIndex = _selectedIndex;
                     _selectedIndex = index;
                   });
+                  _reportSection();
                 },
                 destinations: [
                   for (final item in CodexAppSection.values)
@@ -181,6 +192,7 @@ class _CodexAppShellState extends State<CodexAppShell> {
                     _previousIndex = _selectedIndex;
                     _selectedIndex = CodexAppSection.settings.index;
                   });
+                  _reportSection();
                 },
               ),
             ),
@@ -247,7 +259,13 @@ class _SectionContent extends StatelessWidget {
       ),
       child: KeyedSubtree(
         key: ValueKey(section),
-        child: _buildSection(context),
+        child: Semantics(
+          label: '${section.label} screen',
+          liveRegion: true,
+          container: true,
+          explicitChildNodes: true,
+          child: _buildSection(context),
+        ),
       ),
     );
   }

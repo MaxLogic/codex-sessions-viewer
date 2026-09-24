@@ -216,7 +216,6 @@ class _MessageBody extends StatelessWidget {
         key: const Key('focus-reader-message'),
         label:
             'Tool output collapsed, ${message.lineCount} lines. Press X to expand.',
-        button: true,
         child: ExcludeSemantics(
           child: Align(
             alignment: Alignment.topLeft,

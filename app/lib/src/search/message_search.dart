@@ -99,6 +99,13 @@ class MessageSearchIndex {
     if (tokens.isEmpty || query.limit <= 0) {
       return const [];
     }
+    // Older read-only indexes predate the multi-harness schema.
+    final harnessExpression =
+        db
+            .select('pragma table_info(sessions)')
+            .any((row) => row['name'] == 'harness')
+        ? 's.harness'
+        : "'codex'";
     final rows = db.select(
       '''
       select
@@ -114,6 +121,7 @@ class MessageSearchIndex {
         coalesce(s.title, '') as session_title,
         coalesce(s.project_name_snapshot, '') as project_name,
         s.source_type as source_type,
+        $harnessExpression as harness,
         coalesce(
           m.created_at_utc,
           s.last_message_at_utc,
@@ -149,6 +157,7 @@ class MessageSearchIndex {
           sessionTitle: row['session_title'] as String? ?? '',
           projectName: row['project_name'] as String? ?? '',
           sourceType: row['source_type'] as String? ?? '',
+          harness: row['harness'] as String? ?? 'codex',
           timestampUtc: _dateTime(row['timestamp_utc'] as String?),
         ),
     ];
@@ -222,6 +231,7 @@ class MessageSearchResult {
     required this.projectName,
     required this.sourceType,
     required this.timestampUtc,
+    this.harness = 'codex',
   });
 
   final String sessionId;
@@ -232,6 +242,7 @@ class MessageSearchResult {
   final String sessionTitle;
   final String projectName;
   final String sourceType;
+  final String harness;
   final DateTime? timestampUtc;
 }
 

@@ -180,7 +180,7 @@ void main() {
 
     await tester.tap(find.bySemanticsLabel('Platform filter'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Windows').last);
+    await tester.tap(find.text('Windows only').last);
     await tester.pumpAndSettle();
     await tester.tap(find.text('Refresh'));
     await tester.pumpAndSettle();

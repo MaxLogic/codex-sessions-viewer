@@ -3,6 +3,12 @@ class SessionLabelFormatter {
 
   static const unknown = 'Unknown';
 
+  static String harness(String value) => switch (value.trim().toLowerCase()) {
+    'codex' => 'Codex',
+    'claude' => 'Claude Code',
+    _ => value.trim().isEmpty ? 'Unknown harness' : value,
+  };
+
   static String platform(String platformName) {
     return switch (platformName.trim().toLowerCase()) {
       'windows' => 'Windows',

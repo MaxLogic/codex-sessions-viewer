@@ -158,7 +158,13 @@ void main() {
           (a, b) => a.uri.pathSegments.last.compareTo(b.uri.pathSegments.last),
         );
     for (final file in scripts) {
-      if (file.uri.pathSegments.last.startsWith('016_')) continue;
+      // This isolated ordering fixture omits the usage-generation schema.
+      // Later migrations install triggers that require those usage tables.
+      if (file.uri.pathSegments.last.startsWith('016_') ||
+          file.uri.pathSegments.last.startsWith('021_') ||
+          file.uri.pathSegments.last.startsWith('023_')) {
+        continue;
+      }
       db.execute(file.readAsStringSync());
     }
     db.execute('''

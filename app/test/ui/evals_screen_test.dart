@@ -208,6 +208,22 @@ void main() {
     expect(find.text('Provider row'), findsOneWidget);
     expect(find.text('Unknown row'), findsNothing);
   });
+
+  testWidgets('announces export status as a live region', (tester) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: EvalsScreen(
+          initialRows: [],
+          statusMessage: 'Eval export failed.',
+        ),
+      ),
+    );
+
+    final status = tester.getSemantics(
+      find.bySemanticsLabel('Eval export failed.'),
+    );
+    expect(status.flagsCollection.isLiveRegion, isTrue);
+  });
 }
 
 SessionRowViewModel _row({

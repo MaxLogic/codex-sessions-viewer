@@ -12,6 +12,7 @@ import '../config/app_settings.dart';
 import '../config/settings_diagnostics.dart';
 import '../commands/resume_command_generator.dart';
 import '../database/database_connection.dart';
+import '../database/external_database_changes.dart';
 import '../database/application_maintenance.dart';
 import '../database/database_maintenance.dart';
 import '../database/database_migrator.dart';
@@ -20,17 +21,20 @@ import '../database/session_eval_state.dart';
 import '../app/runtime_session_controller.dart';
 import 'logs_loader.dart';
 import '../export/eval_dataset_exporter.dart';
+import '../export/session_list_message_loader.dart';
 import '../parser/codex_session_parser.dart';
 import '../platform/terminal_launcher.dart';
 import '../pricing/pricing_repository.dart';
 import '../search/message_search.dart';
 import '../ui/app_shell.dart';
 import '../ui/dialogs/move_to_project_dialog.dart';
+import '../ui/dialogs/delayed_export_progress.dart';
 import '../ui/models/session_project_change.dart';
 import '../ui/screens/context_search_screen.dart';
 import '../ui/screens/evals_screen.dart';
 import '../ui/screens/projects_screen.dart';
 import '../ui/screens/sessions_screen.dart';
+import '../ui/screens/hub_sessions_screen.dart';
 import '../ui/screens/settings_screen.dart';
 import '../ui/screens/usage_screen.dart';
 import '../ui/themes.dart';
@@ -142,6 +146,10 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   var _exitRequested = false;
   var _seenMaintenanceRevision = 0;
   var _pricingRevision = 0;
+  var _externalRevision = 0;
+  var _externalUsagePending = false;
+  var _visibleSection = CodexAppSection.sessions;
+  ExternalDatabaseChanges? _externalChanges;
   var _pricingUpdating = false;
   var _synchronizingPricing = false;
   var _maintenanceUsageReloadScheduled = false;
@@ -165,6 +173,40 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     _lifecycleListener = AppLifecycleListener(onExitRequested: _prepareForExit);
     _seenMaintenanceRevision = widget.applicationMaintenance?.dataRevision ?? 0;
     widget.applicationMaintenance?.addListener(_maintenanceChanged);
+    unawaited(
+      widget.databaseStartup.then((result) {
+        if (!mounted || _exitRequested || !result.canStartNormalUi) return;
+        _externalChanges = ExternalDatabaseChanges(
+          widget.databaseFile,
+          onChange: _externalDatabaseChanged,
+        );
+        _externalChanges!.start();
+      }, onError: (Object _) {}),
+    );
+  }
+
+  void _externalDatabaseChanged() {
+    if (!mounted || _exitRequested) return;
+    setState(() {
+      _externalRevision++;
+      _usageSummary = null;
+    });
+    _externalUsagePending = true;
+    final settings = _settings;
+    if (settings != null && !_usageIsRefreshing) {
+      unawaited(_loadUsageSummary(settings));
+    }
+  }
+
+  void _visibleSectionChanged(CodexAppSection section) {
+    _visibleSection = section;
+    final settings = _settings;
+    if (section == CodexAppSection.usage &&
+        settings != null &&
+        !_usageIsRefreshing &&
+        (_externalUsagePending || _usageSummary == null)) {
+      unawaited(_loadUsageSummary(settings));
+    }
   }
 
   void _maintenanceChanged() {
@@ -208,6 +250,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
 
   Future<AppExitResponse> _prepareForExitOnce() async {
     _exitRequested = true;
+    _externalChanges?.dispose();
     final refreshStop = _cancelAndJoinRefresh(_activeSessionRefreshOperation);
     final backfillStop = _messageSearchBackfill?.cancel();
     final startupMaintenanceStop = _databaseMaintenanceOperation?.requestStop();
@@ -377,40 +420,50 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         if (mounted) setState(() {});
                       });
                     }
-                    _startUsageSummaryLoad(settings);
+                    if (_visibleSection == CodexAppSection.usage) {
+                      _startUsageSummaryLoad(settings);
+                    }
                     _startMessageSearchBackfill();
                     return CodexAppShell(
+                      onSectionChanged: _visibleSectionChanged,
                       motionMode: settings.ui.motion,
                       requestedSection: _requestedSection,
                       sectionRequestSerial: _sectionRequestSerial,
                       sessionsScreenBuilder: (context, onOpenSettings) =>
-                          _SessionsScreenLoader(
+                          SessionSourcePane(
                             settings: settings,
                             settingsFile: widget.settingsFile,
                             databaseFile: widget.databaseFile,
-                            writerCoordinator: _writerCoordinator,
-                            pricingRevision: _pricingRevision,
-                            pricingUpdating: _pricingUpdating,
-                            onRefreshOperation: _sessionRefreshOperation,
-                            onLoadCachedRows: widget.sessionCachedRowsLoader,
-                            deferInitialLoad: widget.deferInitialSessionLoad,
-                            onOpenSettings: onOpenSettings,
-                            onSessionAction: (request) =>
-                                _handleSessionAction(request),
-                            onExportMarkdown: _exportConversationMarkdown,
-                            onSaveSessionListCsv: _saveSessionListCsv,
-                            onCopyText: _copyText,
-                            onVoiceEvent: _playVoiceEvent,
-                            onTableStateChanged: (state) {
-                              unawaited(_saveSessionTableState(state));
-                            },
-                            openTarget: _sessionOpenTarget,
-                            openTargetSerial: _sessionOpenTargetSerial,
-                            projectFilterRequest: _sessionsProjectFilter,
-                            projectFilterSerial: _sessionsProjectFilterSerial,
-                            now: widget.now,
+                            local: _SessionsScreenLoader(
+                              settings: settings,
+                              settingsFile: widget.settingsFile,
+                              databaseFile: widget.databaseFile,
+                              writerCoordinator: _writerCoordinator,
+                              externalRevision: _externalRevision,
+                              pricingRevision: _pricingRevision,
+                              pricingUpdating: _pricingUpdating,
+                              onRefreshOperation: _sessionRefreshOperation,
+                              onLoadCachedRows: widget.sessionCachedRowsLoader,
+                              deferInitialLoad: widget.deferInitialSessionLoad,
+                              onOpenSettings: onOpenSettings,
+                              onSessionAction: (request) =>
+                                  _handleSessionAction(request),
+                              onExportMarkdown: _exportConversationMarkdown,
+                              onSaveSessionListCsv: _saveSessionListCsv,
+                              onCopyText: _copyText,
+                              onVoiceEvent: _playVoiceEvent,
+                              onTableStateChanged: (state) {
+                                unawaited(_saveSessionTableState(state));
+                              },
+                              openTarget: _sessionOpenTarget,
+                              openTargetSerial: _sessionOpenTargetSerial,
+                              projectFilterRequest: _sessionsProjectFilter,
+                              projectFilterSerial: _sessionsProjectFilterSerial,
+                              now: widget.now,
+                            ),
                           ),
                       projectsScreen: ProjectsScreen(
+                        dataRevision: _externalRevision,
                         repository: RuntimeSessionController(
                           settingsFile: widget.settingsFile,
                           databaseFile: widget.databaseFile,
@@ -424,6 +477,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         now: widget.now,
                       ),
                       evalsScreen: _EvalsScreenLoader(
+                        externalRevision: _externalRevision,
                         settingsFile: widget.settingsFile,
                         databaseFile: widget.databaseFile,
                         writerCoordinator: _writerCoordinator,
@@ -434,6 +488,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         onExport: _exportEvalDataset,
                       ),
                       contextScreen: _ContextSearchLoader(
+                        externalRevision: _externalRevision,
                         settingsFile: widget.settingsFile,
                         databaseFile: widget.databaseFile,
                         writerCoordinator: _writerCoordinator,
@@ -531,6 +586,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   @override
   void dispose() {
     widget.applicationMaintenance?.removeListener(_maintenanceChanged);
+    _externalChanges?.dispose();
     _lifecycleListener.dispose();
     unawaited(widget.applicationMaintenance?.stop());
     unawaited(_databaseMaintenanceOperation?.requestStop());
@@ -773,6 +829,12 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   }
 
   Future<void> _loadUsageSummary(AppSettings settings) async {
+    if (_visibleSection != CodexAppSection.usage) {
+      _externalUsagePending = true;
+      return;
+    }
+    _externalUsagePending = false;
+    _usageLoadScheduled = true;
     if (_pricingUpdating || _exitRequested) return;
     final generation = ++_usageLoadGeneration;
     final request = UsageSummaryRequest(
@@ -810,6 +872,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
         setState(() {
           _usageIsRefreshing = false;
         });
+        if (_externalUsagePending) unawaited(_loadUsageSummary(settings));
       }
     }
   }
@@ -1107,7 +1170,12 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     if (destination == null) {
       return;
     }
-    await File(destination.path).writeAsString(markdown);
+    if (!mounted) return;
+    await runWithDelayedExportProgress(
+      context,
+      label: 'Saving Markdown',
+      operation: () => File(destination.path).writeAsString(markdown),
+    );
     _playVoiceEvent(VoiceOverStaticEvent.exportFinished);
   }
 
@@ -1319,6 +1387,7 @@ class _SessionsScreenLoader extends StatefulWidget {
   const _SessionsScreenLoader({
     required this.settings,
     required this.settingsFile,
+    required this.externalRevision,
     required this.databaseFile,
     required this.writerCoordinator,
     required this.pricingRevision,
@@ -1341,6 +1410,7 @@ class _SessionsScreenLoader extends StatefulWidget {
   });
 
   final AppSettings settings;
+  final int externalRevision;
   final File settingsFile;
   final File databaseFile;
   final DatabaseMaintenanceCoordinator writerCoordinator;
@@ -1370,6 +1440,10 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
   var _cachedRows = <SessionRowViewModel>[];
   var _cachedStatusMessage = '';
   var _cachedLoadGeneration = 0;
+  var _externalLoadRunning = false;
+  var _externalLoadPending = false;
+  int? _externalSessionRevision;
+  Timer? _externalRetry;
   var _autoRefreshToken = 0;
 
   @override
@@ -1381,6 +1455,9 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
   @override
   void didUpdateWidget(covariant _SessionsScreenLoader oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.externalRevision != widget.externalRevision) {
+      unawaited(_loadExternalRows());
+    }
     if (oldWidget.settingsFile.path != widget.settingsFile.path ||
         oldWidget.databaseFile.path != widget.databaseFile.path) {
       _startCachedLoad();
@@ -1393,11 +1470,50 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
     writerCoordinator: widget.writerCoordinator,
   );
 
+  @override
+  void dispose() {
+    _externalRetry?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadExternalRows() async {
+    if (_externalLoadRunning) {
+      _externalLoadPending = true;
+      return;
+    }
+    _externalLoadRunning = true;
+    try {
+      do {
+        _externalLoadPending = false;
+        final result = await _controller.loadExternalRowChanges(
+          afterRevision: _externalSessionRevision,
+        );
+        if (!mounted) return;
+        _externalSessionRevision = result.revision;
+        final merged = result.merge(_cachedRows);
+        if (!identical(merged, _cachedRows)) {
+          setState(() {
+            _cachedRows = merged;
+          });
+        }
+      } while (_externalLoadPending);
+    } on Object {
+      // Keep the usable snapshot and retry even if there is no later commit.
+      _externalRetry?.cancel();
+      _externalRetry = Timer(const Duration(seconds: 2), () {
+        if (mounted) unawaited(_loadExternalRows());
+      });
+    } finally {
+      _externalLoadRunning = false;
+    }
+  }
+
   void _startCachedLoad() {
     if (!mounted) {
       return;
     }
     final generation = ++_cachedLoadGeneration;
+    _externalSessionRevision = null;
     setState(() {
       _cachedRows = const [];
       _cachedStatusMessage = 'Loading previous sessions...';
@@ -1425,9 +1541,11 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       }
       setState(() {
         _cachedRows = result.rows;
+        _externalSessionRevision = null;
         _cachedStatusMessage = '';
         _autoRefreshToken++;
       });
+      if (widget.externalRevision > 0) unawaited(_loadExternalRows());
     } on Object catch (error) {
       if (!mounted || generation != _cachedLoadGeneration) {
         return;
@@ -1443,6 +1561,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
     return SessionsScreen(
       settings: widget.settings,
       initialRows: _cachedRows,
+      externalRevision: widget.externalRevision,
       initialStatusMessage: _cachedStatusMessage,
       autoRefreshToken: _autoRefreshToken,
       pricingRevision: widget.pricingRevision,
@@ -1456,6 +1575,17 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       onCopyText: widget.onCopyText,
       onVoiceEvent: widget.onVoiceEvent,
       onLoadSessionDetail: _controller.loadSessionDetail,
+      onLoadSessionListExportMessages:
+          (
+            sessionIds, {
+            required includeFirstMessage,
+            required includeLastMessage,
+          }) => loadSessionListExportMessages(
+            widget.databaseFile,
+            sessionIds,
+            includeFirstMessage: includeFirstMessage,
+            includeLastMessage: includeLastMessage,
+          ),
       onReloadSessionDetailFromSource:
           _controller.reloadSessionDetailFromSource,
       onLoadMessagePage: _controller.loadMessagePage,
@@ -1484,6 +1614,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
 class _ContextSearchLoader extends StatefulWidget {
   const _ContextSearchLoader({
     required this.settingsFile,
+    required this.externalRevision,
     required this.databaseFile,
     required this.writerCoordinator,
     this.onLoadCachedRows,
@@ -1491,6 +1622,7 @@ class _ContextSearchLoader extends StatefulWidget {
     required this.onOpenResult,
   });
 
+  final int externalRevision;
   final File settingsFile;
   final File databaseFile;
   final DatabaseMaintenanceCoordinator writerCoordinator;
@@ -1506,6 +1638,10 @@ class _ContextSearchLoaderState extends State<_ContextSearchLoader> {
   var _cachedRows = <SessionRowViewModel>[];
   var _cachedStatusMessage = '';
   var _cachedLoadGeneration = 0;
+  var _externalLoadRunning = false;
+  var _externalLoadPending = false;
+  int? _externalSessionRevision;
+  Timer? _externalRetry;
 
   @override
   void initState() {
@@ -1516,6 +1652,9 @@ class _ContextSearchLoaderState extends State<_ContextSearchLoader> {
   @override
   void didUpdateWidget(covariant _ContextSearchLoader oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.externalRevision != widget.externalRevision) {
+      unawaited(_loadExternalRows());
+    }
     if (oldWidget.settingsFile.path != widget.settingsFile.path ||
         oldWidget.databaseFile.path != widget.databaseFile.path) {
       _startCachedLoad();
@@ -1528,11 +1667,50 @@ class _ContextSearchLoaderState extends State<_ContextSearchLoader> {
     writerCoordinator: widget.writerCoordinator,
   );
 
+  @override
+  void dispose() {
+    _externalRetry?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadExternalRows() async {
+    if (_externalLoadRunning) {
+      _externalLoadPending = true;
+      return;
+    }
+    _externalLoadRunning = true;
+    try {
+      do {
+        _externalLoadPending = false;
+        final result = await _controller.loadExternalRowChanges(
+          afterRevision: _externalSessionRevision,
+        );
+        if (!mounted) return;
+        _externalSessionRevision = result.revision;
+        final merged = result.merge(_cachedRows);
+        if (!identical(merged, _cachedRows)) {
+          setState(() {
+            _cachedRows = merged;
+          });
+        }
+      } while (_externalLoadPending);
+    } on Object {
+      // Keep the usable snapshot and retry even if there is no later commit.
+      _externalRetry?.cancel();
+      _externalRetry = Timer(const Duration(seconds: 2), () {
+        if (mounted) unawaited(_loadExternalRows());
+      });
+    } finally {
+      _externalLoadRunning = false;
+    }
+  }
+
   void _startCachedLoad() {
     if (!mounted) {
       return;
     }
     final generation = ++_cachedLoadGeneration;
+    _externalSessionRevision = null;
     setState(() {
       _cachedRows = const [];
       _cachedStatusMessage = 'Loading context sessions...';
@@ -1560,8 +1738,10 @@ class _ContextSearchLoaderState extends State<_ContextSearchLoader> {
       }
       setState(() {
         _cachedRows = result.rows;
+        _externalSessionRevision = null;
         _cachedStatusMessage = '';
       });
+      if (widget.externalRevision > 0) unawaited(_loadExternalRows());
     } on Object catch (error) {
       if (!mounted || generation != _cachedLoadGeneration) {
         return;
@@ -1597,6 +1777,7 @@ class _ContextSearchLoaderState extends State<_ContextSearchLoader> {
 class _EvalsScreenLoader extends StatefulWidget {
   const _EvalsScreenLoader({
     required this.settingsFile,
+    required this.externalRevision,
     required this.databaseFile,
     required this.writerCoordinator,
     this.onLoadCachedRows,
@@ -1605,6 +1786,7 @@ class _EvalsScreenLoader extends StatefulWidget {
     required this.onExport,
   });
 
+  final int externalRevision;
   final File settingsFile;
   final File databaseFile;
   final DatabaseMaintenanceCoordinator writerCoordinator;
@@ -1621,6 +1803,10 @@ class _EvalsScreenLoaderState extends State<_EvalsScreenLoader> {
   var _cachedRows = <SessionRowViewModel>[];
   var _cachedStatusMessage = '';
   var _cachedLoadGeneration = 0;
+  var _externalLoadRunning = false;
+  var _externalLoadPending = false;
+  int? _externalSessionRevision;
+  Timer? _externalRetry;
 
   @override
   void initState() {
@@ -1631,6 +1817,9 @@ class _EvalsScreenLoaderState extends State<_EvalsScreenLoader> {
   @override
   void didUpdateWidget(covariant _EvalsScreenLoader oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.externalRevision != widget.externalRevision) {
+      unawaited(_loadExternalRows());
+    }
     if (oldWidget.settingsFile.path != widget.settingsFile.path ||
         oldWidget.databaseFile.path != widget.databaseFile.path) {
       _startCachedLoad();
@@ -1643,11 +1832,50 @@ class _EvalsScreenLoaderState extends State<_EvalsScreenLoader> {
     writerCoordinator: widget.writerCoordinator,
   );
 
+  @override
+  void dispose() {
+    _externalRetry?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadExternalRows() async {
+    if (_externalLoadRunning) {
+      _externalLoadPending = true;
+      return;
+    }
+    _externalLoadRunning = true;
+    try {
+      do {
+        _externalLoadPending = false;
+        final result = await _controller.loadExternalRowChanges(
+          afterRevision: _externalSessionRevision,
+        );
+        if (!mounted) return;
+        _externalSessionRevision = result.revision;
+        final merged = result.merge(_cachedRows);
+        if (!identical(merged, _cachedRows)) {
+          setState(() {
+            _cachedRows = merged;
+          });
+        }
+      } while (_externalLoadPending);
+    } on Object {
+      // Keep the usable snapshot and retry even if there is no later commit.
+      _externalRetry?.cancel();
+      _externalRetry = Timer(const Duration(seconds: 2), () {
+        if (mounted) unawaited(_loadExternalRows());
+      });
+    } finally {
+      _externalLoadRunning = false;
+    }
+  }
+
   void _startCachedLoad() {
     if (!mounted) {
       return;
     }
     final generation = ++_cachedLoadGeneration;
+    _externalSessionRevision = null;
     setState(() {
       _cachedRows = const [];
       _cachedStatusMessage = 'Loading eval sessions...';
@@ -1675,8 +1903,10 @@ class _EvalsScreenLoaderState extends State<_EvalsScreenLoader> {
       }
       setState(() {
         _cachedRows = result.rows;
+        _externalSessionRevision = null;
         _cachedStatusMessage = '';
       });
+      if (widget.externalRevision > 0) unawaited(_loadExternalRows());
     } on Object catch (error) {
       if (!mounted || generation != _cachedLoadGeneration) {
         return;

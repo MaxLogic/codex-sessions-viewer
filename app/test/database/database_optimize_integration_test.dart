@@ -15,70 +15,68 @@ void main() {
   });
   tearDown(() async => temp.delete(recursive: true));
 
-  test(
-    'each committed migration is optimized before the next migration',
-    () async {
-      final root = Directory('${temp.path}/sql');
-      for (final folder in ['init', 'migration']) {
-        await Directory('${root.path}/$folder').create(recursive: true);
-        for (final source in Directory(
-          '../sql/$folder',
-        ).listSync().whereType<File>()) {
-          if (source.path.endsWith('.sql')) {
-            await source.copy(
-              '${root.path}/$folder/${source.uri.pathSegments.last}',
-            );
-          }
+  test('each committed migration is optimized before the next migration', () async {
+    final root = Directory('${temp.path}/sql');
+    var lastFixtureVersion = 0;
+    for (final folder in ['init', 'migration']) {
+      await Directory('${root.path}/$folder').create(recursive: true);
+      for (final source in Directory(
+        '../sql/$folder',
+      ).listSync().whereType<File>()) {
+        if (source.path.endsWith('.sql')) {
+          final version = int.parse(
+            source.uri.pathSegments.last.split('_').first,
+          );
+          if (version > lastFixtureVersion) lastFixtureVersion = version;
+          await source.copy(
+            '${root.path}/$folder/${source.uri.pathSegments.last}',
+          );
         }
       }
-      await File('${root.path}/migration/021_optimize_probe.sql').writeAsString(
-        '''
+    }
+    final probeVersion = lastFixtureVersion + 1;
+    final auditVersion = probeVersion + 1;
+    await File(
+      '${root.path}/migration/${probeVersion.toString().padLeft(3, '0')}_optimize_probe.sql',
+    ).writeAsString('''
       create table optimize_probe (id integer primary key, value integer);
       create index idx_optimize_probe_value on optimize_probe(value);
       with recursive n(i) as (select 1 union all select i + 1 from n where i < 1000)
       insert into optimize_probe select i, i % 100 from n;
       select count(*) from optimize_probe where value = 42;
-    ''',
-      );
-      await File('${root.path}/migration/022_optimize_audit.sql').writeAsString(
-        '''
+    ''');
+    await File(
+      '${root.path}/migration/${auditVersion.toString().padLeft(3, '0')}_optimize_audit.sql',
+    ).writeAsString('''
       create table optimize_steps as select
         (select last_optimized_schema_version from database_state) previous_version,
         (select stat from sqlite_stat1 where idx = 'idx_optimize_probe_value') previous_stats;
-    ''',
-      );
-      final result = await DatabaseMigrator(
-        sqlRoot: root,
-        supportedSchemaVersion: 22,
-      ).openAndMigrate(file);
-      expect(
-        result.canStartNormalUi,
-        isTrue,
-        reason: result.fatalError?.details,
-      );
-      final db = openFileBackedDatabase(file);
-      addTearDown(db.close);
-      final step = db.select('select * from optimize_steps').single;
-      expect(step['previous_version'], 21);
-      expect(step['previous_stats'], '1000 10');
-      expect(
-        db
-            .select(
-              'explain query plan select id from optimize_probe where value = 42',
-            )
-            .single['detail'],
-        contains('idx_optimize_probe_value'),
-      );
-      expect(
-        db
-            .select(
-              'select last_optimized_schema_version v from database_state',
-            )
-            .single['v'],
-        22,
-      );
-    },
-  );
+    ''');
+    final result = await DatabaseMigrator(
+      sqlRoot: root,
+      supportedSchemaVersion: auditVersion,
+    ).openAndMigrate(file);
+    expect(result.canStartNormalUi, isTrue, reason: result.fatalError?.details);
+    final db = openFileBackedDatabase(file);
+    addTearDown(db.close);
+    final step = db.select('select * from optimize_steps').single;
+    expect(step['previous_version'], probeVersion);
+    expect(step['previous_stats'], '1000 10');
+    expect(
+      db
+          .select(
+            'explain query plan select id from optimize_probe where value = 42',
+          )
+          .single['detail'],
+      contains('idx_optimize_probe_value'),
+    );
+    expect(
+      db
+          .select('select last_optimized_schema_version v from database_state')
+          .single['v'],
+      auditVersion,
+    );
+  });
 
   test(
     'migration optimization advances its durable watermark and recovers failure',
@@ -95,7 +93,7 @@ void main() {
                 'select last_optimized_schema_version v from database_state',
               )
               .single['v'],
-          20,
+          23,
         );
         db.execute('''
       update database_state set last_optimized_schema_version = 15;
@@ -144,7 +142,7 @@ void main() {
               'select last_optimized_schema_version v from database_state',
             )
             .single['v'],
-        20,
+        23,
       );
       expect(
         db

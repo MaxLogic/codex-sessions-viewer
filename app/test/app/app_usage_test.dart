@@ -5,19 +5,32 @@ import 'dart:ui';
 import 'package:codex_sessions_viewer/src/app/codex_sessions_viewer_app.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_generation.dart';
 import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter/material.dart'
-    show FilterChip, TextField, DateRangePickerDialog;
+    show FilterChip, TextField, DateRangePickerDialog, SizedBox;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
 void main() {
+  late Directory isolated;
+  setUp(() {
+    isolated = Directory.systemTemp.createTempSync('usage_widget_');
+    final db = sqlite3.open('${isolated.path}/unused.sqlite');
+    configureFileBackedDatabase(db);
+    db.execute('create table fixture (id integer)');
+    db.close();
+  });
+  tearDown(() {
+    isolated.deleteSync(recursive: true);
+  });
   testWidgets(
     'opening Usage reads persisted data without observing pricing settings',
     (tester) async {
+      addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
       await tester.binding.setSurfaceSize(const Size(1400, 1200));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       final root = Directory.systemTemp.createTempSync('usage_read_only_');
@@ -125,11 +138,13 @@ void main() {
   );
 
   testWidgets('changing usage period reloads its summary', (tester) async {
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
     await tester.binding.setSurfaceSize(const Size(1400, 1200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     var loadCalls = 0;
     await tester.pumpWidget(
       CodexSessionsViewerApp(
+        databaseFile: File('${isolated.path}/unused.sqlite'),
         databaseStartup: Future.value(
           DatabaseStartupResult.ready(lastAppliedSchemaVersion: 16),
         ),
@@ -217,11 +232,13 @@ void main() {
   testWidgets('failed usage refresh retains last successful snapshot', (
     tester,
   ) async {
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
     await tester.binding.setSurfaceSize(const Size(1400, 1200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     var loadCalls = 0;
     await tester.pumpWidget(
       CodexSessionsViewerApp(
+        databaseFile: File('${isolated.path}/unused.sqlite'),
         databaseStartup: Future.value(
           DatabaseStartupResult.ready(lastAppliedSchemaVersion: 15),
         ),
@@ -247,6 +264,14 @@ void main() {
     );
     await _pumpFrames(tester);
 
+    // Load the retained snapshot through the visible Usage route first.
+    await tester.tap(find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')));
+    await _pumpFrames(tester);
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
+    );
+    await _pumpFrames(tester);
+
     await tester.tap(find.text('Refresh'));
     await _pumpFrames(tester);
     await tester.tap(find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')));
@@ -263,12 +288,14 @@ void main() {
   });
 
   testWidgets('usage status refreshes without blocking', (tester) async {
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
     await tester.binding.setSurfaceSize(const Size(1400, 1200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     final refreshed = Completer<UsageSummary?>();
     var loadCalls = 0;
     await tester.pumpWidget(
       CodexSessionsViewerApp(
+        databaseFile: File('${isolated.path}/unused.sqlite'),
         databaseStartup: Future.value(
           DatabaseStartupResult.ready(lastAppliedSchemaVersion: 15),
         ),
@@ -294,6 +321,14 @@ void main() {
     );
     await _pumpFrames(tester);
 
+    // Load the retained snapshot through the visible Usage route first.
+    await tester.tap(find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')));
+    await _pumpFrames(tester);
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
+    );
+    await _pumpFrames(tester);
+
     await tester.tap(find.text('Refresh'));
     await _pumpFrames(tester, count: 2);
     expect(find.text('Scan finished.'), findsOneWidget);
@@ -315,10 +350,12 @@ void main() {
   testWidgets('usage screen displays refreshed calculated statistics', (
     tester,
   ) async {
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
     await tester.binding.setSurfaceSize(const Size(1400, 1200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       CodexSessionsViewerApp(
+        databaseFile: File('${isolated.path}/unused.sqlite'),
         databaseStartup: Future.value(
           DatabaseStartupResult.ready(lastAppliedSchemaVersion: 5),
         ),
@@ -341,11 +378,13 @@ void main() {
   });
 
   testWidgets('usage statistics update after refresh', (tester) async {
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
     await tester.binding.setSurfaceSize(const Size(1400, 1200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     var loadCalls = 0;
     await tester.pumpWidget(
       CodexSessionsViewerApp(
+        databaseFile: File('${isolated.path}/unused.sqlite'),
         databaseStartup: Future.value(
           DatabaseStartupResult.ready(lastAppliedSchemaVersion: 5),
         ),
@@ -366,6 +405,14 @@ void main() {
           statusMessage: 'Scan finished.',
         ),
       ),
+    );
+    await _pumpFrames(tester);
+
+    // Load the retained snapshot through the visible Usage route first.
+    await tester.tap(find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')));
+    await _pumpFrames(tester);
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
     );
     await _pumpFrames(tester);
 

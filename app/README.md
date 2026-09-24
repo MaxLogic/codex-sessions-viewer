@@ -1,17 +1,9 @@
-# codex_sessions_viewer
+# Flutter application
 
-A new Flutter project.
+This directory contains the Windows UI for Codex Session Viewer. See the
+[repository README](../README.md) for setup, configuration, and release commands.
 
-## Getting Started
-
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+From this directory, run `flutter analyze`, `flutter test`, and
+`flutter test integration_test` for local checks. Use
+`../scripts/build_windows.ps1` from the repository root to refresh the testable
+`release/windows` folder after a Windows build.

@@ -31,6 +31,121 @@ void main() {
   MaintenanceJobRepository repository() =>
       MaintenanceJobRepository(db, clock: () => now);
 
+  test('each UTC slot advances only after its exact boundary', () {
+    for (final monthDay in [(3, 29), (10, 25), (12, 31)]) {
+      for (final hour in [0, 6, 12, 18]) {
+        final slot = DateTime.utc(2026, monthDay.$1, monthDay.$2, hour);
+        expect(
+          nextPricingUtcSlot(slot.subtract(const Duration(microseconds: 1))),
+          slot,
+        );
+        expect(nextPricingUtcSlot(slot), slot.add(const Duration(hours: 6)));
+        expect(
+          nextPricingUtcSlot(slot.add(const Duration(microseconds: 1))),
+          slot.add(const Duration(hours: 6)),
+        );
+      }
+    }
+  });
+
+  test('a download observed before a slot catches up after delayed apply', () {
+    const type = 'openrouter_price_refresh';
+    final jobs = repository();
+    now = DateTime.utc(2026, 9, 7, 5, 58);
+    jobs.configureSchedule(
+      jobType: type,
+      enabled: true,
+      intervalSeconds: 21600,
+      utcSlots: true,
+    );
+    jobs.recordScheduleAttempt(type);
+
+    final observed = DateTime.utc(2026, 9, 7, 5, 59);
+    now = DateTime.utc(2026, 9, 7, 6, 1);
+    final completed = jobs.completeScheduleAttempt(
+      type,
+      succeeded: true,
+      utcSlots: true,
+      successfulObservationAtUtc: observed,
+    );
+
+    expect(completed.lastSuccessAtUtc, observed);
+    expect(completed.nextDueAtUtc, now);
+  });
+
+  test(
+    'UTC slots ignore local offsets and coalesce missed slots after restart',
+    () {
+      const type = 'openrouter_price_refresh';
+      final jobs = repository();
+      for (final hour in [0, 6, 12, 18, 23]) {
+        now = DateTime.utc(2026, 3, 29, hour, 17);
+        jobs.configureSchedule(
+          jobType: type,
+          enabled: true,
+          intervalSeconds: 21600,
+          utcSlots: true,
+        );
+        jobs.recordScheduleAttempt(type);
+        final done = jobs.completeScheduleAttempt(
+          type,
+          succeeded: true,
+          utcSlots: true,
+        );
+        expect(done.lastSuccessAtUtc, now);
+        expect(
+          done.nextDueAtUtc,
+          DateTime.utc(2026, 3, 29, (hour ~/ 6 + 1) * 6),
+        );
+      }
+      now = DateTime.parse('2026-10-25T08:00:00+02:00');
+      jobs.recordScheduleAttempt(type);
+      expect(
+        jobs
+            .completeScheduleAttempt(type, succeeded: true, utcSlots: true)
+            .nextDueAtUtc,
+        DateTime.utc(2026, 10, 25, 12),
+      );
+      now = DateTime.utc(2026, 11, 1, 14, 13);
+      db.close();
+      db = openFileBackedDatabase(databaseFile);
+      final restarted = repository().configureSchedule(
+        jobType: type,
+        enabled: true,
+        intervalSeconds: 21600,
+        utcSlots: true,
+      );
+      expect(restarted.nextDueAtUtc!.isBefore(now), isTrue);
+      repository().recordScheduleAttempt(type);
+      final caughtUp = repository().completeScheduleAttempt(
+        type,
+        succeeded: true,
+        utcSlots: true,
+      );
+      expect(caughtUp.nextDueAtUtc, DateTime.utc(2026, 11, 1, 18));
+      expect(caughtUp.lastSuccessAtUtc, now);
+      repository().recordScheduleAttempt(type);
+      final failed = repository().completeScheduleAttempt(
+        type,
+        succeeded: false,
+        utcSlots: true,
+        retryAfter: const Duration(hours: 2),
+      );
+      expect(failed.nextDueAtUtc, now.add(const Duration(hours: 2)));
+      expect(
+        repository()
+            .configureSchedule(
+              jobType: type,
+              enabled: true,
+              intervalSeconds: 21600,
+              utcSlots: true,
+            )
+            .nextDueAtUtc,
+        failed.nextDueAtUtc,
+      );
+    },
+  );
+
   test(
     'configures only app schedules and retains unchanged due times on reopen',
     () {

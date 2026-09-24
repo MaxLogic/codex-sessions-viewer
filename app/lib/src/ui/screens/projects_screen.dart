@@ -26,6 +26,7 @@ class ProjectsScreen extends StatefulWidget {
     required this.viewState,
     this.openProjectName,
     this.openProjectSerial = 0,
+    this.dataRevision = 0,
     this.onProjectsChanged,
     this.onShowSessions,
     this.pickDirectory,
@@ -38,6 +39,7 @@ class ProjectsScreen extends StatefulWidget {
   /// Selects this project when [openProjectSerial] changes.
   final String? openProjectName;
   final int openProjectSerial;
+  final int dataRevision;
 
   /// Called after folder rules or project assignments change.
   final VoidCallback? onProjectsChanged;
@@ -75,6 +77,7 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
   @override
   void didUpdateWidget(covariant ProjectsScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.dataRevision != oldWidget.dataRevision) unawaited(_reload());
     if (widget.openProjectSerial != oldWidget.openProjectSerial) {
       _pendingOpenName = widget.openProjectName;
       _applyPendingOpen();
@@ -506,7 +509,11 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
                   ],
                 ),
               ),
-              if (_busy) const LinearProgressIndicator(minHeight: 2),
+              if (_busy)
+                const LinearProgressIndicator(
+                  minHeight: 2,
+                  semanticsLabel: 'Updating projects',
+                ),
               Divider(height: 1, color: theme.colorScheme.outlineVariant),
               Expanded(
                 child: LayoutBuilder(
@@ -558,7 +565,9 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
       );
     }
     if (_projects == null) {
-      return const Center(child: CircularProgressIndicator());
+      return const Center(
+        child: CircularProgressIndicator(semanticsLabel: 'Loading projects'),
+      );
     }
     if (visible.isEmpty) {
       return _Message(
@@ -613,7 +622,11 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
     }
     final detail = _detail;
     if (detail == null || detail.projectId != project.id) {
-      return const Center(child: CircularProgressIndicator());
+      return const Center(
+        child: CircularProgressIndicator(
+          semanticsLabel: 'Loading project details',
+        ),
+      );
     }
     final theme = Theme.of(context);
     final muted = theme.textTheme.bodyMedium?.copyWith(
@@ -730,12 +743,22 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
                 leading: const Icon(Icons.folder_outlined),
                 title: Text(folder.folder),
                 subtitle: Text(_count(folder.sessionCount, 'session')),
-                trailing: AppButton.text(
-                  onPressed: _busy
+                trailing: Semantics(
+                  label: 'Merge ${folder.folder} into another project',
+                  button: true,
+                  container: true,
+                  onTap: _busy
                       ? null
                       : () => _moveFolder(folder.folder, isRule: false),
-                  icon: const Icon(Icons.merge),
-                  label: const Text('Merge into…'),
+                  child: ExcludeSemantics(
+                    child: AppButton.text(
+                      onPressed: _busy
+                          ? null
+                          : () => _moveFolder(folder.folder, isRule: false),
+                      icon: const Icon(Icons.merge),
+                      label: const Text('Merge into…'),
+                    ),
+                  ),
                 ),
               );
             },

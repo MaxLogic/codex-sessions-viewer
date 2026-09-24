@@ -4,6 +4,21 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('session pane split fraction round trips through settings', () {
+    final settings = AppSettings.fromTomlMap({
+      'ui': {
+        'session_table': {'pane_fraction': 0.62},
+      },
+    });
+    expect(settings.ui.sessionTable.paneFraction, 0.62);
+    expect(
+      ((settings.toTomlMap()['ui'] as Map)['session_table']
+          as Map)['pane_fraction'],
+      0.62,
+    );
+    expect(AppSettings.fromTomlMap(settings.toTomlMap()), settings);
+  });
+
   test(
     'maintenance schedules migrate legacy keys and round trip new settings',
     () {
@@ -13,7 +28,9 @@ void main() {
         'database_optimize_interval_days': 7,
       });
       expect((defaults['pricing'] as Map)['automatic_refresh_enabled'], isTrue);
-      expect((defaults['pricing'] as Map)['refresh_interval_hours'], 24);
+      expect((defaults['pricing'] as Map)['refresh_interval_hours'], 6);
+      expect(AppSettings.defaults().pricing.refreshUtcSlots, isTrue);
+      expect(AppSettings.fromTomlMap({}).pricing.refreshUtcSlots, isTrue);
       for (final (input, hours) in [
         (<String, dynamic>{'cache_pricing_hours': 72}, 72),
         (
@@ -31,6 +48,8 @@ void main() {
           1,
         ),
         (<String, dynamic>{'refresh_interval_hours': 720}, 720),
+        (<String, dynamic>{'refresh_interval_hours': 6}, 6),
+        (<String, dynamic>{'cache_pricing_hours': 24}, 24),
       ]) {
         final loaded = AppSettings.fromTomlMap({
           'pricing': {...input, 'automatic_refresh_enabled': false},
@@ -39,6 +58,7 @@ void main() {
             'database_optimize_interval_days': 365,
           },
         });
+        expect(loaded.pricing.refreshUtcSlots, isFalse);
         final encoded = loaded.copyWith().toTomlMap();
         expect((encoded['pricing'] as Map)['refresh_interval_hours'], hours);
         expect(

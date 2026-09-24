@@ -216,6 +216,32 @@ void main() {
     },
   );
 
+  test('first launch starts maximized without saved placement', () async {
+    final manager = _FakeWindowManager();
+    final controller = AppWindowStateController(
+      store: _MemoryWindowStateStore(null),
+      manager: manager,
+    );
+
+    await controller.restoreAndTrack();
+
+    expect(manager.maximizeCount, 1);
+    expect(manager.listenerAdded, isTrue);
+  });
+
+  test('damaged placement still starts maximized', () async {
+    final manager = _FakeWindowManager();
+    final controller = AppWindowStateController(
+      store: _ThrowingWindowStateStore(),
+      manager: manager,
+    );
+
+    await controller.restoreAndTrack();
+
+    expect(manager.maximizeCount, 1);
+    expect(manager.listenerAdded, isTrue);
+  });
+
   test('restore treats barely visible windows as off-screen', () async {
     final store = _MemoryWindowStateStore(
       const PersistedWindowState(
@@ -239,6 +265,7 @@ void main() {
 
     expect(manager.positions.single, const Offset(80, 80));
     expect(manager.sizes.single, const Size(1200, 700));
+    expect(manager.maximizeCount, 1);
   });
 
   test('restore fallback keeps oversized windows inside the display', () async {
@@ -297,6 +324,15 @@ class _MemoryWindowStateStore implements WindowStatePersistence {
     this.state = state;
     saved.add(state);
   }
+}
+
+class _ThrowingWindowStateStore implements WindowStatePersistence {
+  @override
+  Future<PersistedWindowState?> load() async =>
+      throw const FormatException('bad placement');
+
+  @override
+  Future<void> save(PersistedWindowState state) async {}
 }
 
 class _FakeDisplayProvider implements WindowDisplayProvider {

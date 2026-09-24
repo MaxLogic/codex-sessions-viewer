@@ -80,6 +80,8 @@ class SessionRowViewModel {
   /// The agent harness that wrote the session (`codex`, `claude`). Session
   /// IDs are unique only within a harness.
   final String harness;
+
+  String get harnessLabel => SessionLabelFormatter.harness(harness);
   final String threadName;
   final String threadSource;
   final String parentThreadId;

@@ -116,7 +116,13 @@ class _UsageScreenState extends State<UsageScreen>
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('Usage', style: Theme.of(context).textTheme.titleLarge),
+              Semantics(
+                header: true,
+                child: Text(
+                  'Usage',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+              ),
               const SizedBox(height: 16),
               Semantics(
                 label: 'Period filter',
@@ -150,9 +156,12 @@ class _UsageScreenState extends State<UsageScreen>
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'Usage summary',
-                        style: Theme.of(context).textTheme.titleMedium,
+                      Semantics(
+                        header: true,
+                        child: Text(
+                          'Usage summary',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       _UsageStatus(

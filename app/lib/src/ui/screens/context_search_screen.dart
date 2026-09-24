@@ -48,6 +48,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
   var _sessionResults = <SessionRowViewModel>[];
   var _isSearching = false;
   var _statusMessage = '';
+  var _searchGeneration = 0;
 
   @override
   void initState() {
@@ -58,6 +59,10 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
   @override
   void didUpdateWidget(covariant ContextSearchScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.initialSessionRows != widget.initialSessionRows &&
+        _queryController.text.trim().isNotEmpty) {
+      _search(preserveSelection: true);
+    }
     if (oldWidget.statusMessage != widget.statusMessage) {
       _statusMessage = widget.statusMessage;
     }
@@ -91,7 +96,11 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
               _buildSearchBar(),
               if (_statusMessage.trim().isNotEmpty) ...[
                 const SizedBox(height: 8),
-                Text(_statusMessage),
+                Semantics(
+                  liveRegion: true,
+                  label: _statusMessage,
+                  child: ExcludeSemantics(child: Text(_statusMessage)),
+                ),
               ],
               const SizedBox(height: 12),
               Expanded(child: _buildResults()),
@@ -154,6 +163,8 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
           label: 'Search context',
           button: true,
           enabled: !_isSearching,
+          excludeSemantics: true,
+          onTap: _isSearching ? null : _search,
           child: AppButton.filled(
             onPressed: _isSearching ? null : _search,
             icon: const Icon(Icons.search),
@@ -164,6 +175,8 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
           label: 'Copy selected context results',
           button: true,
           enabled: hasSelected,
+          excludeSemantics: true,
+          onTap: hasSelected ? _copySelected : null,
           child: AppButton.outlined(
             onPressed: hasSelected ? _copySelected : null,
             icon: const Icon(Icons.copy),
@@ -209,11 +222,12 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
     );
   }
 
-  Future<void> _search() async {
+  Future<void> _search({bool preserveSelection = false}) async {
     final text = _queryController.text.trim();
+    final generation = ++_searchGeneration;
     setState(() {
       _isSearching = true;
-      _selectedKeys.clear();
+      if (!preserveSelection) _selectedKeys.clear();
       _statusMessage = '';
     });
     try {
@@ -223,7 +237,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
             : await widget.onSearchMessages(
                 MessageSearchQuery(text: text, limit: 100),
               );
-        if (!mounted) {
+        if (!mounted || generation != _searchGeneration) {
           return;
         }
         setState(() {
@@ -231,7 +245,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
         });
       } else {
         final results = _searchSessions(text);
-        if (!mounted) {
+        if (!mounted || generation != _searchGeneration) {
           return;
         }
         setState(() {
@@ -239,14 +253,14 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
         });
       }
     } on Object catch (error) {
-      if (!mounted) {
+      if (!mounted || generation != _searchGeneration) {
         return;
       }
       setState(() {
         _statusMessage = 'Context search failed. $error';
       });
     } finally {
-      if (mounted) {
+      if (mounted && generation == _searchGeneration) {
         setState(() {
           _isSearching = false;
         });
@@ -275,6 +289,7 @@ class _ContextSearchScreenState extends State<ContextSearchScreen> {
       row.summary,
       row.project,
       row.platformLabel,
+      row.harnessLabel,
       row.modelProviderLabel,
       row.path,
       ...row.tags,
@@ -356,7 +371,7 @@ class _MessageContextRow extends StatelessWidget {
     return _ResultSurface(
       selected: selected,
       semanticsLabel:
-          '$label. ${result.authorLabel}. ${result.projectName}. ${result.sourceLabel}.',
+          '$label. ${result.authorLabel}. ${result.projectName}. ${result.sourceLabel}. ${result.harnessLabel}.',
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -384,6 +399,7 @@ class _MessageContextRow extends StatelessWidget {
                     _ChipText(result.authorLabel),
                     _ChipText(result.projectName),
                     _ChipText(result.sourceLabel),
+                    _ChipText(result.harnessLabel),
                     _ChipText(_timestampUtc(result.timestampUtc)),
                   ],
                 ),
@@ -422,7 +438,8 @@ class _SessionContextRow extends StatelessWidget {
     final label = row.primaryIdentity;
     return _ResultSurface(
       selected: selected,
-      semanticsLabel: '$label. ${row.project}. ${row.platformLabel}.',
+      semanticsLabel:
+          '$label. ${row.project}. ${row.platformLabel}. ${row.harnessLabel}.',
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -449,6 +466,7 @@ class _SessionContextRow extends StatelessWidget {
                   children: [
                     _ChipText(row.project),
                     _ChipText(row.platformLabel),
+                    _ChipText(row.harnessLabel),
                     if (row.providerLabel != SessionLabelFormatter.unknown)
                       _ChipText(row.providerLabel),
                     _ChipText(row.modelLabel),
@@ -607,7 +625,7 @@ String _messageResultLabel(MessageSearchResult result) =>
 String _messageCopyText(MessageSearchResult result) {
   return [
     result.sessionIdentity,
-    '${result.authorLabel} | ${result.projectName} | ${result.sourceLabel} | ${_timestampUtc(result.timestampUtc)}',
+    '${result.authorLabel} | ${result.projectName} | ${result.sourceLabel} | ${result.harnessLabel} | ${_timestampUtc(result.timestampUtc)}',
     _plainSnippet(result.snippet),
   ].join('\n');
 }
@@ -615,7 +633,7 @@ String _messageCopyText(MessageSearchResult result) {
 String _sessionCopyText(SessionRowViewModel row) {
   return [
     row.primaryIdentity,
-    '${row.project} | ${row.platformLabel} | ${_shortDate(row.lastMessageAtUtc)}',
+    '${row.project} | ${row.platformLabel} | ${row.harnessLabel} | ${_shortDate(row.lastMessageAtUtc)}',
     row.summary,
   ].join('\n');
 }
@@ -649,6 +667,7 @@ String _timestampUtc(DateTime? value) {
 }
 
 extension on MessageSearchResult {
+  String get harnessLabel => SessionLabelFormatter.harness(harness);
   String get authorLabel {
     final trimmed = author.trim();
     if (trimmed.isEmpty) {

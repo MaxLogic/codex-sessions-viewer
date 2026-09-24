@@ -10,6 +10,7 @@ import '../config/app_settings.dart';
 import '../database/maintenance_job.dart';
 import '../usage/usage_summary.dart';
 import 'openrouter_price_rules.dart';
+import 'hub_price_history.dart';
 
 class PricingRepository {
   const PricingRepository(this.db);
@@ -177,17 +178,38 @@ class PricingRepository {
         continue;
       }
       for (final key in keys) {
+        final canonicalSource =
+            useProvider && PriceObservationStore(db).available
+            ? db.select(
+                '''select source from price_history_model_sources
+                 where revision = (select revision from price_history_state where id = 1)
+                   and model_id = ?''',
+                [key],
+              )
+            : const <Row>[];
         final rows = db.select(
           '''
           select * from ${useProvider ? 'model_price_periods' : 'local_price_override_periods'}
-          where ${useProvider ? "source = 'openrouter' and" : ''}
+          where ${useProvider ? "source in ('openrouter', ?) and" : ''}
             model_id = ? and valid_from_utc <= ?
-          order by valid_from_utc desc limit 1
+          order by ${useProvider ? "case when source = 'openrouter' then 1 else 0 end," : ''} valid_from_utc desc limit 1
         ''',
-          [key, _priceTimestamp(at)],
+          [
+            if (useProvider)
+              canonicalSource.isEmpty
+                  ? 'openrouter'
+                  : canonicalSource.single['source'],
+            key,
+            _priceTimestamp(at),
+          ],
         );
         if (rows.isEmpty) continue;
         final row = rows.single;
+        if (useProvider &&
+            (jsonDecode(row['raw_pricing_json'] as String) as Map)['removed'] ==
+                true) {
+          continue;
+        }
         final end = _dateTimeUtc(row['valid_to_utc']);
         if (end != null && !at.isBefore(end)) continue;
         period = row;
@@ -376,6 +398,7 @@ class PricingRepository {
     OpenRouterModelsResponse response, {
     required DateTime startedAtUtc,
     required DateTime observedAtUtc,
+    String origin = 'local',
   }) {
     response.validateComplete();
     db.execute('begin immediate');
@@ -393,6 +416,46 @@ class PricingRepository {
       }
       for (final model in response.models) {
         _upsertOpenRouterModel(model, observedAtUtc.toUtc());
+      }
+      final observations = PriceObservationStore(db);
+      if (observations.available) {
+        for (final model in response.models) {
+          observations.insert(
+            PriceObservation(
+              origin: origin,
+              authority: 'local',
+              observedAtUtc: observedAtUtc,
+              provider: model.provider,
+              modelId: model.modelId,
+              model: _modelObservationJson(model),
+            ),
+          );
+        }
+        if (response.declaredTotalCount != null) {
+          final present = response.models.map((model) => model.modelId).toSet();
+          for (final row in db.select(
+            "select model_id, provider from model_price_periods where source = 'openrouter' and valid_to_utc = ?",
+            [_priceTimestamp(observedAtUtc)],
+          )) {
+            if (!present.contains(row['model_id'])) {
+              observations.insert(
+                _removedPriceObservation(
+                  row['model_id'] as String,
+                  row['provider'] as String,
+                  observedAtUtc,
+                  origin,
+                ),
+              );
+            }
+          }
+        }
+        if (db
+            .select(
+              "select 1 from price_observations where authority = 'hub' limit 1",
+            )
+            .isNotEmpty) {
+          _materializeCanonicalHistory();
+        }
       }
       db.execute('commit');
     } on Object {
@@ -418,6 +481,350 @@ class PricingRepository {
         (nowUtc ?? DateTime.now()).toUtc().toIso8601String(),
       ],
     );
+  }
+
+  /// Called under the application writer. Observations and the active revision
+  /// commit together; existing cost rows keep their immutable snapshot FKs.
+  String mergePriceObservations(
+    Iterable<PriceObservation> incoming, {
+    String? hubUrl,
+    int? through,
+    String? hubRevision,
+  }) {
+    final store = PriceObservationStore(db);
+    if (!store.available) {
+      throw StateError('Price-history migration is required.');
+    }
+    final validated = incoming.toList();
+    for (final observation in validated) {
+      final model = OpenRouterModelPricing.fromJson(observation.model);
+      if (model.provider != observation.provider) {
+        throw const FormatException('Price observation provider mismatch.');
+      }
+    }
+    db.execute('begin immediate');
+    try {
+      final existingIds = db
+          .select('select fingerprint from price_observations')
+          .map((row) => row['fingerprint'])
+          .toSet();
+      for (final observation in validated) {
+        if (!existingIds.contains(observation.fingerprint)) {
+          store.insert(observation);
+        }
+      }
+      _importLegacyPriceObservations();
+      final revision = _materializeCanonicalHistory();
+      if (hubUrl != null) {
+        if (through == null ||
+            hubRevision == null ||
+            CanonicalPriceHistory(validated).revision != hubRevision) {
+          throw const FormatException('Invalid acknowledged hub snapshot.');
+        }
+        final existingMembers = db
+            .select(
+              'select fingerprint from price_hub_membership where hub_url = ?',
+              [hubUrl],
+            )
+            .map((row) => row['fingerprint'])
+            .toSet();
+        final incomingIds = validated.map((item) => item.fingerprint).toSet();
+        for (final removed in existingMembers.difference(incomingIds)) {
+          db.execute(
+            'delete from price_hub_membership where hub_url = ? and fingerprint = ?',
+            [hubUrl, removed],
+          );
+        }
+        for (final observation in validated) {
+          if (!existingMembers.contains(observation.fingerprint)) {
+            db.execute(
+              'insert into price_hub_membership(hub_url,fingerprint) values (?,?)',
+              [hubUrl, observation.fingerprint],
+            );
+          }
+        }
+        db.execute(
+          '''insert into price_hub_sync_state(hub_url,through_rowid,revision) values (?,?,?)
+          on conflict(hub_url) do update set through_rowid=excluded.through_rowid,revision=excluded.revision''',
+          [hubUrl, through, hubRevision],
+        );
+      }
+      db.execute('commit');
+      return revision;
+    } on Object {
+      if (!db.autocommit) db.execute('rollback');
+      rethrow;
+    }
+  }
+
+  HubPriceSyncResult hubSyncSnapshot(String url) {
+    final state = db.select(
+      'select through_rowid,revision from price_hub_sync_state where hub_url = ?',
+      [url],
+    );
+    if (state.isEmpty) return const HubPriceSyncResult([], 0, '');
+    final observations = db
+        .select(
+          '''select o.payload_json from price_hub_membership m
+      join price_observations o on o.fingerprint=m.fingerprint where m.hub_url=?''',
+          [url],
+        )
+        .map(
+          (row) => PriceObservation.fromJson(
+            jsonDecode(row['payload_json'] as String) as Map<String, dynamic>,
+          ),
+        )
+        .toList();
+    return HubPriceSyncResult(
+      observations,
+      state.single['through_rowid'] as int,
+      state.single['revision'] as String,
+    );
+  }
+
+  List<PriceObservation> localPriceObservationsForHub(String origin) {
+    final store = PriceObservationStore(db);
+    if (!store.available) return const [];
+    db.execute('begin immediate');
+    try {
+      _importLegacyPriceObservations();
+      for (final item in store.read()) {
+        if (item.authority == 'local' &&
+            ['local', 'legacy-local'].contains(item.origin)) {
+          store.insert(
+            PriceObservation(
+              origin: origin,
+              authority: 'local',
+              observedAtUtc: item.observedAtUtc,
+              provider: item.provider,
+              modelId: item.modelId,
+              model: item.model,
+            ),
+          );
+        }
+      }
+      final result = store
+          .read()
+          .where((item) => item.authority == 'local' && item.origin == origin)
+          .toList();
+      db.execute('commit');
+      return result;
+    } on Object {
+      if (!db.autocommit) db.execute('rollback');
+      rethrow;
+    }
+  }
+
+  void _importLegacyPriceObservations() {
+    if (db
+        .select(
+          "select 1 from app_metadata where key = 'price_observations_backfilled'",
+        )
+        .isNotEmpty) {
+      return;
+    }
+    final store = PriceObservationStore(db);
+    for (final row in db.select(
+      "select * from model_price_periods where source = 'openrouter' order by id",
+    )) {
+      final ruleJson = db.select(
+        'select raw_rule_json from provider_price_rules where price_period_id = ? order by provider_order',
+        [row['id']],
+      );
+      final model = OpenRouterModelPricing(
+        modelId: row['model_id'] as String,
+        provider: row['provider'] as String,
+        modelName: row['model_name'] as String?,
+        canonicalSlug: row['canonical_slug'] as String?,
+        promptPricePerToken: row['prompt_price_per_token'] as String?,
+        completionPricePerToken: row['completion_price_per_token'] as String?,
+        inputCacheReadPricePerToken:
+            row['input_cache_read_price_per_token'] as String?,
+        inputCacheWritePricePerToken:
+            row['input_cache_write_price_per_token'] as String?,
+        internalReasoningPricePerToken:
+            row['internal_reasoning_price_per_token'] as String?,
+        requestPrice: row['request_price'] as String?,
+        imagePrice: row['image_price'] as String?,
+        webSearchPrice: row['web_search_price'] as String?,
+        additionalRates:
+            (jsonDecode(row['additional_prices_json'] as String) as Map)
+                .cast<String, String>(),
+        rules: parseOpenRouterPriceRules([
+          for (final rule in ruleJson)
+            jsonDecode(rule['raw_rule_json'] as String),
+        ]),
+        rawPricingJson: row['raw_pricing_json'] as String,
+      );
+      store.insert(
+        PriceObservation(
+          origin: 'legacy-local',
+          authority: 'local',
+          observedAtUtc: DateTime.parse(row['valid_from_utc'] as String),
+          provider: model.provider,
+          modelId: model.modelId,
+          model: _modelObservationJson(model),
+        ),
+      );
+      if (row['valid_to_utc'] != null &&
+          db.select(
+            "select 1 from model_price_periods where source = 'openrouter' and model_id = ? and valid_from_utc = ?",
+            [model.modelId, row['valid_to_utc']],
+          ).isEmpty) {
+        store.insert(
+          _removedPriceObservation(
+            model.modelId,
+            model.provider,
+            DateTime.parse(row['valid_to_utc'] as String),
+            'legacy-local',
+          ),
+        );
+      }
+    }
+    db.execute(
+      "insert into app_metadata(key,value,updated_at_utc) values ('price_observations_backfilled','1',?)",
+      [DateTime.now().toUtc().toIso8601String()],
+    );
+  }
+
+  String _materializeCanonicalHistory() {
+    final history = CanonicalPriceHistory(PriceObservationStore(db).read());
+    final previous = db
+        .select('select revision from price_history_state where id = 1')
+        .single['revision'];
+    if (previous == history.revision) return history.revision;
+    db.execute(
+      '''insert or ignore into price_history_revisions
+      (revision, observations_json, created_at_utc) values (?, ?, ?)''',
+      [
+        history.revision,
+        canonicalPriceJson({
+          'through_rowid': db
+              .select('select coalesce(max(rowid),0) n from price_observations')
+              .single['n'],
+        }),
+        DateTime.now().toUtc().toIso8601String(),
+      ],
+    );
+    final models = <String, List<PriceObservation>>{};
+    for (final observation in history.winners) {
+      models.putIfAbsent(observation.modelId, () => []).add(observation);
+    }
+    for (final entry in models.entries) {
+      // Repeated unchanged fetches belong in the evidence log, not in another
+      // full copy of every model's periods and snapshots.
+      final effective = <PriceObservation>[];
+      String? lastPrices;
+      for (final item in entry.value) {
+        final prices = priceFingerprint({
+          'pricing': item.model['pricing'],
+          'canonical_slug': item.model['canonical_slug'],
+          'removed': item.model['removed'] == true,
+        });
+        if (prices != lastPrices) effective.add(item);
+        lastPrices = prices;
+      }
+      final source =
+          'canonical:${priceFingerprint(effective.map((o) => {'observed_at_utc': priceObservationTimestamp(o.observedAtUtc), 'pricing': o.model['pricing'], 'model_id': o.modelId, 'canonical_slug': o.model['canonical_slug'], 'removed': o.model['removed'] == true}).toList())}';
+      final prior = db.select(
+        'select source from price_history_model_sources where revision = ? and model_id = ?',
+        [previous, entry.key],
+      );
+      if (db.select(
+        'select 1 from model_price_periods where source = ? limit 1',
+        [source],
+      ).isEmpty) {
+        for (final observation in effective) {
+          _recordCatalogHistory(
+            OpenRouterModelsResponse([
+              OpenRouterModelPricing.fromJson(observation.model),
+            ]),
+            started: observation.observedAtUtc,
+            observed: observation.observedAtUtc,
+            source: source,
+            canonicalRevision: history.revision,
+            markDirty: false,
+          );
+        }
+      }
+      db.execute(
+        '''insert or ignore into price_history_model_sources
+        (revision, model_id, source) values (?, ?, ?)''',
+        [history.revision, entry.key, source],
+      );
+      if (prior.isEmpty || prior.single['source'] != source) {
+        _markChangedPriceIntervals(
+          entry.key,
+          prior.isEmpty ? 'openrouter' : prior.single['source'] as String,
+          source,
+        );
+      }
+      final latest = entry.value.last;
+      if (latest.model['removed'] == true) {
+        db.execute(
+          "delete from model_pricing_cache where model_id = ? and source = 'openrouter'",
+          [entry.key],
+        );
+      } else {
+        _upsertOpenRouterModel(
+          OpenRouterModelPricing.fromJson(latest.model),
+          latest.observedAtUtc,
+        );
+      }
+    }
+    db.execute('update price_history_state set revision = ? where id = 1', [
+      history.revision,
+    ]);
+    return history.revision;
+  }
+
+  void _markChangedPriceIntervals(
+    String model,
+    String oldSource,
+    String newSource,
+  ) {
+    final old = db.select(
+      'select * from model_price_periods where source = ? and model_id = ? order by valid_from_utc',
+      [oldSource, model],
+    );
+    final current = db.select(
+      'select * from model_price_periods where source = ? and model_id = ? order by valid_from_utc',
+      [newSource, model],
+    );
+    final boundaries = <DateTime>{};
+    for (final row in [...old, ...current]) {
+      boundaries.add(DateTime.parse(row['valid_from_utc'] as String));
+      if (row['valid_to_utc'] != null) {
+        boundaries.add(DateTime.parse(row['valid_to_utc'] as String));
+      }
+    }
+    String? fingerprint(List<Row> rows, DateTime at) {
+      for (final row in rows.reversed) {
+        final start = DateTime.parse(row['valid_from_utc'] as String);
+        final end = row['valid_to_utc'] == null
+            ? null
+            : DateTime.parse(row['valid_to_utc'] as String);
+        if (!at.isBefore(start) && (end == null || at.isBefore(end))) {
+          return row['pricing_fingerprint'] as String;
+        }
+      }
+      return null;
+    }
+
+    final ordered = boundaries.toList()..sort();
+    for (var index = 0; index < ordered.length; index++) {
+      final start = ordered[index];
+      final before = fingerprint(old, start);
+      // Legacy observed history remains applicable before canonical evidence.
+      final after = fingerprint(current, start) ?? fingerprint(old, start);
+      if (before != after) {
+        _markModelCostsDirty(
+          model,
+          start,
+          until: index + 1 < ordered.length ? ordered[index + 1] : null,
+        );
+      }
+    }
   }
 
   Future<void> _fetchAndCache(
@@ -460,6 +867,9 @@ class PricingRepository {
     OpenRouterModelsResponse response, {
     required DateTime started,
     required DateTime observed,
+    String source = 'openrouter',
+    String? canonicalRevision,
+    bool markDirty = true,
   }) {
     final stamp = _priceTimestamp(observed);
     db.execute(
@@ -467,9 +877,10 @@ class PricingRepository {
       insert into price_catalog_snapshots (
         source, started_at_utc, finished_at_utc, status, model_count,
         page_count, completeness_status, declared_total_count, payload_sha256)
-      values ('openrouter', ?, ?, 'succeeded', ?, ?, ?, ?, ?)
+      values (?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)
     ''',
       [
+        source,
         started.toIso8601String(),
         stamp,
         response.models.length,
@@ -482,6 +893,12 @@ class PricingRepository {
       ],
     );
     final snapshotId = db.lastInsertRowId;
+    if (canonicalRevision != null) {
+      db.execute(
+        'update price_catalog_snapshots set canonical_revision = ? where id = ?',
+        [canonicalRevision, snapshotId],
+      );
+    }
     // Reuse SQLite's monotonic snapshot identity instead of scanning all prior
     // catalog generations for every imported cache observation.
     db.execute(
@@ -518,6 +935,9 @@ class PricingRepository {
               jsonEncode([
                 prices,
                 model.canonicalSlug,
+                model.rawPricingJson != null &&
+                    (jsonDecode(model.rawPricingJson!) as Map)['removed'] ==
+                        true,
                 {
                   for (final key in model.additionalRates.keys.toList()..sort())
                     key: model.additionalRates[key],
@@ -530,9 +950,9 @@ class PricingRepository {
       final current = db.select(
         '''
         select id, pricing_fingerprint from model_price_periods
-        where source = 'openrouter' and model_id = ? and valid_to_utc is null
+        where source = ? and model_id = ? and valid_to_utc is null
       ''',
-        [model.modelId],
+        [source, model.modelId],
       );
       if (current.isNotEmpty &&
           current.single['pricing_fingerprint'] == fingerprint) {
@@ -557,9 +977,10 @@ class PricingRepository {
           request_price, image_price, web_search_price, canonical_slug, additional_prices_json,
           pricing_fingerprint, raw_pricing_json, valid_from_utc,
           first_snapshot_id, last_seen_snapshot_id)
-        values ('openrouter', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ''',
         [
+          source,
           model.modelId,
           model.modelName,
           model.provider,
@@ -609,7 +1030,7 @@ class PricingRepository {
           ],
         );
       }
-      _markModelCostsDirty(model.modelId, observed);
+      if (markDirty) _markModelCostsDirty(model.modelId, observed);
     }
     if (response.declaredTotalCount != null) {
       var cursor = 0;
@@ -640,7 +1061,11 @@ class PricingRepository {
     }
   }
 
-  void _markModelCostsDirty(String modelId, DateTime observed) {
+  void _markModelCostsDirty(
+    String modelId,
+    DateTime observed, {
+    DateTime? until,
+  }) {
     final keys = [
       modelId,
       if (modelId.startsWith('openai/gpt-')) modelId.substring(7),
@@ -659,7 +1084,9 @@ class PricingRepository {
       );
       if (partitions.isEmpty) return;
       for (final partition in partitions) {
-        if (!_partitionHasEventAtOrAfter(partition, observed)) continue;
+        if (!_partitionHasEventAtOrAfter(partition, observed, until: until)) {
+          continue;
+        }
         db.execute(
           '''
           insert into usage_cost_dirty_partitions (
@@ -684,7 +1111,11 @@ class PricingRepository {
     }
   }
 
-  bool _partitionHasEventAtOrAfter(Row partition, DateTime observed) {
+  bool _partitionHasEventAtOrAfter(
+    Row partition,
+    DateTime observed, {
+    DateTime? until,
+  }) {
     var ordinal = -1;
     while (true) {
       final events = db.select(
@@ -708,7 +1139,11 @@ class PricingRepository {
         // exact UTC ordering, including imported offset timestamps, in Dart.
         final raw = event['occurred_at_utc'] as String?;
         final at = raw == null ? null : DateTime.tryParse(raw)?.toUtc();
-        if (at != null && !at.isBefore(observed)) return true;
+        if (at != null &&
+            !at.isBefore(observed) &&
+            (until == null || at.isBefore(until))) {
+          return true;
+        }
       }
       ordinal = events.last['source_record_ordinal'] as int;
     }
@@ -1559,6 +1994,46 @@ const _storedPriceKeys = [
   'image',
   'web_search',
 ];
+
+Map<String, dynamic> _modelObservationJson(OpenRouterModelPricing model) => {
+  'id': model.modelId,
+  if (model.rawPricingJson != null) 'raw_pricing_json': model.rawPricingJson,
+  if (model.modelName != null) 'name': model.modelName,
+  if (model.canonicalSlug != null) 'canonical_slug': model.canonicalSlug,
+  'pricing': {
+    if (model.promptPricePerToken != null) 'prompt': model.promptPricePerToken,
+    if (model.completionPricePerToken != null)
+      'completion': model.completionPricePerToken,
+    if (model.inputCacheReadPricePerToken != null)
+      'input_cache_read': model.inputCacheReadPricePerToken,
+    if (model.inputCacheWritePricePerToken != null)
+      'input_cache_write': model.inputCacheWritePricePerToken,
+    if (model.internalReasoningPricePerToken != null)
+      'internal_reasoning': model.internalReasoningPricePerToken,
+    if (model.requestPrice != null) 'request': model.requestPrice,
+    if (model.imagePrice != null) 'image': model.imagePrice,
+    if (model.webSearchPrice != null) 'web_search': model.webSearchPrice,
+    ...model.additionalRates,
+    if (model.rules.isNotEmpty)
+      'overrides': [
+        for (final rule in model.rules) jsonDecode(rule.rawRuleJson),
+      ],
+  },
+};
+
+PriceObservation _removedPriceObservation(
+  String model,
+  String provider,
+  DateTime at,
+  String origin,
+) => PriceObservation(
+  origin: origin,
+  authority: 'local',
+  observedAtUtc: at,
+  provider: provider,
+  modelId: model,
+  model: {'id': model, 'pricing': <String, Object?>{}, 'removed': true},
+);
 
 const _priceColumns = {
   'prompt': 'prompt_price_per_token',

@@ -589,15 +589,29 @@ void main() {
               .single['retry_count'],
           0,
         );
-        now = now.add(const Duration(hours: 23));
+        now = now.add(const Duration(hours: 5));
         await scheduler.runDueJobs();
         expect(client.calls, 1);
+        expect(
+          scheduler.schedules
+              .firstWhere((row) => row.jobType == 'openrouter_price_refresh')
+              .nextDueAtUtc,
+          DateTime.utc(2026, 9, 7, 6),
+        );
         now = now.add(const Duration(days: 10));
         await scheduler.runDueJobs();
         expect(
           client.calls,
           2,
           reason: 'ten missed days coalesce into one fetch',
+        );
+        await scheduler.runDueJobs();
+        expect(client.calls, 2);
+        expect(
+          scheduler.schedules
+              .firstWhere((row) => row.jobType == 'openrouter_price_refresh')
+              .nextDueAtUtc,
+          DateTime.utc(2026, 9, 17, 6),
         );
       } finally {
         if (!releaseWriter.isCompleted) releaseWriter.complete();

@@ -1318,6 +1318,9 @@ class _ConversationMessageCard extends StatelessWidget {
       container: true,
       focusable: true,
       readOnly: true,
+      button: true,
+      selected: selected,
+      onTap: onSelect,
       label: _messageSemanticsLabel(
         message,
         collapsedToolOutput
@@ -1435,21 +1438,31 @@ class _ConversationMessageCard extends StatelessWidget {
                   if (bodyLoaded &&
                       (message.isLong || message.hasToolOutput)) ...[
                     const SizedBox(height: 4),
-                    AppButton.text(
-                      style: TextButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      onPressed: onToggleExpanded,
-                      icon: AppSvgIcon(
-                        expanded ? AppIcons.collapse : AppIcons.expand,
-                        size: 14,
-                      ),
-                      label: Text(
-                        expanded
-                            ? 'Collapse'
-                            : message.hasToolOutput
-                            ? 'Expand tool output'
-                            : 'Show full message',
+                    Semantics(
+                      label: expanded
+                          ? 'Collapse message ${message.number}'
+                          : 'Expand message ${message.number}',
+                      button: true,
+                      expanded: expanded,
+                      onTap: onToggleExpanded,
+                      child: ExcludeSemantics(
+                        child: AppButton.text(
+                          style: TextButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: onToggleExpanded,
+                          icon: AppSvgIcon(
+                            expanded ? AppIcons.collapse : AppIcons.expand,
+                            size: 14,
+                          ),
+                          label: Text(
+                            expanded
+                                ? 'Collapse'
+                                : message.hasToolOutput
+                                ? 'Expand tool output'
+                                : 'Show full message',
+                          ),
+                        ),
                       ),
                     ),
                   ],

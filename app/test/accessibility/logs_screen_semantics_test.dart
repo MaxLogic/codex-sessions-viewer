@@ -1,6 +1,9 @@
+import 'dart:ui' show Tristate;
+
 import 'package:codex_sessions_viewer/src/logging/structured_logger.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/logs_screen.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -31,8 +34,24 @@ void main() {
 
     expect(find.bySemanticsLabel('Logs table'), findsOneWidget);
 
-    await tester.tap(find.text('Database error'));
+    final rowFinder = find.bySemanticsLabel(
+      'Log 10:00:00, error, Database, Database error, details available',
+    );
+    final rowBefore = tester.getSemantics(rowFinder).getSemanticsData();
+    expect(rowBefore.hasAction(SemanticsAction.tap), isTrue);
+    expect(rowBefore.flagsCollection.isSelected, Tristate.isFalse);
+
+    await tester.tap(rowFinder);
     await tester.pump();
+
+    expect(
+      tester
+          .getSemantics(rowFinder)
+          .getSemanticsData()
+          .flagsCollection
+          .isSelected,
+      Tristate.isTrue,
+    );
 
     expect(find.bySemanticsLabel('Selected log details'), findsOneWidget);
     expect(find.textContaining('"safe":"details"'), findsOneWidget);

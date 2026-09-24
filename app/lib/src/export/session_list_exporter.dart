@@ -1,9 +1,34 @@
 import 'dart:convert';
+import 'dart:isolate';
 
 import '../commands/resume_command_generator.dart';
 import '../config/app_settings.dart';
 import '../ui/models/conversation_message_view_model.dart';
 import '../ui/models/session_row_view_model.dart';
+
+Future<String> formatSessionListMarkdown(
+  AppSettings settings,
+  List<SessionRowViewModel> rows, {
+  bool includeFirstMessage = false,
+  bool includeLastMessage = false,
+}) {
+  if (rows.length < 100) {
+    return Future.value(
+      SessionListExporter(settings: settings).exportMarkdown(
+        rows,
+        includeFirstMessage: includeFirstMessage,
+        includeLastMessage: includeLastMessage,
+      ),
+    );
+  }
+  return Isolate.run(
+    () => SessionListExporter(settings: settings).exportMarkdown(
+      rows,
+      includeFirstMessage: includeFirstMessage,
+      includeLastMessage: includeLastMessage,
+    ),
+  );
+}
 
 class SessionListExporter {
   const SessionListExporter({required this.settings});
@@ -175,6 +200,7 @@ class SessionListExporter {
       'tags',
       'status',
       'session_id',
+      'harness',
     ];
     final buffer = StringBuffer('\ufeff${columns.join(',')}\r\n');
     for (final row in rows) {
@@ -198,6 +224,7 @@ class SessionListExporter {
         row.tags.join('; '),
         row.status,
         row.sessionId,
+        row.harnessLabel,
       ];
       buffer
         ..write(values.map(_csvValue).join(','))
@@ -231,6 +258,7 @@ class SessionListExporter {
     final commandSet = ResumeCommandGenerator(settings: settings).build(
       ResumeCommandSession(
         sessionId: row.sessionId,
+        harness: row.harness,
         sourceType: row.platform == SessionRowPlatform.wsl
             ? ResumeSessionSourceType.wsl
             : ResumeSessionSourceType.windows,
@@ -252,7 +280,7 @@ class SessionListExporter {
         '**Tokens:** ${_groupedInt(row.displayTotalTokens)} · '
         '**Cost:** ${row.displayEstimatedCost} · '
         '**Model:** ${row.modelLabel} · '
-        '**Platform:** ${row.platformLabel}';
+        '**Platform:** ${row.platformLabel} · **Harness:** ${row.harnessLabel}';
   }
 }
 

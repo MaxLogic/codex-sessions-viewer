@@ -1,6 +1,7 @@
 /// The cached Sessions query shared by runtime and query-plan benchmarks.
 ({String sql, List<Object?> parameters}) sessionListQuery({
   String? sessionId,
+  List<String>? sessionIds,
   int? limit,
   int offset = 0,
 }) {
@@ -10,14 +11,16 @@
     's.session_id is not null',
     "s.session_id <> ''",
     if (sessionId != null) 's.id = ?',
+    if (sessionIds != null)
+      's.id in (${List.filled(sessionIds.length, '?').join(', ')})',
   ];
   final limitClause = limit == null ? '' : 'limit ? offset ?';
   // Skewed status statistics can otherwise choose a filter index plus a sort.
   // Point reads must remain free to use the primary key.
-  final indexClause = sessionId == null
+  final indexClause = sessionId == null && sessionIds == null
       ? ' indexed by idx_sessions_available_activity'
       : '';
-  final args = <Object?>[?sessionId];
+  final args = <Object?>[?sessionId, ...?sessionIds];
   if (limit != null) {
     args
       ..add(limit)

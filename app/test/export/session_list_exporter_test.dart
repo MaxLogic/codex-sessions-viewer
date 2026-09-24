@@ -85,7 +85,7 @@ void main() {
         '\ufeffname,thread_name,title,project,working_directory,'
         'resume_command,started_utc,last_message_utc,duration_minutes,'
         'message_count,total_tokens,estimated_cost,model,platform,tags,'
-        'status,session_id\r\n',
+        'status,session_id,harness\r\n',
       ),
     );
     expect(csv, contains('"Parser, ""review"" — DelphiAiKit"'));
@@ -101,7 +101,7 @@ void main() {
       csv,
       endsWith(
         ',87,123456,1.24,gpt-5.6,WSL,accessibility,'
-        'Available,session-1\r\n',
+        'Available,session-1,Codex\r\n',
       ),
     );
   });
@@ -231,6 +231,22 @@ void main() {
         expect(markdown, isNot(contains(message.body)));
       }
     }
+  });
+
+  test('large list formatting on a worker preserves exact Markdown', () async {
+    final settings = AppSettings.defaults();
+    final rows = [
+      for (var index = 0; index < 100; index++)
+        _row(
+          id: 'row-$index',
+          sessionId: 'session-$index',
+          workingDirectory: r'F:\projects',
+        ),
+    ];
+    final expected = SessionListExporter(
+      settings: settings,
+    ).exportMarkdown(rows);
+    expect(await formatSessionListMarkdown(settings, rows), expected);
   });
 }
 

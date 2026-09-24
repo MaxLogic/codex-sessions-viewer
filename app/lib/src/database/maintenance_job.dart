@@ -158,6 +158,7 @@ final class MaintenanceJobRepository {
     required String jobType,
     required bool enabled,
     required int intervalSeconds,
+    bool utcSlots = false,
   }) {
     _validateScheduleType(jobType);
     if (intervalSeconds <= 0) {
@@ -168,13 +169,14 @@ final class MaintenanceJobRepository {
       final stamp = _timestamp(_clock());
       final due =
           previous != null &&
-              previous.intervalSeconds != intervalSeconds &&
               previous.retryCount == 0 &&
               previous.lastSuccessAtUtc != null
           ? _timestamp(
-              previous.lastSuccessAtUtc!.add(
-                Duration(seconds: intervalSeconds),
-              ),
+              utcSlots
+                  ? nextPricingUtcSlot(previous.lastSuccessAtUtc!)
+                  : previous.lastSuccessAtUtc!.add(
+                      Duration(seconds: intervalSeconds),
+                    ),
             )
           : previous?.nextDueAtUtc == null
           ? stamp
@@ -237,16 +239,22 @@ final class MaintenanceJobRepository {
     required bool succeeded,
     String? errorMessage,
     Duration? retryAfter,
+    bool utcSlots = false,
+    DateTime? successfulObservationAtUtc,
   }) => _scheduleTransaction(() {
     final schedule = readSchedule(jobType);
     if (schedule?.lastAttemptAtUtc == null) {
       throw StateError('Schedule attempt has not started.');
     }
     final now = _clock().toUtc();
+    final successAt = successfulObservationAtUtc?.toUtc() ?? now;
     final retryCount = succeeded ? 0 : schedule!.retryCount + 1;
     Duration delay;
     if (succeeded) {
-      delay = Duration(seconds: schedule!.intervalSeconds);
+      final next = utcSlots
+          ? nextPricingUtcSlot(successAt)
+          : successAt.add(Duration(seconds: schedule!.intervalSeconds));
+      delay = next.isAfter(now) ? next.difference(now) : Duration.zero;
     } else {
       const minutes = [15, 60, 240, 720, 1440];
       final base = Duration(
@@ -270,7 +278,7 @@ final class MaintenanceJobRepository {
     ''',
       [
         succeeded
-            ? _timestamp(now)
+            ? _timestamp(successAt)
             : schedule!.lastSuccessAtUtc == null
             ? null
             : _timestamp(schedule.lastSuccessAtUtc!),
@@ -846,4 +854,10 @@ String? _payloadWithStop(String? payloadJson, {required bool stopRequested}) {
     payload.remove('stop_requested');
   }
   return payload.isEmpty ? null : jsonEncode(payload);
+}
+
+/// Next strictly future UTC slot, independent of local timezone and DST.
+DateTime nextPricingUtcSlot(DateTime observation) {
+  final utc = observation.toUtc();
+  return DateTime.utc(utc.year, utc.month, utc.day, (utc.hour ~/ 6 + 1) * 6);
 }

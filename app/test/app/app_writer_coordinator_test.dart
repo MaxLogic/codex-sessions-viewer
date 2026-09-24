@@ -86,7 +86,7 @@ void main() {
       release.complete();
       await _pumpUntil(
         tester,
-        condition: () => usageLoads == 1,
+        condition: () => cachedLoads > 0,
         description: 'configured application startup',
       );
       expect(cachedLoads, greaterThan(0));
@@ -102,7 +102,11 @@ void main() {
         db.close();
       }
       await tester.pump();
-      expect(usageLoads, 1, reason: 'rebuilds do not start another scheduler');
+      expect(
+        usageLoads,
+        0,
+        reason: 'hidden Usage does not query after startup',
+      );
       final saved = AppSettings.fromTomlMap({
         'pricing': {
           'use_external_pricing': false,
@@ -144,11 +148,8 @@ void main() {
         isTrue,
       );
       maintenance.publishCostWork(running: false, committed: true);
-      await _pumpUntil(
-        tester,
-        condition: () => usageLoads == 2,
-        description: 'committed pricing invalidation',
-      );
+      await tester.pump();
+      expect(usageLoads, 0, reason: 'hidden Usage defers pricing invalidation');
       final updatedSessions = tester.widget<SessionsScreen>(
         find.byType(SessionsScreen),
       );
@@ -180,6 +181,14 @@ void main() {
       } finally {
         savedDb.close();
       }
+      await tester.tap(
+        find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')),
+      );
+      await _pumpUntil(
+        tester,
+        condition: () => usageLoads == 1,
+        description: 'visible Usage catches up with committed pricing',
+      );
     } finally {
       if (!release.isCompleted) release.complete();
       await tester.pumpWidget(const SizedBox.shrink());

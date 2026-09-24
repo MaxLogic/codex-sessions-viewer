@@ -228,6 +228,11 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(deferredSessionLoads, greaterThan(0));
+      expect(usageLoads, 0);
+      await tester.tap(
+        find.bySemanticsLabel(RegExp('^Usage navigation\\nTab ')),
+      );
+      await tester.pumpAndSettle();
       expect(usageLoads, 1);
     } finally {
       if (!result.isCompleted) {

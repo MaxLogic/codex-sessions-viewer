@@ -8,6 +8,7 @@ import 'package:sqlite3/sqlite3.dart' show sqlite3;
 import '../platform/application_working_directory.dart';
 import 'database_connection.dart';
 import 'database_maintenance_cancelled.dart';
+import 'writer_version_agreement.dart';
 
 File defaultDatabaseFile() {
   final appData = Platform.environment['APPDATA'];
@@ -33,7 +34,7 @@ Directory defaultSqlRoot() {
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 20,
+    this.supportedSchemaVersion = 23,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
@@ -169,6 +170,7 @@ class DatabaseMigrator {
       );
 
       _recoverInterruptedScanRuns(db);
+      recordViewerWriterVersions(db);
 
       return DatabaseStartupResult.ready(
         lastAppliedSchemaVersion: _lastAppliedVersion(db),

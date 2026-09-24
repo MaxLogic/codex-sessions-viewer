@@ -9,16 +9,16 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
-/// The Rust collector (T-119) writes the viewer's database with SQL that must
-/// match the Dart scan writer. This test scans one fixture tree twice, once
-/// with the production Dart writer and once with the built collector
-/// executable, and compares every written table. It then reads the collector's
-/// database through the production repositories.
+/// GUI Refresh and the collector CLI share Rust ingestion after T-134. This
+/// suite proves their public entry points converge on the same stored content
+/// and do not reparse unchanged sessions when interleaved. Independent parser
+/// golden suites retain the Dart-versus-Rust parsing comparison.
 /// A database prepared the way production startup prepares it: schema files,
 /// then the persisted-usage startup migration. Migrated once (the startup
 /// migration takes about a minute) and copied for each test database.
@@ -86,19 +86,41 @@ void main() {
 
   tearDownAll(() => _template.parent.delete(recursive: true));
 
+  test('viewer startup records both writer versions for collector agreement', () {
+    final db = openFileBackedDatabase(_template);
+    try {
+      final versions = {
+        for (final row in db.select(
+          "select key, value from app_metadata where key like 'writer_%_version'",
+        ))
+          row['key']: row['value'],
+      };
+      expect(
+        versions['writer_codex_parser_version'],
+        CodexSessionParser.currentVersion.toString(),
+      );
+      expect(
+        versions['writer_usage_cost_projection_version'],
+        usageCostProjectionVersion.toString(),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   test(
-    'collector writes the same rows as the Dart scan across scan, rescan, append, and delete',
+    'collector CLI and GUI Refresh write the same rows across scan, rescan, append, and delete',
     () async {
       final fixture = await _Fixture.create();
       addTearDown(fixture.dispose);
 
-      final dartDb = await fixture.migratedDatabase('dart.sqlite');
+      final guiDb = await fixture.migratedDatabase('gui.sqlite');
       final rustDb = await fixture.migratedDatabase('rust.sqlite');
 
       Future<void> scanBoth(String label) async {
-        await fixture.dartScan(dartDb);
+        await fixture.guiScan(guiDb);
         await fixture.collectorScan(collector, rustDb);
-        _expectSameContent(_content(dartDb), _content(rustDb), reason: label);
+        _expectSameContent(_content(guiDb), _content(rustDb), reason: label);
       }
 
       await scanBoth('first scan');
@@ -118,66 +140,62 @@ void main() {
       await fixture.deleteHistoryBaseSession();
       await scanBoth('rescan after append and delete');
 
-      await _expectProductionReadsMatch(fixture, dartDb, rustDb);
+      await _expectProductionReadsMatch(fixture, guiDb, rustDb);
     },
     timeout: const Timeout(Duration(minutes: 5)),
   );
 
-  test(
-    'the viewer and the collector take turns on one database without reparsing',
-    () async {
-      final fixture = await _Fixture.create();
-      addTearDown(fixture.dispose);
-      final shared = await fixture.migratedDatabase('shared.sqlite');
-      final reference = await fixture.migratedDatabase('reference.sqlite');
-      await fixture.dartScan(reference);
+  test('GUI Refresh and collector CLI take turns without reparsing', () async {
+    final fixture = await _Fixture.create();
+    addTearDown(fixture.dispose);
+    final shared = await fixture.migratedDatabase('shared.sqlite');
+    final reference = await fixture.migratedDatabase('reference.sqlite');
+    await fixture.guiScan(reference);
 
-      Map<String, Object?> parsedAt(File file) {
-        final db = openFileBackedDatabase(file);
-        try {
-          return {
-            for (final row in db.select(
-              "select id, last_parsed_utc from sessions where parse_status = 'available'",
-            ))
-              row['id'] as String: row['last_parsed_utc'],
-          };
-        } finally {
-          db.close();
-        }
+    Map<String, Object?> parsedAt(File file) {
+      final db = openFileBackedDatabase(file);
+      try {
+        return {
+          for (final row in db.select(
+            "select id, last_parsed_utc from sessions where parse_status = 'available'",
+          ))
+            row['id'] as String: row['last_parsed_utc'],
+        };
+      } finally {
+        db.close();
       }
+    }
 
-      await fixture.dartScan(shared);
-      final afterViewer = parsedAt(shared);
-      await fixture.collectorScan(collector, shared);
-      expect(
-        parsedAt(shared),
-        afterViewer,
-        reason: 'the collector must not reparse what the viewer parsed',
-      );
-      await fixture.dartScan(shared);
-      expect(
-        parsedAt(shared),
-        afterViewer,
-        reason: 'the viewer must not reparse what is unchanged',
-      );
-      _expectSameContent(
-        _content(reference),
-        _content(shared),
-        reason: 'interleaved writers converge on a single-writer result',
-      );
+    await fixture.guiScan(shared);
+    final afterViewer = parsedAt(shared);
+    await fixture.collectorScan(collector, shared);
+    expect(
+      parsedAt(shared),
+      afterViewer,
+      reason: 'the collector must not reparse what the viewer parsed',
+    );
+    await fixture.guiScan(shared);
+    expect(
+      parsedAt(shared),
+      afterViewer,
+      reason: 'the viewer must not reparse what is unchanged',
+    );
+    _expectSameContent(
+      _content(reference),
+      _content(shared),
+      reason: 'interleaved writers converge on a single-writer result',
+    );
 
-      await fixture.appendToForkedSession();
-      await fixture.collectorScan(collector, shared);
-      await fixture.dartScan(shared);
-      await fixture.dartScan(reference);
-      _expectSameContent(
-        _content(reference),
-        _content(shared),
-        reason:
-            'a change collected by the collector is not redone by the viewer',
-      );
-    },
-  );
+    await fixture.appendToForkedSession();
+    await fixture.collectorScan(collector, shared);
+    await fixture.guiScan(shared);
+    await fixture.guiScan(reference);
+    _expectSameContent(
+      _content(reference),
+      _content(shared),
+      reason: 'a change collected by the collector is not redone by the viewer',
+    );
+  });
 
   test('the viewer refuses a database a standalone collector owns', () async {
     final fixture = await _Fixture.create();
@@ -199,7 +217,7 @@ void main() {
     ).openAndMigrate(standalone);
     expect(startup.canStartNormalUi, isFalse);
     expect(startup.fatalError?.summary, contains('standalone collector'));
-    expect(await _schemaVersion(standalone), 20);
+    expect(await _schemaVersion(standalone), 23);
     expect(await standalone.readAsBytes(), hasLength(before.length));
   });
 
@@ -375,7 +393,7 @@ class _Fixture {
   Future<File> migratedDatabase(String name) =>
       _template.copy(p.join(temp.path, name));
 
-  Future<void> dartScan(File db) async {
+  Future<void> guiScan(File db) async {
     await RuntimeSessionController(
       settingsFile: settingsFile,
       databaseFile: db,
@@ -582,7 +600,7 @@ void _expectSameContent(
 
 Future<void> _expectProductionReadsMatch(
   _Fixture fixture,
-  File dartDb,
+  File guiDb,
   File rustDb,
 ) async {
   Future<List<Map<String, Object?>>> rows(File db) async {
@@ -609,7 +627,7 @@ Future<void> _expectProductionReadsMatch(
     ];
   }
 
-  final dartRows = await rows(dartDb);
+  final dartRows = await rows(guiDb);
   final rustRows = await rows(rustDb);
   expect(rustRows, isNotEmpty);
   _expectSameContent(
@@ -628,7 +646,7 @@ Future<void> _expectProductionReadsMatch(
   }
 
   for (final text in ['parser', 'subagent', 'shell', 'Parity']) {
-    expect(search(rustDb, text), search(dartDb, text), reason: text);
+    expect(search(rustDb, text), search(guiDb, text), reason: text);
   }
   expect(search(rustDb, 'parser'), isNotEmpty);
 
@@ -660,7 +678,7 @@ Future<void> _expectProductionReadsMatch(
 
   final rustUsage = usage(rustDb);
   expect(rustUsage['total'], greaterThan(0));
-  _expectSameContent(usage(dartDb), rustUsage, reason: 'usage summary');
+  _expectSameContent(usage(guiDb), rustUsage, reason: 'usage summary');
 }
 
 Future<int> _schemaVersion(File file) async {

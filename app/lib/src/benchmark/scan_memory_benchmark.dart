@@ -7,6 +7,7 @@ import '../app/runtime_session_controller.dart';
 import '../config/app_settings.dart';
 import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
+import '../database/database_maintenance.dart';
 import '../database/session_cache_repair.dart';
 import '../parser/codex_session_parser.dart';
 import '../scanner/scan_batching.dart';
@@ -95,10 +96,15 @@ Future<int> runScanMemoryBenchmark(ScanMemoryBenchmarkRequest request) async {
   );
   final startup = await DatabaseMigrator(
     sqlRoot: request.sqlRoot,
-  ).openAndMigrate(databaseFile);
+  ).openAndMigrate(databaseFile, deferUsageMigration: true);
   if (!startup.canStartNormalUi) {
     return 70;
   }
+  final migration = await startPendingDatabaseMigration(
+    databaseFile,
+    sqlRoot: request.sqlRoot,
+  );
+  if (migration != null && !(await migration.result).succeeded) return 70;
   final preflightDb = openFileBackedDatabase(databaseFile);
   try {
     preflightDb.execute(

@@ -1,4 +1,6 @@
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
+import 'dart:async';
+
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:flutter/material.dart';
@@ -656,6 +658,65 @@ void main() {
     expect(exported.single, contains('# Parser cache'));
     expect(exported.single, contains('## Message 1 - User'));
     expect(exported.single, contains('Hello'));
+  });
+
+  testWidgets('shows delayed progress while preparing conversation Markdown', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(2400, 1400));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final loadGate = Completer<List<ConversationMessageViewModel>>();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TestSessionsScreen(
+            initialRows: [
+              _row(
+                sessionId: 'abc123',
+                messages: [
+                  ConversationMessageViewModel(
+                    id: 'm1',
+                    number: 1,
+                    author: ConversationAuthor.user,
+                    createdAtUtc: DateTime.utc(2026, 6, 18, 10),
+                    preview: 'Hello',
+                    body: '',
+                    tokenCount: 3,
+                    isBodyLoaded: false,
+                  ),
+                ],
+              ),
+            ],
+            onLoadAllMessages: (_) => loadGate.future,
+            onExportMarkdown: (_, _) async {},
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Parser cache').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('More'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Export Markdown…'));
+    await tester.pump(const Duration(milliseconds: 1999));
+    expect(find.text('Preparing Markdown'), findsNothing);
+    await tester.pump(const Duration(milliseconds: 1));
+    await tester.pump();
+    expect(find.text('Preparing Markdown'), findsOneWidget);
+    expect(find.byType(LinearProgressIndicator), findsOneWidget);
+    loadGate.complete([
+      ConversationMessageViewModel(
+        id: 'm1',
+        number: 1,
+        author: ConversationAuthor.user,
+        createdAtUtc: DateTime.utc(2026, 6, 18, 10),
+        preview: 'Hello',
+        body: 'Hello',
+        tokenCount: 3,
+      ),
+    ]);
+    await tester.pumpAndSettle();
+    expect(find.text('Preparing Markdown'), findsNothing);
   });
 
   testWidgets('pin and archive show immediately without a rescan', (

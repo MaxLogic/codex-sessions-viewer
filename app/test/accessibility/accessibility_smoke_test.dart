@@ -18,8 +18,103 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../helpers/test_sessions_screen.dart';
+import '../helpers/semantics_audit.dart';
 
 void main() {
+  testWidgets('second filter row exposes actionable dropdowns', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final handle = tester.ensureSemantics();
+    await tester.pumpWidget(
+      MaterialApp(home: TestSessionsScreen(initialRows: const [])),
+    );
+
+    for (final label in const [
+      'Time range filter',
+      'Project filter',
+      'Model filter',
+      'Platform filter',
+      'Origin filter',
+    ]) {
+      final data = tester
+          .getSemantics(find.bySemanticsLabel(label))
+          .getSemanticsData();
+      expect(data.flagsCollection.isButton, isTrue, reason: label);
+      expect(data.hasAction(SemanticsAction.tap), isTrue, reason: label);
+      expect(data.value, isNotEmpty, reason: label);
+    }
+
+    tester.semantics.performAction(
+      find.semantics.byLabel('Project filter'),
+      SemanticsAction.tap,
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byWidgetPredicate((widget) => widget is CheckedPopupMenuItem),
+      findsWidgets,
+    );
+    expect(find.text('All projects'), findsWidgets);
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('More filters'));
+    await tester.pumpAndSettle();
+    final archive = tester
+        .getSemantics(find.bySemanticsLabel('Viewer archive filter'))
+        .getSemanticsData();
+    expect(archive.flagsCollection.isButton, isTrue);
+    expect(archive.hasAction(SemanticsAction.tap), isTrue);
+    expect(archive.value, isNotEmpty);
+    handle.dispose();
+  });
+
+  testWidgets(
+    'session row actions and compact counts have complete semantics',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TestSessionsScreen(
+            initialRows: [
+              SessionRowViewModel(
+                id: 'session-1',
+                sessionId: 'abc123',
+                startedAtUtc: DateTime.utc(2026, 6, 12, 9),
+                lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9, 5),
+                title: 'Parser review',
+                summary: 'Reviewed JSONL formats',
+                project: 'Codex Viewer',
+                path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+                platform: SessionRowPlatform.windows,
+                messageCount: 12345,
+                totalTokens: 72151861,
+                model: 'gpt-5',
+                tags: const ['parser'],
+                status: 'Parsed',
+              ),
+            ],
+          ),
+        ),
+      );
+
+      for (final label in const [
+        'Open terminal and resume for Parser review',
+        'Add tag to Parser review',
+      ]) {
+        final data = tester
+            .getSemantics(find.bySemanticsLabel(label))
+            .getSemanticsData();
+        expect(data.hasAction(SemanticsAction.tap), isTrue, reason: label);
+      }
+      expect(find.bySemanticsLabel('Messages 12.3K'), findsOneWidget);
+      expect(find.bySemanticsLabel('Tokens 72.2M'), findsOneWidget);
+      await expectSemanticsAuditPasses(
+        tester,
+        context: 'Populated session table',
+      );
+    },
+  );
+
   testWidgets('important command actions expose specific semantics labels', (
     tester,
   ) async {
@@ -96,6 +191,62 @@ void main() {
       find.bySemanticsLabel('More actions for Parser review'),
       findsOneWidget,
     );
+    final row = tester.getSemantics(
+      find.bySemanticsLabel('Session Parser review. Status Parsed.'),
+    );
+    expect(row.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
+  });
+
+  testWidgets('session table headers and split handle are keyboard operable', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1600, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: TestSessionsScreen(
+          initialRows: [
+            SessionRowViewModel(
+              id: 'session-1',
+              startedAtUtc: DateTime.utc(2026, 6, 12, 9),
+              lastMessageAtUtc: DateTime.utc(2026, 6, 12, 9, 5),
+              title: 'Parser review',
+              summary: 'Reviewed JSONL formats',
+              project: 'Codex Viewer',
+              path: r'F:\projects\MaxLogic\codex-sessions-viewer',
+              platform: SessionRowPlatform.windows,
+              messageCount: 4,
+              totalTokens: 1200,
+              model: 'gpt-5',
+              tags: const [],
+              status: 'Parsed',
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final projectHeader = tester.getSemantics(
+      find.bySemanticsLabel('Project column'),
+    );
+    expect(
+      projectHeader.getSemanticsData().hasAction(SemanticsAction.tap),
+      isTrue,
+    );
+
+    final projectResize = tester
+        .getSemantics(find.bySemanticsLabel('Resize Project column'))
+        .getSemanticsData();
+    expect(projectResize.hasAction(SemanticsAction.increase), isTrue);
+    expect(projectResize.hasAction(SemanticsAction.decrease), isTrue);
+
+    final splitHandle = tester.getSemantics(
+      find.bySemanticsLabel('Resize session table and detail panes'),
+    );
+    final splitData = splitHandle.getSemanticsData();
+    expect(splitData.hasAction(SemanticsAction.increase), isTrue);
+    expect(splitData.hasAction(SemanticsAction.decrease), isTrue);
+    expect(splitData.hasAction(SemanticsAction.tap), isTrue);
   });
 
   testWidgets(
@@ -403,6 +554,14 @@ void main() {
       find.byKey(const Key('message-card-semantics-1')),
     );
     expect(message.flagsCollection.isFocused, isNot(Tristate.none));
+    expect(message.flagsCollection.isSelected, Tristate.isFalse);
+    expect(
+      tester
+          .getSemantics(find.byKey(const Key('message-card-semantics-2')))
+          .flagsCollection
+          .isSelected,
+      Tristate.isTrue,
+    );
     expect(message.label, contains('Prompt body'));
     expect(
       find.bySemanticsLabel(
