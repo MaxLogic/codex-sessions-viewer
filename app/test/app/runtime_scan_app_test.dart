@@ -2606,33 +2606,8 @@ void main() {
       settingsFile: settingsFile,
       databaseFile: databaseFile,
     );
-    await controller.refresh();
-    final afterFailedScan = openFileBackedDatabase(databaseFile);
-    expect(
-      afterFailedScan
-          .select(
-            "select count(*) as count from sessions where id = 'source:legacy-artifact'",
-          )
-          .single['count'],
-      1,
-    );
-    expect(
-      afterFailedScan
-          .select(
-            "select count(*) as count from app_metadata where key = '$sessionCacheRepairCompletionKey'",
-          )
-          .single['count'],
-      0,
-    );
-    afterFailedScan.close();
-
-    await malformed.writeAsString('''
-      {
-        "session_id": "repair-gate",
-        "source_type": "windows",
-        "messages": [{"type": "user", "content": "repaired"}]
-      }
-      ''');
+    // A file that fails to parse under a reachable Codex home does not
+    // postpone the repair: only unreachable roots make discovery incomplete.
     await controller.refresh();
 
     final repaired = openFileBackedDatabase(databaseFile);
