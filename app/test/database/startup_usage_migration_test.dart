@@ -832,6 +832,34 @@ void main() {
     }
   });
 
+  test(
+    'production migration of an empty database probes disk space quickly',
+    () async {
+      // Regression: each space check once started powershell.exe (~3.6 s per
+      // phase boundary), so this empty-database migration took about 26 s.
+      final temporary = await Directory.systemTemp.createTemp(
+        'csv_startup_speed_',
+      );
+      addTearDown(() => temporary.delete(recursive: true));
+      final file = File('${temporary.path}/viewer.sqlite');
+      final sqlRoot = Directory('../sql');
+      await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(file, deferUsageMigration: true);
+      final stopwatch = Stopwatch()..start();
+      final operation = await startPendingDatabaseMigration(
+        file,
+        sqlRoot: sqlRoot,
+        pricingSettings: AppSettings.defaults().pricing,
+      );
+      final result = await operation!.result;
+      stopwatch.stop();
+      expect(result.succeeded, isTrue, reason: result.errorMessage);
+      expect(stopwatch.elapsed, lessThan(const Duration(seconds: 8)));
+    },
+    skip: Platform.isWindows ? false : 'The production probe requires Windows.',
+  );
+
   test('startup factory creates and resumes an inactive generation', () async {
     final temporary = await Directory.systemTemp.createTemp(
       'csv_startup_usage_',

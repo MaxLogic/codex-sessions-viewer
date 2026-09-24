@@ -1,8 +1,3 @@
-// The persisted-usage migration and the real collector runs take longer than
-// the default 30 s test timeout in a debug build.
-@Timeout(Duration(minutes: 3))
-library;
-
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
@@ -53,8 +48,7 @@ void main() {
     ).openAndMigrate(dbFile, deferUsageMigration: true);
     expect(startup.canStartNormalUi, isTrue);
     // The collector writes only a database whose persisted-usage migration
-    // finished. That migration (backup, shadow generation, verification)
-    // alone takes most of the default 30 s test timeout in a debug build.
+    // finished.
     final migration = await startPendingDatabaseMigration(
       dbFile,
       sqlRoot: sqlRoot,

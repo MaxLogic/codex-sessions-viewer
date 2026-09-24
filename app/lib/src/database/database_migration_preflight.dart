@@ -8,19 +8,12 @@ import 'package:sqlite3/sqlite3.dart' show SqliteException, OpenMode, sqlite3;
 
 import 'database_backup.dart';
 import 'database_connection.dart';
+import 'disk_space_probe.dart';
 import 'maintenance_job.dart';
 
+export 'disk_space_probe.dart' show DiskVolumeSpace;
+
 const _minimumRecoveryReserveBytes = 64 * 1024 * 1024;
-
-final class DiskVolumeSpace {
-  const DiskVolumeSpace({
-    required this.volumeKey,
-    required this.availableBytes,
-  });
-
-  final String volumeKey;
-  final int availableBytes;
-}
 
 final class MigrationSpaceRequirement {
   const MigrationSpaceRequirement({
@@ -66,7 +59,7 @@ final class DatabaseMigrationPreflight {
     SqliteBackupService? backupService,
     MigrationDiskSpaceProbe? diskSpaceProbe,
   }) : _backupService = backupService ?? SqliteBackupService(),
-       _diskSpaceProbe = diskSpaceProbe ?? _probeWindowsDiskSpace;
+       _diskSpaceProbe = diskSpaceProbe ?? _probePlatformDiskSpace;
 
   final SqliteBackupService _backupService;
   final MigrationDiskSpaceProbe _diskSpaceProbe;
@@ -468,49 +461,7 @@ String _mergeBackupEvidence(String? payloadJson, VerifiedSqliteBackup backup) {
   return jsonEncode(payload);
 }
 
-Future<DiskVolumeSpace> _probeWindowsDiskSpace(Directory directory) async {
-  if (!Platform.isWindows) {
-    throw UnsupportedError('Database migration disk probing requires Windows.');
-  }
-  const script = r'''
-$ErrorActionPreference = 'Stop'
-$probePath = [System.IO.Path]::GetFullPath($env:CODEX_SESSIONS_VOLUME_PATH)
-while (-not [System.IO.Directory]::Exists($probePath)) {
-  $parentPath = [System.IO.Path]::GetDirectoryName($probePath)
-  if ([string]::IsNullOrEmpty($parentPath) -or $parentPath -eq $probePath) {
-    throw 'No existing directory found for migration volume.'
-  }
-  $probePath = $parentPath
-}
-$volume = Get-Volume -FilePath ($probePath.TrimEnd('\') + '\') -ErrorAction Stop
-if ($null -eq $volume -or [string]::IsNullOrEmpty($volume.UniqueId)) {
-  throw 'Unable to resolve migration volume.'
-}
-Write-Output $volume.UniqueId
-Write-Output $volume.SizeRemaining
-''';
-  final result = await Process.run(
-    'powershell.exe',
-    const ['-NoProfile', '-NonInteractive', '-Command', script],
-    environment: {'CODEX_SESSIONS_VOLUME_PATH': directory.path},
-  );
-  if (result.exitCode != 0) {
-    throw StateError('Unable to determine migration disk headroom.');
-  }
-  final lines = const LineSplitter()
-      .convert(result.stdout.toString())
-      .map((line) => line.trim())
-      .where((line) => line.isNotEmpty)
-      .toList();
-  if (lines.length < 2) {
-    throw StateError('Disk headroom probe returned incomplete output.');
-  }
-  final availableBytes = int.tryParse(lines.last);
-  if (availableBytes == null || availableBytes < 0) {
-    throw StateError('Disk headroom probe returned an invalid byte count.');
-  }
-  return DiskVolumeSpace(
-    volumeKey: lines.first.toLowerCase(),
-    availableBytes: availableBytes,
-  );
-}
+/// Each phase boundary re-probes every target directory: free space can
+/// shrink between phases, and a Win32 probe costs microseconds.
+Future<DiskVolumeSpace> _probePlatformDiskSpace(Directory directory) async =>
+    DiskSpaceProbe.forCurrentPlatform().probe(directory);
