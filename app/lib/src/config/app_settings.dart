@@ -176,6 +176,7 @@ class AppSettings {
     required this.pricing,
     required this.logging,
     this.maintenance = const MaintenanceSettings(),
+    this.database = const DatabaseSettings(),
     this.hub = const HubSettings(),
     this.legacyPricingHubKeys = const {},
   });
@@ -204,6 +205,7 @@ class AppSettings {
   final PricingSettings pricing;
   final LoggingSettings logging;
   final MaintenanceSettings maintenance;
+  final DatabaseSettings database;
   final HubSettings hub;
 
   factory AppSettings.defaults() => const AppSettings(
@@ -357,6 +359,7 @@ class AppSettings {
         defaults.pricing,
       ),
       maintenance: MaintenanceSettings.fromMap(_table(map, 'maintenance')),
+      database: DatabaseSettings.fromMap(_table(map, 'database')),
       hub: HubSettings.fromMap(_table(map, 'hub'), _table(map, 'pricing')),
       logging: LoggingSettings.fromMap(
         _table(map, 'logging'),
@@ -377,6 +380,7 @@ class AppSettings {
     PricingSettings? pricing,
     LoggingSettings? logging,
     MaintenanceSettings? maintenance,
+    DatabaseSettings? database,
     HubSettings? hub,
     Map<String, Object?>? legacyPricingHubKeys,
   }) => AppSettings(
@@ -391,6 +395,7 @@ class AppSettings {
     pricing: pricing ?? this.pricing,
     logging: logging ?? this.logging,
     maintenance: maintenance ?? this.maintenance,
+    database: database ?? this.database,
     hub: hub ?? this.hub,
     legacyPricingHubKeys: legacyPricingHubKeys ?? this.legacyPricingHubKeys,
   );
@@ -407,6 +412,7 @@ class AppSettings {
     'pricing': {...pricing.toTomlMap(), ...legacyPricingHubKeys},
     'logging': logging.toTomlMap(),
     'maintenance': maintenance.toTomlMap(),
+    'database': database.toTomlMap(),
     'hub': hub.toTomlMap(),
   };
 
@@ -423,6 +429,7 @@ class AppSettings {
       voiceOver == other.voiceOver &&
       pricing == other.pricing &&
       maintenance == other.maintenance &&
+      database == other.database &&
       hub == other.hub &&
       logging == other.logging;
 
@@ -437,6 +444,7 @@ class AppSettings {
     toolOutput,
     voiceOver,
     maintenance,
+    database,
     hub,
     pricing,
     logging,
@@ -1252,6 +1260,43 @@ class MaintenanceSettings {
   @override
   int get hashCode =>
       Object.hash(databaseOptimizeEnabled, databaseOptimizeIntervalDays);
+}
+
+/// Days a database backup is kept before it is deleted, unless a migration
+/// or repair still needs it.
+const defaultBackupRetentionDays = 7;
+
+/// `[database]`: how long the application keeps its database backups.
+class DatabaseSettings {
+  const DatabaseSettings({
+    this.backupRetentionDays = defaultBackupRetentionDays,
+  });
+
+  /// From 1 to 3650 days. There is no "keep forever" value; use 3650.
+  final int backupRetentionDays;
+
+  factory DatabaseSettings.fromMap(Map<String, dynamic> map) =>
+      DatabaseSettings(
+        backupRetentionDays: _boundedPositiveInt(
+          map,
+          'backup_retention_days',
+          defaultBackupRetentionDays,
+          'database.backup_retention_days',
+          3650,
+        ),
+      );
+
+  Map<String, Object?> toTomlMap() => {
+    'backup_retention_days': backupRetentionDays,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is DatabaseSettings &&
+      backupRetentionDays == other.backupRetentionDays;
+
+  @override
+  int get hashCode => backupRetentionDays.hashCode;
 }
 
 class PricingSettings {

@@ -14,6 +14,9 @@ pub struct CollectorSettings {
     pub wsl_codex_unc_path: String,
     pub wsl_linux_root_unc: String,
     pub max_tool_output_preview_chars: usize,
+    /// `[database] backup_retention_days`: days to keep the collector's own
+    /// backups, from 1 to 3650 (a smaller value means 1).
+    pub backup_retention_days: u32,
 }
 
 impl Default for CollectorSettings {
@@ -28,6 +31,7 @@ impl Default for CollectorSettings {
             wsl_codex_unc_path: String::new(),
             wsl_linux_root_unc: "\\\\wsl.localhost\\Ubuntu\\".to_owned(),
             max_tool_output_preview_chars: DEFAULT_MAX_TOOL_OUTPUT_PREVIEW_CHARS,
+            backup_retention_days: crate::backup_retention::DEFAULT_RETENTION_DAYS,
         }
     }
 }
@@ -68,6 +72,14 @@ impl CollectorSettings {
                 "max_tool_output_preview_chars",
                 defaults.max_tool_output_preview_chars,
             ),
+            backup_retention_days: table
+                .get("database")
+                .and_then(|value| value.get("backup_retention_days"))
+                .and_then(toml::Value::as_integer)
+                .map_or(
+                    defaults.backup_retention_days,
+                    crate::backup_retention::clamp_days,
+                ),
         })
     }
 }

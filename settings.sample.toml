@@ -20,6 +20,12 @@ background_rescan_enabled = false
 [terminal]
 default_terminal = 'windows_terminal'
 
+# Database backups made before a migration or repair are deleted after this
+# many days (1 to 3650; default 7). A backup that an unfinished migration or
+# repair still needs is kept whatever its age.
+[database]
+backup_retention_days = 7
+
 # Public model prices refresh at 00:00, 06:00, 12:00 and 18:00 UTC. Only the
 # public OpenRouter model catalog is downloaded; it needs no API key, and no
 # session data is sent.

@@ -2696,6 +2696,66 @@ void main() {
     );
   });
 
+  test('a scan logs the old repair backups the collector deleted', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_repair_backup_retention_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) await temp.delete(recursive: true);
+    });
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    await Directory(p.join(codexRoot.path, 'sessions')).create(recursive: true);
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: codexRoot.path,
+          wslCodexUncPath: '',
+        ),
+        logging: _testLogging(temp),
+        database: const DatabaseSettings(backupRetentionDays: 3),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    expect(
+      (await _migrateCollectorFixture(databaseFile)).canStartNormalUi,
+      isTrue,
+    );
+    final db = openFileBackedDatabase(databaseFile);
+    db.execute(
+      "insert into app_metadata(key, value, updated_at_utc) values (?, 'repair-3-1-1', '2026-07-01T00:00:00Z')",
+      [sessionCacheRepairCompletionKey],
+    );
+    db.close();
+    final created = DateTime.now().subtract(const Duration(days: 4));
+    final backup = File(
+      p.join(
+        temp.path,
+        'backups',
+        'viewer.pre-session-cache-repair-v3.repair-3-${created.microsecondsSinceEpoch}-1.sqlite',
+      ),
+    );
+    await backup.parent.create();
+    await backup.writeAsBytes(List.filled(9, 0));
+
+    await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
+
+    expect(await backup.exists(), isFalse);
+    final logged = openFileBackedDatabase(databaseFile);
+    addTearDown(logged.close);
+    final details = logged
+        .select(
+          "select details from logs where message = 'Deleted an old database backup.'",
+        )
+        .single['details']
+        .toString();
+    expect(details, contains(jsonEncode(backup.path)));
+    expect(details, contains('"bytes":9'));
+  });
+
   test(
     'refresh applies session_index thread names to unchanged cached rows',
     () async {

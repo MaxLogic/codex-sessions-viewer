@@ -1,6 +1,7 @@
 //! Collects local coding-agent sessions into the Codex Sessions Viewer
 //! database through a versioned ingestion contract.
 
+pub mod backup_retention;
 pub mod claude;
 pub mod cli;
 pub mod codex;

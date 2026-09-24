@@ -2235,15 +2235,39 @@ String _statusMessage(
   return 'Scan finished. $available available. $parsed parsed.$failures';
 }
 
-/// Logs the collector's report of the legacy session cache repair.
+/// Logs the collector's report of the legacy session cache repair, and each
+/// old repair backup the collector deleted after the retention period.
 Future<void> _logCacheRepair(
   StructuredLogger logger,
   Map<String, dynamic> repair,
-) {
+) async {
   final status = repair['status'] as String? ?? 'postponed';
   final reason = repair['reason_code'] as String? ?? '';
   final postponed = status == 'postponed';
   final categories = repair['categories'] as Map<String, dynamic>? ?? const {};
+  for (final pruned in repair['pruned_backups'] as List? ?? const []) {
+    if (pruned case {'path': final String path, 'bytes': final int bytes}) {
+      await logger.writeBestEffort(
+        LogEntryDraft(
+          level: LogLevel.info,
+          category: LogCategory.database,
+          message: 'Deleted an old database backup.',
+          details: {'path': path, 'bytes': bytes},
+        ),
+      );
+    }
+  }
+  for (final path in repair['prune_failures'] as List? ?? const []) {
+    await logger.writeBestEffort(
+      LogEntryDraft(
+        level: LogLevel.warning,
+        category: LogCategory.database,
+        message:
+            'An old database backup could not be deleted; it may be open in another program.',
+        details: {'path': '$path'},
+      ),
+    );
+  }
   return logger.writeBestEffort(
     LogEntryDraft(
       level: postponed && reason != 'cancelled'
