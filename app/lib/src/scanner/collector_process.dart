@@ -56,8 +56,9 @@ class CollectorProcess {
            ),
        _start = start ?? _startProcess;
 
-  /// A write batch holds the lease for well under a second; the one-time
-  /// cache repair also copies the database. Anything longer is a hang.
+  /// A write batch holds the lease for well under a second. The one-time
+  /// cache repair copies the database between two leases, not under one,
+  /// and a stopped repair backs off for a day, so anything longer is a hang.
   static const defaultLeaseTimeout = Duration(minutes: 5);
 
   final String executable;

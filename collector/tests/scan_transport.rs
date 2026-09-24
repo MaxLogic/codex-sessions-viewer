@@ -258,9 +258,10 @@ fn a_cancel_after_parsing_skips_the_remaining_batches() {
         match event["event"].as_str().unwrap() {
             "write_requested" => {
                 requested += 1;
-                // Grant the placeholder cleanup and the first session batch,
-                // then cancel instead of granting the next request.
-                if requested <= 2 {
+                // Grant the first session batch (a new database has no
+                // placeholders to clean), then cancel instead of granting the
+                // next request.
+                if requested <= 1 {
                     writeln!(input, "grant").unwrap();
                 } else {
                     writeln!(input, "cancel").unwrap();
@@ -272,7 +273,7 @@ fn a_cancel_after_parsing_skips_the_remaining_batches() {
         }
     }
     assert!(child.wait().unwrap().success());
-    assert_eq!(requested, 3, "statuses, hints and names are skipped");
+    assert_eq!(requested, 2, "statuses, hints and names are skipped");
     let terminal = terminal.unwrap();
     assert_eq!(terminal["cancelled"], true);
     assert_eq!(terminal["sessions_written"], 1);

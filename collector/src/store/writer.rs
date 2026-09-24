@@ -661,18 +661,26 @@ fn replace_source_extras(
     Ok(())
 }
 
+/// Stores the calls after `replace_messages`. `message_id` links the last
+/// message stored before the call's `message_index` (the message that issued
+/// it); it is null when the record has no index or no message precedes it.
 fn replace_tool_calls(conn: &Connection, id: &str, snapshot: &SessionSnapshot) -> StoreResult<()> {
     conn.prepare_cached("delete from tool_calls where session_id = ?")?
         .execute([id])?;
     let mut insert = conn.prepare_cached(
         "insert into tool_calls (
-           session_id, tool_index, tool_name, status, started_at_utc, finished_at_utc,
+           session_id, message_id, tool_index, tool_name, status, started_at_utc, finished_at_utc,
            input_preview, output_preview, output_truncated, error_message
-         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) values (
+           ?1,
+           (select m.id from messages m where m.session_id = ?1 and m.message_index < ?2
+            order by m.message_index desc limit 1),
+           ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for tool in &snapshot.tool_calls {
         insert.execute(params![
             id,
+            tool.message_index,
             tool.tool_index,
             tool.tool_name,
             tool.status,
@@ -1847,16 +1855,20 @@ pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> Store
     finish(conn, result)
 }
 
-/// `_cleanSessionMetadataPlaceholders`.
-pub fn clean_session_metadata_placeholders(conn: &Connection) -> StoreResult<()> {
-    let pending: i64 = conn.query_row(
+/// Sessions whose title or summary is a placeholder older viewers stored.
+pub fn session_metadata_placeholder_count(conn: &Connection) -> StoreResult<i64> {
+    Ok(conn.query_row(
         "select count(*) from sessions
          where lower(trim(coalesce(title, ''))) like '# agents.md%'
             or lower(trim(coalesce(summary, ''))) = 'auto'",
         [],
         |row| row.get(0),
-    )?;
-    if pending == 0 {
+    )?)
+}
+
+/// `_cleanSessionMetadataPlaceholders`.
+pub fn clean_session_metadata_placeholders(conn: &Connection) -> StoreResult<()> {
+    if session_metadata_placeholder_count(conn)? == 0 {
         return Ok(());
     }
     // Select the rows again under the write lock: rowids read earlier could

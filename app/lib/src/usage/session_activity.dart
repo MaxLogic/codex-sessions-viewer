@@ -34,6 +34,14 @@ final _failurePattern = RegExp(
   r'\\*"exit_code\\*"\s*:\s*[1-9]|Exit code: [1-9]|Script failed',
 );
 
+/// Whether a tool output reports a failure, searching its first
+/// [_failureScanChars] characters.
+bool toolOutputSignalsFailure(String output) => _failurePattern.hasMatch(
+  output.length > _failureScanChars
+      ? output.substring(0, _failureScanChars)
+      : output,
+);
+
 /// Activity facts derived from a session's stored messages and tool calls.
 ///
 /// Durations are wall-clock intervals. Parallel tool calls are merged, so
@@ -205,6 +213,7 @@ class ActivityMessage {
     required this.createdAtUtc,
     this.model,
     this.content = '',
+    this.injectedContext,
   });
 
   final String author;
@@ -213,6 +222,13 @@ class ActivityMessage {
 
   /// Enough of the text to recognize injected environment context.
   final String content;
+
+  /// Whether the message is injected environment context, when the caller
+  /// already decided it without loading the text; null checks [content].
+  final bool? injectedContext;
+
+  bool get isInjectedContext =>
+      injectedContext ?? isInjectedEnvironmentContextMessage(content);
 }
 
 /// A stored tool call, as far as activity needs it.
@@ -225,6 +241,7 @@ class ActivityToolCall {
     this.errorMessage,
     this.inputPreview = '',
     this.outputPreview = '',
+    this.outputSignalsFailure,
   });
 
   final String name;
@@ -235,15 +252,15 @@ class ActivityToolCall {
   final String inputPreview;
   final String outputPreview;
 
+  /// [toolOutputSignalsFailure] of the output, when the caller already
+  /// decided it without loading the output; null checks [outputPreview].
+  final bool? outputSignalsFailure;
+
   bool get failed =>
       status == 'error' ||
       status == 'failed' ||
       (errorMessage?.trim().isNotEmpty ?? false) ||
-      _failurePattern.hasMatch(
-        outputPreview.length > _failureScanChars
-            ? outputPreview.substring(0, _failureScanChars)
-            : outputPreview,
-      );
+      (outputSignalsFailure ?? toolOutputSignalsFailure(outputPreview));
 }
 
 /// Derives activity from stored messages (in message order) and tool calls.
@@ -295,7 +312,7 @@ SessionActivityStats computeSessionActivity({
     for (final message in messages)
       if (message.author == 'user' &&
           message.createdAtUtc != null &&
-          !isInjectedEnvironmentContextMessage(message.content))
+          !message.isInjectedContext)
         message.createdAtUtc!,
   ]..sort();
   final turnIntervals = <_Interval>[];

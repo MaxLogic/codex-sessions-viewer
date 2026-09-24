@@ -1,3 +1,8 @@
+// The persisted-usage migration and the real collector runs take longer than
+// the default 30 s test timeout in a debug build.
+@Timeout(Duration(minutes: 3))
+library;
+
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
@@ -17,11 +22,7 @@ import 'package:sqlite3/sqlite3.dart';
 void main() {
   test('core local workflows work together on fixtures', () async {
     final temp = await Directory.systemTemp.createTemp('csv_integration_');
-    addTearDown(() async {
-      if (await temp.exists()) {
-        await temp.delete(recursive: true);
-      }
-    });
+    addTearDown(() => _deleteWithRetry(temp));
 
     final settingsFile = File(p.join(temp.path, 'settings.toml'));
     final defaults = await SettingsRepository(settingsFile).loadOrCreate();
@@ -51,6 +52,9 @@ void main() {
       sqlRoot: sqlRoot,
     ).openAndMigrate(dbFile, deferUsageMigration: true);
     expect(startup.canStartNormalUi, isTrue);
+    // The collector writes only a database whose persisted-usage migration
+    // finished. That migration (backup, shadow generation, verification)
+    // alone takes most of the default 30 s test timeout in a debug build.
     final migration = await startPendingDatabaseMigration(
       dbFile,
       sqlRoot: sqlRoot,
@@ -153,6 +157,21 @@ void main() {
     expect(find.text('Windows refreshed'), findsOneWidget);
     expect(find.text('WSL refreshed'), findsNothing);
   });
+}
+
+/// Deletes [directory], retrying while Windows still reports a file in use
+/// (a collector process or SQLite handle closing after a failed test).
+Future<void> _deleteWithRetry(Directory directory) async {
+  for (var attempt = 0; ; attempt++) {
+    if (!await directory.exists()) return;
+    try {
+      await directory.delete(recursive: true);
+      return;
+    } on FileSystemException {
+      if (attempt >= 20) rethrow;
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+  }
 }
 
 Future<File> _copyFixture(String name, Directory destination) async {

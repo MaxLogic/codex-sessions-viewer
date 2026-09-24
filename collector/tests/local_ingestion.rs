@@ -1577,7 +1577,9 @@ impl RepairFixture {
             &self.roots(),
             discovery_complete,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cancelled)),
+            &mut |_| Ok(true),
         )
+        .unwrap()
     }
 
     fn ids(&self) -> Vec<String> {
@@ -1756,16 +1758,8 @@ fn scans_run_the_cache_repair_after_complete_discovery_and_report_it() {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     };
-    // A file the scan could not parse means discovery is not complete.
-    let report = scan(&fixture);
-    assert_eq!(
-        report["cache_repair"]["reason_code"],
-        "root_discovery_incomplete"
-    );
-    assert_eq!(fixture.ids().len(), 2);
-
-    std::fs::remove_file(&malformed).unwrap();
-    // A failing repair is postponed; the scan still succeeds.
+    // A file that fails to parse under a reachable root does not make
+    // discovery incomplete. A failing repair is postponed; the scan still succeeds.
     open(&fixture.db)
         .execute_batch(
             "create trigger fail_repair before insert on session_cache_repair_manifest
@@ -1788,6 +1782,357 @@ fn scans_run_the_cache_repair_after_complete_discovery_and_report_it() {
     assert!(fixture.completed());
     let report = scan(&fixture);
     assert_eq!(report["cache_repair"]["status"], "already_completed");
+    assert!(malformed.exists());
+}
+
+#[test]
+fn scans_postpone_the_cache_repair_while_a_codex_home_is_unreachable() {
+    let fixture = RepairFixture::new("repair-unreachable");
+    let plugin = fixture.file("plugins/legacy.json");
+    fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    let moved = fixture.temp.path().join("moved-home");
+    std::fs::rename(&fixture.home, &moved).unwrap();
+    let output = support::scan(&fixture.db, &fixture.home, &["--json"]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["cache_repair"]["reason_code"],
+        "root_discovery_incomplete"
+    );
+    assert_eq!(fixture.ids().len(), 1);
+}
+
+impl RepairFixture {
+    fn audit_id(&self) -> Option<String> {
+        open(&self.db)
+            .query_row(
+                "select min(audit_id) from session_cache_repair_manifest",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Age the retry marker past the backoff, as if a day had passed.
+    fn age_attempt(&self) {
+        let changed = open(&self.db)
+            .execute(
+                "update app_metadata
+                 set value = json_set(value, '$.attempted_at_utc', '2000-01-01T00:00:00.000Z')
+                 where key = 'session_cache_repair.v3.attempt'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "a retry marker must exist");
+    }
+
+    /// Replace the backup folder with a file so every backup fails.
+    fn block_backups(&self, blocked: bool) {
+        let path = self.temp.path().join("backups");
+        if blocked {
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::write(&path, "not a folder").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+#[test]
+fn a_failed_repair_backs_off_until_the_inputs_change_or_a_day_passes() {
+    let fixture = RepairFixture::new("repair-backoff");
+    let plugin = fixture.file("plugins/legacy.json");
+    fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    fixture.block_backups(true);
+
+    let report = fixture.repair(true, false);
+    assert_eq!(
+        (report.status, report.reason_code),
+        ("postponed", "backup_failed")
+    );
+    let audit = fixture.audit_id().unwrap();
+    // The next refresh repeats neither the audit nor the backup.
+    let report = fixture.repair(true, false);
+    assert_eq!(
+        (report.status, report.reason_code),
+        ("postponed", "backoff")
+    );
+
+    // After the backoff the repair runs again, but an unchanged audit is not
+    // rewritten.
+    fixture.age_attempt();
+    let report = fixture.repair(true, false);
+    assert_eq!(report.reason_code, "backup_failed");
+    assert_eq!(fixture.audit_id().unwrap(), audit);
+
+    // Changed inputs retry at once.
+    let other = fixture.file("plugins/other.json");
+    fixture.insert(&format!("source:{other}"), None, &other, 1);
+    fixture.block_backups(false);
+    let report = fixture.repair(true, false);
+    assert_eq!((report.status, report.deleted_rows), ("completed", 2));
+    assert_eq!(
+        count(
+            &open(&fixture.db),
+            "select count(*) from app_metadata where key = 'session_cache_repair.v3.attempt'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_repair_killed_during_its_backup_deletes_the_orphan_and_retries_after_the_backoff() {
+    let fixture = RepairFixture::new("repair-killed");
+    let plugin = fixture.file("plugins/legacy.json");
+    fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    // The first attempt records its marker; the process then "dies" and leaves
+    // a partial backup behind.
+    fixture.block_backups(true);
+    fixture.repair(true, false);
+    fixture.block_backups(false);
+    let backups = fixture.temp.path().join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    let stem = fixture
+        .db
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let orphan = backups.join(format!(
+        "{stem}.pre-session-cache-repair-v3.repair-3-1-1.sqlite"
+    ));
+    std::fs::write(&orphan, "partial").unwrap();
+    std::fs::write(backups.join("unrelated.sqlite"), "keep").unwrap();
+
+    let report = fixture.repair(true, false);
+    assert_eq!(
+        (report.status, report.reason_code),
+        ("postponed", "backoff")
+    );
+    assert!(!orphan.exists(), "the orphaned backup is deleted");
+    assert!(backups.join("unrelated.sqlite").exists());
+
+    fixture.age_attempt();
+    let report = fixture.repair(true, false);
+    assert_eq!((report.status, report.deleted_rows), ("completed", 1));
+    let names: Vec<String> = fixture
+        .backups()
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&report.backup_file.clone().unwrap()));
+    // The completed repair's backup is kept on later runs.
+    assert_eq!(fixture.repair(true, false).status, "already_completed");
+    assert_eq!(fixture.backups().len(), 2);
+}
+
+#[test]
+fn an_unrelated_foreign_key_violation_does_not_block_the_repair() {
+    let fixture = RepairFixture::new("repair-unrelated-fk");
+    let plugin = fixture.file("plugins/legacy.json");
+    fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    let conn = open(&fixture.db);
+    conn.execute_batch(
+        "pragma foreign_keys = off;
+         insert into messages (session_id, message_index, author_type, content_preview,
+           created_at_db_utc, updated_at_db_utc)
+         values ('session:gone', 0, 'user', '', 'now', 'now');
+         pragma foreign_keys = on;",
+    )
+    .unwrap();
+    let report = fixture.repair(true, false);
+    assert_eq!(
+        (report.status, report.reason_code, report.deleted_rows),
+        ("completed", "completed", 1)
+    );
+}
+
+#[test]
+fn cache_repair_leaves_claude_rows_with_source_ids_alone() {
+    let fixture = RepairFixture::new("repair-claude");
+    let plugin = fixture.file("plugins/legacy.json");
+    let codex = format!("source:{plugin}");
+    let claude = format!("source:{plugin}.claude");
+    fixture.insert(&codex, None, &plugin, 1);
+    fixture.insert(&claude, None, &plugin, 1);
+    open(&fixture.db)
+        .execute(
+            "update sessions set harness = 'claude' where id = ?",
+            [&claude],
+        )
+        .unwrap();
+    let report = fixture.repair(true, false);
+    assert_eq!((report.status, report.deleted_rows), ("completed", 1));
+    assert_eq!(fixture.ids(), [claude]);
+}
+
+/// A scan through the library, counting the writer leases it asks for and
+/// noting whether a repair backup existed when each lease was granted.
+fn coordinated_scan(db: &Path, home: &Path) -> (usize, Vec<bool>) {
+    use codex_sessions_collector::codex::scanner::{ScanOptions, session_scan_roots};
+    use codex_sessions_collector::codex::{self, CollectionBatching, parser::SourceType};
+    use codex_sessions_collector::path_mapping::PathMapper;
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let store = Store::open(db, OwnerMode::Viewer).unwrap();
+    let options = ScanOptions {
+        roots: session_scan_roots(home.to_str().unwrap(), SourceType::Windows),
+        mapper: PathMapper {
+            wsl_unc_root: String::new(),
+        },
+        parser: ParserOptions::default(),
+        parser_workers: 1,
+        wsl_root_retry_delays: vec![],
+        thread_names: std::collections::HashMap::new(),
+        force: false,
+    };
+    let backups = db.parent().unwrap().join("backups");
+    let mut leases = 0;
+    let mut backup_seen = Vec::new();
+    codex::collect_coordinated(
+        &store,
+        &options,
+        false,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_, _| {},
+        |acquire| {
+            if acquire {
+                leases += 1;
+                backup_seen.push(
+                    std::fs::read_dir(&backups).is_ok_and(|mut entries| entries.next().is_some()),
+                );
+            }
+            Ok(true)
+        },
+        CollectionBatching::default(),
+    )
+    .unwrap();
+    (leases, backup_seen)
+}
+
+#[test]
+fn scans_ask_for_a_placeholder_cleanup_lease_only_when_there_is_something_to_clean() {
+    let temp = TempDir::new("placeholder-lease");
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let db = viewer_database(&temp);
+    coordinated_scan(&db, &home);
+    let (clean, _) = coordinated_scan(&db, &home);
+    open(&db)
+        .execute_batch("update sessions set summary = 'auto'")
+        .unwrap();
+    let (dirty, _) = coordinated_scan(&db, &home);
+    assert_eq!(dirty, clean + 1);
+}
+
+#[test]
+fn the_repair_backup_is_taken_between_writer_leases() {
+    let fixture = RepairFixture::new("repair-lease");
+    let plugin = fixture.file("plugins/legacy.json");
+    fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    let (_, backup_seen) = coordinated_scan(&fixture.db, &fixture.home);
+    assert!(fixture.completed());
+    // The last lease deletes the rows; the backup already existed when it was
+    // granted, and no earlier lease saw it.
+    assert_eq!(backup_seen.last(), Some(&true));
+    let seen = backup_seen.iter().filter(|seen| **seen).count();
+    assert_eq!(seen, 1, "{backup_seen:?}");
+}
+
+/// `tool_calls.message_id` of every stored call, as the `message_index` of
+/// the message it links (the message that preceded the call).
+fn tool_call_origins(conn: &Connection, session: &str) -> Vec<Option<i64>> {
+    let mut statement = conn
+        .prepare(
+            "select m.message_index from tool_calls tc
+             left join messages m on m.id = tc.message_id
+             where tc.session_id = ? order by tc.tool_index",
+        )
+        .unwrap();
+    statement
+        .query_map([session], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn stored_codex_tool_calls_link_the_message_that_preceded_them() {
+    for fixture in ["rich_session.jsonl", "legacy_session.json"] {
+        let temp = TempDir::new("codex-tool-links");
+        let home = support::codex_home(&temp, &[fixture]);
+        let db = viewer_database(&temp);
+        let output = support::scan(&db, &home, &[]);
+        assert!(output.status.success());
+        let parsed = parse_file(
+            support::day_folder(&home).join(fixture).to_str().unwrap(),
+            ParserOptions::default(),
+        )
+        .unwrap()
+        .session;
+        assert!(!parsed.tool_calls.is_empty(), "{fixture}");
+        // The parser's `message_index` is the index of the next message after
+        // the call; the stored link is the last message before it.
+        let expected: Vec<Option<i64>> = parsed
+            .tool_calls
+            .iter()
+            .map(|tool| {
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.index)
+                    .filter(|index| *index < tool.message_index)
+                    .max()
+            })
+            .collect();
+        assert!(expected.iter().any(Option::is_some), "{fixture}");
+        let conn = open(&db);
+        let session: String = conn
+            .query_row("select id from sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tool_call_origins(&conn, &session), expected, "{fixture}");
+    }
+}
+
+#[test]
+fn stored_claude_tool_calls_link_the_message_that_issued_them() {
+    use codex_sessions_collector::codex::parser::SourceType;
+    use codex_sessions_collector::path_mapping::PathMapper;
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let temp = TempDir::new("claude-tool-links");
+    let db = viewer_database(&temp);
+    let transcript = temp.path().join("c-1.jsonl");
+    let lines = [
+        json!({"type": "user", "sessionId": "c-1", "timestamp": "2026-09-24T10:00:00Z",
+               "message": {"role": "user", "content": "list files"}}),
+        json!({"type": "assistant", "sessionId": "c-1", "timestamp": "2026-09-24T10:00:01Z",
+               "message": {"model": "claude-x", "content": [
+                   {"type": "text", "text": "Listing."},
+                   {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}}),
+        json!({"type": "user", "sessionId": "c-1", "timestamp": "2026-09-24T10:00:01Z",
+               "message": {"role": "user", "content": [
+                   {"type": "tool_result", "tool_use_id": "t1", "content": "a.txt"}]}}),
+        json!({"type": "assistant", "sessionId": "c-1", "timestamp": "2026-09-24T10:00:02Z",
+               "message": {"model": "claude-x", "content": [{"type": "text", "text": "Done."}]}}),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&transcript, text).unwrap();
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    codex_sessions_collector::claude::collect_file(
+        &store,
+        &transcript,
+        SourceType::Windows,
+        &PathMapper {
+            wsl_unc_root: String::new(),
+        },
+        &codex_sessions_collector::claude::parser::ClaudeOptions::default(),
+    )
+    .unwrap();
+    let conn = open(&db);
+    let session: String = conn
+        .query_row("select id from sessions", [], |row| row.get(0))
+        .unwrap();
+    // Messages: 0 "list files", 1 "Listing." (issued the call), 2 "Done.".
+    assert_eq!(tool_call_origins(&conn, &session), [Some(1)]);
 }
 
 #[test]

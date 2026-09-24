@@ -404,6 +404,7 @@ pub fn sample_snapshot(session_id: &str) -> SessionSnapshot {
         }],
         tool_calls: vec![ToolCallRecord {
             tool_index: 0,
+            message_index: Some(1),
             tool_name: "shell".to_owned(),
             status: "finished".to_owned(),
             started_at_utc: None,

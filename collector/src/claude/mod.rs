@@ -192,6 +192,9 @@ pub struct ClaudeScanOptions {
     pub parser: ClaudeOptions,
     pub workers: usize,
     pub force: bool,
+    /// Ask `wsl.exe` for the project names of WSL working directories, as
+    /// the Codex scan does (`--no-wsl-projects` turns it off).
+    pub resolve_wsl_projects: bool,
 }
 
 type Parsed = (String, SourceType, Result<ClaudeTranscript, ParseError>);
@@ -391,7 +394,8 @@ pub fn collect_coordinated(
         applied.statuses = statuses.len();
     }
     if !is_cancelled() {
-        applied.project_updates += crate::codex::backfill_projects(store, &mut gate, false)?;
+        applied.project_updates +=
+            crate::codex::backfill_projects(store, &mut gate, options.resolve_wsl_projects)?;
     }
     counts.cancelled = is_cancelled();
     Ok(CollectReport {

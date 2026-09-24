@@ -30,8 +30,8 @@ Future<SessionActivityBundle> noSessionActivity(
 /// Reads activity from the messages and tool calls the collector stored, on
 /// a background isolate, for sessions of every harness.
 ///
-/// Results are cached per row and last-message time, so switching tabs or
-/// sessions does not re-read unchanged sessions.
+/// Results are cached per row revision ([activityRevision]), so switching
+/// tabs or sessions does not re-read unchanged sessions.
 SessionActivityLoader storedSessionActivityLoader(File databaseFile) {
   return (row, subagents) async {
     final all = [row, ...subagents];
@@ -60,7 +60,22 @@ SessionActivityLoader storedSessionActivityLoader(File databaseFile) {
 final _activityCache = <String, SessionActivityStats>{};
 
 String _cacheKey(File databaseFile, SessionRowViewModel row) =>
-    '${databaseFile.path}|${row.id}|${row.lastMessageAtUtc.microsecondsSinceEpoch}';
+    '${databaseFile.path}|${row.id}|${activityRevision(row)}';
+
+/// What changes when the collector stores new activity for a row. A reparse
+/// can keep the last message time (a tool call finishing, a parser upgrade
+/// correcting counts), so the stored counts and tokens are part of it.
+String activityRevision(SessionRowViewModel row) => [
+  row.lastMessageAtUtc.microsecondsSinceEpoch,
+  row.messageCount,
+  row.userMessageCount,
+  row.assistantMessageCount,
+  row.toolCallCount,
+  row.totalTokens,
+  row.duration?.inMicroseconds,
+  row.hasError,
+  row.status,
+].join('|');
 
 void _rememberActivity(String key, SessionActivityStats stats) {
   _activityCache.remove(key);
@@ -124,7 +139,7 @@ class _SessionStatsViewState extends State<SessionStatsView> {
   void didUpdateWidget(covariant SessionStatsView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.row.id != widget.row.id ||
-        oldWidget.row.lastMessageAtUtc != widget.row.lastMessageAtUtc ||
+        activityRevision(oldWidget.row) != activityRevision(widget.row) ||
         oldWidget.subagents.length != widget.subagents.length) {
       _activity = _load();
     }

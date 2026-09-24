@@ -199,6 +199,13 @@ pub struct MessageRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     pub tool_index: i64,
+    /// The number of the session's messages that came before the call: the
+    /// index of the next message after the message that issued it (the
+    /// viewer's historical `message_index`). The writer links the call to
+    /// the last stored message before this index (`tool_calls.message_id`).
+    /// Absent in records from older producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_index: Option<i64>,
     pub tool_name: String,
     pub status: String,
     #[serde(default)]
@@ -496,6 +503,7 @@ impl From<&ParsedToolCall> for ToolCallRecord {
     fn from(tool: &ParsedToolCall) -> Self {
         Self {
             tool_index: tool.tool_index,
+            message_index: Some(tool.message_index),
             tool_name: tool.tool_name.clone(),
             status: tool.status.clone(),
             started_at_utc: iso(tool.started_at_utc),

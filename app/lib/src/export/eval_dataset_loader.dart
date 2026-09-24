@@ -69,15 +69,19 @@ EvalDatasetSession? readEvalDatasetSession(Database db, String id) {
   final toolCalls = [
     for (final tool in db.select(
       '''
-      select tool_name, status, started_at_utc, input_preview, output_preview
-      from tool_calls where session_id = ? order by tool_index
+      select origin.message_index as origin_index, tc.tool_name, tc.status,
+        tc.started_at_utc, tc.input_preview, tc.output_preview
+      from tool_calls tc
+      left join messages origin on origin.id = tc.message_id
+      where tc.session_id = ? order by tc.tool_index
       ''',
       [id],
     ))
       EvalDatasetToolCall(
-        messageIndex: _messageAt(
+        messageIndex: toolCallMessageIndex(
           messageTimes,
-          _time(tool['started_at_utc'] as String?),
+          originIndex: tool['origin_index'] as int?,
+          startedAtUtc: _time(tool['started_at_utc'] as String?),
         ),
         toolName: tool['tool_name'] as String? ?? '',
         status: tool['status'] as String? ?? '',
@@ -106,18 +110,37 @@ EvalDatasetSession? readEvalDatasetSession(Database db, String id) {
   );
 }
 
-/// The last message at or before [at]; tool calls are stored without the
-/// message that issued them.
-int? _messageAt(List<({int index, DateTime? at})> messages, DateTime? at) {
-  if (at == null) return null;
-  int? found;
-  for (final message in messages) {
-    final time = message.at;
-    if (time == null) continue;
-    if (time.isAfter(at)) break;
-    found = message.index;
+/// A tool call's exported `message_index`, with the meaning the viewer's
+/// original parser gave it: the index of the next message after the message
+/// that issued the call (the first message when none came before it, one
+/// past the last message when none follows). [messages] are the session's
+/// stored messages in `message_index` order.
+///
+/// The collector links each call to the message that preceded it
+/// ([originIndex], from `tool_calls.message_id`). Rows stored before it did,
+/// and calls that came before every message, have no link and are placed by
+/// time instead: the preceding message is the highest-indexed message
+/// created at or before [startedAtUtc] (a message with the same timestamp
+/// issued the call), whatever the order of the other timestamps. Without a
+/// start time an unlinked call has no index.
+int? toolCallMessageIndex(
+  List<({int index, DateTime? at})> messages, {
+  int? originIndex,
+  DateTime? startedAtUtc,
+}) {
+  var origin = originIndex;
+  if (origin == null) {
+    if (startedAtUtc == null) return null;
+    for (final message in messages) {
+      final time = message.at;
+      if (time != null && !time.isAfter(startedAtUtc)) origin = message.index;
+    }
+    if (origin == null) return messages.isEmpty ? 0 : messages.first.index;
   }
-  return found;
+  for (final message in messages) {
+    if (message.index > origin) return message.index;
+  }
+  return origin + 1;
 }
 
 DateTime? _time(String? value) =>

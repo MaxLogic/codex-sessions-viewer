@@ -7,7 +7,9 @@
 //! that duplicate a canonical session. After a scan that reached every
 //! configured Codex home, the repair records a content-free audit manifest,
 //! takes a verified backup, and deletes only rows that satisfy every legacy
-//! allowlist predicate. Any doubt postpones the repair to a later scan.
+//! allowlist predicate. Any doubt postpones the repair to a later scan; a
+//! repair postponed after its audit (or stopped mid-backup) backs off for a
+//! day unless its inputs change.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -99,6 +101,8 @@ struct Entry {
 struct Audit {
     id: String,
     entries: Vec<Entry>,
+    /// Nothing was delete-eligible, so the audit completed the repair.
+    completed: bool,
 }
 
 impl Audit {
@@ -125,14 +129,31 @@ impl Audit {
 /// not a plain file or a directory (or a directory link) as expected.
 pub type PhysicalPathResolver = dyn Fn(&str, bool) -> Result<String, String>;
 
+/// The GUI writer-lease gate of [`crate::codex::collect_coordinated`].
+pub type WriterGate<'a> = dyn FnMut(bool) -> StoreResult<bool> + 'a;
+
+/// The last attempt that recorded an audit and had work left. A repair that
+/// was postponed after its audit, or whose process was stopped, is not tried
+/// again until [`RETRY_BACKOFF_MICROS`] passed or its inputs changed.
+pub const ATTEMPT_KEY: &str = "session_cache_repair.v3.attempt";
+pub const RETRY_BACKOFF_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+
 /// Run the repair after a scan. `discovery_complete` is true when the scan
-/// reached every configured root, was not cancelled, and failed no file.
+/// reached and listed every configured root and was not cancelled; files
+/// that failed to parse do not count against it.
+///
+/// Only the audit and the final delete hold a writer lease. The pre-repair
+/// backup (`VACUUM INTO` and its checks) runs between them, and the delete
+/// re-classifies every row under the write lock, so a GUI write made during
+/// the backup cannot be lost. A repair error postpones the repair and never
+/// fails the scan; only a failing `gate` is returned as an error.
 pub fn run(
     store: &Store,
     roots: &[ScanRoot],
     discovery_complete: bool,
     cancel: &Arc<AtomicBool>,
-) -> RepairReport {
+    gate: &mut WriterGate<'_>,
+) -> StoreResult<RepairReport> {
     run_with(
         &store.conn,
         Path::new(&store.path),
@@ -140,6 +161,7 @@ pub fn run(
         discovery_complete,
         cancel,
         &resolve_physical_path_strict,
+        gate,
     )
 }
 
@@ -150,8 +172,18 @@ pub fn run_with(
     discovery_complete: bool,
     cancel: &Arc<AtomicBool>,
     resolver: &PhysicalPathResolver,
-) -> RepairReport {
-    match repair(conn, database, roots, discovery_complete, cancel, resolver) {
+    gate: &mut WriterGate<'_>,
+) -> StoreResult<RepairReport> {
+    let mut leases = Leases { gate, error: None };
+    let report = match repair(
+        conn,
+        database,
+        roots,
+        discovery_complete,
+        cancel,
+        resolver,
+        &mut leases,
+    ) {
         Ok(report) => report,
         Err(_) => {
             if !conn.is_autocommit() {
@@ -159,6 +191,38 @@ pub fn run_with(
             }
             RepairReport::postponed("unexpected_repair_error", None)
         }
+    };
+    match leases.error {
+        Some(error) => Err(error),
+        None => Ok(report),
+    }
+}
+
+/// Runs writes under the GUI lease, keeping a gate failure apart from repair
+/// failures.
+struct Leases<'g, 'a> {
+    gate: &'g mut WriterGate<'a>,
+    error: Option<StoreError>,
+}
+
+impl Leases<'_, '_> {
+    /// `None` when the lease was refused because the scan was cancelled.
+    fn with<T>(&mut self, write: impl FnOnce() -> StoreResult<T>) -> StoreResult<Option<T>> {
+        match (self.gate)(true) {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(error) => {
+                self.error = Some(error);
+                return Err(StoreError::Refused("the writer lease failed".to_owned()));
+            }
+        }
+        let result = write();
+        // A failed release is reported by `run`; the write itself committed
+        // or rolled back already, so its own result still decides the repair.
+        if let Err(error) = (self.gate)(false) {
+            self.error.get_or_insert(error);
+        }
+        result.map(Some)
     }
 }
 
@@ -169,6 +233,7 @@ fn repair(
     discovery_complete: bool,
     cancel: &Arc<AtomicBool>,
     resolver: &PhysicalPathResolver,
+    leases: &mut Leases<'_, '_>,
 ) -> StoreResult<RepairReport> {
     let cancelled = || cancel.load(Ordering::Relaxed);
     if is_completed(conn)? {
@@ -178,47 +243,47 @@ fn repair(
             None,
         ));
     }
-    if cancelled() {
-        return Ok(RepairReport::postponed("cancelled", None));
-    }
-    let cleanup_discovery_complete = discovery_complete && has_recognized_codex_owners(roots);
-    let audit = record_audit(conn, roots, cleanup_discovery_complete, resolver)?;
-    if !cleanup_discovery_complete {
-        return Ok(RepairReport::postponed(
-            if discovery_complete {
-                "no_recognized_codex_owner"
-            } else {
-                "root_discovery_incomplete"
-            },
-            Some(&audit),
-        ));
-    }
-    if audit.delete_eligible() == 0 {
-        if cancelled() {
-            return Ok(RepairReport::postponed("cancelled", Some(&audit)));
-        }
-        begin_write(conn)?;
-        let result = (|| -> StoreResult<()> {
-            if classify_rows(conn, roots, true, resolver)? != audit.entries {
-                return Err(StoreError::Refused(
-                    "repair predicates changed after the audit".to_owned(),
-                ));
-            }
-            write_completion(conn, &audit.id)
-        })();
-        return Ok(match finish(conn, result) {
-            Ok(()) => RepairReport::new("completed", "no_changes", Some(&audit)),
-            Err(_) => RepairReport::postponed("repair_invariant_failed", Some(&audit)),
-        });
-    }
-
-    let data_version = data_version(conn)?;
-    if cancelled() {
-        return Ok(RepairReport::postponed("cancelled", Some(&audit)));
-    }
     let backup_directory = database
         .parent()
         .map_or_else(|| PathBuf::from("backups"), |parent| parent.join("backups"));
+    // Backups of this repair version exist only while it is not completed
+    // when an earlier attempt was stopped (or crashed) before discarding its
+    // copy. Completed repairs keep theirs: this branch never sees them.
+    discard_orphaned_backups(&backup_directory, database);
+    if cancelled() {
+        return Ok(RepairReport::postponed("cancelled", None));
+    }
+    if !discovery_complete {
+        return Ok(RepairReport::postponed("root_discovery_incomplete", None));
+    }
+    if !has_recognized_codex_owners(roots) {
+        return Ok(RepairReport::postponed("no_recognized_codex_owner", None));
+    }
+    let inputs = repair_inputs(conn, roots)?;
+    let now = DartDateTime::now();
+    if is_backing_off(conn, &inputs, now)? {
+        return Ok(RepairReport::postponed("backoff", None));
+    }
+
+    // Classify outside the lease; the audit re-classifies under the write
+    // lock only when another connection committed in between.
+    let classified_at = data_version(conn)?;
+    let entries = classify_rows(conn, roots, resolver)?;
+    if cancelled() {
+        return Ok(RepairReport::postponed("cancelled", None));
+    }
+    let Some(audit) = leases
+        .with(|| record_audit(conn, roots, resolver, entries, classified_at, &inputs, now))?
+    else {
+        return Ok(RepairReport::postponed("cancelled", None));
+    };
+    if audit.completed {
+        return Ok(RepairReport::new("completed", "no_changes", Some(&audit)));
+    }
+
+    if cancelled() {
+        return Ok(RepairReport::postponed("cancelled", Some(&audit)));
+    }
     let backup = backup_directory.join(backup_name(database, &audit.id));
     if let Err(_error) = create_verified_backup(conn, database, &backup, &audit) {
         discard_backup(&backup);
@@ -229,20 +294,47 @@ fn repair(
         return Ok(RepairReport::postponed("cancelled", Some(&audit)));
     }
 
+    // Every failure from here on, including a refused `begin immediate`,
+    // discards the backup: it would otherwise be left behind unreferenced.
+    let deleted = leases.with(|| delete_audited_rows(conn, roots, resolver, &audit));
+    match deleted {
+        Ok(Some(deleted)) => {
+            let mut report = RepairReport::new("completed", "completed", Some(&audit));
+            report.deleted_rows = deleted;
+            report.backup_file = backup
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            Ok(report)
+        }
+        Ok(None) => {
+            discard_backup(&backup);
+            Ok(RepairReport::postponed("cancelled", Some(&audit)))
+        }
+        Err(_) => {
+            discard_backup(&backup);
+            Ok(RepairReport::postponed(
+                "repair_invariant_failed",
+                Some(&audit),
+            ))
+        }
+    }
+}
+
+fn delete_audited_rows(
+    conn: &Connection,
+    roots: &[ScanRoot],
+    resolver: &PhysicalPathResolver,
+    audit: &Audit,
+) -> StoreResult<usize> {
     begin_write(conn)?;
     let result = (|| -> StoreResult<usize> {
-        if self::data_version(conn)? != data_version {
-            return Err(StoreError::Refused(
-                "the database changed after the repair audit".to_owned(),
-            ));
-        }
-        let entries = classify_rows(conn, roots, true, resolver)?;
+        let entries = classify_rows(conn, roots, resolver)?;
         if entries != audit.entries {
             return Err(StoreError::Refused(
                 "repair predicates changed after the backup".to_owned(),
             ));
         }
-        let mut deleted = 0;
+        let mut deleted_ids = Vec::new();
         for entry in entries.iter().filter(|entry| entry.delete_eligible) {
             let id: String = conn
                 .query_row(
@@ -259,33 +351,17 @@ fn repair(
             conn.execute("delete from session_path_keys where session_id = ?", [&id])?;
             conn.execute("delete from session_search where rowid = ?", [entry.row_id])?;
             conn.execute("delete from sessions where rowid = ?", [entry.row_id])?;
-            deleted += 1;
+            deleted_ids.push(id);
         }
         write_completion(conn, &audit.id)?;
-        if !is_healthy(conn)? {
+        if references_remain(conn, &deleted_ids)? {
             return Err(StoreError::Refused(
                 "repair database invariants failed".to_owned(),
             ));
         }
-        Ok(deleted)
+        Ok(deleted_ids.len())
     })();
-    match finish(conn, result) {
-        Ok(deleted) => {
-            let mut report = RepairReport::new("completed", "completed", Some(&audit));
-            report.deleted_rows = deleted;
-            report.backup_file = backup
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
-            Ok(report)
-        }
-        Err(_) => {
-            discard_backup(&backup);
-            Ok(RepairReport::postponed(
-                "repair_invariant_failed",
-                Some(&audit),
-            ))
-        }
-    }
+    finish(conn, result)
 }
 
 fn is_completed(conn: &Connection) -> StoreResult<bool> {
@@ -299,64 +375,221 @@ fn is_completed(conn: &Connection) -> StoreResult<bool> {
         .is_some())
 }
 
-fn write_completion(conn: &Connection, audit_id: &str) -> StoreResult<()> {
+fn write_metadata(conn: &Connection, key: &str, value: &str) -> StoreResult<()> {
     conn.execute(
         "insert into app_metadata (key, value, updated_at_utc) values (?, ?, ?)
          on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc",
-        params![COMPLETION_KEY, audit_id, DartDateTime::now().to_iso8601()],
+        params![key, value, DartDateTime::now().to_iso8601()],
     )?;
     Ok(())
 }
 
+/// Completes the repair and clears its retry marker.
+fn write_completion(conn: &Connection, audit_id: &str) -> StoreResult<()> {
+    write_metadata(conn, COMPLETION_KEY, audit_id)?;
+    conn.execute("delete from app_metadata where key = ?", [ATTEMPT_KEY])?;
+    Ok(())
+}
+
+/// What decides the repair's outcome besides the row predicates: the repair
+/// version, the configured roots, and the legacy fallback rows it may
+/// delete. New sessions do not change it, so they do not end a backoff.
+fn repair_inputs(conn: &Connection, roots: &[ScanRoot]) -> StoreResult<String> {
+    let (fallbacks, last_fallback): (i64, i64) = conn.query_row(
+        "select count(*), coalesce(max(rowid), 0) from sessions
+         where harness = 'codex' and (id like 'source:%' or id like 'source-status:%')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let roots: Vec<Value> = roots
+        .iter()
+        .map(|root| {
+            json!([
+                root.path,
+                root.source_state,
+                root.source_type == SourceType::Wsl,
+                root.availability_root_path
+            ])
+        })
+        .collect();
+    Ok(sha256_hex(
+        json!([REPAIR_VERSION, fallbacks, last_fallback, roots])
+            .to_string()
+            .as_bytes(),
+    ))
+}
+
+fn is_backing_off(conn: &Connection, inputs: &str, now: DartDateTime) -> StoreResult<bool> {
+    let marker: Option<String> = conn
+        .query_row(
+            "select value from app_metadata where key = ?",
+            [ATTEMPT_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(marker) = marker.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
+        return Ok(false);
+    };
+    let attempted = marker["attempted_at_utc"]
+        .as_str()
+        .and_then(DartDateTime::try_parse);
+    Ok(marker["inputs"].as_str() == Some(inputs)
+        && attempted.is_some_and(|at| {
+            let elapsed = now.micros() - at.micros();
+            (0..RETRY_BACKOFF_MICROS).contains(&elapsed)
+        }))
+}
+
 static AUDIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Records the content-free manifest under the write lock. An unchanged
+/// audit keeps its manifest and ID. With nothing to delete the repair
+/// completes in the same transaction; otherwise the retry marker is written
+/// before the backup starts, so a stopped process is not retried at once.
 fn record_audit(
     conn: &Connection,
     roots: &[ScanRoot],
-    discovery_complete: bool,
     resolver: &PhysicalPathResolver,
+    entries: Vec<Entry>,
+    classified_at: i64,
+    inputs: &str,
+    now: DartDateTime,
 ) -> StoreResult<Audit> {
-    let now = DartDateTime::now();
-    let id = format!(
-        "repair-{REPAIR_VERSION}-{}-{}",
-        now.micros(),
-        AUDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
-    );
-    let entries = classify_rows(conn, roots, discovery_complete, resolver)?;
     begin_write(conn)?;
-    let result = (|| -> StoreResult<()> {
-        conn.execute("delete from session_cache_repair_manifest", [])?;
-        let mut insert = conn.prepare(
-            "insert into session_cache_repair_manifest (
-               audit_id, repair_version, session_rowid, row_fingerprint,
-               category, reason_code, delete_eligible, recorded_at_utc
-             ) values (?, ?, ?, ?, ?, ?, ?, ?)",
-        )?;
-        let recorded = now.to_iso8601();
-        for entry in &entries {
-            insert.execute(params![
-                id,
-                REPAIR_VERSION,
-                entry.row_id,
-                entry.fingerprint,
-                entry.category.wire_name(),
-                entry.reason_code,
-                entry.delete_eligible,
-                recorded,
-            ])?;
+    let result = (|| -> StoreResult<Audit> {
+        let entries = if data_version(conn)? == classified_at {
+            entries
+        } else {
+            classify_rows(conn, roots, resolver)?
+        };
+        let id = match recorded_audit_id(conn, &entries)? {
+            Some(id) => id,
+            None => {
+                let id = format!(
+                    "repair-{REPAIR_VERSION}-{}-{}",
+                    now.micros(),
+                    AUDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
+                );
+                write_manifest(conn, &id, &entries, now)?;
+                id
+            }
+        };
+        let mut audit = Audit {
+            id,
+            entries,
+            completed: false,
+        };
+        if audit.delete_eligible() == 0 {
+            write_completion(conn, &audit.id)?;
+            audit.completed = true;
+        } else {
+            write_metadata(
+                conn,
+                ATTEMPT_KEY,
+                &json!({"inputs": inputs, "attempted_at_utc": now.to_iso8601(), "audit_id": audit.id})
+                    .to_string(),
+            )?;
         }
-        Ok(())
+        Ok(audit)
     })();
-    finish(conn, result)?;
-    Ok(Audit { id, entries })
+    finish(conn, result)
 }
 
-fn backup_name(database: &Path, audit_id: &str) -> String {
+/// The stored manifest's audit ID when it records exactly `entries`.
+fn recorded_audit_id(conn: &Connection, entries: &[Entry]) -> StoreResult<Option<String>> {
+    let mut statement = conn.prepare(
+        "select audit_id, repair_version, session_rowid, row_fingerprint, category, reason_code,
+           delete_eligible
+         from session_cache_repair_manifest order by session_rowid",
+    )?;
+    let rows: Vec<(String, i64, i64, String, String, String, bool)> = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let Some(id) = rows.first().map(|row| row.0.clone()) else {
+        return Ok(None);
+    };
+    let mut expected: Vec<&Entry> = entries.iter().collect();
+    expected.sort_by_key(|entry| entry.row_id);
+    let same = rows.len() == expected.len()
+        && rows.iter().zip(&expected).all(|(row, entry)| {
+            row.0 == id
+                && row.1 == REPAIR_VERSION
+                && row.2 == entry.row_id
+                && row.3 == entry.fingerprint
+                && row.4 == entry.category.wire_name()
+                && row.5 == entry.reason_code
+                && row.6 == entry.delete_eligible
+        });
+    Ok(same.then_some(id))
+}
+
+fn write_manifest(
+    conn: &Connection,
+    id: &str,
+    entries: &[Entry],
+    now: DartDateTime,
+) -> StoreResult<()> {
+    conn.execute("delete from session_cache_repair_manifest", [])?;
+    let mut insert = conn.prepare(
+        "insert into session_cache_repair_manifest (
+           audit_id, repair_version, session_rowid, row_fingerprint,
+           category, reason_code, delete_eligible, recorded_at_utc
+         ) values (?, ?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    let recorded = now.to_iso8601();
+    for entry in entries {
+        insert.execute(params![
+            id,
+            REPAIR_VERSION,
+            entry.row_id,
+            entry.fingerprint,
+            entry.category.wire_name(),
+            entry.reason_code,
+            entry.delete_eligible,
+            recorded,
+        ])?;
+    }
+    Ok(())
+}
+
+fn backup_prefix(database: &Path) -> String {
     let stem = database.file_stem().map_or_else(
         || "database".to_owned(),
         |stem| stem.to_string_lossy().into_owned(),
     );
-    format!("{stem}.pre-session-cache-repair-v{REPAIR_VERSION}.{audit_id}.sqlite")
+    format!("{stem}.pre-session-cache-repair-v{REPAIR_VERSION}.")
+}
+
+fn backup_name(database: &Path, audit_id: &str) -> String {
+    format!("{}{audit_id}.sqlite", backup_prefix(database))
+}
+
+/// Deletes this repair version's backups (and their journal files). Called
+/// only while the repair is not completed, when no such backup is wanted.
+fn discard_orphaned_backups(directory: &Path, database: &Path) {
+    let prefix = backup_prefix(database);
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix)
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            // A backup another collector is still writing stays open and
+            // cannot be deleted on Windows; it is retried on the next run.
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn create_verified_backup(
@@ -385,14 +618,21 @@ fn create_verified_backup(
     verify_backup(backup, audit, expected_schema).map_err(|error| error.to_string())
 }
 
+/// The copy must be a readable SQLite database holding this audit. A
+/// foreign-key problem elsewhere in the source database is copied too and
+/// does not make the backup unusable, so it is not checked here.
 fn verify_backup(backup: &Path, audit: &Audit, expected_schema: i64) -> StoreResult<()> {
     let verification = Connection::open_with_flags(
         backup,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    if !is_healthy(&verification)? {
+    let check: Vec<String> = verification
+        .prepare("pragma quick_check")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if check != ["ok"] {
         return Err(StoreError::Refused(
-            "the repair backup failed SQLite integrity checks".to_owned(),
+            "the repair backup failed the SQLite quick check".to_owned(),
         ));
     }
     if last_applied_version(&verification)? != expected_schema {
@@ -445,16 +685,37 @@ fn data_version(conn: &Connection) -> StoreResult<i64> {
     Ok(conn.query_row("pragma data_version", [], |row| row.get(0))?)
 }
 
-fn is_healthy(conn: &Connection) -> StoreResult<bool> {
-    let integrity: Vec<String> = conn
-        .prepare("pragma integrity_check")?
-        .query_map([], |row| row.get(0))?
+/// Whether a row of any table with a foreign key to `sessions` still points
+/// at a deleted session. Only the deleted IDs are checked: a whole-database
+/// `integrity_check`/`foreign_key_check` is slow on a large database and
+/// would fail for problems the repair did not cause.
+fn references_remain(conn: &Connection, deleted_ids: &[String]) -> StoreResult<bool> {
+    if deleted_ids.is_empty() {
+        return Ok(false);
+    }
+    let references: Vec<(String, String)> = conn
+        .prepare(
+            "select m.name, f.\"from\" from sqlite_master m
+             join pragma_foreign_key_list(m.name) f
+             where m.type = 'table' and lower(f.\"table\") = 'sessions'
+               and coalesce(f.\"to\", 'id') = 'id'",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    let foreign_key_problems = conn
-        .prepare("pragma foreign_key_check")?
-        .query_map([], |_| Ok(()))?
-        .count();
-    Ok(integrity == ["ok"] && foreign_key_problems == 0)
+    for (table, column) in references {
+        let sql = format!(
+            "select exists(select 1 from \"{}\" where \"{}\" = ?)",
+            table.replace('"', "\"\""),
+            column.replace('"', "\"\"")
+        );
+        let mut statement = conn.prepare(&sql)?;
+        for id in deleted_ids {
+            if statement.query_row([id], |row| row.get::<_, bool>(0))? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn has_recognized_codex_owners(roots: &[ScanRoot]) -> bool {
@@ -589,7 +850,6 @@ fn load_rows(conn: &Connection) -> StoreResult<Vec<Row>> {
 fn classify_rows(
     conn: &Connection,
     roots: &[ScanRoot],
-    discovery_complete: bool,
     resolver: &PhysicalPathResolver,
 ) -> StoreResult<Vec<Entry>> {
     let rows = load_rows(conn)?;
@@ -608,7 +868,7 @@ fn classify_rows(
     }
     Ok(rows
         .iter()
-        .map(|row| classify_row(row, roots, &canonical, discovery_complete, resolver))
+        .map(|row| classify_row(row, roots, &canonical, resolver))
         .collect())
 }
 
@@ -616,7 +876,6 @@ fn classify_row(
     row: &Row,
     roots: &[ScanRoot],
     canonical: &HashSet<(bool, String)>,
-    discovery_complete: bool,
     resolver: &PhysicalPathResolver,
 ) -> Entry {
     let entry = |category, reason_code, delete_eligible| Entry {
@@ -627,9 +886,6 @@ fn classify_row(
         delete_eligible,
     };
     let unresolved = |reason| entry(Category::Unresolved, reason, false);
-    if !discovery_complete {
-        return unresolved("root_discovery_incomplete");
-    }
     let source_type = row.source_type();
     let paths = &row.paths;
     if !row.stable_id().is_empty() {

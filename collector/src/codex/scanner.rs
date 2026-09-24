@@ -131,6 +131,10 @@ pub struct ScanOutcome {
     pub statuses: Vec<SourceStatus>,
     pub parsed: Vec<ParsedRef>,
     pub errors: Vec<SourceStatus>,
+    /// Every configured root's owner was reachable and listed completely,
+    /// and the scan was not cancelled. Files that fail to parse do not
+    /// make discovery incomplete.
+    pub discovery_complete: bool,
 }
 
 struct Candidate {
@@ -597,6 +601,7 @@ pub fn scan_controlled<E>(
         })
         .collect();
     counts.cancelled = cancel.load(Ordering::Relaxed);
+    let discovery_complete = !counts.cancelled && discovery.failed_owners.is_empty();
     if !counts.cancelled && !complete_roots.is_empty() {
         let found: HashSet<String> = discovery
             .candidates
@@ -631,6 +636,7 @@ pub fn scan_controlled<E>(
         statuses,
         parsed,
         errors,
+        discovery_complete,
     })
 }
 

@@ -252,8 +252,9 @@ class EvalDatasetToolCall {
     this.outputPreview = '',
   });
 
-  /// The message the call belongs to, when its time places it; null
-  /// otherwise.
+  /// The index of the next message after the message that issued the call
+  /// (see `toolCallMessageIndex`); null when an older, unlinked row has no
+  /// start time.
   final int? messageIndex;
   final String toolName;
   final String status;

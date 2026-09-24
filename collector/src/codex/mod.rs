@@ -103,10 +103,13 @@ pub fn collect_coordinated(
     batching: CollectionBatching,
 ) -> StoreResult<CollectReport> {
     let is_cancelled = || cancel.load(Ordering::Relaxed);
-    if gated(&mut gate, || {
-        writer::clean_session_metadata_placeholders(&store.conn)
-    })?
-    .is_none()
+    // Count first: a lease that would find nothing to clean only makes the
+    // GUI's writers wait.
+    if writer::session_metadata_placeholder_count(&store.conn)? > 0
+        && gated(&mut gate, || {
+            writer::clean_session_metadata_placeholders(&store.conn)
+        })?
+        .is_none()
     {
         cancel.store(true, Ordering::Relaxed);
     }
@@ -178,17 +181,17 @@ pub fn collect_coordinated(
         })?
         .unwrap_or(0);
         applied.project_updates += backfill_projects(store, &mut gate, resolve_wsl_projects)?;
-        let discovery_complete = !outcome.counts.cancelled
-            && outcome.errors.iter().all(|error| error.status == "missing");
+        // Only unreachable or unlisted roots make discovery incomplete; a
+        // file that fails to parse under a reachable root does not.
+        let discovery_complete = outcome.discovery_complete;
         if !is_cancelled() {
-            cache_repair = gated(&mut gate, || {
-                Ok(crate::store::cache_repair::run(
-                    store,
-                    &options.roots,
-                    discovery_complete,
-                    cancel,
-                ))
-            })?;
+            cache_repair = Some(crate::store::cache_repair::run(
+                store,
+                &options.roots,
+                discovery_complete,
+                cancel,
+                &mut gate,
+            )?);
         }
     }
     outcome.counts.cancelled |= is_cancelled();

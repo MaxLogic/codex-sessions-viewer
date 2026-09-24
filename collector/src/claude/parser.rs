@@ -288,6 +288,7 @@ impl Builder<'_> {
             None => {
                 self.tool_calls.push(ToolCallRecord {
                     tool_index: self.tool_calls.len() as i64,
+                    message_index: Some(self.messages.len() as i64),
                     tool_name: "unknown".to_owned(),
                     status: "started".to_owned(),
                     started_at_utc: None,
@@ -349,6 +350,8 @@ impl Builder<'_> {
                         let position = self.tool_calls.len();
                         self.tool_calls.push(ToolCallRecord {
                             tool_index: position as i64,
+                            // The text blocks before it are already stored.
+                            message_index: Some(self.messages.len() as i64),
                             tool_name: string(block, "name").unwrap_or("unknown").to_owned(),
                             status: "started".to_owned(),
                             started_at_utc: at.map(DartDateTime::to_iso8601),

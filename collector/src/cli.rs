@@ -851,6 +851,7 @@ fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
             .parser_workers
             .unwrap_or_else(default_parser_workers),
         force: options.force,
+        resolve_wsl_projects: options.wsl_projects,
     };
     let flush_sessions = if options.flush_sessions == codex::FLUSH_SESSIONS {
         crate::claude::FLUSH_SESSIONS
