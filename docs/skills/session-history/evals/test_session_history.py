@@ -10,6 +10,8 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
+# The schema the collector creates is the newest migration in sql/migration.
+LATEST_SCHEMA = max(int(p.name[:3]) for p in (HERE.parents[3] / 'sql' / 'migration').glob('[0-9][0-9][0-9]_*.sql'))
 sys.path.insert(0, str(HERE))
 import fixture  # noqa: E402
 
@@ -127,7 +129,7 @@ class HistoryTests(unittest.TestCase):
         names = [row['project'] for row in self.invoke('projects')['results']]
         self.assertEqual(names, ['Atlas', 'Atlas-old'])
         status = self.invoke('status')
-        self.assertEqual(status['schema_version'], 20)
+        self.assertEqual(status['schema_version'], LATEST_SCHEMA)
         self.assertEqual(status['database_owner'], 'collector')
         self.assertEqual(sum(row['sessions'] for row in status['harnesses']), 3)
 
