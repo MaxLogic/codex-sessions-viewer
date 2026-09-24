@@ -188,6 +188,49 @@ void main() {
     semantics.dispose();
   });
 
+  testWidgets('changing the price interval away from 6 turns UTC slots off', (
+    tester,
+  ) async {
+    AppSettings? saved;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          initialSettings: AppSettings.defaults(),
+          onSave: (settings) async => saved = settings,
+        ),
+      ),
+    );
+    Switch utcSwitch() => tester.widget<Switch>(
+      find.descendant(
+        of: find.ancestor(
+          of: find.text('Use fixed UTC pricing slots'),
+          matching: find.byType(Row),
+        ),
+        matching: find.byType(Switch),
+      ),
+    );
+    expect(utcSwitch().value, isTrue);
+    final interval = find.bySemanticsLabel(
+      'Price refresh interval (hours) input',
+    );
+    await tester.ensureVisible(interval);
+    await tester.enterText(interval, '12');
+    await tester.pump();
+    expect(utcSwitch().value, isFalse);
+    expect(
+      find.text('Cadence: interval after the last successful observation.'),
+      findsOneWidget,
+    );
+    await tester.enterText(interval, '6');
+    await tester.pump();
+    // Returning to 6 hours does not silently re-enable slots.
+    expect(utcSwitch().value, isFalse);
+    await tester.tap(find.text('Save settings'));
+    await tester.pump();
+    expect(saved!.pricing.refreshIntervalHours, 6);
+    expect(saved!.pricing.refreshUtcSlots, isFalse);
+  });
+
   testWidgets(
     'edits maintenance schedules without losing them on unrelated changes',
     (tester) async {

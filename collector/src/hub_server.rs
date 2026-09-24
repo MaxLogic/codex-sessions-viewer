@@ -1,24 +1,63 @@
 //! Optional personal hub. Each authenticated machine has an isolated SQLite
 //! database; a shared SQLite file is never opened over the network.
+//!
+//! The listener is a small HTTP/1.1 server on the standard library so that
+//! every connection has socket read and write timeouts, a whole-request
+//! deadline, and a bounded body. Each connection is served on its own thread,
+//! up to a fixed limit, so a slow client cannot hold up other requests.
 
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::net::SocketAddr;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use rusqlite::{OpenFlags, OptionalExtension};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::contract::{self, Record};
 use crate::query;
+use crate::store::schema::{StoreError, in_write_transaction};
 use crate::store::{OwnerMode, Store};
 
-const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RECORDS: usize = 128;
+/// Upload bodies above this size are refused before they are read.
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Every other request carries a small JSON document.
+const MAX_SMALL_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// Concurrent connections; further clients get 503 instead of waiting.
+const MAX_CONNECTIONS: usize = 32;
+pub const MAX_RECORDS: usize = 128;
 pub const HUB_PROTOCOL_VERSION: u64 = 1;
+
+/// Query options a hub owner may forward. Destination and output options
+/// (`--db`, `--format`, `--hub`, `--hub-machine`) are chosen by the hub.
+const QUERY_VALUE_OPTIONS: [&str; 18] = [
+    "--query",
+    "--project",
+    "--path",
+    "--since",
+    "--until",
+    "--harness",
+    "--machine",
+    "--limit",
+    "--chars",
+    "--cursor",
+    "--session",
+    "--ref",
+    "--after-index",
+    "--index",
+    "--text-offset",
+    "--export-format",
+    "--max-chars",
+    "--max-messages",
+];
+const QUERY_FLAG_OPTIONS: [&str; 1] = ["--include-tools"];
 
 #[derive(Deserialize)]
 pub struct HubConfig {
@@ -26,6 +65,14 @@ pub struct HubConfig {
     pub machines: BTreeMap<String, String>,
     #[serde(default)]
     pub pricing: crate::price_history::FetchConfig,
+    /// Each socket read or write must progress within this time, and a whole
+    /// request must arrive within ten times it.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_seconds: u64,
+}
+
+fn default_request_timeout() -> u64 {
+    30
 }
 
 #[derive(Deserialize)]
@@ -33,7 +80,7 @@ struct Upload {
     protocol: u64,
     sequence: i64,
     batch_id: String,
-    records: Vec<Value>,
+    records: Vec<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -78,17 +125,45 @@ pub fn serve(listen: &str, data_root: &Path, config_path: &Path) -> Result<(), S
     if config.machines.keys().any(|id| !valid_machine_id(id)) {
         return Err("hub machine IDs must use ASCII letters, digits, '-' or '_'".to_owned());
     }
+    if !(1..=3600).contains(&config.request_timeout_seconds) {
+        return Err("request_timeout_seconds must be between 1 and 3600".to_owned());
+    }
     std::fs::create_dir_all(data_root)
         .map_err(|error| format!("cannot create hub data directory: {error}"))?;
     for machine in config.machines.keys() {
         open_machine(data_root, machine)?;
     }
-    let server =
-        Server::http(address).map_err(|error| format!("cannot start hub listener: {error}"))?;
+    let listener = TcpListener::bind(address)
+        .map_err(|error| format!("cannot start hub listener: {error}"))?;
     let _price_worker = crate::price_history::Worker::start(data_root, config.pricing.clone())?;
     println!("hub listening on http://{address}");
-    for request in server.incoming_requests() {
-        handle(request, data_root, &config);
+    let config = Arc::new(config);
+    let data_root = Arc::new(data_root.to_owned());
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            write_response(
+                &stream,
+                503,
+                &json!({"error":"hub is busy; retry later","code":"busy"}),
+            );
+            continue;
+        }
+        let (config, data_root, guard) = (config.clone(), data_root.clone(), active.clone());
+        let spawned = std::thread::Builder::new()
+            .name("hub-connection".into())
+            .spawn(move || {
+                serve_connection(stream, &data_root, &config);
+                guard.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            active.fetch_sub(1, Ordering::SeqCst);
+        }
     }
     Ok(())
 }
@@ -110,34 +185,251 @@ fn token_matches(expected: &str, actual: &str) -> bool {
         == 0
 }
 
-fn bearer(request: &Request) -> &str {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Authorization"))
-        .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
-        .unwrap_or("")
-}
-
-fn respond(request: Request, status: u16, value: Value) {
-    let header = Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap();
-    let response = Response::from_string(value.to_string())
-        .with_status_code(StatusCode(status))
-        .with_header(header);
-    let _ = request.respond(response);
-}
-
-fn body(request: &mut Request) -> Result<Value, (u16, String)> {
-    let mut bytes = Vec::new();
-    request
-        .as_reader()
-        .take(MAX_BODY_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| (400, "cannot read request body".to_owned()))?;
-    if bytes.len() as u64 > MAX_BODY_BYTES {
-        return Err((413, "request body exceeds 64 MiB".to_owned()));
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        413 => "Content Too Large",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        _ => "Status",
     }
-    serde_json::from_slice(&bytes).map_err(|_| (400, "invalid JSON body".to_owned()))
+}
+
+fn write_response(mut stream: &TcpStream, status: u16, value: &Value) {
+    let body = value.to_string();
+    let head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason(status),
+        body.len()
+    );
+    let _ = stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()))
+        .and_then(|()| stream.flush());
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // Closing with unread request bytes resets the connection, which can
+    // discard the response before the client reads it. Drain briefly.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut sink = [0u8; 16 * 1024];
+    let mut drained = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while drained < 8 * 1024 * 1024 && Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => drained += read,
+        }
+    }
+}
+
+/// Fails a read once the whole request exceeds its deadline; the socket read
+/// timeout bounds each individual read.
+struct DeadlineReader {
+    inner: TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() > self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request deadline exceeded",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+type HttpError = (u16, String);
+type Connection = BufReader<DeadlineReader>;
+
+fn io_error(error: &std::io::Error) -> HttpError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        (408, "request timed out".to_owned())
+    } else {
+        (400, "cannot read request".to_owned())
+    }
+}
+
+fn read_line(reader: &mut Connection, budget: &mut usize) -> Result<String, HttpError> {
+    let mut line = Vec::new();
+    reader
+        .by_ref()
+        .take(*budget as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|error| io_error(&error))?;
+    if line.len() > *budget {
+        return Err((431, "request header is too large".to_owned()));
+    }
+    if !line.ends_with(b"\n") {
+        return Err((400, "incomplete request header".to_owned()));
+    }
+    *budget -= line.len();
+    let text =
+        String::from_utf8(line).map_err(|_| (400, "request header is not UTF-8".to_owned()))?;
+    Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+struct Head {
+    method: String,
+    path: String,
+    authorization: String,
+    content_length: Option<usize>,
+    chunked: bool,
+    expect_continue: bool,
+}
+
+fn read_head(reader: &mut Connection) -> Result<Head, HttpError> {
+    let mut budget = MAX_HEADER_BYTES;
+    let request_line = read_line(reader, &mut budget)?;
+    let mut parts = request_line.split(' ');
+    let (Some(method), Some(path), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err((400, "invalid request line".to_owned()));
+    };
+    if !version.starts_with("HTTP/1.") {
+        return Err((400, "unsupported HTTP version".to_owned()));
+    }
+    let mut head = Head {
+        method: method.to_owned(),
+        path: path.to_owned(),
+        authorization: String::new(),
+        content_length: None,
+        chunked: false,
+        expect_continue: false,
+    };
+    loop {
+        let line = read_line(reader, &mut budget)?;
+        if line.is_empty() {
+            return Ok(head);
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err((400, "invalid request header".to_owned()));
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "authorization" => head.authorization = value.to_owned(),
+            "content-length" => {
+                let length = value
+                    .parse::<usize>()
+                    .map_err(|_| (400, "invalid Content-Length".to_owned()))?;
+                if head
+                    .content_length
+                    .is_some_and(|previous| previous != length)
+                {
+                    return Err((400, "conflicting Content-Length".to_owned()));
+                }
+                head.content_length = Some(length);
+            }
+            "transfer-encoding" => {
+                if value.eq_ignore_ascii_case("chunked") {
+                    head.chunked = true;
+                } else {
+                    return Err((501, "unsupported Transfer-Encoding".to_owned()));
+                }
+            }
+            "expect" => head.expect_continue = value.eq_ignore_ascii_case("100-continue"),
+            _ => {}
+        }
+    }
+}
+
+fn read_body(
+    reader: &mut Connection,
+    stream: &TcpStream,
+    head: &Head,
+    limit: usize,
+) -> Result<Vec<u8>, HttpError> {
+    let too_large = || {
+        (
+            413,
+            format!("request body exceeds {} MiB", limit / (1024 * 1024)),
+        )
+    };
+    if head.content_length.is_some_and(|length| length > limit) {
+        return Err(too_large());
+    }
+    if head.expect_continue {
+        let mut writer = stream;
+        writer
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .map_err(|error| io_error(&error))?;
+    }
+    if head.chunked {
+        if head.content_length.is_some() {
+            return Err((400, "both Content-Length and chunked encoding".to_owned()));
+        }
+        let mut body = Vec::new();
+        loop {
+            let mut budget = 1024;
+            let size_line = read_line(reader, &mut budget)?;
+            let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|_| (400, "invalid chunk size".to_owned()))?;
+            if size == 0 {
+                // Optional trailers end with an empty line.
+                let mut budget = MAX_HEADER_BYTES;
+                while !read_line(reader, &mut budget)?.is_empty() {}
+                return Ok(body);
+            }
+            if body.len().saturating_add(size) > limit {
+                return Err(too_large());
+            }
+            let start = body.len();
+            body.resize(start + size, 0);
+            reader
+                .read_exact(&mut body[start..])
+                .map_err(|error| io_error(&error))?;
+            let mut terminator = [0u8; 2];
+            reader
+                .read_exact(&mut terminator)
+                .map_err(|error| io_error(&error))?;
+            if &terminator != b"\r\n" {
+                return Err((400, "invalid chunk terminator".to_owned()));
+            }
+        }
+    }
+    let mut body = vec![0u8; head.content_length.unwrap_or(0)];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| io_error(&error))?;
+    Ok(body)
+}
+
+fn serve_connection(stream: TcpStream, data_root: &Path, config: &HubConfig) {
+    let timeout = Duration::from_secs(config.request_timeout_seconds);
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return;
+    }
+    let Ok(read_half) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(DeadlineReader {
+        inner: read_half,
+        deadline: Instant::now() + timeout * 10,
+    });
+    let (status, value) = match read_head(&mut reader) {
+        Ok(head) => handle(&head, &mut reader, &stream, data_root, config),
+        Err((status, message)) => (status, json!({"error": message})),
+    };
+    write_response(&stream, status, &value);
+}
+
+fn parse_json(body: &[u8]) -> Result<Value, HttpError> {
+    serde_json::from_slice(body).map_err(|_| (400, "invalid JSON body".to_owned()))
 }
 
 fn machine_db(data_root: &Path, machine: &str) -> PathBuf {
@@ -195,87 +487,176 @@ pub(crate) fn open_machine(data_root: &Path, machine: &str) -> Result<Store, Str
     Ok(store)
 }
 
-fn ingest(data_root: &Path, machine: &str, value: Value) -> Result<Value, (u16, String)> {
-    let upload: Upload =
-        serde_json::from_value(value).map_err(|_| (400, "invalid upload envelope".to_owned()))?;
-    if upload.protocol != HUB_PROTOCOL_VERSION {
-        return Err((409, "unsupported hub protocol version".to_owned()));
-    }
-    if upload.sequence <= 0
-        || upload.batch_id.is_empty()
-        || upload.batch_id.len() > 128
-        || upload.records.len() > MAX_RECORDS
-    {
-        return Err((400, "invalid batch ID or record count".to_owned()));
-    }
-    let mut records = Vec::with_capacity(upload.records.len());
-    for value in upload.records {
-        let mut envelope =
-            contract::parse_line(&value.to_string()).map_err(|error| (400, error.to_string()))?;
-        if let Record::SessionSnapshot(snapshot) = &mut envelope.record {
-            if snapshot
-                .machine_id
-                .as_deref()
-                .is_some_and(|id| id != machine)
-            {
-                return Err((403, "record machine does not match credential".to_owned()));
-            }
-            snapshot.machine_id = Some(machine.to_owned());
-        }
-        records.push(envelope);
-    }
-    let store = open_machine(data_root, machine).map_err(|error| (500, error))?;
-    let received: Option<String> = store
-        .conn
-        .query_row(
-            "select batch_id from hub_received_batches where sequence = ?",
-            [upload.sequence],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| (500, error.to_string()))?;
-    if let Some(received) = received {
-        if received != upload.batch_id {
-            return Err((409, "sequence was already used by another batch".to_owned()));
-        }
-        return Ok(
-            json!({"protocol": HUB_PROTOCOL_VERSION, "sequence": upload.sequence, "batch_id": upload.batch_id, "duplicate": true}),
-        );
-    }
-    let previous: i64 = store
+/// The highest sequence the hub accepted from a machine.
+fn high_water(store: &Store) -> Result<i64, String> {
+    store
         .conn
         .query_row(
             "select coalesce(max(sequence), 0) from hub_received_batches",
             [],
             |row| row.get(0),
         )
-        .map_err(|error| (500, error.to_string()))?;
-    if upload.sequence != previous + 1 {
+        .map_err(|error| error.to_string())
+}
+
+/// `code` lets a client tell a refused record, which it sets aside, from a
+/// sequence conflict or a transient failure, which keep the queue intact.
+type IngestError = (u16, &'static str, String);
+
+fn store_error(error: &StoreError) -> IngestError {
+    match error {
+        StoreError::Refused(message) => (409, "record_rejected", message.clone()),
+        StoreError::Sql(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            (503, "busy", "hub database is busy; retry later".to_owned())
+        }
+        StoreError::Sql(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            (
+                409,
+                "record_rejected",
+                "record violates a hub database constraint".to_owned(),
+            )
+        }
+        _ => (500, "internal", "hub database operation failed".to_owned()),
+    }
+}
+
+fn ingest(data_root: &Path, machine: &str, body: &[u8]) -> Result<Value, IngestError> {
+    let upload: Upload = serde_json::from_slice(body)
+        .map_err(|_| (400, "invalid_batch", "invalid upload envelope".to_owned()))?;
+    if upload.protocol != HUB_PROTOCOL_VERSION {
         return Err((
             409,
-            "upload sequence has a gap or is older than the accepted revision".to_owned(),
+            "protocol",
+            "unsupported hub protocol version".to_owned(),
         ));
     }
-    store
-        .apply(records)
-        .map_err(|error| (409, error.to_string()))?;
-    store
-        .conn
-        .execute(
+    if upload.sequence <= 0
+        || upload.batch_id.is_empty()
+        || upload.batch_id.len() > 256
+        || upload.records.len() > MAX_RECORDS
+    {
+        return Err((
+            400,
+            "invalid_batch",
+            "invalid batch ID or record count".to_owned(),
+        ));
+    }
+    let mut records = Vec::with_capacity(upload.records.len());
+    for raw in upload.records {
+        let mut envelope = contract::parse_line(raw.get())
+            .map_err(|error| (400, "record_rejected", error.to_string()))?;
+        if let Record::SessionSnapshot(snapshot) = &mut envelope.record {
+            if snapshot
+                .machine_id
+                .as_deref()
+                .is_some_and(|id| id != machine)
+            {
+                return Err((
+                    403,
+                    "record_rejected",
+                    "record machine does not match credential".to_owned(),
+                ));
+            }
+            snapshot.machine_id = Some(machine.to_owned());
+        }
+        records.push(envelope);
+    }
+    let store = open_machine(data_root, machine).map_err(|error| (500, "internal", error))?;
+    let sequence = upload.sequence;
+    let batch_id = upload.batch_id;
+    // The sequence check, the records, and the received-batch row commit in
+    // one immediate transaction: concurrent uploads serialize, and a failed
+    // record leaves neither data nor a consumed sequence behind.
+    let outcome = in_write_transaction(&store.conn, || {
+        let received: Option<String> = store
+            .conn
+            .query_row(
+                "select batch_id from hub_received_batches where sequence = ?",
+                [sequence],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(received) = received {
+            if received != batch_id {
+                return Ok(Err((
+                    409,
+                    "sequence_conflict",
+                    "sequence was already used by another batch".to_owned(),
+                )));
+            }
+            return Ok(Ok(true));
+        }
+        let previous: i64 = store.conn.query_row(
+            "select coalesce(max(sequence), 0) from hub_received_batches",
+            [],
+            |row| row.get(0),
+        )?;
+        let batch_reused: bool = store.conn.query_row(
+            "select exists(select 1 from hub_received_batches where batch_id = ?)",
+            [&batch_id],
+            |row| row.get(0),
+        )?;
+        if batch_reused {
+            return Ok(Err((
+                409,
+                "sequence_conflict",
+                "batch ID was already accepted under another sequence".to_owned(),
+            )));
+        }
+        if sequence != previous + 1 {
+            return Ok(Err((
+                409,
+                "sequence_conflict",
+                format!(
+                    "upload sequence {sequence} does not follow the hub's last accepted sequence {previous}"
+                ),
+            )));
+        }
+        store.apply(records)?;
+        store.conn.execute(
             "insert into hub_received_batches(sequence, batch_id) values (?, ?)",
-            rusqlite::params![upload.sequence, upload.batch_id],
-        )
-        .map_err(|error| (500, error.to_string()))?;
+            rusqlite::params![sequence, batch_id],
+        )?;
+        Ok(Ok(false))
+    });
+    let duplicate = outcome.map_err(|error| store_error(&error))??;
     Ok(
-        json!({"protocol": HUB_PROTOCOL_VERSION, "sequence": upload.sequence, "batch_id": upload.batch_id, "duplicate": false}),
+        json!({"protocol": HUB_PROTOCOL_VERSION, "sequence": sequence, "batch_id": batch_id, "duplicate": duplicate}),
     )
 }
 
-fn remote_query(
-    data_root: &Path,
-    config: &HubConfig,
-    value: Value,
-) -> Result<Value, (u16, String)> {
+/// Only listed query options are forwarded; every option name is checked,
+/// and each option's value is skipped exactly as the query parser consumes it.
+fn allowed_query_arguments(args: &[String]) -> bool {
+    if args.is_empty() || args.len() > 40 || args[0].starts_with('-') {
+        return false;
+    }
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        let (name, inline_value) = match arg.split_once('=') {
+            Some((name, _)) if name.starts_with("--") => (name, true),
+            _ => (arg.as_str(), false),
+        };
+        if QUERY_FLAG_OPTIONS.contains(&name) && !inline_value {
+            index += 1;
+        } else if QUERY_VALUE_OPTIONS.contains(&name) {
+            index += if inline_value { 1 } else { 2 };
+        } else {
+            return false;
+        }
+    }
+    index == args.len()
+}
+
+fn remote_query(data_root: &Path, config: &HubConfig, value: Value) -> Result<Value, HttpError> {
     let query_request: RemoteQuery =
         serde_json::from_value(value).map_err(|_| (400, "invalid query envelope".to_owned()))?;
     if query_request.protocol != HUB_PROTOCOL_VERSION {
@@ -286,15 +667,7 @@ fn remote_query(
     }
     let path = machine_db(data_root, &query_request.machine);
     let mut args = query_request.args;
-    if args.is_empty()
-        || args.len() > 40
-        || args.iter().any(|arg| {
-            arg == "--db"
-                || arg.starts_with("--db=")
-                || arg == "--format"
-                || arg.starts_with("--format=")
-        })
-    {
+    if !allowed_query_arguments(&args) {
         return Err((400, "invalid query arguments".to_owned()));
     }
     args.extend([
@@ -307,7 +680,12 @@ fn remote_query(
     let mut err = Vec::new();
     let code = query::run(&args, &mut out, &mut err);
     if code != 0 {
-        return Err((if code == 2 { 400 } else { 404 }, "query failed".to_owned()));
+        let status = match code {
+            2 => 400,
+            3 => 403,
+            _ => 404,
+        };
+        return Err((status, "query failed".to_owned()));
     }
     let mut payload: Value =
         serde_json::from_slice(&out).map_err(|_| (500, "invalid query response".to_owned()))?;
@@ -319,11 +697,7 @@ fn remote_query(
     Ok(payload)
 }
 
-fn remote_usage(
-    data_root: &Path,
-    config: &HubConfig,
-    value: Value,
-) -> Result<Value, (u16, String)> {
+fn remote_usage(data_root: &Path, config: &HubConfig, value: Value) -> Result<Value, HttpError> {
     let request: UsageQuery =
         serde_json::from_value(value).map_err(|_| (400, "invalid usage query".to_owned()))?;
     if request.protocol != HUB_PROTOCOL_VERSION {
@@ -367,103 +741,125 @@ fn remote_usage(
     Ok(json!({"protocol":HUB_PROTOCOL_VERSION,"machine":request.machine,"days":rows}))
 }
 
-fn handle(mut request: Request, data_root: &Path, config: &HubConfig) {
-    if request.method() == &Method::Get && request.url() == "/v1/health" {
-        return respond(request, 200, json!({"protocol": HUB_PROTOCOL_VERSION}));
+fn reply(result: Result<Value, HttpError>) -> (u16, Value) {
+    match result {
+        Ok(value) => (200, value),
+        Err((status, message)) => (status, json!({"error": message})),
     }
-    let token = bearer(&request);
+}
+
+/// Authentication is checked before any request body is read.
+fn handle(
+    head: &Head,
+    reader: &mut Connection,
+    stream: &TcpStream,
+    data_root: &Path,
+    config: &HubConfig,
+) -> (u16, Value) {
+    let method = head.method.as_str();
+    let path = head.path.as_str();
+    if method == "GET" && path == "/v1/health" {
+        return (200, json!({"protocol": HUB_PROTOCOL_VERSION}));
+    }
+    let token = head
+        .authorization
+        .strip_prefix("Bearer ")
+        .unwrap_or_default();
     let machine = config
         .machines
         .iter()
         .find_map(|(machine, expected)| token_matches(expected, token).then_some(machine.as_str()));
-    match (request.method(), request.url()) {
-        (&Method::Post, "/v1/prices/sync") => {
-            let Some(machine) = machine else {
-                return respond(request, 401, json!({"error":"invalid machine credential"}));
-            };
-            let result = body(&mut request)
-                .and_then(|value| crate::price_history::synchronize(data_root, machine, value));
-            match result {
-                Ok(value) => respond(request, 200, value),
-                Err((status, message)) => respond(request, status, json!({"error":message})),
-            }
-        }
-        (&Method::Post, "/v1/annotations" | "/v1/annotations/edit") => {
-            if !token_matches(&config.owner_token, token) {
-                return respond(request, 401, json!({"error":"invalid owner credential"}));
-            }
-            let edit = request.url().ends_with("/edit");
-            let result = body(&mut request).and_then(|value| {
-                if edit {
-                    crate::hub_annotations::edit(data_root, config, value)
+    let owner = token_matches(&config.owner_token, token);
+    let machine_route = matches!(
+        (method, path),
+        ("POST", "/v1/prices/sync" | "/v1/ingest") | ("GET", "/v1/verify")
+    );
+    let owner_route = matches!(
+        (method, path),
+        (
+            "POST",
+            "/v1/annotations" | "/v1/annotations/edit" | "/v1/query" | "/v1/usage"
+        ) | ("GET", "/v1/machines")
+    );
+    if !machine_route && !owner_route {
+        return (404, json!({"error":"unknown route"}));
+    }
+    if machine_route && machine.is_none() {
+        return (401, json!({"error":"invalid machine credential"}));
+    }
+    if owner_route && !owner {
+        return (401, json!({"error":"invalid owner credential"}));
+    }
+    let limit = if path == "/v1/ingest" {
+        MAX_BODY_BYTES
+    } else {
+        MAX_SMALL_BODY_BYTES
+    };
+    let body = if method == "POST" {
+        match read_body(reader, stream, head, limit) {
+            Ok(body) => body,
+            Err((status, message)) => {
+                let code = if status == 413 {
+                    "record_rejected"
                 } else {
-                    crate::hub_annotations::read(data_root, config, value)
-                }
-            });
-            match result {
-                Ok(value) => respond(request, 200, value),
-                Err((status, message)) => respond(request, status, json!({"error":message})),
+                    "request"
+                };
+                return (status, json!({"error": message, "code": code}));
             }
         }
-        (&Method::Get, "/v1/verify") => {
-            let Some(machine) = machine else {
-                return respond(request, 401, json!({"error":"invalid machine credential"}));
-            };
-            respond(
-                request,
+    } else {
+        Vec::new()
+    };
+    match (method, path) {
+        ("POST", "/v1/prices/sync") => reply(parse_json(&body).and_then(|value| {
+            crate::price_history::synchronize(data_root, machine.unwrap_or_default(), value)
+        })),
+        ("POST", "/v1/annotations") => reply(
+            parse_json(&body)
+                .and_then(|value| crate::hub_annotations::read(data_root, config, value)),
+        ),
+        ("POST", "/v1/annotations/edit") => reply(
+            parse_json(&body)
+                .and_then(|value| crate::hub_annotations::edit(data_root, config, value)),
+        ),
+        ("GET", "/v1/verify") => {
+            let machine = machine.unwrap_or_default();
+            let high_water =
+                match open_machine(data_root, machine).and_then(|store| high_water(&store)) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return (500, json!({"error":"cannot read hub delivery state"}));
+                    }
+                };
+            (
                 200,
                 json!({
                     "protocol": HUB_PROTOCOL_VERSION,
                     "schema_version": crate::store::schema::SUPPORTED_SCHEMA_VERSION,
                     "contract": crate::contract::CONTRACT_NAME,
                     "contract_version": crate::contract::CONTRACT_VERSION,
-                    "machine_id": machine
+                    "machine_id": machine,
+                    "high_water": high_water
                 }),
             )
         }
-        (&Method::Post, "/v1/ingest") => {
-            let Some(machine) = machine else {
-                return respond(request, 401, json!({"error":"invalid machine credential"}));
-            };
-            let result = body(&mut request).and_then(|value| ingest(data_root, machine, value));
-            match result {
-                Ok(value) => respond(request, 200, value),
-                Err((status, message)) => respond(request, status, json!({"error": message})),
-            }
+        ("POST", "/v1/ingest") => match ingest(data_root, machine.unwrap_or_default(), &body) {
+            Ok(value) => (200, value),
+            Err((status, code, message)) => (status, json!({"error": message, "code": code})),
+        },
+        ("POST", "/v1/query") => {
+            reply(parse_json(&body).and_then(|value| remote_query(data_root, config, value)))
         }
-        (&Method::Post, "/v1/query") => {
-            if !token_matches(&config.owner_token, token) {
-                return respond(request, 401, json!({"error":"invalid owner credential"}));
-            }
-            let result =
-                body(&mut request).and_then(|value| remote_query(data_root, config, value));
-            match result {
-                Ok(value) => respond(request, 200, value),
-                Err((status, message)) => respond(request, status, json!({"error": message})),
-            }
+        ("POST", "/v1/usage") => {
+            reply(parse_json(&body).and_then(|value| remote_usage(data_root, config, value)))
         }
-        (&Method::Post, "/v1/usage") => {
-            if !token_matches(&config.owner_token, token) {
-                return respond(request, 401, json!({"error":"invalid owner credential"}));
-            }
-            let result =
-                body(&mut request).and_then(|value| remote_usage(data_root, config, value));
-            match result {
-                Ok(value) => respond(request, 200, value),
-                Err((status, message)) => respond(request, status, json!({"error": message})),
-            }
-        }
-        (&Method::Get, "/v1/machines") => {
-            if !token_matches(&config.owner_token, token) {
-                return respond(request, 401, json!({"error":"invalid owner credential"}));
-            }
+        ("GET", "/v1/machines") => {
             let machines: Vec<&str> = config.machines.keys().map(String::as_str).collect();
-            respond(
-                request,
+            (
                 200,
                 json!({"protocol":HUB_PROTOCOL_VERSION,"machines":machines}),
             )
         }
-        _ => respond(request, 404, json!({"error":"unknown route"})),
+        _ => (404, json!({"error":"unknown route"})),
     }
 }

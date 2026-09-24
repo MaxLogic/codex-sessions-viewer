@@ -6,6 +6,7 @@ import 'package:codex_sessions_viewer/src/database/application_maintenance.dart'
 import 'package:codex_sessions_viewer/src/database/database_connection.dart';
 import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
 import 'package:codex_sessions_viewer/src/pricing/hub_price_history.dart';
 import 'package:codex_sessions_viewer/src/pricing/pricing_repository.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -370,15 +371,13 @@ void main() {
         coordinator: DatabaseMaintenanceCoordinator(file),
         client: fallback,
         clock: () => DateTime.utc(2026, 9, 1, 7),
+        hubMachineToken: () => 'fixture-token',
       );
+      final machine = _machineId(file);
       try {
         await maintenance.configure(
           AppSettings.fromTomlMap({
-            'pricing': {
-              'hub_url': 'http://127.0.0.1:${server.port}',
-              'hub_token': 'fixture-token',
-              'hub_machine_id': 'machine-a',
-            },
+            'hub': {'url': 'http://127.0.0.1:${server.port}'},
             'maintenance': {'database_optimize_enabled': false},
           }),
         );
@@ -395,9 +394,16 @@ void main() {
         expect(fallback.calls, 1);
         final reopened = openFileBackedDatabase(file);
         try {
+          // Local evidence carries this database's machine identity.
           expect(
             PriceObservationStore(reopened).read().map((o) => o.origin),
-            containsAll(['hub', 'machine-a']),
+            containsAll(['hub', machine]),
+          );
+          expect(
+            MaintenanceJobRepository(
+              reopened,
+            ).readSchedule('openrouter_price_refresh')!.lastWarning,
+            contains('HTTP 503'),
           );
         } finally {
           reopened.close();
@@ -408,6 +414,177 @@ void main() {
         await server.close(force: true);
         temp.deleteSync(recursive: true);
       }
+    },
+  );
+
+  test(
+    'hub price sync keeps the URL path prefix and reports rejection in Settings',
+    () async {
+      final temp = Directory.systemTemp.createTempSync('hub_prices_prefix_');
+      final file = File('${temp.path}/viewer.sqlite');
+      expect(
+        (await DatabaseMigrator(
+          sqlRoot: Directory('../sql'),
+        ).openAndMigrate(file)).canStartNormalUi,
+        isTrue,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final paths = <String>[];
+      server.listen((request) async {
+        paths.add(request.uri.path);
+        await request.drain<void>();
+        request.response.statusCode = 401;
+        request.response.write(
+          jsonEncode({'error': 'invalid machine credential'}),
+        );
+        await request.response.close();
+      });
+      String? token = 'secret-machine-token';
+      final fallback = _FallbackCatalog();
+      final maintenance = ApplicationMaintenance(
+        databaseFile: file,
+        coordinator: DatabaseMaintenanceCoordinator(file),
+        client: fallback,
+        clock: () => DateTime.utc(2026, 9, 1, 7),
+        hubMachineToken: () => token,
+      );
+      String? warning() {
+        final db = openFileBackedDatabase(file);
+        try {
+          return MaintenanceJobRepository(
+            db,
+          ).readSchedule('openrouter_price_refresh')!.lastWarning;
+        } finally {
+          db.close();
+        }
+      }
+
+      try {
+        await maintenance.configure(
+          AppSettings.fromTomlMap({
+            'hub': {'url': 'http://127.0.0.1:${server.port}/team-hub/'},
+            'maintenance': {'database_optimize_enabled': false},
+          }),
+        );
+        // The local fallback still observes prices; the hub failure is kept.
+        expect(await maintenance.refreshPrices(), isTrue);
+        expect(fallback.calls, 1);
+        expect(paths, ['/team-hub/v1/prices/sync']);
+        expect(warning(), contains('HTTP 401'));
+        expect(warning(), contains('CODEX_SESSIONS_HUB_MACHINE_TOKEN'));
+        expect(warning(), isNot(contains('secret-machine-token')));
+        expect(maintenance.hubPriceSyncError, warning());
+        // Without a machine token nothing is sent, and Settings says why.
+        token = null;
+        expect(await maintenance.refreshPrices(), isTrue);
+        expect(paths, hasLength(1));
+        expect(warning(), contains('set CODEX_SESSIONS_HUB_MACHINE_TOKEN'));
+      } finally {
+        await maintenance.stop();
+        maintenance.dispose();
+        await server.close(force: true);
+        temp.deleteSync(recursive: true);
+      }
+    },
+  );
+
+  test('hub evidence wins across its confirmed coverage in Dart', () {
+    final hub = observation(0, '0.4', authority: 'hub', origin: 'hub');
+    final inside = observation(3, '0.9');
+    final after = observation(9, '0.8');
+    final confirmations = {hub.fingerprint: DateTime.utc(2026, 9, 1, 6)};
+    final history = CanonicalPriceHistory([
+      hub,
+      inside,
+      after,
+    ], confirmations: confirmations);
+    expect(history.winners.map((o) => o.model['pricing']['prompt']), [
+      '0.4',
+      '0.8',
+    ]);
+    // Confirmations change the winners, not the verified observation set.
+    expect(
+      history.revision,
+      CanonicalPriceHistory([hub, inside, after]).revision,
+    );
+    expect(history.materializedRevision, isNot(history.revision));
+    expect(CanonicalPriceHistory([hub, inside, after]).winners, hasLength(3));
+
+    final db = fixture();
+    addTearDown(db.close);
+    final expected = fixture();
+    addTearDown(expected.close);
+    PricingRepository(expected).mergePriceObservations([hub]);
+    final repo = PricingRepository(db);
+    repo.mergePriceObservations([hub, inside]);
+    expect(
+      cost(db, 4).estimatedCostText,
+      isNot(cost(expected, 4).estimatedCostText),
+    );
+    repo.mergePriceObservations(
+      [hub],
+      hubUrl: 'https://hub.example.test',
+      through: 1,
+      hubRevision: CanonicalPriceHistory([hub]).revision,
+      confirmations: confirmations,
+      confirmationSeq: 1,
+    );
+    expect(cost(db, 4).estimatedCostText, cost(expected, 4).estimatedCostText);
+    expect(repo.hubSyncSnapshot('https://hub.example.test').confirmationSeq, 1);
+  });
+
+  test(
+    'client downloads confirmations with their own bounded cursor',
+    () async {
+      final hub = observation(0, '0.4', authority: 'hub', origin: 'hub');
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final requests = <Map<String, dynamic>>[];
+      server.listen((request) async {
+        final body =
+            jsonDecode(await utf8.decoder.bind(request).join())
+                as Map<String, dynamic>;
+        requests.add(body);
+        final after = body['confirmations_after'] as int;
+        request.response.write(
+          jsonEncode({
+            'protocol': 1,
+            'revision': CanonicalPriceHistory([hub]).revision,
+            'observations': [if (body['after'] == 0) hub.toJson()],
+            'after': 1,
+            'through': 1,
+            // Two confirmation pages after the observations are complete.
+            'confirmations': [
+              if (after == 0)
+                {
+                  'fingerprint': hub.fingerprint,
+                  'confirmed_at_utc': '2026-09-01T06:00:00.000000Z',
+                }
+              else
+                {
+                  'fingerprint': hub.fingerprint,
+                  'confirmed_at_utc': '2026-09-01T12:00:00.000000Z',
+                },
+            ],
+            'confirmations_after': after + 1,
+            'confirmations_through': 2,
+            'complete': after + 1 == 2,
+          }),
+        );
+        await request.response.close();
+      });
+      final result = await HubPriceHistoryClient().synchronizeIncremental(
+        endpoint: Uri.parse('http://127.0.0.1:${server.port}'),
+        token: 'fixture',
+        observations: const [],
+      );
+      expect(requests.map((r) => r['confirmations_after']), [0, 1]);
+      expect(requests.last['confirmations_through'], 2);
+      expect(result.confirmationSeq, 2);
+      expect(
+        result.confirmations[hub.fingerprint],
+        DateTime.utc(2026, 9, 1, 12),
+      );
     },
   );
 
@@ -731,6 +908,18 @@ void main() {
       );
     },
   );
+}
+
+String _machineId(File file) {
+  final db = openFileBackedDatabase(file);
+  try {
+    return db
+            .select("select value from app_metadata where key = 'machine_id'")
+            .single['value']
+        as String;
+  } finally {
+    db.close();
+  }
 }
 
 class _FallbackCatalog implements OpenRouterModelsClient {

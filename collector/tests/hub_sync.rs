@@ -5,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use codex_sessions_collector::contract::{Envelope, Record, SourceStatus};
+use codex_sessions_collector::contract::{Envelope, Record, SourceStatus, ThreadName};
 use codex_sessions_collector::hub_client;
 use codex_sessions_collector::store::{OwnerMode, Store};
 use serde_json::{Value, json};
@@ -53,19 +53,22 @@ impl Hub {
 }
 
 fn start(temp: &TempDir) -> Hub {
+    start_with(temp, json!({}))
+}
+
+fn start_with(temp: &TempDir, extra: Value) -> Hub {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let config = temp.path().join("hub.json");
-    std::fs::write(
-        &config,
-        json!({
-            "owner_token": OWNER_TOKEN,
-            "machines": {"machine-a": MACHINE_A_TOKEN, "machine-b": MACHINE_B_TOKEN}
-        })
-        .to_string(),
-    )
-    .unwrap();
+    let mut value = json!({
+        "owner_token": OWNER_TOKEN,
+        "machines": {"machine-a": MACHINE_A_TOKEN, "machine-b": MACHINE_B_TOKEN}
+    });
+    for (key, item) in extra.as_object().unwrap() {
+        value[key] = item.clone();
+    }
+    std::fs::write(&config, value.to_string()).unwrap();
     let url = format!("http://127.0.0.1:{port}");
     let child = Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
         .arg(format!("127.0.0.1:{port}"))
@@ -385,7 +388,7 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
             .unwrap();
         let envelope: Value = serde_json::from_str(&queued).unwrap();
         assert_eq!(
-            upload(&hub, MACHINE_A_TOKEN, 1, "machine-a:1", vec![envelope]).unwrap()["duplicate"],
+            upload(&hub, MACHINE_A_TOKEN, 1, "machine-a:1:1", vec![envelope]).unwrap()["duplicate"],
             false
         );
     }
@@ -423,4 +426,404 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
         (Some(0), Some(0))
     );
     assert_eq!(session_count(&hub, "machine-a"), 1);
+}
+
+/// A standalone local database with machine-a's identity, paired with `url`.
+fn paired_database(temp: &TempDir, url: &str) -> std::path::PathBuf {
+    let db = temp.path().join("local.sqlite");
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .conn
+            .execute(
+                "update app_metadata set value = 'machine-a' where key = 'machine_id'",
+                [],
+            )
+            .unwrap();
+    }
+    hub_client::enable_for_collection(&db, OwnerMode::Standalone, url).unwrap();
+    db
+}
+
+fn hub_command(db: &std::path::Path, command: &str, token: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+        .args(["hub", command, "--standalone"])
+        .arg(db)
+        .env("CODEX_SESSIONS_HUB_MACHINE_TOKEN", token)
+        .output()
+        .unwrap()
+}
+
+fn json_output(output: &std::process::Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn hub_rows(temp: &TempDir, sql: &str) -> i64 {
+    rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite"))
+        .unwrap()
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap()
+}
+
+fn status_record(path: &str, status: &str) -> Envelope {
+    Envelope::new(Record::SourceStatus(SourceStatus {
+        harness: "codex".to_owned(),
+        path: path.to_owned(),
+        status: status.to_owned(),
+        state: if status == "missing" {
+            "missing"
+        } else {
+            "active"
+        }
+        .to_owned(),
+        message: None,
+    }))
+}
+
+fn thread_name(session: &str, name: &str) -> Envelope {
+    Envelope::new(Record::ThreadName(ThreadName {
+        harness: "codex".to_owned(),
+        session_id: session.to_owned(),
+        thread_name: name.to_owned(),
+    }))
+}
+
+fn outbox_keys(store: &Store) -> Vec<Option<String>> {
+    let mut statement = store
+        .conn
+        .prepare("select record_key from collector_upload_outbox order by id")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn outbox_queues_only_changes_and_coalesces_unsent_state_per_source() {
+    let temp = TempDir::new("hub_outbox_changes");
+    let db = paired_database(&temp, "http://127.0.0.1:9");
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let path = "C:\\synthetic\\status-only.jsonl";
+    // Every scan reports every source; unchanged state is queued once.
+    for _ in 0..3 {
+        store
+            .apply(vec![
+                status_record(path, "available"),
+                thread_name("named", "Stable title"),
+            ])
+            .unwrap();
+    }
+    assert_eq!(hub_client::pending(&store.conn).unwrap(), 2);
+    // A newer state replaces the unsent older state of the same source.
+    store.apply(vec![status_record(path, "missing")]).unwrap();
+    store.apply(vec![thread_name("named", "Renamed")]).unwrap();
+    let mut first = sample_snapshot("coalesced");
+    first.session.title = Some("First".to_owned());
+    let mut second = sample_snapshot("coalesced");
+    second.session.title = Some("Second".to_owned());
+    second.source.size = 200;
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            first,
+        )))])
+        .unwrap();
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            second,
+        )))])
+        .unwrap();
+    let keys = outbox_keys(&store);
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    let queued: Vec<String> = {
+        let mut statement = store
+            .conn
+            .prepare("select record_json from collector_upload_outbox order by id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert!(queued[0].contains("\"missing\""));
+    assert!(queued[1].contains("Renamed"));
+    assert!(queued[2].contains("Second") && !queued[2].contains("First"));
+}
+
+#[test]
+fn sync_delivers_full_batches_and_hub_disable_stops_queuing() {
+    let temp = TempDir::new("hub_batches");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let records: Vec<Envelope> = (0..300)
+            .map(|index| {
+                Envelope::new(Record::SessionSnapshot(Box::new(sample_snapshot(
+                    &format!("batched-{index}"),
+                ))))
+            })
+            .collect();
+        store.apply(records).unwrap();
+        assert_eq!(hub_client::pending(&store.conn).unwrap(), 300);
+    }
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(
+        (
+            report["sent"].as_u64(),
+            report["batches"].as_u64(),
+            report["pending"].as_i64(),
+            report["last_sequence"].as_i64()
+        ),
+        (Some(300), Some(3), Some(0), Some(3))
+    );
+    assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 300);
+    assert_eq!(
+        hub_rows(&temp, "select count(*) from hub_received_batches"),
+        3
+    );
+
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot("before-disable"),
+            )))])
+            .unwrap();
+        assert_eq!(hub_client::pending(&store.conn).unwrap(), 1);
+    }
+    let disabled = json_output(&hub_command(&db, "disable", ""));
+    assert_eq!(
+        (disabled["enabled"].as_bool(), disabled["cleared"].as_i64()),
+        (Some(false), Some(1))
+    );
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot("after-disable"),
+            )))])
+            .unwrap();
+        assert_eq!(hub_client::pending(&store.conn).unwrap(), 0);
+    }
+    let status = json_output(&hub_command(&db, "status", ""));
+    assert_eq!(status["delivery"]["enabled"], false);
+    assert_eq!(status["pending"], 0);
+    assert!(!hub_command(&db, "sync", MACHINE_A_TOKEN).status.success());
+}
+
+#[test]
+fn rejected_record_moves_to_dead_letters_without_blocking_the_queue() {
+    let temp = TempDir::new("hub_dead_letter");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot("before-poison"),
+            )))])
+            .unwrap();
+        // A record this collector queued but the hub can never accept.
+        store
+            .conn
+            .execute(
+                "insert into collector_upload_outbox(record_json, created_at_utc) values (?, 'now')",
+                [json!({"contract":"codex-sessions-viewer.ingest","version":999,"kind":"thread_name","record":{}}).to_string()],
+            )
+            .unwrap();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot("after-poison"),
+            )))])
+            .unwrap();
+    }
+    // Wrong credential: a transient failure that keeps every record queued
+    // and reports the hub's reason without echoing the credential.
+    let denied = hub_command(&db, "sync", "wrong-token-that-must-not-be-echoed");
+    assert!(!denied.status.success());
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(stderr.contains("HTTP 401"), "{stderr}");
+    assert!(stderr.contains("invalid machine credential"), "{stderr}");
+    assert!(!stderr.contains("wrong-token-that-must-not-be-echoed"));
+    let status = json_output(&hub_command(&db, "status", ""));
+    assert_eq!(
+        (status["pending"].as_i64(), status["dead_letters"].as_i64()),
+        (Some(3), Some(0))
+    );
+
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(
+        (
+            report["sent"].as_u64(),
+            report["dead_lettered"].as_u64(),
+            report["pending"].as_i64()
+        ),
+        (Some(2), Some(1), Some(0))
+    );
+    assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 2);
+    let status = json_output(&hub_command(&db, "status", ""));
+    assert_eq!(status["dead_letters"], 1);
+    let rejected = &status["recent_dead_letters"][0];
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported contract version"),
+        "{rejected}"
+    );
+    assert_eq!(rejected["http_status"], 400);
+    assert!(!status.to_string().contains(MACHINE_A_TOKEN));
+}
+
+#[test]
+fn hub_resync_continues_after_a_restored_local_database() {
+    let temp = TempDir::new("hub_resync");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let queue = |session: &str| {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot(session),
+            )))])
+            .unwrap();
+    };
+    queue("first");
+    json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    // Restoring an older backup rewinds the local sequence.
+    Store::open(&db, OwnerMode::Standalone)
+        .unwrap()
+        .conn
+        .execute("update collector_hub_state set last_sequence = 0", [])
+        .unwrap();
+    queue("second");
+    let conflict = hub_command(&db, "sync", MACHINE_A_TOKEN);
+    assert!(!conflict.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr).contains("hub resync"),
+        "{}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
+    let resync = json_output(&hub_command(&db, "resync", MACHINE_A_TOKEN));
+    assert_eq!(
+        (
+            resync["previous_sequence"].as_i64(),
+            resync["last_sequence"].as_i64(),
+            resync["pending"].as_i64()
+        ),
+        (Some(0), Some(1), Some(1))
+    );
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(
+        (report["sent"].as_u64(), report["last_sequence"].as_i64()),
+        (Some(1), Some(2))
+    );
+    assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 2);
+}
+
+#[test]
+fn failed_ingest_leaves_neither_records_nor_a_consumed_sequence() {
+    let temp = TempDir::new("hub_atomic_ingest");
+    let hub = start(&temp);
+    upload(
+        &hub,
+        MACHINE_A_TOKEN,
+        1,
+        "reused-batch",
+        vec![record("first")],
+    )
+    .unwrap();
+    // The batch ID was already used by sequence 1, so this batch fails.
+    let failed = upload(
+        &hub,
+        MACHINE_A_TOKEN,
+        2,
+        "reused-batch",
+        vec![record("second")],
+    );
+    assert!(failed.is_err());
+    assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 1);
+    assert_eq!(
+        hub_rows(&temp, "select count(*) from hub_received_batches"),
+        1
+    );
+    assert!(
+        upload(
+            &hub,
+            MACHINE_A_TOKEN,
+            2,
+            "fresh-batch",
+            vec![record("second")]
+        )
+        .is_ok()
+    );
+    assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 2);
+}
+
+#[test]
+fn slow_or_oversized_requests_do_not_block_the_hub() {
+    use std::io::{Read, Write};
+    let temp = TempDir::new("hub_slow_client");
+    let hub = start_with(&temp, json!({"request_timeout_seconds": 1}));
+    let address = hub.url.trim_start_matches("http://").to_owned();
+    // A client that announces a body and then stops sending.
+    let mut slow = std::net::TcpStream::connect(&address).unwrap();
+    slow.write_all(
+        format!(
+            "POST /v1/ingest HTTP/1.1\r\nHost: hub\r\nAuthorization: Bearer {MACHINE_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .into();
+    let started = Instant::now();
+    assert!(agent.get(format!("{}/v1/health", hub.url)).call().is_ok());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // The stalled request is closed by the socket read timeout.
+    slow.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut response = String::new();
+    let _ = slow.read_to_string(&mut response);
+    assert!(response.starts_with("HTTP/1.1 408"), "{response:?}");
+
+    // An oversized body is refused from its declared length, unread.
+    let mut large = std::net::TcpStream::connect(&address).unwrap();
+    large
+        .write_all(
+            format!(
+                "POST /v1/ingest HTTP/1.1\r\nHost: hub\r\nAuthorization: Bearer {MACHINE_A_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+                80 * 1024 * 1024
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    large
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut response = String::new();
+    let _ = large.read_to_string(&mut response);
+    assert!(response.starts_with("HTTP/1.1 413"), "{response:?}");
+    // Unauthenticated bodies are never read.
+    let mut anonymous = std::net::TcpStream::connect(&address).unwrap();
+    anonymous
+        .write_all(b"POST /v1/ingest HTTP/1.1\r\nHost: hub\r\nContent-Length: 1000000\r\n\r\n")
+        .unwrap();
+    anonymous
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut response = String::new();
+    let _ = anonymous.read_to_string(&mut response);
+    assert!(response.starts_with("HTTP/1.1 401"), "{response:?}");
 }

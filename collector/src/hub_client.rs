@@ -1,5 +1,6 @@
 //! Durable, optional upload of locally committed contract records.
 
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -7,17 +8,58 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::contract::{CONTRACT_NAME, CONTRACT_VERSION, Envelope, Record};
-use crate::hub_server::HUB_PROTOCOL_VERSION;
+use crate::hub_server::{HUB_PROTOCOL_VERSION, MAX_RECORDS};
 use crate::store::schema::{
     SUPPORTED_SCHEMA_VERSION, StoreError, StoreResult, begin_write, finish,
 };
+use crate::store::writer::{session_row_id, source_status_id};
 use crate::store::{OwnerMode, Store};
+
+/// A batch body stays below the hub's 64 MiB request limit, with headroom for
+/// the envelope. A single record above this size can never be delivered and
+/// moves to the dead-letter table without contacting the hub.
+pub const MAX_BATCH_BYTES: usize = 48 * 1024 * 1024;
+/// Upper bound of batches per `hub sync` run.
+const MAX_BATCHES_PER_RUN: usize = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncReport {
     pub sent: usize,
+    pub batches: usize,
+    pub dead_lettered: usize,
     pub pending: i64,
     pub last_sequence: i64,
+}
+
+/// The coalescing key of a record, and whether an unchanged repeat of the
+/// last queued state is dropped. Scans report every source's status and every
+/// thread name each time; only changes are delivered.
+fn record_key(record: &Record) -> Option<(String, bool)> {
+    match record {
+        Record::SessionSnapshot(snapshot) => Some((
+            format!(
+                "session:{}",
+                session_row_id(
+                    &snapshot.harness,
+                    snapshot.session.session_id.as_deref(),
+                    &snapshot.source.path,
+                )
+            ),
+            false,
+        )),
+        Record::SourceStatus(status) => Some((
+            format!(
+                "status:{}:{}",
+                status.harness,
+                source_status_id(&status.path)
+            ),
+            true,
+        )),
+        Record::ThreadName(name) => {
+            Some((format!("thread:{}:{}", name.harness, name.session_id), true))
+        }
+        Record::ProjectHints(_) => None,
+    }
 }
 
 /// Called while the local record transaction is open. No destination or
@@ -42,16 +84,62 @@ pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> 
     if !enabled {
         return Ok(());
     }
+    let key = record_key(&record);
+    if let Record::SessionSnapshot(snapshot) = &record {
+        // A new snapshot makes the source available again; a later identical
+        // missing status must be delivered, not treated as unchanged.
+        conn.execute(
+            "delete from collector_hub_record_state where record_key = ?",
+            [format!(
+                "status:{}:{}",
+                snapshot.harness,
+                source_status_id(&snapshot.source.path)
+            )],
+        )?;
+    }
     let envelope = serde_json::to_string(&Envelope::new(record))
         .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
+    let Some((key, deduplicate)) = key else {
+        conn.execute(
+            "insert into collector_upload_outbox(record_json, created_at_utc) values (?, ?)",
+            params![envelope, now],
+        )?;
+        return Ok(());
+    };
+    if deduplicate {
+        let hash = crate::dart::sha256_hex(envelope.as_bytes());
+        let previous: Option<String> = conn
+            .query_row(
+                "select record_hash from collector_hub_record_state where record_key = ?",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(hash.as_str()) {
+            return Ok(());
+        }
+        conn.execute(
+            "insert into collector_hub_record_state(record_key, record_hash) values (?, ?)
+             on conflict(record_key) do update set record_hash = excluded.record_hash",
+            params![key, hash],
+        )?;
+    }
+    // The newest state of a source replaces any unsent older state. It is
+    // appended so that delivery order still follows local commit order.
     conn.execute(
-        "insert into collector_upload_outbox(record_json, created_at_utc) values (?, ?)",
-        params![envelope, now],
+        "delete from collector_upload_outbox where record_key = ?",
+        [&key],
+    )?;
+    conn.execute(
+        "insert into collector_upload_outbox(record_json, created_at_utc, record_key) values (?, ?, ?)",
+        params![envelope, now, key],
     )?;
     Ok(())
 }
 
-fn validate_url(url: &str) -> Result<String, String> {
+/// Accepts HTTPS, or plain HTTP only on a literal loopback address. A host
+/// name such as `localhost` can be resolved elsewhere, so it is refused.
+pub fn validate_url(url: &str) -> Result<String, String> {
     let url = url.trim_end_matches('/');
     let authority = url
         .split_once("://")
@@ -63,11 +151,9 @@ fn validate_url(url: &str) -> Result<String, String> {
                 .to_owned(),
         );
     }
-    let safe_loopback = url.starts_with("http://127.0.0.1:")
-        || url.starts_with("http://[::1]:")
-        || url.starts_with("http://localhost:");
+    let safe_loopback = url.starts_with("http://127.0.0.1:") || url.starts_with("http://[::1]:");
     if !url.starts_with("https://") && !safe_loopback {
-        return Err("hub URL must use HTTPS, except a loopback listener".to_owned());
+        return Err("hub URL must use HTTPS, except a 127.0.0.1 or [::1] listener".to_owned());
     }
     Ok(url.to_owned())
 }
@@ -105,6 +191,25 @@ fn enable(store: &Store, url: &str, machine: &str) -> Result<i64, String> {
     finish(&store.conn, result).map_err(|error| error.to_string())
 }
 
+/// Stops queuing and discards every queued, in-flight and dead-lettered
+/// record. The pairing and acknowledged sequence are kept, so enabling again
+/// continues the same hub history.
+pub fn disable(db_path: &Path, mode: OwnerMode) -> Result<i64, String> {
+    let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
+    begin_write(&store.conn).map_err(|error| error.to_string())?;
+    let result = (|| -> StoreResult<i64> {
+        let cleared = pending(&store.conn)?;
+        store.conn.execute_batch(
+            "update collector_hub_state set enabled = 0, inflight_batch_id = null, inflight_last_id = null where id = 1;
+             delete from collector_upload_outbox;
+             delete from collector_hub_record_state;
+             delete from collector_upload_dead_letters;",
+        )?;
+        Ok(cleared)
+    })();
+    finish(&store.conn, result).map_err(|error| error.to_string())
+}
+
 pub fn pending(conn: &Connection) -> StoreResult<i64> {
     Ok(
         conn.query_row("select count(*) from collector_upload_outbox", [], |row| {
@@ -113,31 +218,89 @@ pub fn pending(conn: &Connection) -> StoreResult<i64> {
     )
 }
 
-/// An acknowledged record is removed only after the server's matching
-/// sequence and batch ID are observed. A lost acknowledgment retries the
-/// exact record and the server returns a duplicate acknowledgment.
-pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<SyncReport, String> {
-    let url = validate_url(url)?;
-    if token.trim().is_empty() {
-        return Err("hub credential is missing".to_owned());
-    }
-    let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
-    let machine = store
-        .machine_id()
-        .map_err(|error| error.to_string())?
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "local database has no machine identity".to_owned())?;
-    let mut sequence = enable(&store, &url, &machine)?;
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(15)))
+pub fn dead_letters(conn: &Connection) -> StoreResult<(i64, Vec<Value>)> {
+    let count: i64 = conn.query_row(
+        "select count(*) from collector_upload_dead_letters",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut statement = conn.prepare(
+        "select id, outbox_id, record_key, failed_at_utc, http_status, error
+         from collector_upload_dead_letters order by id desc limit 20",
+    )?;
+    let recent = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "outbox_id": row.get::<_, i64>(1)?,
+                "record_key": row.get::<_, Option<String>>(2)?,
+                "failed_at_utc": row.get::<_, String>(3)?,
+                "http_status": row.get::<_, Option<i64>>(4)?,
+                "error": row.get::<_, String>(5)?,
+            }))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((count, recent))
+}
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(120)))
+        .max_redirects(0)
+        .http_status_as_error(false)
         .build()
-        .new_agent();
-    let mut verify = agent
+        .new_agent()
+}
+
+/// The hub's error text, limited and with the credential removed.
+fn error_text(response: &mut ureq::http::Response<ureq::Body>, token: &str) -> (String, String) {
+    let mut bytes = Vec::new();
+    let _ = response
+        .body_mut()
+        .as_reader()
+        .take(64 * 1024)
+        .read_to_end(&mut bytes);
+    let parsed: Option<Value> = serde_json::from_slice(&bytes).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value["error"].as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+    let code = parsed
+        .as_ref()
+        .and_then(|value| value["code"].as_str())
+        .unwrap_or("")
+        .to_owned();
+    let mut message: String = message
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(500)
+        .collect();
+    if !token.is_empty() {
+        message = message.replace(token, "[credential]");
+    }
+    (code, message)
+}
+
+struct Verified {
+    machine: String,
+    high_water: i64,
+}
+
+fn verify(agent: &ureq::Agent, url: &str, token: &str, machine: &str) -> Result<Verified, String> {
+    let mut response = agent
         .get(format!("{url}/v1/verify"))
         .header("Authorization", format!("Bearer {token}"))
         .call()
         .map_err(|error| format!("hub compatibility check failed: {error}"))?;
-    let server: Value = verify
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let (_, message) = error_text(&mut response, token);
+        return Err(format!(
+            "hub compatibility check failed (HTTP {status}): {message}"
+        ));
+    }
+    let server: Value = response
         .body_mut()
         .read_json()
         .map_err(|_| "hub returned an invalid compatibility response".to_owned())?;
@@ -149,63 +312,322 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
     {
         return Err("hub protocol, schema, contract, or machine identity differs from this collector release".to_owned());
     }
-    let mut sent = 0usize;
-    while sent < 256 {
-        let next: Option<(i64, String)> = store
-            .conn
-            .query_row(
-                "select id, record_json from collector_upload_outbox order by id limit 1",
+    Ok(Verified {
+        machine: machine.to_owned(),
+        high_water: server["high_water"].as_i64().unwrap_or(0),
+    })
+}
+
+fn local_machine(store: &Store) -> Result<String, String> {
+    store
+        .machine_id()
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "local database has no machine identity".to_owned())
+}
+
+struct Batch {
+    batch_id: String,
+    last_id: i64,
+    rows: Vec<(i64, String)>,
+}
+
+fn now_utc() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+fn dead_letter(conn: &Connection, id: i64, status: Option<u16>, error: &str) -> StoreResult<()> {
+    conn.execute(
+            "insert into collector_upload_dead_letters(outbox_id, record_key, record_json, created_at_utc, failed_at_utc, http_status, error)
+             select id, record_key, record_json, created_at_utc, ?, ?, ? from collector_upload_outbox where id = ?",
+            params![now_utc(), status, error, id],
+        )?;
+    conn.execute("delete from collector_upload_outbox where id = ?", [id])?;
+    conn.execute(
+            "update collector_hub_state set inflight_batch_id = null, inflight_last_id = null where id = 1",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Returns the persisted in-flight batch, or builds and persists the next one.
+/// `isolate_until` sends records one at a time so a rejected batch reveals
+/// which record is refused.
+fn next_batch(
+    conn: &Connection,
+    machine: &str,
+    sequence: i64,
+    isolate_until: Option<i64>,
+    dead_lettered: &mut usize,
+) -> StoreResult<Option<Batch>> {
+    let inflight: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "select inflight_batch_id, inflight_last_id from collector_hub_state where id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((Some(batch_id), Some(last_id))) = inflight {
+        let mut statement = conn.prepare(
+            "select id, record_json from collector_upload_outbox where id <= ? order by id",
+        )?;
+        let rows = statement
+            .query_map([last_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Some(Batch {
+            batch_id,
+            last_id,
+            rows,
+        }));
+    }
+    loop {
+        let mut rows: Vec<(i64, String)> = Vec::new();
+        let mut bytes = 0usize;
+        let mut oversized = None;
+        {
+            let mut statement = conn.prepare(
+                "select id, length(record_json) from collector_upload_outbox order by id limit ?",
+            )?;
+            let limit = if isolate_until.is_some() {
+                1
+            } else {
+                MAX_RECORDS as i64
+            };
+            let candidates = statement
+                .query_map([limit], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (id, size) in candidates {
+                let size = usize::try_from(size).unwrap_or(usize::MAX);
+                if size > MAX_BATCH_BYTES {
+                    if rows.is_empty() {
+                        oversized = Some(id);
+                    }
+                    break;
+                }
+                if bytes + size > MAX_BATCH_BYTES {
+                    break;
+                }
+                bytes += size;
+                let json: String = conn.query_row(
+                    "select record_json from collector_upload_outbox where id = ?",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                rows.push((id, json));
+            }
+        }
+        if let Some(id) = oversized {
+            dead_letter(
+                conn,
+                id,
+                None,
+                "record exceeds the hub upload size limit and was not sent",
+            )?;
+            *dead_lettered += 1;
+            continue;
+        }
+        let Some(&(last_id, _)) = rows.last() else {
+            return Ok(None);
+        };
+        let batch_id = format!("{machine}:{sequence}:{last_id}");
+        conn.execute(
+            "update collector_hub_state set inflight_batch_id = ?, inflight_last_id = ? where id = 1",
+            params![batch_id, last_id],
+        )?;
+        return Ok(Some(Batch {
+            batch_id,
+            last_id,
+            rows,
+        }));
+    }
+}
+
+fn batch_body(sequence: i64, batch: &Batch) -> String {
+    let mut body = String::with_capacity(
+        batch
+            .rows
+            .iter()
+            .map(|(_, json)| json.len() + 1)
+            .sum::<usize>()
+            + 256,
+    );
+    body.push_str(&format!(
+        "{{\"protocol\":{HUB_PROTOCOL_VERSION},\"sequence\":{sequence},\"batch_id\":{},\"records\":[",
+        serde_json::to_string(&batch.batch_id).expect("string serialization cannot fail")
+    ));
+    for (index, (_, json)) in batch.rows.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(json);
+    }
+    body.push_str("]}");
+    body
+}
+
+/// Records are sent in batches of up to the hub's record limit. A batch is
+/// persisted before sending; a lost acknowledgment retries the same sequence
+/// and batch ID and the hub answers with a duplicate acknowledgment. A record
+/// the hub permanently rejects moves to the dead-letter table; transient
+/// failures leave the queue untouched for the next run.
+pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<SyncReport, String> {
+    let url = validate_url(url)?;
+    if token.trim().is_empty() {
+        return Err("hub credential is missing".to_owned());
+    }
+    let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
+    let machine = local_machine(&store)?;
+    let mut sequence = enable(&store, &url, &machine)?;
+    let agent = agent();
+    let verified = verify(&agent, &url, token, &machine)?;
+    let mut report = SyncReport {
+        sent: 0,
+        batches: 0,
+        dead_lettered: 0,
+        pending: 0,
+        last_sequence: sequence,
+    };
+    let mut isolate_until: Option<i64> = None;
+    let conn = &store.conn;
+    while report.batches < MAX_BATCHES_PER_RUN {
+        if isolate_until.is_some_and(|last| {
+            conn.query_row(
+                "select coalesce(min(id), 0) from collector_upload_outbox",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get::<_, i64>(0),
             )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let Some((id, record_json)) = next else {
+            .map_or(true, |first| first == 0 || first > last)
+        }) {
+            isolate_until = None;
+        }
+        begin_write(conn).map_err(|error| error.to_string())?;
+        let mut dead = 0;
+        let batch = next_batch(
+            conn,
+            &verified.machine,
+            sequence + 1,
+            isolate_until,
+            &mut dead,
+        );
+        let batch = finish(conn, batch).map_err(|error| error.to_string())?;
+        report.dead_lettered += dead;
+        let Some(batch) = batch else {
             break;
         };
-        let record: Value = serde_json::from_str(&record_json)
-            .map_err(|error| format!("queued record {id} is malformed: {error}"))?;
-        let batch_id = format!("{machine}:{id}");
         let expected = sequence + 1;
-        let payload = json!({
-            "protocol": HUB_PROTOCOL_VERSION,
-            "sequence": expected,
-            "batch_id": batch_id,
-            "records": [record]
-        });
         let mut response = agent
             .post(format!("{url}/v1/ingest"))
             .header("Authorization", format!("Bearer {token}"))
-            .send_json(&payload)
-            .map_err(|error| format!("hub upload failed; local record remains queued: {error}"))?;
+            .header("Content-Type", "application/json")
+            .send(batch_body(expected, &batch))
+            .map_err(|error| format!("hub upload failed; local records remain queued: {error}"))?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            let (code, message) = error_text(&mut response, token);
+            if code == "sequence_conflict" {
+                return Err(format!(
+                    "hub rejected upload sequence {expected}: {message}. Local records remain queued; run `hub resync` to continue from the hub's last accepted sequence"
+                ));
+            }
+            let permanent = code == "record_rejected"
+                || (matches!(status, 400 | 409 | 413) && code != "protocol");
+            if !permanent {
+                return Err(format!(
+                    "hub upload failed (HTTP {status}): {message}. Local records remain queued"
+                ));
+            }
+            // The hub applies a batch atomically, so nothing was stored.
+            if batch.rows.len() == 1 {
+                begin_write(conn).map_err(|error| error.to_string())?;
+                let result = dead_letter(conn, batch.rows[0].0, Some(status), &message);
+                finish(conn, result).map_err(|error| error.to_string())?;
+                report.dead_lettered += 1;
+            } else {
+                conn.execute(
+                    "update collector_hub_state set inflight_batch_id = null, inflight_last_id = null where id = 1",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+                isolate_until = Some(batch.last_id);
+            }
+            report.batches += 1;
+            continue;
+        }
         let ack: Value = response.body_mut().read_json().map_err(|_| {
-            "hub returned an invalid acknowledgment; local record remains queued".to_owned()
+            "hub returned an invalid acknowledgment; local records remain queued".to_owned()
         })?;
         if ack["protocol"] != HUB_PROTOCOL_VERSION
             || ack["sequence"] != expected
-            || ack["batch_id"] != batch_id
+            || ack["batch_id"] != batch.batch_id.as_str()
         {
-            return Err("hub acknowledgment does not match the queued record".to_owned());
+            return Err("hub acknowledgment does not match the queued batch".to_owned());
         }
-        begin_write(&store.conn).map_err(|error| error.to_string())?;
+        begin_write(conn).map_err(|error| error.to_string())?;
         let result = (|| -> StoreResult<()> {
-            store
-                .conn
-                .execute("delete from collector_upload_outbox where id = ?", [id])?;
-            store.conn.execute(
-                "update collector_hub_state set last_sequence = ? where id = 1",
+            conn.execute(
+                "delete from collector_upload_outbox where id <= ?",
+                [batch.last_id],
+            )?;
+            conn.execute(
+                "update collector_hub_state set last_sequence = ?, inflight_batch_id = null, inflight_last_id = null where id = 1",
                 [expected],
             )?;
             Ok(())
         })();
-        finish(&store.conn, result).map_err(|error| error.to_string())?;
+        finish(conn, result).map_err(|error| error.to_string())?;
         sequence = expected;
-        sent += 1;
+        report.sent += batch.rows.len();
+        report.batches += 1;
     }
-    Ok(SyncReport {
-        sent,
+    report.pending = pending(conn).map_err(|error| error.to_string())?;
+    report.last_sequence = sequence;
+    Ok(report)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResyncReport {
+    pub previous_sequence: i64,
+    pub last_sequence: i64,
+    pub pending: i64,
+}
+
+/// Re-bases the local sequence on the hub's last accepted sequence, for
+/// example after restoring an older local database or hub backup. Queued
+/// records stay queued and are delivered after the hub's high-water mark;
+/// the hub applies source revisions idempotently. Change tracking is reset so
+/// that the next scan reports every status and thread name again.
+pub fn resync(
+    db_path: &Path,
+    mode: OwnerMode,
+    url: &str,
+    token: &str,
+) -> Result<ResyncReport, String> {
+    let url = validate_url(url)?;
+    if token.trim().is_empty() {
+        return Err("hub credential is missing".to_owned());
+    }
+    let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
+    let machine = local_machine(&store)?;
+    let previous = enable(&store, &url, &machine)?;
+    let verified = verify(&agent(), &url, token, &machine)?;
+    begin_write(&store.conn).map_err(|error| error.to_string())?;
+    let result = (|| -> StoreResult<()> {
+        store.conn.execute(
+            "update collector_hub_state set last_sequence = ?, inflight_batch_id = null, inflight_last_id = null where id = 1",
+            [verified.high_water],
+        )?;
+        store
+            .conn
+            .execute("delete from collector_hub_record_state", [])?;
+        Ok(())
+    })();
+    finish(&store.conn, result).map_err(|error| error.to_string())?;
+    Ok(ResyncReport {
+        previous_sequence: previous,
+        last_sequence: verified.high_water,
         pending: pending(&store.conn).map_err(|error| error.to_string())?,
-        last_sequence: sequence,
     })
 }
 

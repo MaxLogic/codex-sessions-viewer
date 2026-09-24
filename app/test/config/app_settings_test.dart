@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:toml/toml.dart';
 
 void main() {
   test('session pane split fraction round trips through settings', () {
@@ -395,4 +396,55 @@ prompt = '0.5'
     expect(settings.pricing.overrides['local/model']?.completion, '0');
     expect(settings.pricing.overrides, contains('openai/gpt-5.5-thinking'));
   });
+
+  test('packaged sample refreshes public prices in six-hour UTC slots', () {
+    final sample = File('../settings.sample.toml').readAsStringSync();
+    final settings = AppSettings.fromTomlMap(
+      TomlDocument.parse(sample).toMap(),
+    );
+    expect(settings.pricing.useExternalPricing, isTrue);
+    expect(settings.pricing.automaticRefreshEnabled, isTrue);
+    expect(settings.pricing.refreshIntervalHours, 6);
+    expect(settings.pricing.refreshUtcSlots, isTrue);
+    // Public catalog only: no provider key and no hub credential.
+    expect(settings.pricing.openRouter.apiKey, isEmpty);
+    expect(sample, isNot(contains('hub_token')));
+    expect(sample, isNot(contains('hub_url')));
+    expect(settings.hub, const HubSettings());
+  });
+
+  test(
+    'one hub setting: legacy pricing hub URL migrates and no token is kept',
+    () async {
+      final legacy = AppSettings.fromTomlMap({
+        'pricing': {
+          'hub_url': 'https://hub.example.test/base',
+          'hub_token': 'legacy-machine-secret',
+          'hub_machine_id': 'laptop-1',
+        },
+      });
+      expect(legacy.hub.url, 'https://hub.example.test/base');
+      final encoded = legacy.toTomlMap();
+      final pricing = encoded['pricing'] as Map;
+      expect(pricing.keys, isNot(contains('hub_url')));
+      expect(pricing.keys, isNot(contains('hub_token')));
+      expect(pricing.keys, isNot(contains('hub_machine_id')));
+      expect((encoded['hub'] as Map)['url'], 'https://hub.example.test/base');
+      // An explicit [hub] URL wins over the legacy key.
+      expect(
+        AppSettings.fromTomlMap({
+          'hub': {'url': 'https://current.example.test'},
+          'pricing': {'hub_url': 'https://legacy.example.test'},
+        }).hub.url,
+        'https://current.example.test',
+      );
+      final temp = await Directory.systemTemp.createTemp('hub_settings_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.toml');
+      await SettingsRepository(file).save(legacy);
+      final saved = await file.readAsString();
+      expect(saved, isNot(contains('legacy-machine-secret')));
+      expect(saved, contains('https://hub.example.test/base'));
+    },
+  );
 }
