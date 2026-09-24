@@ -490,8 +490,24 @@ fn setup(harness: &str, o: &Options) -> Result<Value, String> {
     } else {
         None
     };
+    // An applied setup also deletes its own old configuration backups.
+    let pruned = if o.apply {
+        let days = crate::settings::default_settings_file()
+            .and_then(|path| crate::settings::CollectorSettings::load(&path).ok())
+            .map_or(
+                crate::backup_retention::DEFAULT_RETENTION_DAYS,
+                |settings| settings.backup_retention_days,
+            );
+        crate::backup_retention::prune_config_backups(
+            &o.config,
+            crate::backup_retention::retention(days),
+            SystemTime::now(),
+        )
+    } else {
+        crate::backup_retention::PruneOutcome::default()
+    };
     Ok(
-        json!({"command":"setup","harness":harness,"ok":true,"detected":detected,"roots":roots,"config":o.config,"changed":changed,"applied":o.apply,"backup":backup,"hook_state_before":plan.state.name(),"planned_sha256":crate::dart::sha256_hex(plan.contents.as_bytes()),"hook_command":args,"preserves_existing_hook":plan.preserves_previous,"notice":"Preview contains the managed command only; existing notify arguments and unrelated configuration are never printed. Rerun with --apply to write this plan."}),
+        json!({"command":"setup","harness":harness,"ok":true,"detected":detected,"roots":roots,"config":o.config,"changed":changed,"applied":o.apply,"backup":backup,"pruned_backups":pruned.deleted,"backup_prune_failures":pruned.failed,"hook_state_before":plan.state.name(),"planned_sha256":crate::dart::sha256_hex(plan.contents.as_bytes()),"hook_command":args,"preserves_existing_hook":plan.preserves_previous,"notice":"Preview contains the managed command only; existing notify arguments and unrelated configuration are never printed. Rerun with --apply to write this plan."}),
     )
 }
 

@@ -71,6 +71,12 @@ pub struct RepairReport {
     pub categories: BTreeMap<&'static str, usize>,
     /// The verified pre-repair backup's file name, when rows were deleted.
     pub backup_file: Option<String>,
+    /// Backups of the completed repair deleted after the retention period.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pruned_backups: Vec<crate::backup_retention::PrunedBackup>,
+    /// Old backups that could not be deleted (for example, still open).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prune_failures: Vec<String>,
 }
 
 impl RepairReport {
@@ -81,6 +87,8 @@ impl RepairReport {
             deleted_rows: 0,
             categories: audit.map(Audit::category_counts).unwrap_or_default(),
             backup_file: None,
+            pruned_backups: Vec::new(),
+            prune_failures: Vec::new(),
         }
     }
 
@@ -243,9 +251,7 @@ fn repair(
             None,
         ));
     }
-    let backup_directory = database
-        .parent()
-        .map_or_else(|| PathBuf::from("backups"), |parent| parent.join("backups"));
+    let backup_directory = backup_directory(database);
     // Backups of this repair version exist only while it is not completed
     // when an earlier attempt was stopped (or crashed) before discarding its
     // copy. Completed repairs keep theirs: this branch never sees them.
@@ -562,7 +568,16 @@ fn write_manifest(
     Ok(())
 }
 
-fn backup_prefix(database: &Path) -> String {
+/// The `backups` folder beside the database.
+pub fn backup_directory(database: &Path) -> PathBuf {
+    database
+        .parent()
+        .map_or_else(|| PathBuf::from("backups"), |parent| parent.join("backups"))
+}
+
+/// `{database stem}.pre-session-cache-repair-v3.`; the backup name adds the
+/// audit ID (`repair-3-{micros}-{sequence}`) and `.sqlite`.
+pub fn backup_prefix(database: &Path) -> String {
     let stem = database.file_stem().map_or_else(
         || "database".to_owned(),
         |stem| stem.to_string_lossy().into_owned(),

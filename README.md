@@ -133,6 +133,26 @@ Observation time is the actual download time, so history is never backdated.
 Keep the OpenRouter API key in local private configuration. Do not commit real
 keys.
 
+Database backups:
+
+```toml
+[database]
+backup_retention_days = 7
+```
+
+Before a schema migration or the legacy session cache repair, the viewer and
+the collector copy the database to `backups\` beside it
+(`%APPDATA%\CodexSessionViewer\backups`). These copies are deleted once they
+are older than `backup_retention_days` (1 to 3650, default 7), together with
+their `-wal`, `-shm` and `-journal` files. A backup that an unfinished
+migration or repair still needs is kept whatever its age, and files that do
+not match a backup name are never touched. The viewer checks once a day after
+startup finishes and deletes its own `usage-pre16-*` and legacy v1/v2 repair
+copies; the collector deletes its v3 repair copies after a scan and its old
+setup `*.collector-backup` files after `setup --apply`. Each deletion is
+logged with its path and size; a copy that is still open is retried later.
+There is no "keep forever" value; use 3650, or copy a backup elsewhere.
+
 ## Local Evals And Context Search
 
 Use Sessions to mark a local session as eval-ready. Select a session, use the

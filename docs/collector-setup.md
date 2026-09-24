@@ -54,8 +54,10 @@ Relative roots and database paths are resolved before hook registration.
   the collector wrapped itself are unwrapped.
 - Before replacing an existing file, setup keeps the previous version beside it
   as `<name>.<UTC time>.collector-backup` and reports that path as `backup`.
-  The backup can contain the same secrets as the configuration. Delete it once
-  the new configuration works.
+  The backup can contain the same secrets as the configuration. Each
+  `setup --apply` deletes this configuration's own `*.collector-backup` files
+  older than `[database] backup_retention_days` (7 days by default) from the
+  `settings.toml` beside the collector; other files are never touched.
 - Files are staged and replaced atomically. Existing Windows file ACLs are
   preserved with `ReplaceFileW`, which also gives the backup the original ACL.
   A UTF-8 byte order mark is accepted and kept. Malformed configurations and

@@ -5,9 +5,11 @@ import 'dart:isolate';
 import 'package:flutter/foundation.dart';
 
 import '../config/app_settings.dart';
+import '../logging/structured_logger.dart';
 import '../pricing/pricing_repository.dart';
 import '../pricing/hub_price_history.dart';
 import '../usage/usage_cost_projection.dart';
+import 'backup_retention.dart';
 import 'database_connection.dart';
 import 'database_maintenance.dart';
 import 'maintenance_job.dart';
@@ -38,6 +40,11 @@ class ApplicationMaintenance extends ChangeNotifier {
   /// The last hub price sync problem in this session; also persisted as the
   /// price schedule's fixed-text warning for Settings.
   String? hubPriceSyncError;
+
+  /// Set when an old backup could not be deleted (for example, a file still
+  /// open elsewhere); the details are in the logs. Retried the next day.
+  String? backupRetentionWarning;
+  DateTime? _lastBackupRetention;
 
   AppSettings? _settings;
   List<MaintenanceScheduleRecord> schedules = const [];
@@ -138,6 +145,7 @@ class ApplicationMaintenance extends ChangeNotifier {
     try {
       errorMessage = null;
       _readStatus();
+      await _pruneBackups();
       await _reprice();
       if (_manualPricing || _due('openrouter_price_refresh')) {
         final manual = _manualPricing;
@@ -160,6 +168,65 @@ class ApplicationMaintenance extends ChangeNotifier {
         state: DatabaseMaintenanceState.failed,
       );
     }
+  }
+
+  /// Deletes the viewer's own old backups once a day. It runs only here,
+  /// after the startup gate released normal database access, so it never
+  /// races a startup migration; unfinished migrations keep their backups.
+  Future<void> _pruneBackups() async {
+    final settings = _settings;
+    final now = clock().toUtc();
+    final last = _lastBackupRetention;
+    if (_stopped ||
+        settings == null ||
+        (last != null && now.difference(last) < const Duration(days: 1))) {
+      return;
+    }
+    _lastBackupRetention = now;
+    try {
+      await coordinator.runWriter(() async {
+        if (_stopped) return;
+        final db = openFileBackedDatabase(databaseFile);
+        try {
+          final result = ViewerBackupRetention(
+            databaseFile: databaseFile,
+            retention: Duration(days: settings.database.backupRetentionDays),
+            clock: clock,
+          ).prune(db);
+          backupRetentionWarning = result.failed.isEmpty
+              ? null
+              : 'An old database backup could not be deleted; it will be retried tomorrow.';
+          final logger = StructuredLogger(db: db, settings: settings.logging);
+          for (final entry in result.deleted) {
+            await logger.writeBestEffort(
+              LogEntryDraft(
+                level: LogLevel.info,
+                category: LogCategory.database,
+                message: 'Deleted an old database backup.',
+                details: {'path': entry.path, 'bytes': entry.bytes},
+              ),
+            );
+          }
+          for (final path in result.failed) {
+            await logger.writeBestEffort(
+              LogEntryDraft(
+                level: LogLevel.warning,
+                category: LogCategory.database,
+                message:
+                    'An old database backup could not be deleted; it may be open in another program.',
+                details: {'path': path},
+              ),
+            );
+          }
+        } finally {
+          db.close();
+        }
+      }, priority: DatabaseWriterPriority.optimize);
+    } on Object {
+      backupRetentionWarning =
+          'Old database backups could not be checked; retried tomorrow.';
+    }
+    if (!_disposed) notifyListeners();
   }
 
   void _report(

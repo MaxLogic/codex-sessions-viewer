@@ -4,7 +4,7 @@
 //! (ownership, schema version, or a pending viewer migration).
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
 use serde_json::json;
@@ -488,7 +488,7 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     let settings = load_settings(options)?;
     let store = open_store(options)?;
     let scan = scan_options(options, &settings, configured_roots(&settings));
-    let report = scan_transport(options, out, |cancel, progress, gate| {
+    let mut report = scan_transport(options, out, |cancel, progress, gate| {
         codex::collect_coordinated(
             &store,
             &scan,
@@ -502,6 +502,17 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
             },
         )
     })?;
+    // After the repair, delete its backups once they are past the retention.
+    if let Some(repair) = report.cache_repair.as_mut() {
+        let pruned = crate::backup_retention::prune_repair_backups(
+            &store.conn,
+            Path::new(&store.path),
+            crate::backup_retention::retention(settings.backup_retention_days),
+            std::time::SystemTime::now(),
+        );
+        repair.pruned_backups = pruned.deleted;
+        repair.prune_failures = pruned.failed;
+    }
     print_report(out, "codex scan", &store, &report, options.json)
 }
 

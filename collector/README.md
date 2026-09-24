@@ -97,8 +97,11 @@ stored sessions that have none, and, after a scan that reached every configured
 Codex home without errors, runs the one-time legacy cache repair
 (`session_cache_repair.v3`): a content-free audit in
 `session_cache_repair_manifest`, a verified backup in `backups\` next to the
-database, then deletion of allowlisted legacy placeholder rows only. The viewer
-only reads sessions and logs the repair report.
+database, then deletion of allowlisted legacy placeholder rows only. Once the
+repair is completed, each scan deletes its backups older than
+`[database] backup_retention_days` (7 days by default) and reports them in
+`cache_repair.pruned_backups`. The viewer only reads sessions and logs the
+repair report.
 
 Writers coordinate through SQLite: WAL journaling, short `BEGIN IMMEDIATE`
 transactions, and a 30 second busy timeout. The viewer, several collectors,
