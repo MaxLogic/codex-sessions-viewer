@@ -563,6 +563,15 @@ void main() {
       Tristate.isTrue,
     );
     expect(message.label, contains('Prompt body'));
+    // Selectable cards, not buttons: a button role would hide the card's own
+    // controls from screen readers.
+    expect(message.flagsCollection.isButton, isFalse);
+    expect(message.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
+    expect(
+      find.bySemanticsLabel('Expand message 2'),
+      findsWidgets,
+      reason: 'Nested card controls stay separate nodes.',
+    );
     expect(
       find.bySemanticsLabel(
         'Tool output collapsed, 3 lines. Use the Expand tool output button to show it.',

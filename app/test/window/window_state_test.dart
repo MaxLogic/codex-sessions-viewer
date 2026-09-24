@@ -265,7 +265,12 @@ void main() {
 
     expect(manager.positions.single, const Offset(80, 80));
     expect(manager.sizes.single, const Size(1200, 700));
-    expect(manager.maximizeCount, 1);
+    expect(
+      manager.maximizeCount,
+      0,
+      reason: 'A window saved in its normal state must reopen restored.',
+    );
+    expect(manager.listenerAdded, isTrue);
   });
 
   test('restore fallback keeps oversized windows inside the display', () async {

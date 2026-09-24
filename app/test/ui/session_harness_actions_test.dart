@@ -6,6 +6,7 @@ import 'package:codex_sessions_viewer/src/export/session_list_exporter.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/context_search_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
+import 'package:codex_sessions_viewer/src/ui/widgets/menu_header_entry.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
@@ -92,7 +93,7 @@ void main() {
           await tester.pumpAndSettle();
           expect(
             find.widgetWithText(
-              PopupMenuItem<SessionRowAction>,
+              MenuHeaderEntry<SessionRowAction>,
               harness == 'claude' ? 'Claude Code' : 'Codex',
             ),
             findsOneWidget,
@@ -110,7 +111,7 @@ void main() {
         }
         expect(actions.map((r) => r.payload), [
           'codex resume same-id',
-          'claude --resume same-id',
+          r'pushd "C:\project" && claude --resume same-id',
         ]);
 
         final filter = find.bySemanticsLabel('Harness filter');
@@ -120,7 +121,10 @@ void main() {
         await tester.tap(filter);
         await tester.pumpAndSettle();
         await tester.tap(
-          find.widgetWithText(CheckedPopupMenuItem<int>, 'Claude Code'),
+          find.descendant(
+            of: find.byWidgetPredicate((w) => w is CheckedPopupMenuItem),
+            matching: find.text('Claude Code'),
+          ),
         );
         await tester.pumpAndSettle();
         expect(
@@ -138,7 +142,10 @@ void main() {
         await tester.tap(filter);
         await tester.pumpAndSettle();
         await tester.tap(
-          find.widgetWithText(CheckedPopupMenuItem<int>, 'All harnesses'),
+          find.descendant(
+            of: find.byWidgetPredicate((w) => w is CheckedPopupMenuItem),
+            matching: find.text('All harnesses'),
+          ),
         );
         await tester.pumpAndSettle();
         expect(
@@ -231,7 +238,12 @@ void main() {
             harness: 'claude',
           ),
         );
-        expect(result.plainResumeCommand, 'claude --resume same-id');
+        expect(
+          result.plainResumeCommand,
+          platform == ResumeSessionSourceType.wsl
+              ? "cd '/home/test/project' && claude --resume same-id"
+              : r'pushd "C:\project" && claude --resume same-id',
+        );
         expect(result.platformResumeCommand, contains('claude'));
         expect(result.terminalLaunchCommand, contains('claude'));
         expect(result.plainForkCommand, isNull);

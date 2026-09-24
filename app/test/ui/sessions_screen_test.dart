@@ -30,7 +30,12 @@ void main() {
     ) async {
       await tester.tap(find.bySemanticsLabel('$filter filter'));
       await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(CheckedPopupMenuItem<int>, option));
+      await tester.tap(
+        find.descendant(
+          of: find.byWidgetPredicate((w) => w is CheckedPopupMenuItem),
+          matching: find.text(option),
+        ),
+      );
       await tester.pumpAndSettle();
       final control = tester.widget<Semantics>(
         find.bySemanticsLabel('$filter filter'),
