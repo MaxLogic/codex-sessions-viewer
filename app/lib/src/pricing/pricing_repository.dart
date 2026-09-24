@@ -399,6 +399,7 @@ class PricingRepository {
     required DateTime startedAtUtc,
     required DateTime observedAtUtc,
     String origin = 'local',
+    int refreshIntervalHours = 6,
   }) {
     response.validateComplete();
     db.execute('begin immediate');
@@ -419,42 +420,26 @@ class PricingRepository {
       }
       final observations = PriceObservationStore(db);
       if (observations.available) {
-        for (final model in response.models) {
-          observations.insert(
-            PriceObservation(
-              origin: origin,
-              authority: 'local',
-              observedAtUtc: observedAtUtc,
-              provider: model.provider,
-              modelId: model.modelId,
-              model: _modelObservationJson(model),
-            ),
-          );
-        }
-        if (response.declaredTotalCount != null) {
-          final present = response.models.map((model) => model.modelId).toSet();
-          for (final row in db.select(
-            "select model_id, provider from model_price_periods where source = 'openrouter' and valid_to_utc = ?",
-            [_priceTimestamp(observedAtUtc)],
-          )) {
-            if (!present.contains(row['model_id'])) {
-              observations.insert(
-                _removedPriceObservation(
-                  row['model_id'] as String,
-                  row['provider'] as String,
-                  observedAtUtc,
-                  origin,
-                ),
-              );
-            }
-          }
-        }
+        final confirmed = _recordLocalObservations(
+          observations,
+          response,
+          observedAtUtc.toUtc(),
+          origin,
+          refreshIntervalHours,
+        );
         if (db
             .select(
               "select 1 from price_observations where authority = 'hub' limit 1",
             )
             .isNotEmpty) {
           _materializeCanonicalHistory();
+          // A stored copy would have been the newest winner: keep the cache
+          // as it would then be, current as of this fetch.
+          for (final model in response.models) {
+            if (confirmed.contains(model.modelId)) {
+              _upsertOpenRouterModel(model, observedAtUtc.toUtc());
+            }
+          }
         }
       }
       db.execute('commit');
@@ -462,6 +447,159 @@ class PricingRepository {
       if (!db.autocommit) db.execute('rollback');
       rethrow;
     }
+  }
+
+  /// Stores the local evidence of one complete catalog fetch and returns the
+  /// models whose unchanged price was confirmed instead of stored again.
+  ///
+  /// As on the hub (T-138), an unchanged price (same content, time excluded)
+  /// extends the confirmed coverage of this origin's latest observation while
+  /// fetches are contiguous: the previous confirmation is at most one refresh
+  /// slot old. After a missed slot the price is stored again as new evidence.
+  /// A confirmation is used only where a stored copy would not change the
+  /// canonical prices: the copy would be the newest winner, and the winner
+  /// before it has the same prices. Otherwise, for example after hub evidence
+  /// of another price, the copy is stored as before. A model that stays
+  /// absent from complete catalogs confirms its tombstone.
+  ///
+  /// Confirmations of local evidence stay on this machine: the hub protocol
+  /// carries observations only, and a confirmation never decides a winner.
+  Set<String> _recordLocalObservations(
+    PriceObservationStore store,
+    OpenRouterModelsResponse response,
+    DateTime observed,
+    String origin,
+    int refreshIntervalHours,
+  ) {
+    final fresh = [
+      for (final model in response.models)
+        PriceObservation(
+          origin: origin,
+          authority: 'local',
+          observedAtUtc: observed,
+          provider: model.provider,
+          modelId: model.modelId,
+          model: _modelObservationJson(model),
+        ),
+    ];
+    if (response.declaredTotalCount != null) {
+      final present = response.models.map((model) => model.modelId).toSet();
+      for (final row in db.select(
+        "select model_id, provider from model_price_periods where source = 'openrouter' and valid_to_utc = ?",
+        [_priceTimestamp(observed)],
+      )) {
+        if (!present.contains(row['model_id'])) {
+          fresh.add(
+            _removedPriceObservation(
+              row['model_id'] as String,
+              row['provider'] as String,
+              observed,
+              origin,
+            ),
+          );
+        }
+      }
+    }
+    if (!store.confirmationsAvailable) {
+      fresh.forEach(store.insert);
+      return const {};
+    }
+    String key(PriceObservation item) =>
+        canonicalPriceJson([item.provider, item.modelId]);
+    PriceObservation parse(Row row) => PriceObservation.fromJson(
+      jsonDecode(row['payload_json'] as String) as Map<String, dynamic>,
+    );
+    // SQLite returns the bare columns of the row holding the maximum.
+    final prior = <String, PriceObservation>{};
+    for (final row in db.select(
+      '''select payload_json, max(observed_at_utc) from price_observations
+      where authority = 'local' and origin = ? group by provider, model_id''',
+      [origin],
+    )) {
+      final item = parse(row);
+      prior[key(item)] = item;
+    }
+    final latest = {
+      for (final row in db.select(
+        '''select provider, model_id, max(observed_at_utc) latest,
+          max(authority = 'hub') has_hub
+        from price_observations group by provider, model_id''',
+      ))
+        canonicalPriceJson([row['provider'], row['model_id']]): row,
+    };
+    final confirmations = store.readConfirmations();
+    final keys = fresh.map(key).toSet();
+    final absent = [
+      if (response.declaredTotalCount != null)
+        for (final item in prior.values)
+          if (item.model['removed'] == true && !keys.contains(key(item)))
+            _removedPriceObservation(
+              item.modelId,
+              item.provider,
+              observed,
+              origin,
+            ),
+    ];
+    int slot(DateTime at) =>
+        at.millisecondsSinceEpoch ~/ (refreshIntervalHours * 3600000);
+
+    // True when storing [item] would leave the canonical prices unchanged.
+    bool redundant(PriceObservation item) {
+      final state = latest[key(item)];
+      if (state == null) return false;
+      // Without hub evidence nothing is superseded and the newest instant
+      // decides; hub coverage needs the model's whole history.
+      final hub = state['has_hub'] == 1;
+      final existing = db
+          .select(
+            'select payload_json from price_observations where provider = ? and model_id = ?'
+            '${hub ? '' : ' and observed_at_utc = ?'}',
+            [item.provider, item.modelId, if (!hub) state['latest']],
+          )
+          .map(parse)
+          .toList();
+      if (existing.any((o) => !o.observedAtUtc.isBefore(item.observedAtUtc))) {
+        return false;
+      }
+      final winners = CanonicalPriceHistory([
+        ...existing,
+        item,
+      ], confirmations: confirmations).winners;
+      return winners.length >= 2 &&
+          winners.last.fingerprint == item.fingerprint &&
+          _effectivePrices(winners[winners.length - 2]) ==
+              _effectivePrices(item);
+    }
+
+    final confirmed = <String>{};
+    for (final item in [...fresh, ...absent]) {
+      final previous = prior[key(item)];
+      if (previous == null ||
+          !previous.observedAtUtc.isBefore(item.observedAtUtc) ||
+          canonicalPriceJson(previous.model) !=
+              canonicalPriceJson(item.model)) {
+        // New or changed evidence (a still-absent model always matches its
+        // tombstone).
+        store.insert(item);
+        continue;
+      }
+      final contiguous =
+          slot(item.observedAtUtc) -
+              slot(
+                confirmations[previous.fingerprint] ?? previous.observedAtUtc,
+              ) <=
+          1;
+      final unchanged = redundant(item);
+      if (contiguous && unchanged) {
+        store.confirm(previous.fingerprint, observed);
+        confirmed.add(item.modelId);
+      } else if (!absent.contains(item) || unchanged) {
+        // A still-absent model's tombstone is stored again only after a
+        // missed slot, and only where it cannot change the prices.
+        store.insert(item);
+      }
+    }
+    return confirmed;
   }
 
   void recordCatalogFailure({
@@ -748,11 +886,7 @@ class PricingRepository {
       final effective = <PriceObservation>[];
       String? lastPrices;
       for (final item in entry.value) {
-        final prices = priceFingerprint({
-          'pricing': item.model['pricing'],
-          'canonical_slug': item.model['canonical_slug'],
-          'removed': item.model['removed'] == true,
-        });
+        final prices = _effectivePrices(item);
         if (prices != lastPrices) effective.add(item);
         lastPrices = prices;
       }
@@ -875,7 +1009,12 @@ class PricingRepository {
         ),
       );
       final observed = (observationTimeOverride ?? DateTime.now()).toUtc();
-      applyCatalog(response, startedAtUtc: now, observedAtUtc: observed);
+      applyCatalog(
+        response,
+        startedAtUtc: now,
+        observedAtUtc: observed,
+        refreshIntervalHours: settings.refreshIntervalHours,
+      );
     } on Object {
       try {
         recordCatalogFailure(
@@ -2052,6 +2191,13 @@ Map<String, dynamic> _modelObservationJson(OpenRouterModelPricing model) => {
       ],
   },
 };
+
+/// The evidence that decides materialized price periods.
+String _effectivePrices(PriceObservation item) => priceFingerprint({
+  'pricing': item.model['pricing'],
+  'canonical_slug': item.model['canonical_slug'],
+  'removed': item.model['removed'] == true,
+});
 
 PriceObservation _removedPriceObservation(
   String model,

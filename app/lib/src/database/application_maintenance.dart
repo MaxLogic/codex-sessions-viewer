@@ -419,6 +419,7 @@ class ApplicationMaintenance extends ChangeNotifier {
             started,
             observed,
             origin,
+            settings.refreshIntervalHours,
           );
           succeeded = true;
           successfulObservationAtUtc = observed;
@@ -573,6 +574,7 @@ Future<void> _applyCatalog(
   DateTime started,
   DateTime observed,
   String origin,
+  int refreshIntervalHours,
 ) => Isolate.run(() {
   final db = openFileBackedDatabase(File(path));
   try {
@@ -581,6 +583,7 @@ Future<void> _applyCatalog(
       startedAtUtc: started,
       observedAtUtc: observed,
       origin: origin,
+      refreshIntervalHours: refreshIntervalHours,
     );
   } finally {
     db.close();
