@@ -31,10 +31,14 @@ Directory defaultSqlRoot() {
   return releaseSqlRoot;
 }
 
+/// The newest schema this viewer applies and the collector writes
+/// (`SUPPORTED_SCHEMA_VERSION` in `collector/src/store/schema.rs`).
+const latestSchemaVersion = 25;
+
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
-    this.supportedSchemaVersion = 23,
+    this.supportedSchemaVersion = latestSchemaVersion,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 

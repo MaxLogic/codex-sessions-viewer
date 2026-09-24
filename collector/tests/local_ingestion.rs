@@ -846,7 +846,7 @@ fn a_standalone_collector_creates_and_then_reuses_its_own_database() {
             &conn,
             "select max(version) from schema_version where success = 1"
         ),
-        23
+        codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION
     );
     assert_eq!(
         count(
@@ -1104,7 +1104,10 @@ fn the_cli_reports_usage_errors_with_exit_code_two() {
     assert_eq!(output.status.code(), Some(2));
     let output = collector().arg("version").output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("schema 23"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
+        "schema {}",
+        codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION
+    )));
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1147,7 @@ fn a_viewer_migration_started_mid_collection_stops_further_writes() {
     conn.execute_batch(
         "delete from app_metadata where key = 'usage_migration_bootstrap';
          insert into schema_version (version, filename, checksum, applied_at_utc, success)
-         values (24, '024_future.sql', 'x', 'now', 1);",
+         values (999, '999_future.sql', 'x', 'now', 1);",
     )
     .unwrap();
     let result = store.apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
@@ -1274,4 +1277,541 @@ fn source_statuses_only_touch_their_own_harness() {
         );
         assert_eq!(row["parse_status"], "parse_error");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Writer version agreement per harness
+
+fn snapshot_for(harness: &str, session_id: &str, parser_version: i64) -> contract::SessionSnapshot {
+    let mut snapshot = support::sample_snapshot(session_id);
+    snapshot.harness = harness.to_owned();
+    snapshot.session.parser_version = parser_version;
+    snapshot
+}
+
+fn apply_snapshot(
+    store: &codex_sessions_collector::store::Store,
+    snapshot: contract::SessionSnapshot,
+) -> Result<(), String> {
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            snapshot,
+        )))])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn set_metadata(conn: &Connection, key: &str, value: Option<&str>) {
+    conn.execute("delete from app_metadata where key = ?", [key])
+        .unwrap();
+    if let Some(value) = value {
+        conn.execute(
+            "insert into app_metadata(key,value,updated_at_utc) values (?,?,'now')",
+            [key, value],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn each_harness_is_gated_only_by_its_own_parser_version() {
+    use codex_sessions_collector::claude::parser::CLAUDE_PARSER_VERSION;
+    use codex_sessions_collector::codex::parser::PARSER_VERSION;
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let temp = TempDir::new("writer-version-harness");
+    let db = viewer_database(&temp);
+    let conn = open(&db);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+
+    // A viewer from another Codex parser release refuses Codex rows only.
+    set_metadata(&conn, "writer_codex_parser_version", Some("999"));
+    let refused =
+        apply_snapshot(&store, snapshot_for("codex", "codex-a", PARSER_VERSION)).unwrap_err();
+    assert!(
+        refused.contains("codex") && refused.contains("999"),
+        "{refused}"
+    );
+    apply_snapshot(
+        &store,
+        snapshot_for("claude", "claude-a", CLAUDE_PARSER_VERSION),
+    )
+    .unwrap();
+    apply_snapshot(&store, snapshot_for("example", "example-a", 7)).unwrap();
+
+    // A viewer that does not know the Claude parser refuses Claude rows only.
+    set_metadata(
+        &conn,
+        "writer_codex_parser_version",
+        Some(&PARSER_VERSION.to_string()),
+    );
+    set_metadata(&conn, "writer_claude_parser_version", None);
+    let refused = apply_snapshot(
+        &store,
+        snapshot_for("claude", "claude-b", CLAUDE_PARSER_VERSION),
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("claude") && refused.contains("missing"),
+        "{refused}"
+    );
+    apply_snapshot(&store, snapshot_for("codex", "codex-b", PARSER_VERSION)).unwrap();
+
+    // Every harness's usage becomes cost rows: the cost version gates all.
+    set_metadata(
+        &conn,
+        "writer_claude_parser_version",
+        Some(&CLAUDE_PARSER_VERSION.to_string()),
+    );
+    set_metadata(&conn, "writer_usage_cost_projection_version", Some("999"));
+    for (harness, version) in [
+        ("codex", PARSER_VERSION),
+        ("claude", CLAUDE_PARSER_VERSION),
+        ("example", 7),
+    ] {
+        let refused = apply_snapshot(
+            &store,
+            snapshot_for(harness, &format!("{harness}-c"), version),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("projection") && refused.contains("999"),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        count(
+            &conn,
+            "select count(*) from sessions where session_id in ('codex-a','claude-b','codex-c','claude-c','example-c')"
+        ),
+        0
+    );
+    assert_eq!(count(&conn, "select count(*) from sessions"), 3);
+}
+
+#[test]
+fn claude_subagent_usage_is_reconciled_against_the_claude_parser_version() {
+    use codex_sessions_collector::claude::parser::CLAUDE_PARSER_VERSION;
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let temp = TempDir::new("claude-legacy-reconcile");
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    let parent = snapshot_for("claude", "claude-parent", CLAUDE_PARSER_VERSION);
+    let mut child = snapshot_for("claude", "claude-child", CLAUDE_PARSER_VERSION);
+    child.source.path = "C:\\synthetic\\claude-child.jsonl".to_owned();
+    child.session.parent_thread_id = Some("claude-parent".to_owned());
+    // The child's first event repeats the parent's history.
+    child.usage_events[0].event_fingerprint = parent.usage_events[0].event_fingerprint.clone();
+    apply_snapshot(&store, parent).unwrap();
+    apply_snapshot(&store, child).unwrap();
+    let conn = open(&db);
+    let status: String = conn
+        .query_row(
+            "select usage_projection_status from sessions where id = 'claude:session:claude-child'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "complete", "not legacy_pending");
+    let scopes = support::rows(
+        &conn,
+        "select branch_scope from usage_events where session_row_id = 'claude:session:claude-child' order by source_record_ordinal",
+    );
+    assert_eq!(
+        scopes,
+        [
+            json!({"branch_scope": "inherited"}),
+            json!({"branch_scope": "local"})
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The session change journal
+
+fn revision(conn: &Connection) -> i64 {
+    count(
+        conn,
+        "select revision from session_change_state where id = 1",
+    )
+}
+
+#[test]
+fn repricing_does_not_journal_sessions_but_token_changes_and_renames_do() {
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let temp = TempDir::new("journal-precision");
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    apply_snapshot(&store, support::sample_snapshot("journal")).unwrap();
+    let conn = open(&db);
+    let journaled = |conn: &Connection| {
+        count(
+            conn,
+            "select revision from session_changes where session_id = 'session:journal'",
+        )
+    };
+    let start = revision(&conn);
+    assert!(count(&conn, "select count(*) from usage_session_daily") > 0);
+    conn.execute(
+        "update usage_session_daily set cost_projection_version = cost_projection_version + 1,
+           updated_at_utc = 'later'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(revision(&conn), start, "a reprice is not a session change");
+
+    conn.execute(
+        "update usage_session_daily set input_tokens = input_tokens + 1, total_tokens = total_tokens + 1",
+        [],
+    )
+    .unwrap();
+    assert!(revision(&conn) > start);
+    assert_eq!(journaled(&conn), revision(&conn));
+
+    conn.execute(
+        "insert into tags (name, created_at_utc, updated_at_utc) values ('old tag', 'now', 'now')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into session_tags (session_id, tag_id, created_at_utc)
+         select 'session:journal', id, 'now' from tags where name = 'old tag'",
+        [],
+    )
+    .unwrap();
+    let before_rename = revision(&conn);
+    conn.execute(
+        "update tags set name = 'new tag' where name = 'old tag'",
+        [],
+    )
+    .unwrap();
+    assert!(revision(&conn) > before_rename);
+    assert_eq!(journaled(&conn), revision(&conn));
+    let before_color = revision(&conn);
+    conn.execute("update tags set color = 'red'", []).unwrap();
+    assert_eq!(revision(&conn), before_color);
+
+    let project: i64 = conn
+        .query_row(
+            "select coalesce(project_id, detected_project_id) from sessions where id = 'session:journal'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let before_project = revision(&conn);
+    conn.execute(
+        "update projects set name = 'renamed project' where id = ?",
+        [project],
+    )
+    .unwrap();
+    assert!(revision(&conn) > before_project);
+    assert_eq!(journaled(&conn), revision(&conn));
+}
+
+// ---------------------------------------------------------------------------
+// Session cache repair and project backfill, owned by the collector
+
+struct RepairFixture {
+    temp: TempDir,
+    home: std::path::PathBuf,
+    db: std::path::PathBuf,
+}
+
+impl RepairFixture {
+    fn new(label: &str) -> Self {
+        let temp = TempDir::new(label);
+        let home = temp.path().join(".codex");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::create_dir_all(home.join("archived_sessions")).unwrap();
+        let db = viewer_database(&temp);
+        Self { temp, home, db }
+    }
+
+    fn file(&self, relative: &str) -> String {
+        let path = self.home.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn insert(&self, id: &str, session_id: Option<&str>, path: &str, parser_version: i64) -> i64 {
+        let conn = open(&self.db);
+        conn.execute(
+            "insert into sessions (id, session_id, source_type, source_file_path, display_path,
+               platform_path, source_state, parser_version, created_at_utc, updated_at_utc)
+             values (?, ?, 'windows', ?, ?, ?, 'active', ?, '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')",
+            rusqlite::params![id, session_id, path, path, path, parser_version],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn roots(&self) -> Vec<codex_sessions_collector::codex::scanner::ScanRoot> {
+        codex_sessions_collector::codex::scanner::session_scan_roots(
+            self.home.to_str().unwrap(),
+            codex_sessions_collector::codex::parser::SourceType::Windows,
+        )
+    }
+
+    fn repair(
+        &self,
+        discovery_complete: bool,
+        cancelled: bool,
+    ) -> codex_sessions_collector::store::cache_repair::RepairReport {
+        use codex_sessions_collector::store::{OwnerMode, Store, cache_repair};
+        let store = Store::open(&self.db, OwnerMode::Viewer).unwrap();
+        cache_repair::run(
+            &store,
+            &self.roots(),
+            discovery_complete,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cancelled)),
+        )
+    }
+
+    fn ids(&self) -> Vec<String> {
+        let conn = open(&self.db);
+        let mut statement = conn.prepare("select id from sessions order by id").unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn backups(&self) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(self.temp.path().join("backups"))
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+
+    fn completed(&self) -> bool {
+        count(
+            &open(&self.db),
+            "select count(*) from app_metadata where key = 'session_cache_repair.v3.completed'",
+        ) == 1
+    }
+}
+
+#[test]
+fn cache_repair_audits_categories_and_deletes_only_allowlisted_legacy_rows() {
+    let fixture = RepairFixture::new("repair-categories");
+    let active = fixture.file("sessions/canonical.jsonl");
+    let archived = fixture.file("archived_sessions/relocated.jsonl");
+    let plugin = fixture.file("plugins/cache/artifact.json");
+    let canonical = fixture.insert("session:canonical", Some("canonical"), &active, 2);
+    let relocated = fixture.insert("session:relocated", Some("relocated"), &archived, 2);
+    let fallback = fixture.insert(&format!("source:{active}"), None, &active, 1);
+    let protected_fallback = fixture.insert(&format!("source-status:{active}"), None, &active, 1);
+    let legacy = fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    let unresolved = fixture.insert(&format!("source:{plugin}.protected"), None, &plugin, 1);
+    let conn = open(&fixture.db);
+    conn.execute(
+        "update sessions set is_pinned = 1 where rowid in (?, ?)",
+        [protected_fallback, unresolved],
+    )
+    .unwrap();
+
+    let report = fixture.repair(true, false);
+    assert_eq!(report.status, "completed");
+    assert_eq!(report.reason_code, "completed");
+    assert_eq!(report.deleted_rows, 2);
+    assert_eq!(
+        serde_json::to_value(&report.categories).unwrap(),
+        json!({"canonical": 1, "relocated": 1, "fallback_duplicate": 2,
+               "legacy_non_session_artifact": 1, "unresolved": 1})
+    );
+    let manifest = support::rows(
+        &conn,
+        "select session_rowid, category, reason_code, delete_eligible
+         from session_cache_repair_manifest order by session_rowid",
+    );
+    assert_eq!(
+        manifest,
+        [
+            json!({"session_rowid": canonical, "category": "canonical", "reason_code": "stable_active_session", "delete_eligible": 0}),
+            json!({"session_rowid": relocated, "category": "relocated", "reason_code": "stable_archived_session", "delete_eligible": 0}),
+            json!({"session_rowid": fallback, "category": "fallback_duplicate", "reason_code": "canonical_path_match_empty_legacy", "delete_eligible": 1}),
+            json!({"session_rowid": protected_fallback, "category": "fallback_duplicate", "reason_code": "canonical_path_match_requires_reconciliation", "delete_eligible": 0}),
+            json!({"session_rowid": legacy, "category": "legacy_non_session_artifact", "reason_code": "allowlisted_non_session_namespace", "delete_eligible": 1}),
+            json!({"session_rowid": unresolved, "category": "unresolved", "reason_code": "protected_viewer_metadata", "delete_eligible": 0}),
+        ]
+    );
+    // The manifest holds no paths or session content.
+    let text: String = conn
+        .query_row(
+            "select group_concat(row_fingerprint || category || reason_code) from session_cache_repair_manifest",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!text.contains(fixture.home.to_str().unwrap()) && !text.contains("canonical.jsonl"));
+
+    let ids = fixture.ids();
+    assert!(!ids.contains(&format!("source:{active}")));
+    assert!(!ids.contains(&format!("source:{plugin}")));
+    assert_eq!(ids.len(), 4);
+    assert!(fixture.completed());
+    // A verified backup holds the deleted rows.
+    let backups = fixture.backups();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        backups[0].file_name().unwrap().to_string_lossy(),
+        report.backup_file.clone().unwrap()
+    );
+    assert_eq!(
+        count(&open(&backups[0]), "select count(*) from sessions"),
+        6
+    );
+    // Deleted rows leave tombstones for viewers following the journal.
+    assert_eq!(
+        count(
+            &conn,
+            "select count(*) from session_changes where deleted = 1"
+        ),
+        2
+    );
+    assert_eq!(fixture.repair(true, false).status, "already_completed");
+}
+
+#[test]
+fn cache_repair_waits_for_complete_discovery_and_never_mutates_when_cancelled() {
+    let fixture = RepairFixture::new("repair-gates");
+    let plugin = fixture.file("plugins/legacy.json");
+    fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+
+    let report = fixture.repair(false, false);
+    assert_eq!(
+        (report.status, report.reason_code),
+        ("postponed", "root_discovery_incomplete")
+    );
+    let report = fixture.repair(true, true);
+    assert_eq!(
+        (report.status, report.reason_code),
+        ("postponed", "cancelled")
+    );
+    assert_eq!(fixture.ids().len(), 1);
+    assert!(!fixture.completed());
+    assert!(fixture.backups().is_empty());
+
+    let report = fixture.repair(true, false);
+    assert_eq!((report.status, report.deleted_rows), ("completed", 1));
+    assert!(fixture.ids().is_empty());
+}
+
+#[test]
+fn cache_repair_protects_rows_owning_content_and_completes_without_a_backup() {
+    let fixture = RepairFixture::new("repair-protects");
+    let plugin = fixture.file("plugins/owned.json");
+    let id = format!("source:{plugin}");
+    fixture.insert(&id, None, &plugin, 1);
+    open(&fixture.db)
+        .execute(
+            "insert into messages (session_id, message_index, author_type, content_preview,
+               created_at_db_utc, updated_at_db_utc)
+             values (?, 0, 'user', '', 'now', 'now')",
+            [&id],
+        )
+        .unwrap();
+    let report = fixture.repair(true, false);
+    assert_eq!(
+        (report.status, report.reason_code, report.deleted_rows),
+        ("completed", "no_changes", 0)
+    );
+    assert_eq!(fixture.ids(), [id]);
+    assert!(fixture.backups().is_empty());
+    assert_eq!(
+        count(
+            &open(&fixture.db),
+            "select count(*) from session_cache_repair_manifest where reason_code = 'owns_messages'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn scans_run_the_cache_repair_after_complete_discovery_and_report_it() {
+    let fixture = RepairFixture::new("repair-scan");
+    let plugin = fixture.file("plugins/legacy.json");
+    fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    let malformed = fixture.home.join("sessions").join("gate.jsonl");
+    std::fs::write(&malformed, "{ malformed").unwrap();
+    let scan = |fixture: &RepairFixture| -> Value {
+        let output = support::scan(&fixture.db, &fixture.home, &["--json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    // A file the scan could not parse means discovery is not complete.
+    let report = scan(&fixture);
+    assert_eq!(
+        report["cache_repair"]["reason_code"],
+        "root_discovery_incomplete"
+    );
+    assert_eq!(fixture.ids().len(), 2);
+
+    std::fs::remove_file(&malformed).unwrap();
+    // A failing repair is postponed; the scan still succeeds.
+    open(&fixture.db)
+        .execute_batch(
+            "create trigger fail_repair before insert on session_cache_repair_manifest
+             begin select raise(abort, 'injected audit failure'); end;",
+        )
+        .unwrap();
+    let report = scan(&fixture);
+    assert_eq!(report["cache_repair"]["status"], "postponed");
+    assert_eq!(
+        report["cache_repair"]["reason_code"],
+        "unexpected_repair_error"
+    );
+
+    open(&fixture.db)
+        .execute_batch("drop trigger fail_repair")
+        .unwrap();
+    let report = scan(&fixture);
+    assert_eq!(report["cache_repair"]["status"], "completed");
+    assert_eq!(report["cache_repair"]["deleted_rows"], 1);
+    assert!(fixture.completed());
+    let report = scan(&fixture);
+    assert_eq!(report["cache_repair"]["status"], "already_completed");
+}
+
+#[test]
+fn scans_backfill_projects_and_clean_placeholders_the_viewer_no_longer_writes() {
+    let temp = TempDir::new("backfill");
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let db = viewer_database(&temp);
+    let output = support::scan(&db, &home, &[]);
+    assert!(output.status.success());
+    let conn = open(&db);
+    let project: String = conn
+        .query_row("select project_name_snapshot from sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(!project.is_empty());
+    conn.execute_batch(
+        "update sessions set detected_project_id = null, project_id = null,
+           project_name_snapshot = null, project_override = 0,
+           title = '# AGENTS.md instructions', summary = 'auto';
+         update session_search set project_name = '', title = '# AGENTS.md instructions', summary = 'auto';",
+    )
+    .unwrap();
+    // The file is unchanged, so only the scan's maintenance touches the row.
+    let output = support::scan(&db, &home, &[]);
+    assert!(output.status.success());
+    let row = support::rows(
+        &conn,
+        "select s.title, s.summary, s.project_name_snapshot, s.project_override,
+           s.detected_project_id is not null as detected, f.project_name, f.title as search_title
+         from sessions s join session_search f on f.rowid = s.rowid",
+    );
+    assert_eq!(
+        row,
+        [
+            json!({"title": null, "summary": null, "project_name_snapshot": project,
+                "project_override": 0, "detected": 1, "project_name": project, "search_title": ""})
+        ]
+    );
 }

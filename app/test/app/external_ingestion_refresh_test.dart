@@ -34,22 +34,22 @@ void main() {
       );
       try {
         watcher.check();
-        expect(revisions, 1);
+        expect(revisions, 0, reason: 'The first connection is a baseline.');
         for (var i = 0; i < 4; i++) {
           writer.execute('insert into events values (?)', [i]);
         }
         watcher.check();
-        expect(revisions, 2);
+        expect(revisions, 1);
         watcher.check();
-        expect(revisions, 2);
+        expect(revisions, 1);
         watcher.disconnect();
         writer.execute('insert into events values (99)');
         watcher.check();
-        expect(revisions, 3);
+        expect(revisions, 2);
         watcher.dispose();
         writer.execute('insert into events values (100)');
         watcher.check();
-        expect(revisions, 3);
+        expect(revisions, 2);
       } finally {
         watcher.dispose();
         writer.close();
@@ -57,6 +57,131 @@ void main() {
       }
     },
   );
+
+  test(
+    'a busy database keeps the watcher connection and its baseline',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('external_busy_');
+      final file = File('${dir.path}/fixture.sqlite');
+      // A rollback-journal database: an exclusive transaction blocks readers
+      // the way restore and vacuum do.
+      final writer = sqlite3.open(file.path);
+      writer.execute('create table events (value integer)');
+      var revisions = 0;
+      final watcher = ExternalDatabaseChanges(
+        file,
+        onChange: () => revisions++,
+        busyTimeout: Duration.zero,
+      );
+      try {
+        watcher.check();
+        writer.execute('begin exclusive');
+        writer.execute('insert into events values (1)');
+        for (var i = 0; i < 3; i++) {
+          watcher.check();
+        }
+        expect(revisions, 0, reason: 'Busy polls are not changes.');
+        writer.execute('commit');
+        watcher.check();
+        expect(revisions, 1, reason: 'The commit is seen once.');
+        watcher.check();
+        expect(revisions, 1);
+      } finally {
+        watcher.dispose();
+        writer.close();
+        dir.deleteSync(recursive: true);
+      }
+    },
+  );
+
+  test('cached loads record the journal revision they read', () async {
+    final dir = Directory.systemTemp.createTempSync('external_cached_rev_');
+    final file = File('${dir.path}/viewer.sqlite');
+    final writer = sqlite3.open(file.path);
+    try {
+      _createSchema(writer);
+      _insertLive(writer);
+      writer.execute("update sessions set title = 'again' where id = 'live'");
+      final revision =
+          writer
+                  .select('select revision from session_change_state')
+                  .single['revision']
+              as int;
+      final controller = RuntimeSessionController(
+        settingsFile: File('${dir.path}/unused.toml'),
+        databaseFile: file,
+      );
+      final background = await controller.loadCachedRowsInBackground();
+      expect(background.journalRevision, revision);
+      expect(background.rows.single.title, 'again');
+      final direct = await controller.loadCachedRows();
+      expect(direct.journalRevision, revision);
+      // Nothing changed since: the follow-up read is an empty delta.
+      final delta = await controller.loadExternalRowChanges(
+        afterRevision: background.journalRevision,
+      );
+      expect(delta.reset, isFalse);
+      expect(identical(delta.merge(background.rows), background.rows), isTrue);
+    } finally {
+      writer.close();
+      dir.deleteSync(recursive: true);
+    }
+  });
+
+  testWidgets('startup loads session rows once without a second snapshot', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final dir = Directory.systemTemp.createTempSync('external_startup_');
+    final file = File('${dir.path}/viewer.sqlite');
+    final writer = sqlite3.open(file.path);
+    configureFileBackedDatabase(writer);
+    _createSchema(writer);
+    _insertLive(writer);
+    final settingsFile = File('${dir.path}/settings.toml');
+    try {
+      await tester.runAsync(() async {
+        final settings = AppSettings.defaults();
+        await SettingsRepository(settingsFile).save(settings);
+        await tester.pumpWidget(
+          CodexSessionsViewerApp(
+            databaseFile: file,
+            settingsFile: settingsFile,
+            settingsStartup: Future.value(settings),
+            sessionRefresh: () async =>
+                const SessionsRefreshResult(rows: [], statusMessage: ''),
+            usageSummaryLoader: (_, _) async => null,
+          ),
+        );
+        List<SessionRowViewModel> rows() => tester
+            .widget<SessionsScreen>(find.byType(SessionsScreen))
+            .initialRows;
+        final deadline = DateTime.now().add(const Duration(seconds: 12));
+        while ((find.byType(SessionsScreen).evaluate().isEmpty ||
+                rows().isEmpty) &&
+            DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 25));
+          await tester.pump();
+        }
+        final loaded = rows();
+        expect(loaded, hasLength(1));
+        // Longer than a watcher poll: its first connection and the
+        // post-load delta must not replace the list with a second snapshot.
+        final until = DateTime.now().add(const Duration(milliseconds: 2600));
+        while (DateTime.now().isBefore(until)) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+          await tester.pump();
+        }
+        expect(identical(rows(), loaded), isTrue);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      writer.close();
+      dir.deleteSync(recursive: true);
+    }
+  });
 
   test(
     'journal deltas read only changed sessions, coalesce, and retain tombstones',
@@ -612,4 +737,26 @@ void main() {
     },
     timeout: const Timeout(Duration(minutes: 4)),
   );
+}
+
+void _createSchema(Database db) {
+  final scripts =
+      [
+        ...Directory('../sql/init').listSync().whereType<File>(),
+        ...Directory('../sql/migration').listSync().whereType<File>(),
+      ].where((file) => file.path.endsWith('.sql')).toList()..sort(
+        (a, b) => a.uri.pathSegments.last.compareTo(b.uri.pathSegments.last),
+      );
+  for (final script in scripts) {
+    db.execute(script.readAsStringSync());
+  }
+}
+
+void _insertLive(Database db) {
+  db.execute("""
+    insert into sessions(id, session_id, source_type, source_file_path,
+      display_path, platform_path, title, started_at_utc, created_at_utc, updated_at_utc)
+    values ('live', 'live', 'windows', 'absent', 'absent', 'absent', 'before',
+      '2026-06-10T00:00:00Z', 'now', 'now')
+  """);
 }

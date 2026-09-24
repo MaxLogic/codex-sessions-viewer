@@ -14,10 +14,12 @@ import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
-import 'package:codex_sessions_viewer/src/database/session_cache_repair.dart';
+import 'package:codex_sessions_viewer/src/database/collector_versions.dart';
 import 'package:codex_sessions_viewer/src/database/usage_path_context_migration.dart';
 import 'package:codex_sessions_viewer/src/parser/codex_session_parser.dart';
+import 'package:codex_sessions_viewer/src/scanner/collector_process.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
+import 'package:codex_sessions_viewer/src/scanner/session_scanner.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
@@ -57,6 +59,238 @@ void main() {
     db.close();
   });
   tearDownAll(() async => _collectorTemplateFolder.delete(recursive: true));
+
+  group('collector transport', () {
+    test('a cancel during a grant flush is written after it', () async {
+      final collector = _ScriptedCollector(flushDelay: 120);
+      final cancellation = ScanCancellationController();
+      collector.onLine = (line) {
+        if (line == 'grant') {
+          cancellation.cancel();
+          collector.emit({'event': 'write_released'});
+        }
+        if (line == 'cancel') collector.finish(cancelled: true);
+      };
+      final process = CollectorProcess(
+        executable: 'scripted',
+        start: (_, _) async => collector..emit({'event': 'write_requested'}),
+      );
+      final result = await process.scan(
+        settingsFile: File('unused.toml'),
+        databaseFile: File('unused.sqlite'),
+        cancellation: cancellation.token,
+        write: (work) => work(),
+        onProgress: (_, _) {},
+      );
+      expect(collector.received, ['grant', 'cancel']);
+      expect(result.cancelled, isTrue);
+    });
+
+    test(
+      'stdin errors after the collector exits keep a finished scan and cleanup',
+      () async {
+        final collector = _ScriptedCollector(failClose: true);
+        final process = CollectorProcess(
+          executable: 'scripted',
+          start: (_, _) async => collector..finish(cancelled: false),
+        );
+        final result = await process.scan(
+          settingsFile: File('unused.toml'),
+          databaseFile: File('unused.sqlite'),
+          cancellation: ScanCancellationController().token,
+          write: (work) => work(),
+          onProgress: (_, _) {},
+        );
+        expect(result.cancelled, isFalse);
+        expect(collector.killed, isTrue);
+      },
+    );
+
+    test(
+      'a lease held past the watchdog stops the collector and frees the writer',
+      () async {
+        final collector = _ScriptedCollector();
+        // Grants are accepted but the collector never releases the lease.
+        final process = CollectorProcess(
+          executable: 'scripted',
+          start: (_, _) async => collector..emit({'event': 'write_requested'}),
+          leaseTimeout: const Duration(milliseconds: 150),
+        );
+        var writerReleased = false;
+        await expectLater(
+          process.scan(
+            settingsFile: File('unused.toml'),
+            databaseFile: File('unused.sqlite'),
+            cancellation: ScanCancellationController().token,
+            write: (work) async {
+              await work();
+              writerReleased = true;
+            },
+            onProgress: (_, _) {},
+          ),
+          throwsA(isA<CollectorLeaseTimeoutException>()),
+        );
+        expect(collector.received, ['grant']);
+        expect(collector.killed, isTrue);
+        expect(writerReleased, isTrue);
+      },
+    );
+
+    test('a missing collector executable fails with a clear message', () async {
+      final temp = await Directory.systemTemp.createTemp('csv_no_collector_');
+      addTearDown(() => temp.delete(recursive: true));
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(windowsCodexPath: temp.path, wslCodexUncPath: ''),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      expect(
+        (await _migrateCollectorFixture(databaseFile)).canStartNormalUi,
+        isTrue,
+      );
+      final missing = p.join(temp.path, 'codex-sessions-collector.exe');
+      Object? failure;
+      try {
+        await RuntimeSessionController(
+          settingsFile: settingsFile,
+          databaseFile: databaseFile,
+          collectorExecutable: missing,
+        ).refresh();
+      } on Object catch (error) {
+        failure = error;
+      }
+      expect(failure, isA<CollectorUnavailableException>());
+      expect(
+        failure.toString(),
+        allOf(
+          contains(missing),
+          contains('CODEX_SESSIONS_COLLECTOR_EXE'),
+          contains('Reinstall'),
+        ),
+      );
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      expect(
+        db.select('select status from scan_runs').single['status'],
+        'failed',
+      );
+    });
+
+    test(
+      'refresh collects Claude Code transcripts under the writer leases',
+      () async {
+        final temp = await Directory.systemTemp.createTemp('csv_claude_scan_');
+        addTearDown(() => temp.delete(recursive: true));
+        final codexRoot = Directory(p.join(temp.path, '.codex', 'sessions'));
+        await codexRoot.create(recursive: true);
+        await _writeJsonFixture(codexRoot, 'codex-beside-claude');
+        final claudeRoot = Directory(p.join(temp.path, 'claude-projects'));
+        await _copyTree(Directory('../samples/claude/projects'), claudeRoot);
+        final settingsFile = File(p.join(temp.path, 'settings.toml'));
+        await SettingsRepository(settingsFile).save(
+          AppSettings.defaults().copyWith(
+            paths: PathSettings(
+              windowsCodexPath: p.join(temp.path, '.codex'),
+              wslCodexUncPath: '',
+            ),
+            logging: _testLogging(temp),
+          ),
+        );
+        final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+        expect(
+          (await _migrateCollectorFixture(databaseFile)).canStartNormalUi,
+          isTrue,
+        );
+        final coordinator = DatabaseMaintenanceCoordinator(databaseFile);
+        final controller = RuntimeSessionController(
+          settingsFile: settingsFile,
+          databaseFile: databaseFile,
+          writerCoordinator: coordinator,
+          claudeProjectRoots: [claudeRoot.path],
+        );
+        final progress = <SessionsRefreshProgress>[];
+        final result = await controller.refresh(onProgress: progress.add);
+        expect(result.cancelled, isFalse);
+        expect(result.rows.map((row) => row.harness).toSet(), {
+          'codex',
+          'claude',
+        });
+        expect(result.rows.where((row) => row.harness == 'claude'), isNotEmpty);
+        expect(progress.last.statusMessage, isNotEmpty);
+
+        // A cancelled refresh does not start the Claude scan.
+        final db = openFileBackedDatabase(databaseFile);
+        addTearDown(db.close);
+        db.execute("delete from sessions where harness = 'claude'");
+        final operation = controller.startRefreshOperation();
+        await operation.cancel();
+        final cancelled = await operation.result;
+        expect(cancelled.cancelled, isTrue);
+        expect(
+          db
+              .select(
+                "select count(*) as n from sessions where harness = 'claude'",
+              )
+              .single['n'],
+          0,
+        );
+      },
+    );
+
+    test('loading cached rows never writes the database', () async {
+      final temp = await Directory.systemTemp.createTemp('csv_cached_read_');
+      addTearDown(() => temp.delete(recursive: true));
+      final sessionsRoot = Directory(p.join(temp.path, '.codex', 'sessions'));
+      await sessionsRoot.create(recursive: true);
+      await _copyFixture('sample_windows_session.json', sessionsRoot);
+      final settingsFile = File(p.join(temp.path, 'settings.toml'));
+      await SettingsRepository(settingsFile).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: p.join(temp.path, '.codex'),
+            wslCodexUncPath: '',
+          ),
+          logging: _testLogging(temp),
+        ),
+      );
+      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+      expect(
+        (await _migrateCollectorFixture(databaseFile)).canStartNormalUi,
+        isTrue,
+      );
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+      );
+      await controller.refresh();
+      final observer = openFileBackedDatabase(databaseFile);
+      addTearDown(observer.close);
+      // Rows the collector will repair on its next scan.
+      observer.execute('''
+        update sessions set detected_project_id = null, project_id = null,
+          project_name_snapshot = null, title = '# AGENTS.md instructions',
+          summary = 'auto'
+      ''');
+      int dataVersion() =>
+          observer.select('pragma data_version').single.values.single as int;
+      final before = dataVersion();
+      final cached = await controller.loadCachedRows();
+      final background = await controller.loadCachedRowsInBackground();
+      expect(dataVersion(), before, reason: 'Loads must not commit writes.');
+      expect(cached.rows.single.title, isEmpty);
+      expect(background.rows.single.project, isEmpty);
+      await controller.refresh();
+      final row = observer
+          .select('select title, summary, project_name_snapshot from sessions')
+          .single;
+      expect(row['title'], isNull);
+      expect(row['summary'], isNull);
+      expect(row['project_name_snapshot'], isNotEmpty);
+    });
+  });
   test(
     'concurrent refresh requests keep one scan owner without blocking other writers',
     () async {
@@ -462,10 +696,6 @@ void main() {
       expect(
         progressEvents.map((event) => event.statusMessage),
         contains(contains('estimated progress 100%')),
-      );
-      expect(
-        progressEvents.map((event) => event.statusMessage),
-        contains(startsWith('Maintaining session cache:')),
       );
       final spanNames = {
         for (final event in profilingEvents)
@@ -3662,78 +3892,11 @@ void main() {
     },
   );
 
-  test('cached loading backfills auto projects for older sessions', () async {
-    final temp = await Directory.systemTemp.createTemp(
-      'csv_runtime_cached_auto_project_',
-    );
-    addTearDown(() async {
-      if (await temp.exists()) {
-        await temp.delete(recursive: true);
-      }
-    });
-
-    final windowsRoot = Directory(p.join(temp.path, 'windows'));
-    final wslRoot = Directory(p.join(temp.path, 'wsl'));
-    await windowsRoot.create();
-    await wslRoot.create();
-    await _copyFixture('sample_windows_session.json', windowsRoot);
-
-    final settingsFile = File(p.join(temp.path, 'settings.toml'));
-    await SettingsRepository(settingsFile).save(
-      AppSettings.defaults().copyWith(
-        paths: PathSettings(
-          windowsCodexPath: windowsRoot.path,
-          wslCodexUncPath: wslRoot.path,
-        ),
-        logging: _testLogging(temp),
-      ),
-    );
-    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await _migrateCollectorFixture(databaseFile);
-    expect(startup.canStartNormalUi, isTrue);
-
-    final controller = RuntimeSessionController(
-      settingsFile: settingsFile,
-      databaseFile: databaseFile,
-    );
-    await controller.refresh();
-
-    final db = openFileBackedDatabase(databaseFile);
-    addTearDown(db.close);
-    db.execute('''
-      update sessions
-      set project_id = null,
-          project_name_snapshot = null,
-          project_override = 0,
-          title = '# AGENTS.md instructions for this repo',
-          summary = 'auto'
-      ''');
-    db.execute('update session_search set project_name = ?', ['']);
-    db.execute('update session_search set title = ?, summary = ?', [
-      '# AGENTS.md instructions for this repo',
-      'auto',
-    ]);
-
-    final cached = await controller.loadCachedRows();
-    expect(cached.rows.single.project, 'codex-sessions-viewer');
-    expect(cached.rows.single.title, isEmpty);
-    expect(cached.rows.single.summary, isEmpty);
-    final row = db
-        .select(
-          'select title, summary, project_name_snapshot, project_override from sessions',
-        )
-        .single;
-    expect(row['title'], isNull);
-    expect(row['summary'], isNull);
-    expect(row['project_name_snapshot'], 'codex-sessions-viewer');
-    expect(row['project_override'], 0);
-  });
-
   test(
-    'runtime batches WSL project resolution for refresh and cached backfill',
+    'rescans backfill auto projects and clean placeholders the viewer no longer writes',
     () async {
       final temp = await Directory.systemTemp.createTemp(
-        'csv_runtime_wsl_project_batch_',
+        'csv_runtime_cached_auto_project_',
       );
       addTearDown(() async {
         if (await temp.exists()) {
@@ -3745,11 +3908,7 @@ void main() {
       final wslRoot = Directory(p.join(temp.path, 'wsl'));
       await windowsRoot.create();
       await wslRoot.create();
-      const sharedPath = '/home/pawel/projects/shared';
-      const unresolvedPath = '/home/pawel/projects/unresolved';
-      await _writeWslJsonFixture(wslRoot, 'wsl-shared-a', sharedPath);
-      await _writeWslJsonFixture(wslRoot, 'wsl-shared-b', sharedPath);
-      await _writeWslJsonFixture(wslRoot, 'wsl-unresolved', unresolvedPath);
+      await _copyFixture('sample_windows_session.json', windowsRoot);
 
       final settingsFile = File(p.join(temp.path, 'settings.toml'));
       await SettingsRepository(settingsFile).save(
@@ -3765,32 +3924,11 @@ void main() {
       final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
-      final resolver = _RecordingWslProjectResolver({
-        sharedPath: 'shared-root',
-      });
       final controller = RuntimeSessionController(
         settingsFile: settingsFile,
         databaseFile: databaseFile,
-        scanBatchingPolicy: const ScanBatchingPolicy(
-          parsedSessionFlushBatchSize: 1,
-          fullRowSnapshotBatchSize: 1,
-        ),
-        wslProjectResolver: resolver,
       );
-
-      final progressEvents = <SessionsRefreshProgress>[];
-      final refreshed = await controller.refresh(
-        onProgress: progressEvents.add,
-      );
-      expect(refreshed.persistenceFlushCount, greaterThan(1));
-      expect(refreshed.rows.map((row) => row.project).toSet(), {
-        'shared-root',
-        'unresolved',
-      });
-      expect(refreshed.rows, hasLength(3));
-      expect(resolver.calls, [
-        {sharedPath, unresolvedPath},
-      ]);
+      await controller.refresh();
 
       final db = openFileBackedDatabase(databaseFile);
       addTearDown(db.close);
@@ -3798,23 +3936,112 @@ void main() {
       update sessions
       set project_id = null,
           project_name_snapshot = null,
-          project_override = 0
+          project_override = 0,
+          title = '# AGENTS.md instructions for this repo',
+          summary = 'auto'
       ''');
       db.execute('update session_search set project_name = ?', ['']);
-
-      resolver.results[sharedPath] = 'cached-root';
-      final cached = await controller.loadCachedRows();
-
-      expect(cached.rows.map((row) => row.project).toSet(), {
-        'cached-root',
-        'unresolved',
-      });
-      expect(resolver.calls, [
-        {sharedPath, unresolvedPath},
-        {sharedPath, unresolvedPath},
+      db.execute('update session_search set title = ?, summary = ?', [
+        '# AGENTS.md instructions for this repo',
+        'auto',
       ]);
+
+      // The collector repairs stored rows on its next scan; loading only reads.
+      final cached = await controller.refresh();
+      expect(cached.rows.single.project, 'codex-sessions-viewer');
+      expect(cached.rows.single.title, isEmpty);
+      expect(cached.rows.single.summary, isEmpty);
+      final row = db
+          .select(
+            'select title, summary, project_name_snapshot, project_override from sessions',
+          )
+          .single;
+      expect(row['title'], isNull);
+      expect(row['summary'], isNull);
+      expect(row['project_name_snapshot'], 'codex-sessions-viewer');
+      expect(row['project_override'], 0);
     },
   );
+
+  test('runtime batches WSL project resolution for each refresh', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_wsl_project_batch_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    const sharedPath = '/home/pawel/projects/shared';
+    const unresolvedPath = '/home/pawel/projects/unresolved';
+    await _writeWslJsonFixture(wslRoot, 'wsl-shared-a', sharedPath);
+    await _writeWslJsonFixture(wslRoot, 'wsl-shared-b', sharedPath);
+    await _writeWslJsonFixture(wslRoot, 'wsl-unresolved', unresolvedPath);
+
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
+        ),
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await _migrateCollectorFixture(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
+
+    final resolver = _RecordingWslProjectResolver({sharedPath: 'shared-root'});
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      scanBatchingPolicy: const ScanBatchingPolicy(
+        parsedSessionFlushBatchSize: 1,
+        fullRowSnapshotBatchSize: 1,
+      ),
+      wslProjectResolver: resolver,
+    );
+
+    final progressEvents = <SessionsRefreshProgress>[];
+    final refreshed = await controller.refresh(onProgress: progressEvents.add);
+    expect(refreshed.persistenceFlushCount, greaterThan(1));
+    expect(refreshed.rows.map((row) => row.project).toSet(), {
+      'shared-root',
+      'unresolved',
+    });
+    expect(refreshed.rows, hasLength(3));
+    expect(resolver.calls, [
+      {sharedPath, unresolvedPath},
+    ]);
+
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    db.execute('''
+      update sessions
+      set project_id = null,
+          project_name_snapshot = null,
+          project_override = 0
+      ''');
+    db.execute('update session_search set project_name = ?', ['']);
+
+    resolver.results[sharedPath] = 'cached-root';
+    final cached = await controller.refresh();
+
+    expect(cached.rows.map((row) => row.project).toSet(), {
+      'cached-root',
+      'unresolved',
+    });
+    expect(resolver.calls, [
+      {sharedPath, unresolvedPath},
+      {sharedPath, unresolvedPath},
+    ]);
+  });
 
   test('resolved WSL paths expose containing-folder actions', () async {
     final temp = await Directory.systemTemp.createTemp(
@@ -4114,68 +4341,6 @@ void main() {
     },
   );
 
-  test('runtime cancellation is honored during cache maintenance', () async {
-    final temp = await Directory.systemTemp.createTemp(
-      'csv_runtime_cancel_maintenance_',
-    );
-    addTearDown(() async {
-      if (await temp.exists()) {
-        await temp.delete(recursive: true);
-      }
-    });
-
-    final windowsRoot = Directory(p.join(temp.path, 'windows'));
-    final wslRoot = Directory(p.join(temp.path, 'wsl'));
-    await windowsRoot.create();
-    await wslRoot.create();
-    await _writeJsonFixture(windowsRoot, 'maintenance-cancel');
-    final settingsFile = File(p.join(temp.path, 'settings.toml'));
-    await SettingsRepository(settingsFile).save(
-      AppSettings.defaults().copyWith(
-        paths: PathSettings(
-          windowsCodexPath: windowsRoot.path,
-          wslCodexUncPath: wslRoot.path,
-        ),
-        logging: _testLogging(temp),
-      ),
-    );
-    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-    final startup = await _migrateCollectorFixture(databaseFile);
-    expect(startup.canStartNormalUi, isTrue);
-
-    final controller = RuntimeSessionController(
-      settingsFile: settingsFile,
-      databaseFile: databaseFile,
-    );
-    late CancellableSessionScanOperation operation;
-    var maintenanceReported = false;
-    operation = controller.startRefreshOperation(
-      onProgress: (progress) {
-        if (progress.statusMessage ==
-            'Maintaining session cache: auditing cached rows...') {
-          maintenanceReported = true;
-          unawaited(operation.cancel());
-        }
-      },
-    );
-
-    final result = await operation.result;
-
-    expect(maintenanceReported, isTrue);
-    expect(result.cancelled, isTrue);
-    expect(result.statusMessage, contains('cancelled'));
-    final db = openFileBackedDatabase(databaseFile);
-    addTearDown(db.close);
-    expect(
-      db
-          .select(
-            "select count(*) as count from app_metadata where key = '$sessionCacheRepairCompletionKey'",
-          )
-          .single['count'],
-      0,
-    );
-  });
-
   test('background cancellable refresh acknowledges cancellation', () async {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_background_cancel_scan_',
@@ -4312,7 +4477,7 @@ void main() {
     );
   });
 
-  for (final operation in ['rescan', 'cached load']) {
+  for (final operation in ['rescan', 'unchanged rescan']) {
     test(
       'runtime discovery preserves masked and manual projects during $operation',
       () async {
@@ -4369,9 +4534,7 @@ void main() {
           // Changing file size forces the real parse/write path on the next scan.
           await fixture.writeAsString('${await fixture.readAsString()}\n ');
         }
-        final refreshed = operation == 'rescan'
-            ? await controller.refresh()
-            : await controller.loadCachedRows();
+        final refreshed = await controller.refresh();
         expect(refreshed.rows.single.project, 'Masked Project');
         expect(
           db.select(
@@ -4407,7 +4570,7 @@ void main() {
           'update sessions set detected_project_id = null where id = ?',
           [sessionId],
         );
-        final cached = await controller.loadCachedRows();
+        final cached = await controller.refresh();
         expect(cached.rows.single.project, 'Manual Project');
         expect(
           db.select('select detected_project_id from sessions where id = ?', [
@@ -5668,5 +5831,118 @@ void _repriceFixture(File file, PricingSettings settings) {
     );
   } finally {
     db.close();
+  }
+}
+
+Future<void> _copyTree(Directory from, Directory to) async {
+  await to.create(recursive: true);
+  await for (final entity in from.list()) {
+    final target = p.join(to.path, p.basename(entity.path));
+    if (entity is Directory) {
+      await _copyTree(entity, Directory(target));
+    } else if (entity is File) {
+      await entity.copy(target);
+    }
+  }
+}
+
+/// A collector process driven by the test: it emits protocol events and
+/// records the stdin lines it receives.
+class _ScriptedCollector implements Process {
+  _ScriptedCollector({this.flushDelay = 0, this.failClose = false}) {
+    stdin = IOSink(_ScriptedStdin(this));
+  }
+
+  /// Milliseconds each stdin flush takes to reach the collector.
+  final int flushDelay;
+
+  /// Closing stdin reports a broken pipe, as after the collector exited.
+  final bool failClose;
+  final _stdout = StreamController<List<int>>();
+  final _stderr = StreamController<List<int>>();
+  final _exit = Completer<int>();
+  final received = <String>[];
+  void Function(String line) onLine = (_) {};
+  var killed = false;
+
+  @override
+  late final IOSink stdin;
+
+  @override
+  Stream<List<int>> get stdout => _stdout.stream;
+
+  @override
+  Stream<List<int>> get stderr => _stderr.stream;
+
+  @override
+  Future<int> get exitCode => _exit.future;
+
+  @override
+  int get pid => 1;
+
+  void emit(Map<String, Object?> event) {
+    if (!_stdout.isClosed) _stdout.add(utf8.encode('${jsonEncode(event)}\n'));
+  }
+
+  void finish({required bool cancelled}) {
+    emit({
+      'event': 'finished',
+      'cancelled': cancelled,
+      'sessions_written': 0,
+      'persistence_flushes': 0,
+      'directories_scanned': 0,
+      'files_found': 0,
+      'files_skipped': 0,
+      'files_parsed': 0,
+      'files_failed': 0,
+      'sessions_missing': 0,
+      'errors': <Object>[],
+    });
+    _close(0);
+  }
+
+  void _close(int code) {
+    if (_exit.isCompleted) return;
+    unawaited(_stdout.close());
+    unawaited(_stderr.close());
+    _exit.complete(code);
+  }
+
+  @override
+  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
+    killed = true;
+    _close(-1);
+    return true;
+  }
+}
+
+class _ScriptedStdin implements StreamConsumer<List<int>> {
+  _ScriptedStdin(this.process);
+
+  final _ScriptedCollector process;
+  var _pending = '';
+
+  @override
+  Future<void> addStream(Stream<List<int>> stream) async {
+    await for (final chunk in stream) {
+      if (process.flushDelay > 0) {
+        await Future<void>.delayed(Duration(milliseconds: process.flushDelay));
+      }
+      _pending += utf8.decode(chunk);
+      while (_pending.contains('\n')) {
+        final end = _pending.indexOf('\n');
+        final line = _pending.substring(0, end).trim();
+        _pending = _pending.substring(end + 1);
+        process.received.add(line);
+        process.onLine(line);
+      }
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    if (process.failClose) {
+      throw const FileSystemException('The pipe has been ended.');
+    }
   }
 }

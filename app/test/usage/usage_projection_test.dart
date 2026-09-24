@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:codex_sessions_viewer/src/database/collector_versions.dart';
 import 'package:codex_sessions_viewer/src/database/database_generation.dart';
 import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
 import 'package:codex_sessions_viewer/src/database/usage_projection_migration.dart';
@@ -98,6 +99,45 @@ void main() {
       );
     },
   );
+
+  test('persisted costs and coverage follow each harness parser version', () {
+    // Each harness has its own parser: Claude rows are current at the
+    // Claude version, not the Codex one, and third-party rows are unversioned.
+    db.execute('''
+      update sessions set harness = 'claude', session_id = 'claude-selected',
+        parser_version = $collectorClaudeParserVersion
+      where id = 'selected';
+      update sessions set harness = 'example', session_id = 'example-unrelated',
+        parser_version = 77
+      where id = 'unrelated';
+      update sessions set usage_projection_status = 'complete',
+        parse_status = 'available', started_at_utc = '2026-09-05T12:00:00Z';
+    ''');
+    _event(db, contextId, 1, input: 1, output: 1);
+    _event(db, contextId, 1, session: 'unrelated', input: 1, output: 1);
+    _replace(db, repository, ['selected', 'unrelated']);
+    final costs = repository.loadPersistedSessionCosts([
+      'selected',
+      'unrelated',
+    ], projectionVersion: collectorCodexParserVersion);
+    // Included rows are repricing (dirty partitions); hidden rows would read
+    // as settled unknowns.
+    expect(costs!['selected']!.updating, isTrue);
+    expect(costs['unrelated']!.updating, isTrue);
+    final coverage = repository
+        .summarize(
+          UsageSummaryRequest(
+            period: UsagePeriod.custom,
+            customStartUtc: DateTime.utc(2026, 9, 5),
+            customEndExclusiveUtc: DateTime.utc(2026, 9, 6),
+            nowUtc: DateTime.utc(2026, 9, 7),
+            projectionVersion: collectorCodexParserVersion,
+          ),
+        )
+        .projectionCoverage;
+    expect(coverage.currentCompleteSessions, 2);
+    expect(coverage.outdatedProjectionSessions, 0);
+  });
 
   test('active daily replacement requires the caller transaction', () {
     expect(

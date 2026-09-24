@@ -487,3 +487,60 @@ pub fn assert_same(expected: &Value, actual: &Value) {
         )
     );
 }
+
+pub fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// A Claude projects folder holding the sample transcripts.
+pub fn claude_root(temp: &TempDir) -> PathBuf {
+    let root = temp.path().join("claude-projects");
+    copy_tree(Path::new("../samples/claude/projects"), &root);
+    root
+}
+
+/// Lines a coordinated scan wrote to stdout, read with a deadline so a
+/// collector that stops responding fails the test instead of hanging it.
+pub struct EventStream {
+    receiver: std::sync::mpsc::Receiver<String>,
+}
+
+impl EventStream {
+    pub fn new(stdout: std::process::ChildStdout) -> Self {
+        use std::io::BufRead;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { receiver }
+    }
+
+    /// The next event, or `None` at end of output.
+    pub fn next(&self, child: &mut std::process::Child) -> Option<Value> {
+        match self
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+        {
+            Ok(line) => Some(serde_json::from_str(&line).unwrap()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("the collector stopped responding");
+            }
+        }
+    }
+}

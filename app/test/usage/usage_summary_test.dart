@@ -27,6 +27,10 @@ void main() {
     db.execute(
       File('../sql/migration/015_branch_aware_usage.sql').readAsStringSync(),
     );
+    // From 018: parser versions are compared per harness.
+    db.execute(
+      "alter table sessions add column harness text not null default 'codex'",
+    );
     repository = UsageSummaryRepository(db);
   });
 

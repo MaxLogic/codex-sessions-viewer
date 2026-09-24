@@ -2860,6 +2860,7 @@ class SessionsRefreshResult {
     this.cancelled = false,
     this.persistenceFlushCount = 0,
     this.fullRowSnapshotCount = 0,
+    this.journalRevision,
   });
 
   factory SessionsRefreshResult.scanFinished(List<SessionRowViewModel> rows) {
@@ -2875,6 +2876,10 @@ class SessionsRefreshResult {
   final bool cancelled;
   final int persistenceFlushCount;
   final int fullRowSnapshotCount;
+
+  /// The session change journal revision the rows were read at, so later
+  /// external changes load as a delta instead of a second full snapshot.
+  final int? journalRevision;
 }
 
 class _SessionTextFilterRequest {

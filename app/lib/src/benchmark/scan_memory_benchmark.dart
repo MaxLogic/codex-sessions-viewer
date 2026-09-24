@@ -8,7 +8,7 @@ import '../config/app_settings.dart';
 import '../database/database_connection.dart';
 import '../database/database_migrator.dart';
 import '../database/database_maintenance.dart';
-import '../database/session_cache_repair.dart';
+import '../database/collector_versions.dart';
 import '../parser/codex_session_parser.dart';
 import '../scanner/scan_batching.dart';
 

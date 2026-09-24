@@ -162,7 +162,8 @@ void main() {
       // Later migrations install triggers that require those usage tables.
       if (file.uri.pathSegments.last.startsWith('016_') ||
           file.uri.pathSegments.last.startsWith('021_') ||
-          file.uri.pathSegments.last.startsWith('023_')) {
+          file.uri.pathSegments.last.startsWith('023_') ||
+          file.uri.pathSegments.last.startsWith('025_')) {
         continue;
       }
       db.execute(file.readAsStringSync());

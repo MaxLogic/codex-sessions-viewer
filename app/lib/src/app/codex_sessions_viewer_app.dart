@@ -22,6 +22,7 @@ import '../app/runtime_session_controller.dart';
 import 'logs_loader.dart';
 import '../export/eval_dataset_exporter.dart';
 import '../export/session_list_message_loader.dart';
+import '../database/collector_versions.dart';
 import '../parser/codex_session_parser.dart';
 import '../platform/terminal_launcher.dart';
 import '../pricing/pricing_repository.dart';
@@ -842,7 +843,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       nowUtc: DateTime.now().toUtc(),
       customStartUtc: _usageRequest?.customStartUtc,
       customEndExclusiveUtc: _usageRequest?.customEndExclusiveUtc,
-      projectionVersion: CodexSessionParser.currentVersion,
+      projectionVersion: collectorCodexParserVersion,
     );
     if (mounted) {
       setState(() {
@@ -1523,29 +1524,34 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
 
   Future<void> _loadCachedRows(int generation) async {
     try {
-      final cachedRowsLoader =
-          widget.onLoadCachedRows ?? _controller.loadCachedRowsInBackground;
-      final result = await cachedRowsLoader(
-        onProgress: (progress) {
-          if (!mounted || generation != _cachedLoadGeneration) {
-            return;
-          }
-          setState(() {
-            _cachedRows = progress.rows ?? _cachedRows;
-            _cachedStatusMessage = progress.statusMessage;
-          });
-        },
-      );
+      // Typed as the positional loader: an injected loader and the
+      // controller's named-parameter method must be called the same way.
+      final SessionCachedRowsLoader cachedRowsLoader =
+          widget.onLoadCachedRows ??
+          (onProgress) =>
+              _controller.loadCachedRowsInBackground(onProgress: onProgress);
+      final result = await cachedRowsLoader((progress) {
+        if (!mounted || generation != _cachedLoadGeneration) {
+          return;
+        }
+        setState(() {
+          _cachedRows = progress.rows ?? _cachedRows;
+          _cachedStatusMessage = progress.statusMessage;
+        });
+      });
       if (!mounted || generation != _cachedLoadGeneration) {
         return;
       }
       setState(() {
         _cachedRows = result.rows;
-        _externalSessionRevision = null;
+        _externalSessionRevision = result.journalRevision;
         _cachedStatusMessage = '';
         _autoRefreshToken++;
       });
-      if (widget.externalRevision > 0) unawaited(_loadExternalRows());
+      // A known revision replays only commits made since the rows were read.
+      if (result.journalRevision != null || widget.externalRevision > 0) {
+        unawaited(_loadExternalRows());
+      }
     } on Object catch (error) {
       if (!mounted || generation != _cachedLoadGeneration) {
         return;
@@ -1720,28 +1726,33 @@ class _ContextSearchLoaderState extends State<_ContextSearchLoader> {
 
   Future<void> _loadCachedRows(int generation) async {
     try {
-      final cachedRowsLoader =
-          widget.onLoadCachedRows ?? _controller.loadCachedRowsInBackground;
-      final result = await cachedRowsLoader(
-        onProgress: (progress) {
-          if (!mounted || generation != _cachedLoadGeneration) {
-            return;
-          }
-          setState(() {
-            _cachedRows = progress.rows ?? _cachedRows;
-            _cachedStatusMessage = progress.statusMessage;
-          });
-        },
-      );
+      // Typed as the positional loader: an injected loader and the
+      // controller's named-parameter method must be called the same way.
+      final SessionCachedRowsLoader cachedRowsLoader =
+          widget.onLoadCachedRows ??
+          (onProgress) =>
+              _controller.loadCachedRowsInBackground(onProgress: onProgress);
+      final result = await cachedRowsLoader((progress) {
+        if (!mounted || generation != _cachedLoadGeneration) {
+          return;
+        }
+        setState(() {
+          _cachedRows = progress.rows ?? _cachedRows;
+          _cachedStatusMessage = progress.statusMessage;
+        });
+      });
       if (!mounted || generation != _cachedLoadGeneration) {
         return;
       }
       setState(() {
         _cachedRows = result.rows;
-        _externalSessionRevision = null;
+        _externalSessionRevision = result.journalRevision;
         _cachedStatusMessage = '';
       });
-      if (widget.externalRevision > 0) unawaited(_loadExternalRows());
+      // A known revision replays only commits made since the rows were read.
+      if (result.journalRevision != null || widget.externalRevision > 0) {
+        unawaited(_loadExternalRows());
+      }
     } on Object catch (error) {
       if (!mounted || generation != _cachedLoadGeneration) {
         return;
@@ -1885,28 +1896,33 @@ class _EvalsScreenLoaderState extends State<_EvalsScreenLoader> {
 
   Future<void> _loadCachedRows(int generation) async {
     try {
-      final cachedRowsLoader =
-          widget.onLoadCachedRows ?? _controller.loadCachedRowsInBackground;
-      final result = await cachedRowsLoader(
-        onProgress: (progress) {
-          if (!mounted || generation != _cachedLoadGeneration) {
-            return;
-          }
-          setState(() {
-            _cachedRows = progress.rows ?? _cachedRows;
-            _cachedStatusMessage = progress.statusMessage;
-          });
-        },
-      );
+      // Typed as the positional loader: an injected loader and the
+      // controller's named-parameter method must be called the same way.
+      final SessionCachedRowsLoader cachedRowsLoader =
+          widget.onLoadCachedRows ??
+          (onProgress) =>
+              _controller.loadCachedRowsInBackground(onProgress: onProgress);
+      final result = await cachedRowsLoader((progress) {
+        if (!mounted || generation != _cachedLoadGeneration) {
+          return;
+        }
+        setState(() {
+          _cachedRows = progress.rows ?? _cachedRows;
+          _cachedStatusMessage = progress.statusMessage;
+        });
+      });
       if (!mounted || generation != _cachedLoadGeneration) {
         return;
       }
       setState(() {
         _cachedRows = result.rows;
-        _externalSessionRevision = null;
+        _externalSessionRevision = result.journalRevision;
         _cachedStatusMessage = '';
       });
-      if (widget.externalRevision > 0) unawaited(_loadExternalRows());
+      // A known revision replays only commits made since the rows were read.
+      if (result.journalRevision != null || widget.externalRevision > 0) {
+        unawaited(_loadExternalRows());
+      }
     } on Object catch (error) {
       if (!mounted || generation != _cachedLoadGeneration) {
         return;

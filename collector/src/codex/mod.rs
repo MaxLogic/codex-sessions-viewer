@@ -7,7 +7,10 @@ pub mod wsl;
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::contract::{
     ProjectHint, ProjectHints, SessionRef, SessionSnapshot, SourceStatus, ThreadName,
@@ -43,6 +46,8 @@ pub struct CollectReport {
     pub counts: ScanCounts,
     pub applied: ApplySummary,
     pub errors: Vec<SourceStatus>,
+    /// The legacy cache repair's outcome, when a scan ran it.
+    pub cache_repair: Option<crate::store::cache_repair::RepairReport>,
 }
 
 /// Scan Codex roots into `store` in the viewer's order: parsed sessions in
@@ -75,25 +80,36 @@ pub fn collect_controlled(
         resolve_wsl_projects,
         cancel,
         progress,
-        |_| Ok(()),
+        |_| Ok(true),
         CollectionBatching::default(),
     )
 }
 
 /// A GUI may grant each write batch through its own maintenance scheduler.
-/// `gate(true)` acquires a lease; `gate(false)` releases it even on failure.
+/// `gate(true)` acquires a lease and returns `false` when the scan was
+/// cancelled instead, so the write is skipped; `gate(false)` releases a
+/// granted lease even on failure.
+///
+/// After cancellation the scan writes nothing that a coordinating GUI would
+/// have to grant: pending batches, statuses and refinements are left to the
+/// next scan, which reparses the files.
 pub fn collect_coordinated(
     store: &Store,
     options: &ScanOptions,
     resolve_wsl_projects: bool,
     cancel: &Arc<AtomicBool>,
     mut progress: impl FnMut(&ScanCounts, usize),
-    mut gate: impl FnMut(bool) -> StoreResult<()>,
+    mut gate: impl FnMut(bool) -> StoreResult<bool>,
     batching: CollectionBatching,
 ) -> StoreResult<CollectReport> {
-    gated(&mut gate, || {
+    let is_cancelled = || cancel.load(Ordering::Relaxed);
+    if gated(&mut gate, || {
         writer::clean_session_metadata_placeholders(&store.conn)
-    })?;
+    })?
+    .is_none()
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
     let cached = writer::cached_sources(&store.conn, "codex")?;
     let mut pending: Vec<SessionSnapshot> = Vec::new();
     let mut pending_bytes = 0u64;
@@ -109,12 +125,18 @@ pub fn collect_coordinated(
             if pending.len() >= batching.sessions.max(1)
                 || pending_bytes >= batching.source_bytes.max(1)
             {
-                applied.sessions += gated(&mut gate, || {
-                    writer::apply_session_batch(&store.conn, std::mem::take(&mut pending))
-                })?;
-                committed.set(applied.sessions);
-                flushes.set(flushes.get() + 1);
+                let batch = std::mem::take(&mut pending);
                 pending_bytes = 0;
+                match gated(&mut gate, || {
+                    writer::apply_session_batch(&store.conn, batch)
+                })? {
+                    Some(written) => {
+                        applied.sessions += written;
+                        committed.set(applied.sessions);
+                        flushes.set(flushes.get() + 1);
+                    }
+                    None => cancel.store(true, Ordering::Relaxed),
+                }
             }
             Ok::<(), crate::store::StoreError>(())
         },
@@ -125,44 +147,120 @@ pub fn collect_coordinated(
             progress(&counts, committed.get());
         },
     )?;
-    if !pending.is_empty() {
-        applied.sessions += gated(&mut gate, || {
+    if !pending.is_empty()
+        && let Some(written) = gated(&mut gate, || {
             writer::apply_session_batch(&store.conn, pending)
-        })?;
+        })?
+    {
+        applied.sessions += written;
         flushes.set(flushes.get() + 1);
     }
     outcome.counts.persistence_flushes = flushes.get();
-    let hints = refined_project_hints(&outcome.parsed, resolve_wsl_projects);
-    applied.project_updates += gated(&mut gate, || {
-        writer::apply_project_hints(&store.conn, &hints.harness, &hints.sessions, &hints.hints)
-    })?;
-    gated(&mut gate, || {
+    if !is_cancelled() {
+        let hints = refined_project_hints(&outcome.parsed, resolve_wsl_projects);
+        applied.project_updates += gated(&mut gate, || {
+            writer::apply_project_hints(&store.conn, &hints.harness, &hints.sessions, &hints.hints)
+        })?
+        .unwrap_or(0);
+    }
+    if gated(&mut gate, || {
         writer::apply_source_statuses(&store.conn, &outcome.statuses)
-    })?;
-    applied.statuses = outcome.statuses.len();
-    let names: Vec<ThreadName> = thread_name_records(&options.thread_names);
-    applied.thread_names_changed = gated(&mut gate, || {
-        writer::apply_thread_names(&store.conn, &names)
-    })?;
-    outcome.counts.cancelled |= cancel.load(std::sync::atomic::Ordering::Relaxed);
+    })?
+    .is_some()
+    {
+        applied.statuses = outcome.statuses.len();
+    }
+    let mut cache_repair = None;
+    if !is_cancelled() {
+        let names: Vec<ThreadName> = thread_name_records(&options.thread_names);
+        applied.thread_names_changed = gated(&mut gate, || {
+            writer::apply_thread_names(&store.conn, &names)
+        })?
+        .unwrap_or(0);
+        applied.project_updates += backfill_projects(store, &mut gate, resolve_wsl_projects)?;
+        let discovery_complete = !outcome.counts.cancelled
+            && outcome.errors.iter().all(|error| error.status == "missing");
+        if !is_cancelled() {
+            cache_repair = gated(&mut gate, || {
+                Ok(crate::store::cache_repair::run(
+                    store,
+                    &options.roots,
+                    discovery_complete,
+                    cancel,
+                ))
+            })?;
+        }
+    }
+    outcome.counts.cancelled |= is_cancelled();
     Ok(CollectReport {
         counts: outcome.counts,
         applied,
         errors: outcome.errors,
+        cache_repair,
     })
 }
 
-fn gated<T>(
-    gate: &mut impl FnMut(bool) -> StoreResult<()>,
+/// Assign automatic projects to stored sessions of any harness that still
+/// have none. The viewer used to do this while loading its list; the
+/// collector owns it so the viewer never writes parsed session state.
+pub fn backfill_projects(
+    store: &Store,
+    gate: &mut impl FnMut(bool) -> StoreResult<bool>,
+    resolve_wsl_projects: bool,
+) -> StoreResult<usize> {
+    let candidates = writer::project_backfill_candidates(&store.conn)?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let mut hints: Vec<ProjectHint> = Vec::new();
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut wsl_paths: Vec<String> = Vec::new();
+    for candidate in &candidates {
+        let path = crate::dart::trim(&candidate.working_directory).to_owned();
+        match candidate.source_type {
+            SourceType::Windows => {
+                if seen.insert(format!("windows|{path}"), ()).is_none()
+                    && let Some(name) = resolve_windows_project(&path)
+                {
+                    hints.push(ProjectHint {
+                        working_directory: path,
+                        project_name: name,
+                    });
+                }
+            }
+            SourceType::Wsl => {
+                if seen.insert(format!("wsl|{path}"), ()).is_none() {
+                    wsl_paths.push(path);
+                }
+            }
+        }
+    }
+    if resolve_wsl_projects {
+        for (path, name) in wsl::resolve_project_names(&wsl_paths) {
+            hints.push(ProjectHint {
+                working_directory: path,
+                project_name: name,
+            });
+        }
+    }
+    Ok(gated(gate, || writer::apply_project_backfill(&store.conn, &hints))?.unwrap_or(0))
+}
+
+/// Run `write` under a lease. `None` means the lease was refused because the
+/// scan was cancelled, so the write did not run.
+pub fn gated<T>(
+    gate: &mut impl FnMut(bool) -> StoreResult<bool>,
     write: impl FnOnce() -> StoreResult<T>,
-) -> StoreResult<T> {
-    gate(true)?;
+) -> StoreResult<Option<T>> {
+    if !gate(true)? {
+        return Ok(None);
+    }
     let result = write();
     let released = gate(false);
     match result {
         Ok(value) => {
             released?;
-            Ok(value)
+            Ok(Some(value))
         }
         Err(error) => Err(error),
     }
@@ -329,5 +427,6 @@ pub fn collect_file(
         counts,
         applied,
         errors,
+        cache_repair: None,
     })
 }

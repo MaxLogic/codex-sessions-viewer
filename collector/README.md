@@ -34,18 +34,31 @@ Exit codes: `0` success, `1` failure, `2` usage error, `3` database refused.
 
 ## GUI scan transport
 
-Refresh launches the bundled executable with `codex scan --coordinate-writes`.
-The collector emits JSON lines on stdout. `write_requested` waits for `grant`
-on stdin; `write_released` returns that lease to the viewer's maintenance
-scheduler. This lets pricing and other queued writes run between scan batches.
-`progress` carries `counts` and `sessions_written`; the final `finished` record
-contains the scan summary, `cancelled`, and `persistence_flushes`.
+Refresh launches the bundled executable with `codex scan --coordinate-writes`
+and then, unless the refresh was cancelled, `claude scan --coordinate-writes`
+with the Claude Code projects folder (`%USERPROFILE%\.claude\projects` when it
+exists). Both use the same protocol. The collector emits JSON lines on stdout.
+`write_requested` waits for `grant` on stdin; `write_released` returns that
+lease to the viewer's maintenance scheduler. This lets pricing and other queued
+writes run between scan batches. `progress` carries `counts` and
+`sessions_written`, at most once per 100 ms plus once per committed batch; the
+final `finished` record contains the scan summary, `cancelled`,
+`persistence_flushes`, and for `codex scan` the `cache_repair` report.
 
 The viewer sends `cancel` on stdin to stop discovery and new parser work.
-Completed parser results are persisted, and cancelled scans do not mark unseen
-files missing. Closing stdin also requests cancellation. A disconnected writer
-coordinator stops further writes. `--progress-json` streams progress without
-writer leases; ordinary `--json` still emits only the final summary.
+Closing stdin also requests cancellation. A cancel that arrives while the
+collector waits for a `grant` withdraws the request with `write_released`; after
+a cancel the collector asks for no further lease, so parsed sessions that were
+not yet committed, source statuses, and project refinements wait for the next
+scan. Cancelled scans never mark unseen files missing. `--progress-json`
+streams progress without writer leases; ordinary `--json` still emits only the
+final summary.
+
+The viewer writes every stdin line through one serialized writer, treats a
+closed pipe after the collector exits as the end of the conversation, and stops
+a collector that holds a lease for more than five minutes, returning the lease
+to its writer queue. A missing executable is reported with the path the viewer
+expected and how to fix it.
 
 Tests can set `CODEX_SESSIONS_COLLECTOR_EXE` to an explicitly built executable.
 Installed applications use the collector next to the viewer executable.
@@ -54,8 +67,8 @@ Installed applications use the collector next to the viewer executable.
 
 - **Viewer database (`--db`)**: the viewer creates and migrates it. The
   collector writes only when the schema is exactly the version it was built
-  for, its Codex parser and cost projection versions match the viewer's
-  recorded versions, and no viewer migration is pending. Otherwise it refuses with exit code
+  for, its versions agree with the viewer's recorded versions (below), and no
+  viewer migration is pending. Otherwise it refuses with exit code
   3 and says what to do, usually "open the viewer once". It never creates or
   migrates a viewer database.
 - **Standalone database (`--standalone`)**: for a machine without the viewer.
@@ -63,13 +76,29 @@ Installed applications use the collector next to the viewer executable.
   itself as the owner (`app_metadata.database_owner = 'collector'`), and
   migrates only databases it created.
 
-The viewer records `writer_codex_parser_version` and
-`writer_usage_cost_projection_version` in `app_metadata` during successful
-startup. A collector checks both at open and again under each batch's write
-lock. Missing metadata also refuses writes: install matching viewer/collector
-binaries and open the viewer once. Parser or cost algorithm releases must update
-both implementations together and run `collector_ingestion_compat_test.dart`;
-SQL migration checksums alone do not detect an algorithm-only version change.
+The viewer records `writer_codex_parser_version`,
+`writer_claude_parser_version`, and `writer_usage_cost_projection_version` in
+`app_metadata` during successful startup. Every write needs the cost projection
+version to agree, because every harness's usage becomes daily cost rows. A
+session write also needs the parser version of that session's harness: Codex
+rows are gated only by the Codex parser version and Claude rows only by the
+Claude parser version. Third-party harnesses carry their own parser versions,
+which the viewer does not filter on. The collector checks under each batch's
+write lock. Missing metadata also refuses writes: install matching
+viewer/collector binaries and open the viewer once. The viewer mirrors the
+constants in `app/lib/src/database/collector_versions.dart`, and
+`app/test/database/writer_version_agreement_test.dart` fails when they differ
+from the Rust sources; SQL migration checksums alone do not detect an
+algorithm-only version change.
+
+Only the collector writes parsed session state. Besides snapshots it cleans
+legacy `# AGENTS.md`/`auto` title placeholders, assigns automatic projects to
+stored sessions that have none, and, after a scan that reached every configured
+Codex home without errors, runs the one-time legacy cache repair
+(`session_cache_repair.v3`): a content-free audit in
+`session_cache_repair_manifest`, a verified backup in `backups\` next to the
+database, then deletion of allowlisted legacy placeholder rows only. The viewer
+only reads sessions and logs the repair report.
 
 Writers coordinate through SQLite: WAL journaling, short `BEGIN IMMEDIATE`
 transactions, and a 30 second busy timeout. The viewer, several collectors,
@@ -125,7 +154,8 @@ repair anything a hook missed.
 ## Records
 
 Collectors exchange JSON Lines records of the versioned contract
-`codex-sessions-viewer.ingest` version 1 (see `src/contract.rs`):
+`codex-sessions-viewer.ingest` version 1 (field reference in
+[`docs/collectors/contract-v1.md`](../docs/collectors/contract-v1.md)):
 
 ```json
 {"contract":"codex-sessions-viewer.ingest","version":1,"kind":"session_snapshot","record":{...}}

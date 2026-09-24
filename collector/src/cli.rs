@@ -32,7 +32,7 @@ USAGE:
   codex-sessions-collector codex parse  [OPTIONS] <FILE>  Print one file as contract records
   codex-sessions-collector codex notify [--previous-notify <JSON>] <PAYLOAD>
                                                           Codex notify hook: queue the turn's session
-  codex-sessions-collector claude scan   [OPTIONS]        Scan Claude Code transcripts
+  codex-sessions-collector claude scan   [OPTIONS]        Scan Claude Code transcripts (SCAN and CLAUDE OPTIONS)
   codex-sessions-collector claude ingest [OPTIONS] <FILE> Ingest one transcript and its subagents
   codex-sessions-collector claude parse  <FILE>           Print one transcript as contract records
   codex-sessions-collector claude hook                    Claude Code hook (JSON on stdin): queue it
@@ -63,7 +63,7 @@ SCAN OPTIONS:
   --force               Reparse unchanged files
   --parser-workers <N>  Parallel parsers (default: CPU count - 1, at most 8)
   --json                Print a machine-readable summary
-  --progress-json       Stream progress JSON lines before the final summary
+  --progress-json       Stream progress JSON lines (at most one per 100 ms) before the summary
   --cancel-stdin        Gracefully cancel when stdin receives cancel or closes
   --coordinate-writes  Request a GUI writer lease before each database batch
   --flush-sessions <N>  Sessions per persistence batch (default: 64)
@@ -447,74 +447,128 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     let settings = load_settings(options)?;
     let store = open_store(options)?;
     let scan = scan_options(options, &settings, configured_roots(&settings));
+    let report = scan_transport(options, out, |cancel, progress, gate| {
+        codex::collect_coordinated(
+            &store,
+            &scan,
+            options.wsl_projects,
+            cancel,
+            progress,
+            gate,
+            codex::CollectionBatching {
+                sessions: options.flush_sessions,
+                source_bytes: options.flush_bytes,
+            },
+        )
+    })?;
+    print_report(out, "codex scan", &store, &report, options.json)
+}
+
+/// The shortest gap between two progress events unless a batch committed.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A line from the GUI on stdin.
+enum Control {
+    Grant,
+    Cancel,
+}
+
+/// The stdin/stdout protocol of a GUI-driven scan.
+///
+/// stdin carries `grant` (for the pending `write_requested`) and `cancel`;
+/// closing stdin also cancels. stdout carries `progress` events, at most one
+/// per [`PROGRESS_INTERVAL`] unless a batch committed, and with
+/// `--coordinate-writes` a `write_requested`/`write_released` pair around
+/// every database write. A cancel while waiting for a grant withdraws the
+/// request with `write_released`; after a cancel no further lease is asked for.
+fn scan_transport<W: Write>(
+    options: &Options,
+    out: &mut W,
+    collect: impl FnOnce(
+        &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        &mut dyn FnMut(&codex::scanner::ScanCounts, usize),
+        &mut dyn FnMut(bool) -> Result<bool, StoreError>,
+    ) -> Result<CollectReport, StoreError>,
+) -> Result<CollectReport, CliError> {
+    use std::sync::atomic::Ordering;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (grants, granted) = std::sync::mpsc::channel();
+    let (controls, control) = std::sync::mpsc::channel::<Control>();
     if options.cancel_stdin {
         let cancellation = std::sync::Arc::clone(&cancel);
         std::thread::spawn(move || {
             for line in std::io::stdin().lock().lines() {
-                match line.as_deref() {
+                match line.as_deref().map(str::trim) {
                     Ok("grant") => {
-                        if grants.send(()).is_err() {
-                            break;
+                        if controls.send(Control::Grant).is_err() {
+                            return;
                         }
                     }
-                    Ok("cancel") => cancellation.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Ok("cancel") => {
+                        cancellation.store(true, Ordering::Relaxed);
+                        let _ = controls.send(Control::Cancel);
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 }
             }
-            cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancellation.store(true, Ordering::Relaxed);
+            let _ = controls.send(Control::Cancel);
         });
     }
-    let output = std::cell::RefCell::new(&mut *out);
+    let output = std::cell::RefCell::new(out);
+    let emit = |event: serde_json::Value| -> std::io::Result<()> {
+        let mut out = output.borrow_mut();
+        writeln!(out, "{event}")?;
+        out.flush()
+    };
     let mut output_error = None;
-    let report = codex::collect_coordinated(
-        &store,
-        &scan,
-        options.wsl_projects,
-        &cancel,
-        |counts, committed| {
-            if options.progress_json && output_error.is_none() {
-                let event =
-                    json!({"event": "progress", "counts": counts, "sessions_written": committed});
-                let mut out = output.borrow_mut();
-                if let Err(error) = writeln!(out, "{event}").and_then(|_| out.flush()) {
-                    output_error = Some(error);
-                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+    let mut last_progress: Option<(std::time::Instant, usize)> = None;
+    let mut progress = |counts: &codex::scanner::ScanCounts, committed: usize| {
+        if !options.progress_json || output_error.is_some() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some((at, previous)) = last_progress
+            && previous == committed
+            && now.duration_since(at) < PROGRESS_INTERVAL
+        {
+            return;
+        }
+        last_progress = Some((now, committed));
+        if let Err(error) =
+            emit(json!({"event": "progress", "counts": counts, "sessions_written": committed}))
+        {
+            output_error = Some(error);
+            cancel.store(true, Ordering::Relaxed);
+        }
+    };
+    let mut gate = |acquire: bool| -> Result<bool, StoreError> {
+        if !options.coordinate_writes {
+            return Ok(true);
+        }
+        if !acquire {
+            emit(json!({"event": "write_released"}))?;
+            return Ok(true);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        emit(json!({"event": "write_requested"}))?;
+        match control.recv() {
+            Ok(Control::Grant) => Ok(true),
+            Ok(Control::Cancel) | Err(_) => {
+                cancel.store(true, Ordering::Relaxed);
+                // Withdraw the request so the GUI's writer queue moves on.
+                emit(json!({"event": "write_released"}))?;
+                Ok(false)
             }
-        },
-        |acquire| {
-            if !options.coordinate_writes {
-                return Ok(());
-            }
-            let event = if acquire {
-                "write_requested"
-            } else {
-                "write_released"
-            };
-            {
-                let mut out = output.borrow_mut();
-                writeln!(out, "{}", json!({"event":event}))?;
-                out.flush()?;
-            }
-            if acquire {
-                granted.recv().map_err(|_| {
-                    StoreError::Refused("GUI writer coordinator disconnected".to_owned())
-                })?;
-            }
-            Ok(())
-        },
-        codex::CollectionBatching {
-            sessions: options.flush_sessions,
-            source_bytes: options.flush_bytes,
-        },
-    )?;
+        }
+    };
+    let report = collect(&cancel, &mut progress, &mut gate)?;
     if let Some(error) = output_error {
         return Err(CliError::Failed(error.to_string()));
     }
-    print_report(out, "codex scan", &store, &report, options.json)
+    Ok(report)
 }
 
 /// The root a file belongs to, or a root inferred from the path.
@@ -669,6 +723,7 @@ fn print_report(
             "files_failed": counts.files_failed,
             "sessions_missing": counts.sessions_missing,
             "persistence_flushes": counts.persistence_flushes,
+            "cache_repair": report.cache_repair,
             "errors": report.errors.iter().map(|error| json!({
                 "path": error.path,
                 "status": error.status,
@@ -745,20 +800,25 @@ fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
     }
     let settings = load_settings(options)?;
     let store = open_store(options)?;
-    let report = crate::claude::collect(
-        &store,
-        &crate::claude::ClaudeScanOptions {
-            roots: claude_roots(options),
-            mapper: PathMapper {
-                wsl_unc_root: settings.wsl_linux_root_unc.clone(),
-            },
-            parser: claude_parser_options(&settings),
-            workers: options
-                .parser_workers
-                .unwrap_or_else(default_parser_workers),
-            force: options.force,
+    let scan = crate::claude::ClaudeScanOptions {
+        roots: claude_roots(options),
+        mapper: PathMapper {
+            wsl_unc_root: settings.wsl_linux_root_unc.clone(),
         },
-    )?;
+        parser: claude_parser_options(&settings),
+        workers: options
+            .parser_workers
+            .unwrap_or_else(default_parser_workers),
+        force: options.force,
+    };
+    let flush_sessions = if options.flush_sessions == codex::FLUSH_SESSIONS {
+        crate::claude::FLUSH_SESSIONS
+    } else {
+        options.flush_sessions
+    };
+    let report = scan_transport(options, out, |cancel, progress, gate| {
+        crate::claude::collect_coordinated(&store, &scan, cancel, progress, gate, flush_sessions)
+    })?;
     print_report(out, "claude scan", &store, &report, options.json)
 }
 

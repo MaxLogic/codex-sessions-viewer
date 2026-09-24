@@ -1,5 +1,6 @@
 import 'package:sqlite3/sqlite3.dart';
 
+import '../database/collector_versions.dart';
 import '../ui/models/session_label_formatter.dart';
 
 const usageCostProjectionVersion = 1;
@@ -44,7 +45,8 @@ class UsageSummaryRepository {
           and dirty.day_utc = d.day_utc and dirty.model_key = d.model_key
         where d.session_id in (${List.filled(batch.length, '?').join(', ')})
           and d.branch_scope = 'local' and s.parse_status = 'available'
-          and s.usage_projection_status = 'complete' and s.parser_version = ?
+          and s.usage_projection_status = 'complete'
+          and s.parser_version = ${agreedParserVersionSql('s')}
       ''');
       try {
         // Stream daily grains: memory grows with the requested session page,
@@ -128,7 +130,7 @@ class UsageSummaryRepository {
         coalesce(model, ''), path_context_id, branch_scope,
         sum(input_tokens), sum(cached_input_tokens), sum(cache_write_input_tokens),
         sum(output_tokens), sum(reasoning_output_tokens), sum(input_tokens + output_tokens),
-        null, 'unknown', 'pending_history', 1, ?
+        null, 'unknown', 'pending_history', $usageCostProjectionVersion, ?
       from $sourceTable where session_row_id = ?
         and strftime('%Y-%m-%d', occurred_at_utc) is not null
       group by session_row_id, strftime('%Y-%m-%d', occurred_at_utc),
@@ -377,7 +379,7 @@ class UsageSummaryRepository {
       args.addAll(includeSessionIds);
     }
     if (projectionVersion != null) {
-      where.add('s.parser_version = ?');
+      where.add('s.parser_version = ${agreedParserVersionSql('s')}');
       args.add(projectionVersion);
     }
     final rows = db.select(
@@ -426,7 +428,7 @@ class UsageSummaryRepository {
       args.addAll(includeSessionIds);
     }
     if (projectionVersion != null) {
-      where.add('s.parser_version = ?');
+      where.add('s.parser_version = ${agreedParserVersionSql('s')}');
       args.add(projectionVersion);
     }
     return db.select('''
@@ -485,7 +487,7 @@ class UsageSummaryRepository {
       range.endExclusiveUtc.toIso8601String(),
     ];
     if (request.projectionVersion case final projectionVersion?) {
-      where.add('s.parser_version = ?');
+      where.add('s.parser_version = ${agreedParserVersionSql('s')}');
       args.add(projectionVersion);
     }
     final sql = _usageEventAggregationSql(where.join(' and '));
@@ -564,11 +566,11 @@ class UsageSummaryRepository {
       select
         count(*) as available_sessions,
         coalesce(sum(case
-          when s.parser_version = ?
+          when s.parser_version = ${agreedParserVersionSql('s')}
             and s.usage_projection_status = 'complete' then 1 else 0
         end), 0) as current_complete_sessions,
         coalesce(sum(case
-          when s.parser_version is not ?
+          when s.parser_version is not ${agreedParserVersionSql('s')}
             and s.usage_projection_status = 'complete' then 1 else 0
         end), 0) as outdated_projection_sessions,
         coalesce(sum(case
@@ -581,7 +583,7 @@ class UsageSummaryRepository {
           when s.usage_projection_status = 'missing_parent' then 1 else 0
         end), 0) as missing_parent_sessions,
         coalesce(sum(case
-          when s.parser_version = ?
+          when s.parser_version = ${agreedParserVersionSql('s')}
             and s.usage_projection_status = 'complete'
             and $zeroUsagePredicate
           then 1 else 0

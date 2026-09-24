@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
-use crate::codex::parser::{AuthorType, PARSER_VERSION, SourceType, Usage};
+use crate::codex::parser::{AuthorType, SourceType, Usage};
 use crate::contract::{
     ProjectHint, ProjectHints, Record, SessionRef, SessionSnapshot, SourceStatus, ThreadName,
     UsageRecord, parse_time,
@@ -21,7 +21,9 @@ use crate::path_mapping::{canonical_scan_path, normalize_identity_path, normaliz
 use super::projects::{
     ProjectResolver, refresh_session_project, resolve_usage_path_context, upsert_auto_project,
 };
-use super::schema::{StoreError, StoreResult, begin_write, finish};
+use super::schema::{
+    StoreError, StoreResult, begin_write, check_parser_version, finish, parser_version_key,
+};
 
 pub const USAGE_COST_PROJECTION_VERSION: i64 = 1;
 
@@ -171,6 +173,13 @@ pub fn apply_session_batch(
     let count = canonical.len();
     begin_write(conn)?;
     let result = (|| -> StoreResult<()> {
+        let mut checked: Vec<&str> = Vec::new();
+        for (_, snapshot) in &canonical {
+            if !checked.contains(&snapshot.harness.as_str()) {
+                check_parser_version(conn, &snapshot.harness)?;
+                checked.push(&snapshot.harness);
+            }
+        }
         let now = DartDateTime::now().to_iso8601();
         for (id, snapshot) in &canonical {
             let resolver = ProjectResolver::new(
@@ -1345,7 +1354,7 @@ fn reconcile_affected_legacy_usage(
     };
 
     for child in &affected {
-        if child.parser_version != PARSER_VERSION {
+        if !is_current_parser(harness, child.parser_version) {
             mark_unresolved(conn, &child.row_id, "legacy_pending")?;
             continue;
         }
@@ -1390,7 +1399,7 @@ fn reconcile_affected_legacy_usage(
             continue;
         }
         let (parent_row, parent_version, parent_status, parent_aggregate) = parents[0].clone();
-        if parent_version != PARSER_VERSION {
+        if !is_current_parser(harness, parent_version) {
             mark_unresolved(conn, &child.row_id, "legacy_pending")?;
             continue;
         }
@@ -1438,6 +1447,12 @@ fn reconcile_affected_legacy_usage(
     Ok(result)
 }
 
+/// Whether `version` is this collector's parser version for `harness`.
+/// Harnesses the viewer does not version are always current.
+fn is_current_parser(harness: &str, version: i64) -> bool {
+    parser_version_key(harness).is_none_or(|(_, current)| current == version)
+}
+
 /// `UsageSummaryRepository.replaceDailyProjectionsInCurrentTransaction` for
 /// the active (schema 16+) generation. New rows start with unknown cost; the
 /// viewer's pricing maintenance fills in prices from the dirty partitions.
@@ -1456,13 +1471,13 @@ fn replace_daily_projections(conn: &Connection, session_ids: &[String]) -> Store
                coalesce(model, ''), path_context_id, branch_scope,
                sum(input_tokens), sum(cached_input_tokens), sum(cache_write_input_tokens),
                sum(output_tokens), sum(reasoning_output_tokens), sum(input_tokens + output_tokens),
-               null, 'unknown', 'pending_history', 1, ?
+               null, 'unknown', 'pending_history', ?, ?
              from usage_events where session_row_id = ?
                and strftime('%Y-%m-%d', occurred_at_utc) is not null
              group by session_row_id, strftime('%Y-%m-%d', occurred_at_utc),
                coalesce(model, ''), path_context_id, branch_scope",
         )?
-        .execute(params![now, id])?;
+        .execute(params![USAGE_COST_PROJECTION_VERSION, now, id])?;
         conn.prepare_cached(
             "update sessions set usage_local_event_count = (
                select count(*) from usage_events where session_row_id = ? and branch_scope = 'local'
@@ -1755,6 +1770,78 @@ pub fn apply_project_hints(
             &now,
         )?;
         Ok(rows.len())
+    })();
+    finish(conn, result)
+}
+
+/// A stored session without an automatic project.
+pub struct ProjectBackfillCandidate {
+    pub id: String,
+    pub working_directory: String,
+    pub source_type: SourceType,
+}
+
+const PROJECT_BACKFILL_CANDIDATES: &str = "select id, working_directory_display, source_type
+     from sessions
+     where (detected_project_id is null
+         or (coalesce(project_override, 0) = 0 and coalesce(trim(project_name_snapshot), '') = ''))
+       and coalesce(trim(working_directory_display), '') <> ''
+       and parse_status = 'available' and scan_status = 'available'
+     order by id";
+
+/// Sessions of any harness that `apply_project_backfill` would assign.
+pub fn project_backfill_candidates(
+    conn: &Connection,
+) -> StoreResult<Vec<ProjectBackfillCandidate>> {
+    let mut statement = conn.prepare(PROJECT_BACKFILL_CANDIDATES)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ProjectBackfillCandidate {
+                id: row.get(0)?,
+                working_directory: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                source_type: if row.get::<_, Option<String>>(2)?.as_deref() == Some("wsl") {
+                    SourceType::Wsl
+                } else {
+                    SourceType::Windows
+                },
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// `_backfillAutomaticProjects`: assign an automatic project to every
+/// candidate, preferring names resolved on this machine. The candidates are
+/// selected again under the write lock.
+pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> StoreResult<usize> {
+    let resolver = ProjectResolver::new(
+        hints
+            .iter()
+            .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
+    );
+    begin_write(conn)?;
+    let result = (|| -> StoreResult<usize> {
+        let now = DartDateTime::now().to_iso8601();
+        let mut updated = 0;
+        for candidate in project_backfill_candidates(conn)? {
+            let Some(name) =
+                resolver.resolve(Some(&candidate.working_directory), candidate.source_type)
+            else {
+                continue;
+            };
+            let name = trim(&name).to_owned();
+            if name.is_empty() {
+                continue;
+            }
+            let project_id = upsert_auto_project(conn, &name, &now)?;
+            conn.prepare_cached(
+                "update sessions set detected_project_id = ?, updated_at_utc = ? where id = ?",
+            )?
+            .execute(params![project_id, now, candidate.id])?;
+            refresh_session_project(conn, &candidate.id)?;
+            updated += 1;
+        }
+        Ok(updated)
     })();
     finish(conn, result)
 }

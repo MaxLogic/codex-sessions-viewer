@@ -8,14 +8,12 @@ import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart' show sqlite3, OpenMode;
 
 import '../config/app_settings.dart';
+import '../database/collector_versions.dart';
 import '../database/database_connection.dart';
 import '../database/database_maintenance.dart';
 import '../database/project_tag_state.dart';
-import '../database/session_cache_repair.dart';
 import '../database/session_list_query.dart';
 import '../logging/structured_logger.dart';
-import '../parser/codex_session_parser.dart';
-import '../path_mapping/path_mapper.dart';
 import '../pricing/pricing_repository.dart';
 import '../scanner/scan_batching.dart';
 import '../scanner/collector_process.dart';
@@ -67,9 +65,18 @@ class RuntimeSessionController implements ProjectsRepository {
     this.wslProjectResolver = const ProcessWslProjectResolver(),
     this.parserWorkerCountOverride,
     this.writerCoordinator,
+    this.claudeProjectRoots,
+    this.collectorExecutable,
+    this.collectorLeaseTimeout = CollectorProcess.defaultLeaseTimeout,
   }) : assert(
          parserWorkerCountOverride == null || parserWorkerCountOverride > 0,
        );
+
+  /// Claude Code projects folders a refresh collects when
+  /// [claudeProjectRoots] is null. Tests replace it so they never read the
+  /// developer's own transcripts.
+  static List<String> Function() defaultClaudeProjectRoots =
+      _existingDefaultClaudeProjectRoots;
 
   final File settingsFile;
   final File databaseFile;
@@ -77,7 +84,22 @@ class RuntimeSessionController implements ProjectsRepository {
   final WslProjectResolver wslProjectResolver;
   final int? parserWorkerCountOverride;
   final DatabaseMaintenanceCoordinator? writerCoordinator;
+
+  /// Claude Code projects folders to collect; empty skips Claude.
+  final List<String>? claudeProjectRoots;
+
+  /// The collector executable; null uses [CollectorProcess]'s default.
+  final String? collectorExecutable;
+  final Duration collectorLeaseTimeout;
   SendPort? _backgroundWriterPort;
+
+  List<String> get _claudeRoots =>
+      claudeProjectRoots ?? defaultClaudeProjectRoots();
+
+  CollectorProcess _collector() => CollectorProcess(
+    executable: collectorExecutable,
+    leaseTimeout: collectorLeaseTimeout,
+  );
 
   /// Whether the UI already holds the cached session rows, so a rescan can
   /// skip resending the full list before it starts scanning.
@@ -125,11 +147,17 @@ class RuntimeSessionController implements ProjectsRepository {
     SessionsRefreshProgressCallback? onProgress,
   }) {
     return _BackgroundSessionScanOperation.start(
-      settingsFile: settingsFile,
-      databaseFile: databaseFile,
-      scanBatchingPolicy: scanBatchingPolicy,
+      controller: RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+        scanBatchingPolicy: scanBatchingPolicy,
+        writerCoordinator: writerCoordinator,
+        parserWorkerCountOverride: parserWorkerCountOverride,
+        claudeProjectRoots: _claudeRoots,
+        collectorExecutable: collectorExecutable,
+        collectorLeaseTimeout: collectorLeaseTimeout,
+      ),
       onProgress: onProgress,
-      writerCoordinator: writerCoordinator,
     );
   }
 
@@ -144,7 +172,7 @@ class RuntimeSessionController implements ProjectsRepository {
         db.execute('pragma busy_timeout = $defaultSqliteBusyTimeoutMs');
         return UsageSummaryRepository(db).loadPersistedSessionCosts(
           ids,
-          projectionVersion: CodexSessionParser.currentVersion,
+          projectionVersion: collectorCodexParserVersion,
         );
       } finally {
         db.close();
@@ -152,28 +180,25 @@ class RuntimeSessionController implements ProjectsRepository {
     });
   }
 
+  /// Reads the stored rows. The collector cleans placeholders and assigns
+  /// projects during scans; loading never writes parsed session state.
   Future<SessionsRefreshResult> loadCachedRows() {
-    return _runWrite(
-      () => Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
-        final db = openFileBackedDatabase(databaseFile);
-        try {
-          _cleanSessionMetadataPlaceholders(db);
-          await _backfillAutomaticProjects(
-            db,
-            wslProjects: _WslProjectResolutionCache(wslProjectResolver),
-          );
-          final rows = _loadRowsProfiled(db);
-          return SessionsRefreshResult(
-            rows: rows,
-            statusMessage: rows.isEmpty
-                ? ''
-                : 'Loaded ${rows.length} of ${rows.length} sessions from the previous scan.',
-          );
-        } finally {
-          db.close();
-        }
-      }),
-    );
+    return Profiling.spanAsync('scan.runtime.load_cached_rows', () async {
+      final db = _openReader(databaseFile.path);
+      try {
+        final revision = _journalRevision(db);
+        final rows = _loadRowsProfiled(db);
+        return SessionsRefreshResult(
+          rows: rows,
+          statusMessage: rows.isEmpty
+              ? ''
+              : 'Loaded ${rows.length} of ${rows.length} sessions from the previous scan.',
+          journalRevision: revision,
+        );
+      } finally {
+        db.close();
+      }
+    });
   }
 
   /// Read collector commits without metadata repair, scanning, or another writer.
@@ -185,23 +210,10 @@ class RuntimeSessionController implements ProjectsRepository {
   Future<ExternalSessionRows> loadExternalRowChanges({int? afterRevision}) {
     final path = databaseFile.path;
     return Isolate.run(() {
-      final db = sqlite3.open(path, mode: OpenMode.readOnly);
+      final db = _openReader(path);
       try {
-        db.execute('pragma busy_timeout = $defaultSqliteBusyTimeoutMs');
         db.execute('begin');
-        final journalExists = db
-            .select(
-              "select 1 from sqlite_schema where name = 'session_change_state'",
-            )
-            .isNotEmpty;
-        final revision = journalExists
-            ? db
-                      .select(
-                        'select revision from session_change_state where id = 1',
-                      )
-                      .single['revision']
-                  as int
-            : null;
+        final revision = _journalRevision(db);
         if (afterRevision == null ||
             revision == null ||
             revision < afterRevision) {
@@ -249,12 +261,8 @@ class RuntimeSessionController implements ProjectsRepository {
   Future<SessionsRefreshResult> loadCachedRowsInBackground({
     SessionsRefreshProgressCallback? onProgress,
     int batchSize = 250,
-  }) => _runWrite(
-    () => _loadCachedRowsInBackground(
-      onProgress: onProgress,
-      batchSize: batchSize,
-    ),
-  );
+  }) =>
+      _loadCachedRowsInBackground(onProgress: onProgress, batchSize: batchSize);
 
   Future<SessionsRefreshResult> _loadCachedRowsInBackground({
     SessionsRefreshProgressCallback? onProgress,
@@ -328,6 +336,7 @@ class RuntimeSessionController implements ProjectsRepository {
                 SessionsRefreshResult(
                   rows: List.unmodifiable(loaded),
                   statusMessage: '',
+                  journalRevision: message.journalRevision,
                 ),
               );
             }
@@ -543,6 +552,7 @@ class RuntimeSessionController implements ProjectsRepository {
     required File settingsFile,
     required File databaseFile,
     required String sessionId,
+    String? collectorExecutable,
   }) async {
     final db = openFileBackedDatabase(databaseFile);
     late String path;
@@ -559,7 +569,7 @@ class RuntimeSessionController implements ProjectsRepository {
       db.close();
     }
     if (path.isEmpty || !File(path).existsSync()) return null;
-    await CollectorProcess().ingest(
+    await CollectorProcess(executable: collectorExecutable).ingest(
       settingsFile: settingsFile,
       databaseFile: databaseFile,
       sourcePath: path,
@@ -613,6 +623,10 @@ class RuntimeSessionController implements ProjectsRepository {
           fullRowSnapshotBatchSize: scanBatchingPolicy.fullRowSnapshotBatchSize,
           coordinateWrites: writerCoordinator != null,
           emitCachedRowsAtScanStart: !_rowsDelivered,
+          parserWorkerCountOverride: parserWorkerCountOverride,
+          claudeProjectRoots: _claudeRoots,
+          collectorExecutable: collectorExecutable,
+          collectorLeaseTimeout: collectorLeaseTimeout,
         ),
         onError: errors.sendPort,
         onExit: exits.sendPort,
@@ -718,7 +732,7 @@ class RuntimeSessionController implements ProjectsRepository {
         pathMask: pathMask,
         priority: priority,
         isActive: isActive,
-        projectionVersion: CodexSessionParser.currentVersion,
+        projectionVersion: collectorCodexParserVersion,
         pricing: pricing,
       );
     } finally {
@@ -755,7 +769,7 @@ class RuntimeSessionController implements ProjectsRepository {
             folder: folder,
             projectName: projectName,
             sessionId: sessionId,
-            projectionVersion: CodexSessionParser.currentVersion,
+            projectionVersion: collectorCodexParserVersion,
             pricing: pricing,
           );
         case ResetSessionProject():
@@ -763,7 +777,7 @@ class RuntimeSessionController implements ProjectsRepository {
         case RemoveFolderRule(:final folder):
           store.removeFolderRule(
             folder: folder,
-            projectionVersion: CodexSessionParser.currentVersion,
+            projectionVersion: collectorCodexParserVersion,
             pricing: pricing,
           );
         case ManageProjectRules():
@@ -872,7 +886,7 @@ class RuntimeSessionController implements ProjectsRepository {
       final before = store.snapshotProjectRules();
       edit(
         store,
-        CodexSessionParser.currentVersion,
+        collectorCodexParserVersion,
         PricingRepository(db).loadCached(settings.pricing),
       );
       return before;
@@ -934,23 +948,16 @@ class RuntimeSessionController implements ProjectsRepository {
             ),
           ),
         );
-        final scanRoots = [
-          ..._sessionScanRoots(
-            settings.paths.windowsCodexPath,
-            SessionSourceType.windows,
-          ),
-          ..._sessionScanRoots(
-            settings.paths.wslCodexUncPath,
-            SessionSourceType.wsl,
-          ),
-        ];
-        final collector = CollectorProcess();
+        final collector = _collector();
         final result = await Profiling.spanAsync(
           'scan.runtime.collector',
           () => collector.scan(
             settingsFile: settingsFile,
             databaseFile: databaseFile,
             cancellation: cancellationToken,
+            claudeRoots: _claudeRoots,
+            // An injected resolver supplies WSL names after the scan.
+            resolveWslProjects: wslProjectResolver is ProcessWslProjectResolver,
             parserWorkers: parserWorkerCountOverride,
             flushSessions: scanBatchingPolicy.parsedSessionFlushBatchSize,
             flushBytes: scanBatchingPolicy.parsedSessionFlushSourceBytes,
@@ -1016,64 +1023,8 @@ class RuntimeSessionController implements ProjectsRepository {
         onProgress?.call(
           const SessionsRefreshProgress(statusMessage: 'Finalizing scan...'),
         );
-        try {
-          final repair = await _writeScan(
-            () => SessionCacheRepair(databaseFile: databaseFile).run(
-              db: db,
-              roots: scanRoots,
-              discoveryComplete: result.canRunCacheRepair,
-              isCancellationRequested: () =>
-                  cancellationToken.isCancellationRequested,
-              onProgress: (phase) {
-                onProgress?.call(
-                  SessionsRefreshProgress(
-                    statusMessage: _cacheRepairProgressMessage(phase),
-                  ),
-                );
-              },
-            ),
-          );
-          final audit = repair.audit;
-          await _writeScan(
-            () => activeLogger.writeBestEffort(
-              LogEntryDraft(
-                level:
-                    repair.status == SessionCacheRepairStatus.postponed &&
-                        repair.reasonCode != 'cancelled'
-                    ? LogLevel.warning
-                    : LogLevel.info,
-                category: LogCategory.database,
-                message: repair.status == SessionCacheRepairStatus.postponed
-                    ? 'Session cache repair postponed.'
-                    : 'Session cache repair checked.',
-                details: {
-                  'status': repair.status.name,
-                  'reason_code': repair.reasonCode,
-                  'deleted_rows': repair.deletedCount,
-                  if (audit != null)
-                    for (final entry in audit.categoryCounts.entries)
-                      'category_${entry.key.wireName}': entry.value,
-                  if (repair.backupFile != null)
-                    'backup_file': p.basename(repair.backupFile!.path),
-                },
-              ),
-            ),
-          );
-        } on Object catch (error) {
-          await _writeScan(
-            () => activeLogger.writeBestEffort(
-              LogEntryDraft(
-                level: LogLevel.warning,
-                category: LogCategory.database,
-                message: 'Session cache repair postponed.',
-                details: {
-                  'status': 'postponed',
-                  'reason_code': 'unexpected_repair_error',
-                  'error_type': error.runtimeType.toString(),
-                },
-              ),
-            ),
-          );
+        if (collector.cacheRepair case final repair?) {
+          await _writeScan(() => _logCacheRepair(activeLogger, repair));
         }
         final rows = Profiling.spanSync(
           'scan.runtime.final_load_rows',
@@ -1267,6 +1218,10 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
         parsedSessionFlushSourceBytes: request.parsedSessionFlushSourceBytes,
         fullRowSnapshotBatchSize: request.fullRowSnapshotBatchSize,
       ),
+      parserWorkerCountOverride: request.parserWorkerCountOverride,
+      claudeProjectRoots: request.claudeProjectRoots,
+      collectorExecutable: request.collectorExecutable,
+      collectorLeaseTimeout: request.collectorLeaseTimeout,
     );
     if (request.coordinateWrites) {
       controller._backgroundWriterPort = request.sendPort;
@@ -1298,15 +1253,11 @@ Future<void> _backgroundCachedRowsEntry(
   _BackgroundCachedRowsRequest request,
 ) async {
   try {
-    final db = openFileBackedDatabase(File(request.databaseFilePath));
+    final db = _openReader(request.databaseFilePath);
     try {
-      _cleanSessionMetadataPlaceholders(db);
-      await _backfillAutomaticProjects(
-        db,
-        wslProjects: _WslProjectResolutionCache(
-          const ProcessWslProjectResolver(),
-        ),
-      );
+      // Read before the rows: a commit after this point is replayed from
+      // the journal, so rows are never loaded twice at startup.
+      final revision = _journalRevision(db);
       final total = _visibleRowCount(db);
       var offset = 0;
       while (offset < total) {
@@ -1324,7 +1275,7 @@ Future<void> _backgroundCachedRowsEntry(
         // every row once per batch at startup.
         request.sendPort.send(_BackgroundCachedRowsBatch(batch, offset, total));
       }
-      request.sendPort.send(const _BackgroundCachedRowsDone());
+      request.sendPort.send(_BackgroundCachedRowsDone(revision));
     } finally {
       db.close();
     }
@@ -1439,6 +1390,10 @@ class _BackgroundRefreshRequest {
     required this.fullRowSnapshotBatchSize,
     required this.coordinateWrites,
     required this.emitCachedRowsAtScanStart,
+    required this.parserWorkerCountOverride,
+    required this.claudeProjectRoots,
+    required this.collectorExecutable,
+    required this.collectorLeaseTimeout,
   });
 
   final String settingsFilePath;
@@ -1449,6 +1404,10 @@ class _BackgroundRefreshRequest {
   final int fullRowSnapshotBatchSize;
   final bool coordinateWrites;
   final bool emitCachedRowsAtScanStart;
+  final int? parserWorkerCountOverride;
+  final List<String> claudeProjectRoots;
+  final String? collectorExecutable;
+  final Duration collectorLeaseTimeout;
 }
 
 class _BackgroundScanWriteRequest {
@@ -1467,7 +1426,9 @@ class _BackgroundCachedRowsBatch {
 }
 
 class _BackgroundCachedRowsDone {
-  const _BackgroundCachedRowsDone();
+  const _BackgroundCachedRowsDone(this.journalRevision);
+
+  final int? journalRevision;
 }
 
 class _BackgroundCachedRowsRequest {
@@ -1731,24 +1692,15 @@ class _BackgroundMessageSearchBackfillOperation {
 
 class _BackgroundSessionScanOperation {
   static CancellableSessionScanOperation start({
-    required File settingsFile,
-    required File databaseFile,
-    required ScanBatchingPolicy scanBatchingPolicy,
+    required RuntimeSessionController controller,
     SessionsRefreshProgressCallback? onProgress,
-    DatabaseMaintenanceCoordinator? writerCoordinator,
   }) {
     final cancellationHandle = _BackgroundScanCancellationHandle();
-    final controller = RuntimeSessionController(
-      settingsFile: settingsFile,
-      databaseFile: databaseFile,
-      scanBatchingPolicy: scanBatchingPolicy,
-      writerCoordinator: writerCoordinator,
-    );
     Future<SessionsRefreshResult> work() => controller._refreshInBackground(
       onProgress: onProgress,
       cancellationHandle: cancellationHandle,
     );
-    final result = writerCoordinator?.runScan(work) ?? work();
+    final result = controller.writerCoordinator?.runScan(work) ?? work();
     return CancellableSessionScanOperation._(
       result,
       cancellationHandle.requestCancel,
@@ -1861,7 +1813,7 @@ List<SessionRowViewModel> _loadRows(
   final tagsBySessionId = _loadTagsBySessionId(db, loadedSessionIds);
   final persistedCosts = UsageSummaryRepository(db).loadPersistedSessionCosts(
     loadedSessionIds,
-    projectionVersion: CodexSessionParser.currentVersion,
+    projectionVersion: collectorCodexParserVersion,
   );
   return [
     for (final row in rows)
@@ -2231,21 +2183,6 @@ bool _isInjectedContextRow(Row row) {
       );
 }
 
-int _upsertAutoProject(Database db, String name, String now) {
-  db.execute(
-    '''
-    insert into projects (name, description, is_active, created_at_utc, updated_at_utc)
-    values (?, ?, 1, ?, ?)
-    on conflict(name) do update set updated_at_utc = excluded.updated_at_utc
-    ''',
-    [name, 'Auto-detected from session working directory.', now, now],
-  );
-  return db.select('select id from projects where name = ?', [
-        name,
-      ]).single['id']
-      as int;
-}
-
 String _cleanDisplayTitle(String? value) {
   final trimmed = value?.trim();
   if (trimmed == null || trimmed.isEmpty) {
@@ -2266,273 +2203,6 @@ String _cleanDisplaySummary(String? value) {
     return '';
   }
   return trimmed;
-}
-
-void _cleanSessionMetadataPlaceholders(Database db) {
-  final rows = db.select('''
-    select
-      rowid,
-      lower(trim(coalesce(title, ''))) like '# agents.md%' as bad_title,
-      lower(trim(coalesce(summary, ''))) = 'auto' as bad_summary
-    from sessions
-    where lower(trim(coalesce(title, ''))) like '# agents.md%'
-       or lower(trim(coalesce(summary, ''))) = 'auto'
-    ''');
-  if (rows.isEmpty) {
-    return;
-  }
-  db.execute('begin immediate');
-  try {
-    for (final row in rows) {
-      final rowid = row['rowid'] as int;
-      final badTitle = (row['bad_title'] as int? ?? 0) == 1;
-      final badSummary = (row['bad_summary'] as int? ?? 0) == 1;
-      db.execute(
-        '''
-        update sessions
-        set title = case when ? then null else title end,
-            summary = case when ? then null else summary end
-        where rowid = ?
-        ''',
-        [badTitle ? 1 : 0, badSummary ? 1 : 0, rowid],
-      );
-      db.execute(
-        '''
-        update session_search
-        set title = case when ? then '' else title end,
-            summary = case when ? then '' else summary end
-        where rowid = ?
-        ''',
-        [badTitle ? 1 : 0, badSummary ? 1 : 0, rowid],
-      );
-    }
-    db.execute('commit');
-  } on Object {
-    db.execute('rollback');
-    rethrow;
-  }
-}
-
-Future<void> _backfillAutomaticProjects(
-  Database db, {
-  required _WslProjectResolutionCache wslProjects,
-}) async {
-  final rows = db.select('''
-    select id, source_type, working_directory_display
-    from sessions
-    where (
-        detected_project_id is null
-        or (
-          coalesce(project_override, 0) = 0
-          and coalesce(trim(project_name_snapshot), '') = ''
-        )
-      )
-      and coalesce(trim(working_directory_display), '') <> ''
-      and parse_status = 'available'
-      and scan_status = 'available'
-    ''');
-  if (rows.isEmpty) {
-    return;
-  }
-  final candidates = [
-    for (final row in rows)
-      _ProjectPathCandidate(
-        row['working_directory_display'] as String?,
-        (row['source_type'] as String?) == 'wsl'
-            ? SessionSourceType.wsl
-            : SessionSourceType.windows,
-      ),
-  ];
-  final resolver = await _ProjectPathResolver.create(
-    candidates,
-    wslProjects: wslProjects,
-  );
-  final resolvedRows = <({String sessionId, String projectName})>[];
-  for (var i = 0; i < rows.length; i++) {
-    final row = rows[i];
-    final candidate = candidates[i];
-    final autoProject = resolver.resolve(
-      candidate.workingDirectory,
-      sourceType: candidate.sourceType,
-    );
-    final projectName = autoProject?.name.trim() ?? '';
-    if (projectName.isNotEmpty) {
-      resolvedRows.add((
-        sessionId: row['id'] as String,
-        projectName: projectName,
-      ));
-    }
-  }
-  if (resolvedRows.isEmpty) {
-    return;
-  }
-  _applyResolvedProjectRows(db, resolvedRows);
-}
-
-void _applyResolvedProjectRows(
-  Database db,
-  List<({String sessionId, String projectName})> resolvedRows,
-) {
-  db.execute('begin immediate');
-  try {
-    final now = DateTime.now().toUtc().toIso8601String();
-    for (final row in resolvedRows) {
-      final projectName = row.projectName;
-      final projectId = _upsertAutoProject(db, projectName, now);
-      final sessionId = row.sessionId;
-      db.execute(
-        '''
-        update sessions
-        set detected_project_id = ?,
-            updated_at_utc = ?
-        where id = ?
-        ''',
-        [projectId, now, sessionId],
-      );
-      ProjectTagStateStore(db).refreshSessionProject(sessionId);
-    }
-    db.execute('commit');
-  } on Object {
-    db.execute('rollback');
-    rethrow;
-  }
-}
-
-class _ResolvedProjectPath {
-  const _ResolvedProjectPath(this.name);
-
-  final String name;
-}
-
-class _ProjectPathCandidate {
-  const _ProjectPathCandidate(this.workingDirectory, this.sourceType);
-
-  final String? workingDirectory;
-  final SessionSourceType sourceType;
-}
-
-class _WslProjectResolutionCache {
-  _WslProjectResolutionCache(this._resolver);
-
-  final WslProjectResolver _resolver;
-  final _attemptedPaths = <String>{};
-  final _resolvedNames = <String, String>{};
-
-  Future<Map<String, String>> resolve(
-    Iterable<String> workingDirectories,
-  ) async {
-    final requestedPaths = workingDirectories
-        .map((path) => path.trim())
-        .where((path) => path.isNotEmpty)
-        .toSet();
-    final unresolvedPaths = requestedPaths
-        .where((path) => !_attemptedPaths.contains(path))
-        .toSet();
-    if (unresolvedPaths.isNotEmpty) {
-      _attemptedPaths.addAll(unresolvedPaths);
-      try {
-        final resolved = await Profiling.spanAsync(
-          'scan.runtime.resolve_wsl_project',
-          () => _resolver.resolveProjectNames(unresolvedPaths),
-        );
-        for (final entry in resolved.entries) {
-          final path = entry.key.trim();
-          final name = entry.value.trim();
-          if (unresolvedPaths.contains(path) && name.isNotEmpty) {
-            _resolvedNames[path] = name;
-          }
-        }
-      } on Object {
-        // WSL can be unavailable during startup/tests. Callers use path fallback.
-      }
-    }
-    return {
-      for (final path in requestedPaths)
-        if ((_resolvedNames[path] ?? '').isNotEmpty)
-          path: _resolvedNames[path]!,
-    };
-  }
-}
-
-class _ProjectPathResolver {
-  _ProjectPathResolver({this.resolvedWslProjectNames = const {}});
-
-  final Map<String, String> resolvedWslProjectNames;
-  final _cache = <String, _ResolvedProjectPath?>{};
-
-  static Future<_ProjectPathResolver> create(
-    Iterable<_ProjectPathCandidate> candidates, {
-    required _WslProjectResolutionCache wslProjects,
-  }) async {
-    final wslPaths = <String>{};
-    for (final candidate in candidates) {
-      final path = candidate.workingDirectory?.trim();
-      if (candidate.sourceType == SessionSourceType.wsl &&
-          path != null &&
-          path.isNotEmpty) {
-        wslPaths.add(path);
-      }
-    }
-    return _ProjectPathResolver(
-      resolvedWslProjectNames: await wslProjects.resolve(wslPaths),
-    );
-  }
-
-  _ResolvedProjectPath? resolve(
-    String? workingDirectory, {
-    required SessionSourceType sourceType,
-  }) {
-    final path = workingDirectory?.trim();
-    if (path == null || path.isEmpty) {
-      return null;
-    }
-    return _cache.putIfAbsent('$sourceType|$path', () {
-      return switch (sourceType) {
-        SessionSourceType.windows => _resolveWindows(path),
-        SessionSourceType.wsl => _resolveWsl(path),
-      };
-    });
-  }
-
-  _ResolvedProjectPath? _resolveWindows(String path) {
-    final directory = Directory(path);
-    if (!directory.existsSync()) {
-      return _projectFromPath(path);
-    }
-    var current = directory.absolute;
-    while (true) {
-      if (Directory(p.join(current.path, '.git')).existsSync() ||
-          File(p.join(current.path, '.git')).existsSync()) {
-        return _projectFromPath(current.path);
-      }
-      final parent = current.parent;
-      if (parent.path == current.path) {
-        break;
-      }
-      current = parent;
-    }
-    return _projectFromPath(directory.path);
-  }
-
-  _ResolvedProjectPath? _resolveWsl(String path) {
-    final name = resolvedWslProjectNames[path]?.trim() ?? '';
-    if (name.isNotEmpty) {
-      return _ResolvedProjectPath(name);
-    }
-    return _projectFromPath(path);
-  }
-
-  _ResolvedProjectPath? _projectFromPath(String path) {
-    final segments = path
-        .replaceAll(r'\', '/')
-        .split('/')
-        .where((segment) => segment.trim().isNotEmpty)
-        .toList();
-    if (segments.isEmpty) {
-      return null;
-    }
-    return _ResolvedProjectPath(segments.last);
-  }
 }
 
 String _statusMessage(
@@ -2565,14 +2235,35 @@ String _statusMessage(
   return 'Scan finished. $available available. $parsed parsed.$failures';
 }
 
-String _cacheRepairProgressMessage(SessionCacheRepairPhase phase) {
-  final activity = switch (phase) {
-    SessionCacheRepairPhase.auditing => 'auditing cached rows',
-    SessionCacheRepairPhase.creatingBackup => 'creating backup',
-    SessionCacheRepairPhase.verifyingBackup => 'verifying backup',
-    SessionCacheRepairPhase.applying => 'applying verified cleanup',
-  };
-  return 'Maintaining session cache: $activity...';
+/// Logs the collector's report of the legacy session cache repair.
+Future<void> _logCacheRepair(
+  StructuredLogger logger,
+  Map<String, dynamic> repair,
+) {
+  final status = repair['status'] as String? ?? 'postponed';
+  final reason = repair['reason_code'] as String? ?? '';
+  final postponed = status == 'postponed';
+  final categories = repair['categories'] as Map<String, dynamic>? ?? const {};
+  return logger.writeBestEffort(
+    LogEntryDraft(
+      level: postponed && reason != 'cancelled'
+          ? LogLevel.warning
+          : LogLevel.info,
+      category: LogCategory.database,
+      message: postponed
+          ? 'Session cache repair postponed.'
+          : 'Session cache repair checked.',
+      details: {
+        'status': status,
+        'reason_code': reason,
+        'deleted_rows': repair['deleted_rows'] ?? 0,
+        for (final entry in categories.entries)
+          'category_${entry.key}': entry.value,
+        if (repair['backup_file'] case final String backup)
+          'backup_file': backup,
+      },
+    ),
+  );
 }
 
 String _progressStatusMessage(ScanProgress progress) {
@@ -2604,50 +2295,6 @@ int _estimatedProgressPercent(ScanProgress progress) {
   return ((processed / totalKnown) * 100).clamp(0, 99).round();
 }
 
-List<SessionScanRoot> _sessionScanRoots(
-  String configuredPath,
-  SessionSourceType sourceType,
-) {
-  final trimmed = configuredPath.trim();
-  if (trimmed.isEmpty) {
-    return const [];
-  }
-  final normalized = p.normalize(trimmed);
-  final leaf = p.basename(normalized).toLowerCase();
-  final isNamedSessionRoot = leaf == 'sessions' || leaf == 'archived_sessions';
-  final codexRoot = isNamedSessionRoot ? p.dirname(normalized) : normalized;
-  final activePath = p.join(codexRoot, 'sessions');
-  final archivedPath = p.join(codexRoot, 'archived_sessions');
-  final isCodexRoot =
-      isNamedSessionRoot ||
-      leaf == '.codex' ||
-      Directory(activePath).existsSync() ||
-      Directory(archivedPath).existsSync();
-  if (!isCodexRoot) {
-    return [
-      SessionScanRoot(
-        path: normalized,
-        sourceType: sourceType,
-        sourceState: SessionSourceState.active,
-      ),
-    ];
-  }
-  return [
-    SessionScanRoot(
-      path: activePath,
-      availabilityRootPath: codexRoot,
-      sourceType: sourceType,
-      sourceState: SessionSourceState.active,
-    ),
-    SessionScanRoot(
-      path: archivedPath,
-      availabilityRootPath: codexRoot,
-      sourceType: sourceType,
-      sourceState: SessionSourceState.codexArchived,
-    ),
-  ];
-}
-
 Map<String, Object?> _progressLogDetails(ScanProgress progress) => {
   'directories_scanned': progress.directoriesScanned,
   'files_found': progress.filesFound,
@@ -2659,6 +2306,37 @@ Map<String, Object?> _progressLogDetails(ScanProgress progress) => {
   'sessions_missing': progress.sessionsMissing,
   'finished': progress.finishedAtUtc != null,
 };
+
+/// A read-only connection that waits for writers like the viewer does.
+Database _openReader(String path) {
+  final db = sqlite3.open(path, mode: OpenMode.readOnly);
+  try {
+    db.execute('pragma busy_timeout = $defaultSqliteBusyTimeoutMs');
+    return db;
+  } on Object {
+    db.close();
+    rethrow;
+  }
+}
+
+/// The session change journal's revision, or null before schema 21.
+int? _journalRevision(Database db) {
+  final exists = db
+      .select("select 1 from sqlite_schema where name = 'session_change_state'")
+      .isNotEmpty;
+  if (!exists) return null;
+  return db
+          .select('select revision from session_change_state where id = 1')
+          .single['revision']
+      as int;
+}
+
+List<String> _existingDefaultClaudeProjectRoots() {
+  final home = Platform.environment['USERPROFILE'] ?? '';
+  if (home.isEmpty) return const [];
+  final root = p.join(home, '.claude', 'projects');
+  return Directory(root).existsSync() ? [root] : const [];
+}
 
 int _defaultParserWorkerCount() {
   final processors = Platform.numberOfProcessors;

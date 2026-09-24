@@ -5,12 +5,13 @@ pub mod parser;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, Mutex};
 
-use crate::codex::CollectReport;
 use crate::codex::parser::{ParseError, SourceType, file_modified_utc};
 use crate::codex::scanner::{ScanCounts, parse_error_status};
+use crate::codex::{CollectReport, gated};
 use crate::contract::{ProjectHint, SessionSnapshot, Source, SourceStatus};
 use crate::path_mapping::{
     PathMapper, canonical_scan_path, is_path_under_root, normalize_path_key,
@@ -21,7 +22,7 @@ use crate::store::{ApplySummary, Store, StoreResult, writer};
 
 use parser::{CLAUDE_PARSER_VERSION, ClaudeOptions, ClaudeTranscript, HARNESS, parse_transcript};
 
-const FLUSH_SESSIONS: usize = 32;
+pub const FLUSH_SESSIONS: usize = 32;
 const CACHE_MODIFIED_TOLERANCE_MICROS: i64 = 2_000_000;
 
 /// A folder holding Claude project folders (`~/.claude/projects`).
@@ -197,6 +198,28 @@ type Parsed = (String, SourceType, Result<ClaudeTranscript, ParseError>);
 
 /// Scan Claude transcripts into `store`, reparsing only changed files.
 pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<CollectReport> {
+    collect_coordinated(
+        store,
+        options,
+        &Arc::new(AtomicBool::new(false)),
+        |_, _| {},
+        |_| Ok(true),
+        FLUSH_SESSIONS,
+    )
+}
+
+/// `collect` with cancellation, progress, and the GUI writer-lease gate of
+/// [`crate::codex::collect_coordinated`]: every database write asks the gate
+/// first, and nothing asks for a lease once the scan is cancelled.
+pub fn collect_coordinated(
+    store: &Store,
+    options: &ClaudeScanOptions,
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(&ScanCounts, usize),
+    mut gate: impl FnMut(bool) -> StoreResult<bool>,
+    flush_sessions: usize,
+) -> StoreResult<CollectReport> {
+    let is_cancelled = || cancel.load(Ordering::Relaxed);
     let cached: HashMapCache = writer::cached_sources(&store.conn, HARNESS)?
         .into_iter()
         .flat_map(|source| {
@@ -213,7 +236,11 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
     let mut found: HashSet<String> = HashSet::new();
     let mut work: Vec<(String, SourceType)> = Vec::new();
     let mut scanned_roots = Vec::new();
+    progress(&counts, 0);
     for root in &options.roots {
+        if is_cancelled() {
+            break;
+        }
         if !Path::new(&root.path).is_dir() {
             let entry = status(
                 &root.path,
@@ -225,6 +252,7 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
             counts.files_failed += 1;
             continue;
         }
+        counts.directories_scanned += 1;
         scanned_roots.push(root.path.clone());
         for file in discover(Path::new(&root.path)) {
             let path = file.to_string_lossy().into_owned();
@@ -237,6 +265,7 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
                 work.push((path, root.source_type));
             }
         }
+        progress(&counts, 0);
     }
 
     let mut applied = ApplySummary::default();
@@ -245,12 +274,16 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
     let (sender, receiver) = sync_channel::<Parsed>(workers * 2);
     let parser_options = options.parser;
     let mut apply_error = None;
+    let mut flushes = 0u64;
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let sender = sender.clone();
             let queue = &queue;
             scope.spawn(move || {
                 loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let next = queue.lock().ok().and_then(|mut items| items.next());
                     let Some((path, source_type)) = next else {
                         return;
@@ -264,6 +297,21 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
         }
         drop(sender);
         let mut pending: Vec<SessionSnapshot> = Vec::new();
+        let mut flush = |pending: Vec<SessionSnapshot>,
+                         applied: &mut ApplySummary,
+                         flushes: &mut u64|
+         -> StoreResult<()> {
+            match gated(&mut gate, || {
+                writer::apply_session_batch(&store.conn, pending)
+            })? {
+                Some(count) => {
+                    applied.sessions += count;
+                    *flushes += 1;
+                }
+                None => cancel.store(true, Ordering::Relaxed),
+            }
+            Ok(())
+        };
         for (path, source_type, result) in receiver.iter() {
             if apply_error.is_some() {
                 continue;
@@ -274,12 +322,11 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
                     let snapshot = snapshot(&path, source_type, &options.mapper, transcript);
                     statuses.push(status(&path, &snapshot.source.status, None));
                     pending.push(snapshot);
-                    if pending.len() >= FLUSH_SESSIONS {
-                        match writer::apply_session_batch(&store.conn, std::mem::take(&mut pending))
-                        {
-                            Ok(count) => applied.sessions += count,
-                            Err(error) => apply_error = Some(error),
-                        }
+                    if pending.len() >= flush_sessions.max(1)
+                        && let Err(error) =
+                            flush(std::mem::take(&mut pending), &mut applied, &mut flushes)
+                    {
+                        apply_error = Some(error);
                     }
                 }
                 Err(error) => {
@@ -293,21 +340,28 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
                     statuses.push(entry);
                 }
             }
+            counts.persistence_flushes = flushes;
+            progress(&counts, applied.sessions);
         }
-        if apply_error.is_none() && !pending.is_empty() {
-            match writer::apply_session_batch(&store.conn, pending) {
-                Ok(count) => applied.sessions += count,
-                Err(error) => apply_error = Some(error),
-            }
+        if apply_error.is_none()
+            && !pending.is_empty()
+            && let Err(error) = flush(pending, &mut applied, &mut flushes)
+        {
+            apply_error = Some(error);
         }
     });
     if let Some(error) = apply_error {
         return Err(error);
     }
+    counts.persistence_flushes = flushes;
 
     // Previously collected transcripts that disappeared from a scanned root.
+    // A cancelled scan did not look at every file, so it reports none.
     let mut missing_seen = HashSet::new();
     for source in cached.values() {
+        if is_cancelled() {
+            break;
+        }
         let key = canonical_scan_path(&source.source_path);
         if found.contains(&key) || !missing_seen.insert(key.clone()) {
             continue;
@@ -329,12 +383,22 @@ pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<Collec
             statuses.push(entry);
         }
     }
-    writer::apply_source_statuses(&store.conn, &statuses)?;
-    applied.statuses = statuses.len();
+    if gated(&mut gate, || {
+        writer::apply_source_statuses(&store.conn, &statuses)
+    })?
+    .is_some()
+    {
+        applied.statuses = statuses.len();
+    }
+    if !is_cancelled() {
+        applied.project_updates += crate::codex::backfill_projects(store, &mut gate, false)?;
+    }
+    counts.cancelled = is_cancelled();
     Ok(CollectReport {
         counts,
         applied,
         errors,
+        cache_repair: None,
     })
 }
 
@@ -384,5 +448,6 @@ pub fn collect_file(
         counts,
         applied,
         errors,
+        cache_repair: None,
     })
 }

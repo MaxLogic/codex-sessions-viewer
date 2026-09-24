@@ -10,10 +10,11 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::writer::USAGE_COST_PROJECTION_VERSION;
+use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 23;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 25;
 
 pub struct Migration {
     pub version: i64,
@@ -77,6 +78,9 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(21, "migration", "021_session_change_journal.sql"),
     migration!(22, "migration", "022_collector_upload_outbox.sql"),
     migration!(23, "migration", "023_price_history_sync.sql"),
+    // 024 is reserved for a migration developed in parallel; list it here
+    // when it lands so the versions are contiguous again.
+    migration!(25, "migration", "025_session_change_journal_precision.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,37 +194,96 @@ pub fn metadata(conn: &Connection, key: &str) -> StoreResult<Option<String>> {
 
 /// The owner records the writer algorithms independently of schema checksums:
 /// parser and cost changes need not change the SQL schema.
+///
+/// Agreement rule: every write needs the owner's cost projection version,
+/// because every harness's usage becomes daily cost rows. A session write
+/// additionally needs the owner's parser version for that harness when the
+/// viewer interprets it (`parser_version_key`): Codex rows are gated only by
+/// the Codex parser version and Claude rows only by the Claude parser
+/// version. Third-party harnesses carry their own parser versions, which the
+/// viewer does not filter on.
 pub const PARSER_VERSION_KEY: &str = "writer_codex_parser_version";
+pub const CLAUDE_PARSER_VERSION_KEY: &str = "writer_claude_parser_version";
 pub const COST_VERSION_KEY: &str = "writer_usage_cost_projection_version";
 
-fn check_writer_versions(conn: &Connection) -> StoreResult<()> {
-    let parser = metadata(conn, PARSER_VERSION_KEY)?;
+/// The metadata key and this collector's parser version for `harness`, when
+/// the viewer and collector must agree on it.
+pub fn parser_version_key(harness: &str) -> Option<(&'static str, i64)> {
+    match harness {
+        "codex" => Some((PARSER_VERSION_KEY, PARSER_VERSION)),
+        "claude" => Some((CLAUDE_PARSER_VERSION_KEY, CLAUDE_PARSER_VERSION)),
+        _ => None,
+    }
+}
+
+fn version_mismatch(conn: &Connection, harness: &str) -> StoreResult<StoreError> {
+    let (key, collector_parser) = parser_version_key(harness).unwrap_or(("", 0));
+    let parser = if key.is_empty() {
+        None
+    } else {
+        metadata(conn, key)?
+    };
     let cost = metadata(conn, COST_VERSION_KEY)?;
-    if parser.as_deref() != Some(PARSER_VERSION.to_string().as_str())
-        || cost.as_deref() != Some(USAGE_COST_PROJECTION_VERSION.to_string().as_str())
+    Ok(StoreError::Refused(format!(
+        "Writer version mismatch for {harness} sessions: database/viewer parser={}, cost projection={}; collector parser={}, cost projection={}. Install the viewer and collector from the same release, then open the viewer once to record its versions. Standalone databases must use their matching collector release.",
+        if key.is_empty() {
+            "not checked"
+        } else {
+            parser.as_deref().unwrap_or("missing")
+        },
+        cost.as_deref().unwrap_or("missing"),
+        if key.is_empty() {
+            "not checked".to_owned()
+        } else {
+            collector_parser.to_string()
+        },
+        USAGE_COST_PROJECTION_VERSION,
+    )))
+}
+
+/// Every write: the owner's cost projection version must be this collector's.
+fn check_writer_versions(conn: &Connection) -> StoreResult<()> {
+    if metadata(conn, COST_VERSION_KEY)?.as_deref()
+        != Some(USAGE_COST_PROJECTION_VERSION.to_string().as_str())
     {
-        return Err(StoreError::Refused(format!(
-            "Writer version mismatch: database/viewer parser={}, cost projection={}; collector parser={}, cost projection={}. Install the viewer and collector from the same release, then open the viewer once to record its versions. Standalone databases must use their matching collector release.",
-            parser.as_deref().unwrap_or("missing"),
-            cost.as_deref().unwrap_or("missing"),
-            PARSER_VERSION,
-            USAGE_COST_PROJECTION_VERSION,
-        )));
+        return Err(version_mismatch(conn, "codex")?);
     }
     Ok(())
 }
 
-fn record_writer_versions(conn: &Connection) -> StoreResult<()> {
+/// Session writes: the owner's parser version for `harness`, if any, must
+/// be this collector's. Call inside the write transaction.
+pub fn check_parser_version(conn: &Connection, harness: &str) -> StoreResult<()> {
+    let Some((key, version)) = parser_version_key(harness) else {
+        return Ok(());
+    };
+    if metadata(conn, key)?.as_deref() != Some(version.to_string().as_str()) {
+        return Err(version_mismatch(conn, harness)?);
+    }
+    Ok(())
+}
+
+fn record_writer_versions(conn: &Connection, keys: &[&str]) -> StoreResult<()> {
     let now = DartDateTime::now().to_iso8601();
     for (key, version) in [
         (PARSER_VERSION_KEY, PARSER_VERSION),
+        (CLAUDE_PARSER_VERSION_KEY, CLAUDE_PARSER_VERSION),
         (COST_VERSION_KEY, USAGE_COST_PROJECTION_VERSION),
     ] {
+        if !keys.contains(&key) {
+            continue;
+        }
         conn.execute("insert into app_metadata(key,value,updated_at_utc) values (?,?,?) on conflict(key) do update set value=excluded.value, updated_at_utc=excluded.updated_at_utc",
             params![key,version.to_string(),now])?;
     }
     Ok(())
 }
+
+const ALL_VERSION_KEYS: [&str; 3] = [
+    PARSER_VERSION_KEY,
+    CLAUDE_PARSER_VERSION_KEY,
+    COST_VERSION_KEY,
+];
 
 /// `database_owner`; databases older than schema 18 belong to the viewer.
 pub fn database_owner(conn: &Connection) -> StoreResult<String> {
@@ -354,9 +417,13 @@ pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
         if metadata(conn, PARSER_VERSION_KEY)?.is_none()
             && metadata(conn, COST_VERSION_KEY)?.is_none()
         {
-            record_writer_versions(conn)?;
+            record_writer_versions(conn, &ALL_VERSION_KEYS)?;
+        } else if metadata(conn, CLAUDE_PARSER_VERSION_KEY)?.is_none() {
+            // Databases from before the Claude key existed.
+            record_writer_versions(conn, &[CLAUDE_PARSER_VERSION_KEY])?;
         }
-        check_writer_versions(conn)
+        check_writer_versions(conn)?;
+        check_parser_version(conn, "codex")
     })();
     finish(conn, agreement)?;
     for migration in MIGRATIONS {
@@ -399,7 +466,7 @@ fn create_standalone(conn: &Connection, path: &str, migrations: &[Migration]) ->
         }
         let now = DartDateTime::now().to_iso8601();
         activate_empty_usage_generation(conn, &now)?;
-        record_writer_versions(conn)?;
+        record_writer_versions(conn, &ALL_VERSION_KEYS)?;
         conn.execute(
             "insert into app_metadata (key, value, updated_at_utc) values ('database_owner', ?, ?)
              on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc",
@@ -560,8 +627,20 @@ mod tests {
         let listed: Vec<String> = MIGRATIONS.iter().map(|m| m.filename.to_owned()).collect();
         assert_eq!(listed, files);
         assert_eq!(MIGRATIONS.last().unwrap().version, SUPPORTED_SCHEMA_VERSION);
-        for (index, migration) in MIGRATIONS.iter().enumerate() {
-            assert_eq!(migration.version, index as i64 + 1);
+        // Versions strictly increase from 1; 024 is reserved (see MIGRATIONS).
+        assert_eq!(MIGRATIONS[0].version, 1);
+        for pair in MIGRATIONS.windows(2) {
+            assert!(pair[0].version < pair[1].version);
+        }
+        for migration in MIGRATIONS {
+            assert!(
+                migration
+                    .filename
+                    .starts_with(&format!("{:03}_", migration.version)),
+                "{} is not version {}",
+                migration.filename,
+                migration.version
+            );
         }
     }
 
