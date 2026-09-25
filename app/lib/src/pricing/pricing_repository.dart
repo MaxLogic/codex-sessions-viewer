@@ -151,6 +151,8 @@ class PricingRepository {
     return rows.length;
   }
 
+  /// One event's cost. Repricing many events should share one
+  /// [HistoricalUsageCostResolver] instead, which reads each price once.
   HistoricalUsageCost resolveHistoricalUsageCost({
     required PricingSettings settings,
     required DateTime occurredAtUtc,
@@ -160,149 +162,15 @@ class PricingRepository {
     required int cacheWriteInputTokens,
     required int outputTokens,
     required int reasoningOutputTokens,
-  }) {
-    if (model == null || model.isEmpty) return const HistoricalUsageCost();
-    final at = occurredAtUtc.toUtc();
-    final keys = [
-      model,
-      if (model.startsWith('gpt-') && !model.contains('/')) 'openai/$model',
-    ];
-    Row? period;
-    var provider = false;
-    var method = 'unknown';
-    for (final useProvider in [true, false]) {
-      if (useProvider && !settings.useExternalPricing) continue;
-      if (!useProvider &&
-          settings.useExternalPricing &&
-          !settings.fallbackToOverrides) {
-        continue;
-      }
-      for (final key in keys) {
-        final canonicalSource =
-            useProvider && PriceObservationStore(db).available
-            ? db.select(
-                '''select source from price_history_model_sources
-                 where revision = (select revision from price_history_state where id = 1)
-                   and model_id = ?''',
-                [key],
-              )
-            : const <Row>[];
-        final rows = db.select(
-          '''
-          select * from ${useProvider ? 'model_price_periods' : 'local_price_override_periods'}
-          where ${useProvider ? "source in ('openrouter', ?) and" : ''}
-            model_id = ? and valid_from_utc <= ?
-          order by ${useProvider ? "case when source = 'openrouter' then 1 else 0 end," : ''} valid_from_utc desc limit 1
-        ''',
-          [
-            if (useProvider)
-              canonicalSource.isEmpty
-                  ? 'openrouter'
-                  : canonicalSource.single['source'],
-            key,
-            _priceTimestamp(at),
-          ],
-        );
-        if (rows.isEmpty) continue;
-        final row = rows.single;
-        if (useProvider &&
-            (jsonDecode(row['raw_pricing_json'] as String) as Map)['removed'] ==
-                true) {
-          continue;
-        }
-        final end = _dateTimeUtc(row['valid_to_utc']);
-        if (end != null && !at.isBefore(end)) continue;
-        period = row;
-        provider = useProvider;
-        method =
-            '${useProvider ? 'openrouter' : 'local'}_${key == model ? 'exact' : 'openai_exact'}';
-        break;
-      }
-      if (period != null) break;
-    }
-    if (period == null) return const HistoricalUsageCost();
-    final rates = <String, String?>{
-      for (final entry in _priceColumns.entries)
-        entry.key: period[entry.value] as String?,
-    };
-    final additional = provider
-        ? (jsonDecode(period['additional_prices_json'] as String) as Map)
-              .cast<String, String>()
-        : <String, String>{};
-    final ruleIds = <int>[];
-    if (provider) {
-      final rules = db.select(
-        '''
-        select * from provider_price_rules where price_period_id = ?
-        order by provider_order
-      ''',
-        [period['id']],
-      );
-      for (final row in rules) {
-        final rule = OpenRouterPriceRule(
-          providerOrder: row['provider_order'] as int,
-          minPromptTokens: row['prompt_tokens_min'] as int?,
-          utcStartMinute: row['utc_start_minute'] as int?,
-          utcEndMinute: row['utc_end_minute'] as int?,
-          utcWeekdays: row['utc_weekdays'] == null
-              ? null
-              : (jsonDecode(row['utc_weekdays'] as String) as List)
-                    .cast<int>()
-                    .toSet(),
-          rateOverrides: const {},
-          rawRuleJson: row['raw_rule_json'] as String,
-        );
-        if (!rule.matches(promptTokens: inputTokens, occurredAtUtc: at)) {
-          continue;
-        }
-        ruleIds.add(row['id'] as int);
-        for (final entry in _priceColumns.entries) {
-          final override = row[entry.value] as String?;
-          if (override != null) rates[entry.key] = override;
-        }
-        additional.addAll(
-          (jsonDecode(row['additional_prices_json'] as String) as Map)
-              .cast<String, String>(),
-        );
-      }
-    }
-    final estimate = estimateUsageCost(
-      inputTokens: inputTokens,
-      cachedInputTokens: cachedInputTokens,
-      cacheWriteInputTokens: cacheWriteInputTokens,
-      outputTokens: outputTokens,
-      reasoningOutputTokens: reasoningOutputTokens,
-      model: model,
-      pricing: UsagePricingCatalog({
-        model: UsageModelPricing(
-          promptPricePerToken: rates['prompt'],
-          completionPricePerToken: rates['completion'],
-          cachedInputPricePerToken: rates['input_cache_read'],
-          cacheWriteInputPricePerToken: rates['input_cache_write'],
-          internalReasoningPricePerToken: rates['internal_reasoning'],
-        ),
-      }),
-    );
-    final excluded = [
-      rates['request'],
-      rates['image'],
-      rates['web_search'],
-      ...additional.values,
-    ].any((rate) => rate != null && rate != '0');
-    return HistoricalUsageCost(
-      estimatedCostText: estimate.estimatedCostText,
-      costStatus: estimate.costUnknown
-          ? 'unknown'
-          : excluded
-          ? 'partial_unsupported_units'
-          : 'complete',
-      providerPricePeriodId: provider ? period['id'] as int : null,
-      providerRuleIds: List.unmodifiable(ruleIds),
-      localOverridePeriodId: provider ? null : period['id'] as int,
-      catalogSnapshotId: provider ? period['first_snapshot_id'] as int : null,
-      resolutionMethod: method,
-    );
-  }
+  }) => HistoricalUsageCostResolver(db, settings).resolve(
+    occurredAtUtc: occurredAtUtc,
+    model: model,
+    inputTokens: inputTokens,
+    cachedInputTokens: cachedInputTokens,
+    cacheWriteInputTokens: cacheWriteInputTokens,
+    outputTokens: outputTokens,
+    reasoningOutputTokens: reasoningOutputTokens,
+  );
 
   Future<PricingLoadResult> load(
     PricingSettings settings, {
@@ -1720,6 +1588,243 @@ class PricingRepository {
       // SQLite writer slot and the diagnostic row cannot be persisted.
     }
   }
+}
+
+/// Resolves historical usage costs, reading each model's price periods and
+/// rules once. The price history must not change while a resolver is in use,
+/// so use one per write transaction.
+class HistoricalUsageCostResolver {
+  HistoricalUsageCostResolver(this.db, this.settings);
+
+  final Database db;
+  final PricingSettings settings;
+  bool? _observationsAvailable;
+  final _canonicalSources = <String, String>{};
+  final _periods = <(bool, String), List<_PricePeriod>>{};
+  final _rules = <int, List<_PriceRule>>{};
+
+  HistoricalUsageCost resolve({
+    required DateTime occurredAtUtc,
+    required String? model,
+    required int inputTokens,
+    required int cachedInputTokens,
+    required int cacheWriteInputTokens,
+    required int outputTokens,
+    required int reasoningOutputTokens,
+  }) {
+    if (model == null || model.isEmpty) return const HistoricalUsageCost();
+    final at = occurredAtUtc.toUtc();
+    final stamp = _priceTimestamp(at);
+    final keys = [
+      model,
+      if (model.startsWith('gpt-') && !model.contains('/')) 'openai/$model',
+    ];
+    _PricePeriod? period;
+    var provider = false;
+    var method = 'unknown';
+    for (final useProvider in [true, false]) {
+      if (useProvider && !settings.useExternalPricing) continue;
+      if (!useProvider &&
+          settings.useExternalPricing &&
+          !settings.fallbackToOverrides) {
+        continue;
+      }
+      for (final key in keys) {
+        // The latest period that started by then, preferring the canonical
+        // source. Only that period is considered, as in a `limit 1` query.
+        _PricePeriod? latest;
+        for (final candidate in _periodsFor(useProvider, key)) {
+          if (candidate.validFrom.compareTo(stamp) <= 0) {
+            latest = candidate;
+            break;
+          }
+        }
+        if (latest == null) continue;
+        if (useProvider && latest.removed) continue;
+        final end = latest.validTo;
+        if (end != null && !at.isBefore(end)) continue;
+        period = latest;
+        provider = useProvider;
+        method =
+            '${useProvider ? 'openrouter' : 'local'}_${key == model ? 'exact' : 'openai_exact'}';
+        break;
+      }
+      if (period != null) break;
+    }
+    if (period == null) return const HistoricalUsageCost();
+    final rates = Map<String, String?>.of(period.rates);
+    final additional = Map<String, String>.of(period.additional);
+    final ruleIds = <int>[];
+    if (provider) {
+      for (final rule in _rulesFor(period.id)) {
+        if (!rule.rule.matches(promptTokens: inputTokens, occurredAtUtc: at)) {
+          continue;
+        }
+        ruleIds.add(rule.id);
+        for (final entry in rule.rates.entries) {
+          if (entry.value != null) rates[entry.key] = entry.value;
+        }
+        additional.addAll(rule.additional);
+      }
+    }
+    final estimate = estimateUsageCost(
+      inputTokens: inputTokens,
+      cachedInputTokens: cachedInputTokens,
+      cacheWriteInputTokens: cacheWriteInputTokens,
+      outputTokens: outputTokens,
+      reasoningOutputTokens: reasoningOutputTokens,
+      model: model,
+      pricing: UsagePricingCatalog({
+        model: UsageModelPricing(
+          promptPricePerToken: rates['prompt'],
+          completionPricePerToken: rates['completion'],
+          cachedInputPricePerToken: rates['input_cache_read'],
+          cacheWriteInputPricePerToken: rates['input_cache_write'],
+          internalReasoningPricePerToken: rates['internal_reasoning'],
+        ),
+      }),
+    );
+    final excluded = [
+      rates['request'],
+      rates['image'],
+      rates['web_search'],
+      ...additional.values,
+    ].any((rate) => rate != null && rate != '0');
+    return HistoricalUsageCost(
+      estimatedCostText: estimate.estimatedCostText,
+      costStatus: estimate.costUnknown
+          ? 'unknown'
+          : excluded
+          ? 'partial_unsupported_units'
+          : 'complete',
+      providerPricePeriodId: provider ? period.id : null,
+      providerRuleIds: List.unmodifiable(ruleIds),
+      localOverridePeriodId: provider ? null : period.id,
+      catalogSnapshotId: provider ? period.firstSnapshotId : null,
+      resolutionMethod: method,
+    );
+  }
+
+  /// Periods newest first, with the canonical source ahead of OpenRouter.
+  List<_PricePeriod> _periodsFor(bool useProvider, String key) =>
+      _periods.putIfAbsent((useProvider, key), () {
+        if (!useProvider) {
+          return [
+            for (final row in db.select(
+              '''
+              select * from local_price_override_periods where model_id = ?
+              order by valid_from_utc desc
+            ''',
+              [key],
+            ))
+              _PricePeriod.fromRow(row, provider: false),
+          ];
+        }
+        final source = _canonicalSourceFor(key);
+        return [
+          for (final row in db.select(
+            '''
+            select * from model_price_periods
+            where source in ('openrouter', ?) and model_id = ?
+            order by case when source = 'openrouter' then 1 else 0 end,
+              valid_from_utc desc
+          ''',
+            [source, key],
+          ))
+            _PricePeriod.fromRow(row, provider: true),
+        ];
+      });
+
+  String _canonicalSourceFor(String key) =>
+      _canonicalSources.putIfAbsent(key, () {
+        _observationsAvailable ??= PriceObservationStore(db).available;
+        if (!_observationsAvailable!) return 'openrouter';
+        final rows = db.select(
+          '''select source from price_history_model_sources
+           where revision = (select revision from price_history_state where id = 1)
+             and model_id = ?''',
+          [key],
+        );
+        return rows.isEmpty ? 'openrouter' : rows.single['source'] as String;
+      });
+
+  List<_PriceRule> _rulesFor(int periodId) => _rules.putIfAbsent(
+    periodId,
+    () => [
+      for (final row in db.select(
+        '''
+        select * from provider_price_rules where price_period_id = ?
+        order by provider_order
+      ''',
+        [periodId],
+      ))
+        _PriceRule(
+          id: row['id'] as int,
+          rule: OpenRouterPriceRule(
+            providerOrder: row['provider_order'] as int,
+            minPromptTokens: row['prompt_tokens_min'] as int?,
+            utcStartMinute: row['utc_start_minute'] as int?,
+            utcEndMinute: row['utc_end_minute'] as int?,
+            utcWeekdays: row['utc_weekdays'] == null
+                ? null
+                : (jsonDecode(row['utc_weekdays'] as String) as List)
+                      .cast<int>()
+                      .toSet(),
+            rateOverrides: const {},
+            rawRuleJson: row['raw_rule_json'] as String,
+          ),
+          rates: {
+            for (final entry in _priceColumns.entries)
+              entry.key: row[entry.value] as String?,
+          },
+          additional:
+              (jsonDecode(row['additional_prices_json'] as String) as Map)
+                  .cast<String, String>(),
+        ),
+    ],
+  );
+}
+
+final class _PricePeriod {
+  _PricePeriod.fromRow(Row row, {required bool provider})
+    : id = row['id'] as int,
+      validFrom = row['valid_from_utc'] as String,
+      validTo = _dateTimeUtc(row['valid_to_utc']),
+      removed =
+          provider &&
+          (jsonDecode(row['raw_pricing_json'] as String) as Map)['removed'] ==
+              true,
+      rates = {
+        for (final entry in _priceColumns.entries)
+          entry.key: row[entry.value] as String?,
+      },
+      additional = provider
+          ? (jsonDecode(row['additional_prices_json'] as String) as Map)
+                .cast<String, String>()
+          : const {},
+      firstSnapshotId = provider ? row['first_snapshot_id'] as int? : null;
+
+  final int id;
+  final String validFrom;
+  final DateTime? validTo;
+  final bool removed;
+  final Map<String, String?> rates;
+  final Map<String, String> additional;
+  final int? firstSnapshotId;
+}
+
+final class _PriceRule {
+  const _PriceRule({
+    required this.id,
+    required this.rule,
+    required this.rates,
+    required this.additional,
+  });
+
+  final int id;
+  final OpenRouterPriceRule rule;
+  final Map<String, String?> rates;
+  final Map<String, String> additional;
 }
 
 class HistoricalUsageCost {
