@@ -79,9 +79,12 @@ void main() {
       ('a', '2026-09-06', 'z-model'),
     ]) {
       expect(
-        UsageCostProjectionRepository(
-          db,
-        ).repriceNextBatch(jobs: jobs, lease: lease, settings: settings),
+        UsageCostProjectionRepository(db).repriceNextBatch(
+          jobs: jobs,
+          lease: lease,
+          settings: settings,
+          partitionLimit: 1,
+        ),
         1,
       );
       expect(
@@ -167,9 +170,13 @@ void main() {
       leaseDuration: const Duration(minutes: 5),
     )!;
     final before = db.select('select * from usage_session_daily order by id');
-    int reprice() => UsageCostProjectionRepository(
-      db,
-    ).repriceNextBatch(jobs: jobs, lease: lease, settings: settings);
+    // One partition per transaction, so a stop between them is observable.
+    int reprice() => UsageCostProjectionRepository(db).repriceNextBatch(
+      jobs: jobs,
+      lease: lease,
+      settings: settings,
+      partitionLimit: 1,
+    );
     db.execute(
       'update usage_cost_dirty_partitions set target_cost_projection_version = 2',
     );
@@ -241,6 +248,163 @@ void main() {
     );
     expect(jobs.read(job.id)!.completedUnits, 2);
     expect(db.select('pragma foreign_key_check'), isEmpty);
+  });
+
+  test('a batch reprices several partitions atomically, like one by one', () {
+    final day = DateTime.utc(2026, 9, 7);
+    for (final id in ['a', 'b', 'c']) {
+      _insertSession(db, id: id, sourceType: 'windows', startedAtUtc: day);
+    }
+    var ordinal = 0;
+    for (final (id, offset, model, input, output) in [
+      ('a', 0, 'model', 100, 10),
+      ('a', 1, 'model', 7, 3),
+      ('a', 25, 'model', 50, 5),
+      ('b', 0, 'model', 1, 1),
+      ('b', 0, 'other', 2, 2),
+      ('c', 2, 'model', 9, 9),
+    ]) {
+      _insertUsageEvent(
+        db,
+        sessionId: id,
+        ordinal: ++ordinal,
+        occurredAtUtc: day.add(Duration(hours: offset)),
+        model: model,
+        projectId: null,
+        inputTokens: input,
+        outputTokens: output,
+        totalTokens: input + output,
+      );
+    }
+    _activatePersistedUsage(db);
+    db.execute('''
+      insert into local_price_override_periods (model_id, prompt_price_per_token,
+        completion_price_per_token, settings_fingerprint, valid_from_utc,
+        valid_to_utc, first_settings_revision, last_seen_settings_revision)
+      values ('model', '0.01', '0.02', 'first', '2026-01-01T00:00:00.000000Z',
+        '2026-09-08T00:00:00.000000Z', 1, 1),
+        ('model', '0.03', '0.04', 'second', '2026-09-08T00:00:00.000000Z',
+        null, 2, 2);
+      begin immediate;
+    ''');
+    repository.replaceDailyProjectionsInCurrentTransaction(['a', 'b', 'c']);
+    db.execute('commit');
+    final settings = PricingSettings(
+      provider: 'openrouter',
+      useExternalPricing: false,
+      cachePricingHours: 24,
+      fallbackToOverrides: true,
+      openRouter: const OpenRouterSettings(
+        modelsEndpoint: 'https://openrouter.ai/api/v1/models',
+        apiKey: '',
+      ),
+      overrides: const {},
+    );
+    final jobs = MaintenanceJobRepository(db);
+    List<Map<String, Object?>> daily() => [
+      for (final row in db.select('''
+        select * from usage_session_daily
+        order by session_id, day_utc, model_key, path_context_id
+      '''))
+        {...row}
+          ..remove('id')
+          ..remove('updated_at_utc'),
+    ];
+    const partitions = 5;
+    int run({required int limit}) {
+      final job = jobs.enqueue(
+        jobType: 'usage_cost_repricing',
+        phase: 'reprice_costs',
+      );
+      final lease = jobs.claim(
+        jobType: job.jobType,
+        leaseDuration: const Duration(minutes: 5),
+      )!;
+      var calls = 0;
+      while (UsageCostProjectionRepository(db).repriceNextBatch(
+            jobs: jobs,
+            lease: lease,
+            settings: settings,
+            partitionLimit: limit,
+          ) !=
+          0) {
+        calls++;
+      }
+      expect(jobs.read(job.id)!.completedUnits, partitions);
+      jobs.markSucceeded(lease, phase: 'complete', statusMessage: 'done');
+      return calls;
+    }
+
+    void markAllDirty() => db.execute('''
+      insert or ignore into usage_cost_dirty_partitions (session_id, day_utc,
+        model_key, reason, target_cost_projection_version, created_at_utc,
+        updated_at_utc)
+      select distinct session_id, day_utc, model_key, 'fixture', 1, 'x', 'x'
+      from usage_session_daily
+    ''');
+
+    markAllDirty();
+    expect(run(limit: 1), partitions);
+    final oneByOne = daily();
+    // The second day of session a is priced by the later override period.
+    expect(oneByOne.map((row) => row['estimated_cost_text']), [
+      '1.33',
+      '1.7',
+      '0.03',
+      null,
+      '0.27',
+    ]);
+    expect(oneByOne.map((row) => row['local_override_period_id']), [
+      1,
+      2,
+      1,
+      null,
+      1,
+    ]);
+
+    markAllDirty();
+    db.execute('''
+      update usage_session_daily set estimated_cost_text = '999'
+      where estimated_cost_text is not null
+    ''');
+    db.execute('''
+      create trigger reject_last before delete on usage_cost_dirty_partitions
+      when old.session_id = 'c'
+      begin select raise(abort, 'injected failure'); end;
+    ''');
+    final job = jobs.enqueue(
+      jobType: 'usage_cost_repricing',
+      phase: 'reprice_costs',
+    );
+    final lease = jobs.claim(
+      jobType: job.jobType,
+      leaseDuration: const Duration(minutes: 5),
+    )!;
+    expect(
+      () => UsageCostProjectionRepository(
+        db,
+      ).repriceNextBatch(jobs: jobs, lease: lease, settings: settings),
+      throwsA(isA<SqliteException>()),
+    );
+    expect(
+      db.select('select * from usage_cost_dirty_partitions'),
+      hasLength(partitions),
+      reason: 'a failed batch rolls back every partition in it',
+    );
+    expect(
+      db
+          .select(
+            "select count(*) n from usage_session_daily where estimated_cost_text = '999'",
+          )
+          .single['n'],
+      oneByOne.where((row) => row['estimated_cost_text'] != null).length,
+    );
+    expect(jobs.read(job.id)!.completedUnits, 0);
+    jobs.markInterrupted(lease, statusMessage: 'Injected failure.');
+    db.execute('drop trigger reject_last');
+
+    expect(run(limit: repricePartitionsPerBatch), 1);
+    expect(daily(), oneByOne);
   });
 
   test(
@@ -335,7 +499,16 @@ void main() {
       jobType: job.jobType,
       leaseDuration: const Duration(minutes: 5),
     )!;
-    expect(reprice, throwsA(isA<SqliteException>()));
+    expect(
+      reprice,
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('exceeds SQLite integer range'),
+        ),
+      ),
+    );
     expect(db.select('select * from usage_session_daily').single, unknown);
     expect(
       db.select('select * from usage_cost_dirty_partitions'),
