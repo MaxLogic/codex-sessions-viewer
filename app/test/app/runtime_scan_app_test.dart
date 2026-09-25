@@ -670,13 +670,14 @@ void main() {
         db.select('select count(*) as count from sessions').single['count'],
         2,
       );
+      // The collector records a digest of the rows it wrote for each session.
       expect(
         db
             .select(
-              'select count(*) as count from sessions where content_hash is not null',
+              'select count(*) as count from sessions where length(content_hash) = 64',
             )
             .single['count'],
-        0,
+        2,
       );
       expect(
         db

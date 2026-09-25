@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use sha2::{Digest, Sha256};
 
 use crate::codex::parser::{AuthorType, SourceType, Usage};
 use crate::contract::{
     MessageRecord, ProjectHint, ProjectHints, Record, SessionRef, SessionSnapshot, SourceStatus,
-    ThreadName, UsageRecord, parse_time,
+    ThreadName, ToolCallRecord, UsageRecord, parse_time,
 };
 use crate::dart::{DartDateTime, compare_utf16, to_lower, trim};
 use crate::hub_client;
@@ -334,7 +335,7 @@ fn upsert_session(
     })? {
         if let Some(merge) = identity_merge {
             apply_identity_merge(conn, id, &merge)?;
-            let affected = reconcile_affected_legacy_usage(
+            let (affected, _) = reconcile_affected_legacy_usage(
                 conn,
                 &snapshot.harness,
                 id,
@@ -351,6 +352,14 @@ fn upsert_session(
         .unwrap_or("")
         .to_owned();
     let source_type = source_type(snapshot);
+    let stored_digest: Option<String> = conn
+        .prepare_cached("select content_hash from sessions where id = ?")?
+        .query_row([id], |row| row.get(0))
+        .optional()?
+        .flatten();
+    let content = crate::timing::timed("write: content rows", || {
+        SessionContent::build(conn, snapshot, now, resolver, source_type)
+    })?;
     let has_errors = snapshot.messages.iter().any(|message| message.has_error)
         || snapshot
             .tool_calls
@@ -447,7 +456,7 @@ fn upsert_session(
         session.working_directory_unc,
         snapshot.source.size as i64,
         modified_utc,
-        Option::<String>::None,
+        content.digest.as_str(),
         session.parser_version,
         snapshot.messages.len() as i64,
         user_message_count,
@@ -466,24 +475,26 @@ fn upsert_session(
         snapshot.machine_id,
         id,
     ])?;
-    crate::timing::timed("write: messages", || {
-        replace_messages(conn, id, snapshot, now)
-    })?;
-    crate::timing::timed("write: tool calls", || {
-        replace_tool_calls(conn, id, snapshot)
-    })?;
-    let partitions = crate::timing::timed("write: usage events", || {
-        replace_usage_events(conn, id, snapshot, now, resolver, source_type)
-    })?;
-    // A merged identity or a legacy fork/subagent (whose inherited usage the
-    // reconciliation below rescopes) may change this session's usage beyond
-    // the events that changed here: rebuild all of its days.
-    let legacy = session.history_base_thread_id.is_none()
-        && session.subagent_history_start_ordinal.is_none()
-        && [&session.forked_from_id, &session.parent_thread_id]
-            .iter()
-            .any(|value| value.as_deref().is_some_and(|value| !value.is_empty()));
-    let partitions = partitions.filter(|_| identity_merge.is_none() && !legacy);
+    // While the stored digest matches, the stored rows already equal this
+    // parse's rows, and reading them back to compare is skipped.
+    let unchanged =
+        identity_merge.is_none() && stored_digest.as_deref() == Some(content.digest.as_str());
+    let partitions = if unchanged {
+        Some(Vec::new())
+    } else {
+        crate::timing::timed("write: messages", || {
+            replace_messages(conn, id, &content.messages, now)
+        })?;
+        crate::timing::timed("write: tool calls", || {
+            replace_tool_calls(conn, id, snapshot, content.tool_calls)
+        })?;
+        crate::timing::timed("write: usage events", || {
+            sync_usage_events(conn, id, now, &content.usage_events, &content.usage_inputs)
+        })?
+    };
+    // A merged identity may change this session's usage beyond the events
+    // that changed here: rebuild all of its days.
+    let partitions = partitions.filter(|_| identity_merge.is_none());
     crate::timing::timed("write: source extras", || {
         replace_source_extras(conn, id, snapshot, now)
     })?;
@@ -493,9 +504,12 @@ fn upsert_session(
     crate::timing::timed("write: project refresh", || {
         refresh_session_project(conn, id)
     })?;
-    let affected = crate::timing::timed("write: legacy usage", || {
+    let (affected, rescoped) = crate::timing::timed("write: legacy usage", || {
         reconcile_affected_legacy_usage(conn, &snapshot.harness, id, session.session_id.as_deref())
     })?;
+    // Rescoped inherited usage changes this session's days beyond the events
+    // that changed here: rebuild all of them.
+    let partitions = partitions.filter(|_| !rescoped);
     crate::timing::timed("write: daily projections", || {
         replace_daily_projections(
             conn,
@@ -688,6 +702,9 @@ fn message_values(message: &MessageRecord) -> Vec<Value> {
         text(message.raw_type.clone()),
     ]
 }
+
+/// A stored row of one session: its per-session key and its columns.
+type SessionRow = (i64, Vec<Value>);
 
 /// One table's rows of one session, keyed by a per-session index.
 struct SessionRows<'a> {
@@ -887,10 +904,102 @@ fn sync_session_rows(
     Ok(Some(changes))
 }
 
+/// The rows one parse writes to a session's child tables, and their
+/// digest. The digest is kept in `sessions.content_hash`: the collector is
+/// the only writer of these rows, so while the digest matches, the stored
+/// rows equal this parse's rows and need not be read back and compared.
+/// On a forced reparse nearly every file is unchanged.
+struct SessionContent {
+    messages: Vec<(i64, Vec<Value>)>,
+    /// Tool call columns with the message index where the message id goes;
+    /// [`replace_tool_calls`] fills the id in from the stored messages.
+    tool_calls: Vec<(i64, Vec<Value>)>,
+    usage_events: Vec<(i64, Vec<Value>)>,
+    usage_inputs: Vec<(i64, Vec<Value>)>,
+    digest: String,
+}
+
+impl SessionContent {
+    fn build(
+        conn: &Connection,
+        snapshot: &SessionSnapshot,
+        now: &str,
+        resolver: &ProjectResolver,
+        source_type: SourceType,
+    ) -> StoreResult<Self> {
+        let messages: Vec<(i64, Vec<Value>)> = snapshot
+            .messages
+            .iter()
+            .map(|message| (message.index, message_values(message)))
+            .collect();
+        let tool_calls: Vec<(i64, Vec<Value>)> = snapshot
+            .tool_calls
+            .iter()
+            .map(|tool| (tool.tool_index, tool_call_values(tool)))
+            .collect();
+        let (usage_events, usage_inputs) =
+            usage_event_rows(conn, snapshot, now, resolver, source_type)?;
+        let digest = content_digest(&[
+            ("messages", &messages[..]),
+            ("tool_calls", &tool_calls[..]),
+            ("usage_events", &usage_events[..]),
+            ("usage_event_inputs", &usage_inputs[..]),
+        ]);
+        Ok(Self {
+            messages,
+            tool_calls,
+            usage_events,
+            usage_inputs,
+            digest,
+        })
+    }
+}
+
+/// SHA-256 over the tables' rows: each key and each column with its type.
+fn content_digest(tables: &[(&str, &[SessionRow])]) -> String {
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    for (table, rows) in tables {
+        hasher.update(table.as_bytes());
+        hasher.update((rows.len() as u64).to_le_bytes());
+        for (key, values) in rows.iter() {
+            hasher.update(key.to_le_bytes());
+            for value in values {
+                match value {
+                    Value::Null => hasher.update([0u8]),
+                    Value::Integer(number) => {
+                        hasher.update([1u8]);
+                        hasher.update(number.to_le_bytes());
+                    }
+                    Value::Real(number) => {
+                        hasher.update([2u8]);
+                        hasher.update(number.to_bits().to_le_bytes());
+                    }
+                    Value::Text(text) => {
+                        hasher.update([3u8]);
+                        hasher.update((text.len() as u64).to_le_bytes());
+                        hasher.update(text.as_bytes());
+                    }
+                    Value::Blob(bytes) => {
+                        hasher.update([4u8]);
+                        hasher.update((bytes.len() as u64).to_le_bytes());
+                        hasher.update(bytes);
+                    }
+                }
+            }
+        }
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize().iter() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 fn replace_messages(
     conn: &Connection,
     id: &str,
-    snapshot: &SessionSnapshot,
+    rows: &[(i64, Vec<Value>)],
     now: &str,
 ) -> StoreResult<()> {
     let shape = SessionRows {
@@ -902,12 +1011,7 @@ fn replace_messages(
         inserted_stamps: &["created_at_db_utc", "updated_at_db_utc"],
         updated_stamps: &["updated_at_db_utc"],
     };
-    let rows: Vec<(i64, Vec<Value>)> = snapshot
-        .messages
-        .iter()
-        .map(|message| (message.index, message_values(message)))
-        .collect();
-    if sync_session_rows(conn, &shape, id, now, &rows)?.is_none() {
+    if sync_session_rows(conn, &shape, id, now, rows)?.is_none() {
         // Unreachable while `(session_id, message_index)` is unique.
         return Err(StoreError::Refused(
             "a session has two messages with the same index".to_owned(),
@@ -957,7 +1061,30 @@ const TOOL_CALL_COLUMNS: [&str; 9] = [
 ];
 const OUTPUT_PREVIEW: usize = 6;
 
-fn replace_tool_calls(conn: &Connection, id: &str, snapshot: &SessionSnapshot) -> StoreResult<()> {
+/// [`TOOL_CALL_COLUMNS`] values, with the message index standing in for the
+/// message id.
+fn tool_call_values(tool: &ToolCallRecord) -> Vec<Value> {
+    let text =
+        |value: Option<&str>| value.map_or(Value::Null, |value| Value::Text(value.to_owned()));
+    vec![
+        tool.message_index.map_or(Value::Null, Value::Integer),
+        Value::Text(tool.tool_name.clone()),
+        Value::Text(tool.status.clone()),
+        text(iso_or_null(tool.started_at_utc.as_deref()).as_deref()),
+        text(iso_or_null(tool.finished_at_utc.as_deref()).as_deref()),
+        Value::Text(tool.input_preview.clone()),
+        Value::Text(tool.output_preview.clone()),
+        Value::Integer(i64::from(tool.output_truncated)),
+        text(tool.error_message.as_deref()),
+    ]
+}
+
+fn replace_tool_calls(
+    conn: &Connection,
+    id: &str,
+    snapshot: &SessionSnapshot,
+    mut rows: Vec<(i64, Vec<Value>)>,
+) -> StoreResult<()> {
     // Each call links to the last stored message before its index; the
     // messages are already in place.
     let messages: Vec<(i64, i64)> = conn
@@ -966,37 +1093,17 @@ fn replace_tool_calls(conn: &Connection, id: &str, snapshot: &SessionSnapshot) -
         )?
         .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    let text =
-        |value: Option<&str>| value.map_or(Value::Null, |value| Value::Text(value.to_owned()));
-    let rows: Vec<(i64, Vec<Value>)> = snapshot
-        .tool_calls
-        .iter()
-        .map(|tool| {
-            // Without an index the old `message_index < null` matched nothing.
-            let message_id = tool
-                .message_index
-                .and_then(|limit| {
-                    messages
-                        .partition_point(|(index, _)| *index < limit)
-                        .checked_sub(1)
-                })
-                .map_or(Value::Null, |position| Value::Integer(messages[position].1));
-            (
-                tool.tool_index,
-                vec![
-                    message_id,
-                    Value::Text(tool.tool_name.clone()),
-                    Value::Text(tool.status.clone()),
-                    text(iso_or_null(tool.started_at_utc.as_deref()).as_deref()),
-                    text(iso_or_null(tool.finished_at_utc.as_deref()).as_deref()),
-                    Value::Text(tool.input_preview.clone()),
-                    Value::Text(tool.output_preview.clone()),
-                    Value::Integer(i64::from(tool.output_truncated)),
-                    text(tool.error_message.as_deref()),
-                ],
-            )
-        })
-        .collect();
+    for (tool, (_, values)) in snapshot.tool_calls.iter().zip(rows.iter_mut()) {
+        // Without an index the old `message_index < null` matched nothing.
+        values[0] = tool
+            .message_index
+            .and_then(|limit| {
+                messages
+                    .partition_point(|(index, _)| *index < limit)
+                    .checked_sub(1)
+            })
+            .map_or(Value::Null, |position| Value::Integer(messages[position].1));
+    }
     let shape = SessionRows {
         table: "tool_calls",
         session_column: "session_id",
@@ -1107,14 +1214,14 @@ fn usage_day(value: &Value) -> Result<Option<String>, ()> {
     }
 }
 
-fn replace_usage_events(
+/// The `usage_events` and `usage_event_inputs` rows of a snapshot.
+fn usage_event_rows(
     conn: &Connection,
-    id: &str,
     snapshot: &SessionSnapshot,
     now: &str,
     resolver: &ProjectResolver,
     source_type: SourceType,
-) -> StoreResult<ChangedPartitions> {
+) -> StoreResult<(Vec<SessionRow>, Vec<SessionRow>)> {
     let mut project_ids: HashMap<String, i64> = HashMap::new();
     let mut context_ids: HashMap<(Option<String>, Option<String>), i64> = HashMap::new();
     let text =
@@ -1186,6 +1293,16 @@ fn replace_usage_events(
             ));
         }
     }
+    Ok((events, inputs))
+}
+
+fn sync_usage_events(
+    conn: &Connection,
+    id: &str,
+    now: &str,
+    events: &[(i64, Vec<Value>)],
+    inputs: &[(i64, Vec<Value>)],
+) -> StoreResult<ChangedPartitions> {
     let event_shape = SessionRows {
         table: "usage_events",
         session_column: "session_row_id",
@@ -1205,8 +1322,8 @@ fn replace_usage_events(
         updated_stamps: &[],
     };
     // Both tables are keyed by (session, ordinal), so keys never repeat.
-    let changes = sync_session_rows(conn, &event_shape, id, now, &events)?.unwrap_or_default();
-    sync_session_rows(conn, &input_shape, id, now, &inputs)?;
+    let changes = sync_session_rows(conn, &event_shape, id, now, events)?.unwrap_or_default();
+    sync_session_rows(conn, &input_shape, id, now, inputs)?;
     let mut partitions: Vec<DailyPartition> = Vec::new();
     for values in changes
         .iter()
@@ -1698,22 +1815,28 @@ fn set_projection_status(conn: &Connection, row_id: &str, status: &str) -> Store
     Ok(())
 }
 
-fn mark_unresolved(conn: &Connection, row_id: &str, status: &str) -> StoreResult<()> {
-    conn.prepare_cached(
-        "update usage_events set branch_scope = 'ambiguous' where session_row_id = ?",
-    )?
-    .execute([row_id])?;
-    set_projection_status(conn, row_id, status)
+/// Returns how many events changed scope.
+fn mark_unresolved(conn: &Connection, row_id: &str, status: &str) -> StoreResult<usize> {
+    let changed = conn
+        .prepare_cached(
+            "update usage_events set branch_scope = 'ambiguous'
+             where session_row_id = ? and branch_scope <> 'ambiguous'",
+        )?
+        .execute([row_id])?;
+    set_projection_status(conn, row_id, status)?;
+    Ok(changed)
 }
 
 /// `_reconcileAffectedLegacyUsage`. Returns the session IDs whose daily
-/// projections must be rebuilt, in the order the Dart set yields them.
+/// projections must be rebuilt (the replaced session, then the children
+/// whose event scopes changed) and whether the replaced session's own
+/// scopes changed.
 fn reconcile_affected_legacy_usage(
     conn: &Connection,
     harness: &str,
     replaced_row_id: &str,
     replaced_logical_id: Option<&str>,
-) -> StoreResult<Vec<String>> {
+) -> StoreResult<(Vec<String>, bool)> {
     let mut affected: Vec<LegacyUsageSession> = Vec::new();
     let mut affected_index: HashMap<String, usize> = HashMap::new();
     let mut add =
@@ -1822,9 +1945,12 @@ fn reconcile_affected_legacy_usage(
         Ok(Some((parents[0].0.clone(), row.parent_logical_id.clone())))
     };
 
+    let mut rescoped: HashSet<String> = HashSet::new();
     for child in &affected {
         if !is_current_parser(harness, child.parser_version) {
-            mark_unresolved(conn, &child.row_id, "legacy_pending")?;
+            if mark_unresolved(conn, &child.row_id, "legacy_pending")? > 0 {
+                rescoped.insert(child.row_id.clone());
+            }
             continue;
         }
         // hasCycle
@@ -1846,7 +1972,9 @@ fn reconcile_affected_legacy_usage(
             }
         }
         if cycle {
-            mark_unresolved(conn, &child.row_id, "ambiguous")?;
+            if mark_unresolved(conn, &child.row_id, "ambiguous")? > 0 {
+                rescoped.insert(child.row_id.clone());
+            }
             continue;
         }
         let child_fingerprints = fingerprints_for(conn, &mut fingerprint_cache, &child.row_id)?;
@@ -1854,27 +1982,37 @@ fn reconcile_affected_legacy_usage(
             if !child.has_aggregate_usage {
                 set_projection_status(conn, &child.row_id, "complete")?;
             } else {
-                mark_unresolved(conn, &child.row_id, "ambiguous")?;
+                if mark_unresolved(conn, &child.row_id, "ambiguous")? > 0 {
+                    rescoped.insert(child.row_id.clone());
+                }
             }
             continue;
         }
         let parents = parents_for(conn, &mut parent_cache, &child.parent_logical_id)?;
         if parents.is_empty() {
-            mark_unresolved(conn, &child.row_id, "missing_parent")?;
+            if mark_unresolved(conn, &child.row_id, "missing_parent")? > 0 {
+                rescoped.insert(child.row_id.clone());
+            }
             continue;
         }
         if parents.len() != 1 {
-            mark_unresolved(conn, &child.row_id, "ambiguous")?;
+            if mark_unresolved(conn, &child.row_id, "ambiguous")? > 0 {
+                rescoped.insert(child.row_id.clone());
+            }
             continue;
         }
         let (parent_row, parent_version, parent_status, parent_aggregate) = parents[0].clone();
         if !is_current_parser(harness, parent_version) {
-            mark_unresolved(conn, &child.row_id, "legacy_pending")?;
+            if mark_unresolved(conn, &child.row_id, "legacy_pending")? > 0 {
+                rescoped.insert(child.row_id.clone());
+            }
             continue;
         }
         let parent_fingerprints = fingerprints_for(conn, &mut fingerprint_cache, &parent_row)?;
         if parent_fingerprints.is_empty() && (parent_status != "complete" || parent_aggregate) {
-            mark_unresolved(conn, &child.row_id, "ambiguous")?;
+            if mark_unresolved(conn, &child.row_id, "ambiguous")? > 0 {
+                rescoped.insert(child.row_id.clone());
+            }
             continue;
         }
         let prefix = parent_fingerprints
@@ -1883,14 +2021,20 @@ fn reconcile_affected_legacy_usage(
             .take_while(|(left, right)| left == right)
             .count();
         if !parent_fingerprints.is_empty() && prefix == 0 {
-            mark_unresolved(conn, &child.row_id, "ambiguous")?;
+            if mark_unresolved(conn, &child.row_id, "ambiguous")? > 0 {
+                rescoped.insert(child.row_id.clone());
+            }
             continue;
         }
-        if prefix == 0 {
+        // Only rows whose scope differs are written, so a child whose usage
+        // is already scoped costs a read of its fingerprints, not a rewrite
+        // of its events and a rebuild of its days.
+        let changed = if prefix == 0 {
             conn.prepare_cached(
-                "update usage_events set branch_scope = 'local' where session_row_id = ?",
+                "update usage_events set branch_scope = 'local'
+                 where session_row_id = ? and branch_scope <> 'local'",
             )?
-            .execute([&child.row_id])?;
+            .execute([&child.row_id])?
         } else {
             let inherited_end: i64 = conn
                 .prepare_cached(
@@ -1900,20 +2044,24 @@ fn reconcile_affected_legacy_usage(
                 .query_row(params![child.row_id, prefix as i64 - 1], |row| row.get(0))?;
             conn.prepare_cached(
                 "update usage_events set branch_scope = case
-                   when source_record_ordinal <= ? then 'inherited' else 'local' end
-                 where session_row_id = ?",
+                   when source_record_ordinal <= ?1 then 'inherited' else 'local' end
+                 where session_row_id = ?2 and branch_scope is not (case
+                   when source_record_ordinal <= ?1 then 'inherited' else 'local' end)",
             )?
-            .execute(params![inherited_end, child.row_id])?;
+            .execute(params![inherited_end, child.row_id])?
+        };
+        if changed > 0 {
+            rescoped.insert(child.row_id.clone());
         }
         set_projection_status(conn, &child.row_id, "complete")?;
     }
     let mut result = vec![replaced_row_id.to_owned()];
     for session in affected {
-        if !result.contains(&session.row_id) {
+        if rescoped.contains(&session.row_id) && !result.contains(&session.row_id) {
             result.push(session.row_id);
         }
     }
-    Ok(result)
+    Ok((result, rescoped.contains(replaced_row_id)))
 }
 
 /// Whether `version` is this collector's parser version for `harness`.

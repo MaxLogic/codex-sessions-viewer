@@ -75,8 +75,18 @@ Set `CODEX_SESSIONS_COLLECTOR_TIMINGS=1` to print per-phase timings to stderr.
 A changed session is written in place: messages, tool calls and usage events
 that are unchanged keep their rows, and unchanged text keeps its search entry.
 Only the daily usage partitions whose events changed are rebuilt and marked for
-repricing; merged identities and legacy forks or subagents rebuild all of their
-days.
+repricing; a merged identity, or inherited usage that the fork and subagent
+reconciliation rescoped, rebuilds all of the session's days.
+
+The collector keeps a SHA-256 of the rows it wrote for a session in
+`sessions.content_hash`. A reparse whose rows have the same digest, as nearly
+every file has after a parser change forces a full reparse, does not read the
+stored messages, tool calls and usage events back to compare them. The
+collector is the only writer of those rows; an edit made behind its back
+survives until the file changes, so a migration that rewrites those rows must
+clear `content_hash`. A full reparse of the WSL sessions is bound
+by the `\\wsl.localhost` bridge (about 150 MB/s with 8 parsers), not by
+parsing or writing.
 
 ## Who owns the database
 

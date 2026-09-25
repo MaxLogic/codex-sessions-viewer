@@ -718,6 +718,67 @@ fn a_reparse_rewrites_only_changed_messages_and_keeps_search_consistent() {
 }
 
 #[test]
+fn a_reparse_of_unchanged_content_trusts_its_stored_rows() {
+    let temp = TempDir::new("digest");
+    let home = support::codex_home(&temp, &[]);
+    let file = support::day_folder(&home).join("rollout-digest.jsonl");
+    let write = |texts: &[&str]| {
+        let mut lines = vec![
+            r#"{"timestamp":"2026-09-03T10:00:00Z","type":"session_meta","payload":{"id":"digest-001","timestamp":"2026-09-03T10:00:00Z","cwd":"C:\\nonexistent\\digest"}}"#.to_owned(),
+        ];
+        for (index, text) in texts.iter().enumerate() {
+            lines.push(format!(
+                r#"{{"timestamp":"2026-09-03T10:00:0{}Z","type":"event_msg","payload":{{"type":"user_message","message":"{text}"}}}}"#,
+                index + 1
+            ));
+        }
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+    };
+    let db = viewer_database(&temp);
+    let scan = |args: &[&str]| {
+        let output = support::scan(&db, &home, args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let state = || -> (String, String) {
+        open(&db)
+            .query_row(
+                "select s.content_hash, m.content_plain from sessions s
+                 join messages m on m.session_id = s.id and m.message_index = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    write(&["first question"]);
+    scan(&[]);
+    let (digest, text) = state();
+    assert_eq!(digest.len(), 64, "the parse records a digest of its rows");
+    assert_eq!(text, "first question");
+
+    // The collector is the only writer of these rows, so while the digest
+    // matches it does not read them back: an edit it did not make survives a
+    // forced reparse of the unchanged file.
+    open(&db)
+        .execute("update messages set content_plain = 'edited outside'", [])
+        .unwrap();
+    scan(&["--force"]);
+    assert_eq!(state(), (digest.clone(), "edited outside".to_owned()));
+
+    // A changed file gets a new digest and its rows are compared again.
+    write(&["first question", "second question"]);
+    scan(&[]);
+    let (changed, restored) = state();
+    assert_ne!(changed, digest);
+    assert_eq!(restored, "first question");
+    assert_eq!(count(&open(&db), "select count(*) from messages"), 2);
+}
+
+#[test]
 fn rewriting_a_message_keeps_its_tool_calls_linked() {
     let temp = TempDir::new("tool-links");
     let home = support::codex_home(&temp, &["rich_session.jsonl"]);
