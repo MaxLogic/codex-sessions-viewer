@@ -555,7 +555,7 @@ void main() {
       '025_session_change_journal_precision.sql',
     );
     expect(versionRows.last['version'], latestSchemaVersion);
-    expect(versionRows.last['filename'], '026_retire_misread_codex_files.sql');
+    expect(versionRows.last['filename'], '027_fix_search_update_triggers.sql');
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -1008,6 +1008,85 @@ void main() {
             .map((row) => row['title'])
             .toList(),
         ['rollout'],
+      );
+    },
+  );
+
+  test(
+    'migration 027 keeps full-text search exact after in-place text edits',
+    () async {
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(dbFile);
+      expect(result.canStartNormalUi, isTrue);
+      final db = openFileBackedDatabase(dbFile);
+      addTearDown(db.close);
+      expect(
+        db
+            .select('''
+          select name from sqlite_master where type = 'trigger'
+            and (name like 'trg_messages_update_message_search%'
+              or name like 'trg_tool_calls_update_output_search%')
+          order by name
+          ''')
+            .map((row) => row['name'])
+            .toList(),
+        [
+          'trg_messages_update_message_search',
+          'trg_tool_calls_update_output_search',
+        ],
+      );
+      const now = '2026-09-25T08:00:00Z';
+      db.execute(
+        '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        created_at_utc, updated_at_utc, harness
+      ) values ('s', 'windows', 'p', 'p', 'p', ?, ?, 'codex')
+      ''',
+        [now, now],
+      );
+      db.execute(
+        '''
+      insert into messages (
+        id, session_id, message_index, author_type, first_line, content_plain,
+        content_preview, created_at_db_utc, updated_at_db_utc
+      ) values (7, 's', 0, 'user', 'alpha', 'alpha shared', 'alpha', ?, ?)
+      ''',
+        [now, now],
+      );
+      db.execute(
+        "update app_metadata set value = '1' where key = 'tool_output_search.enabled'",
+      );
+      db.execute('''
+      insert into tool_calls (id, session_id, message_id, tool_index, tool_name,
+        status, output_preview)
+      values (9, 's', 7, 0, 'shell', 'ok', 'alpha shared')
+      ''');
+      db.execute(
+        "update messages set content_plain = 'beta shared' where id = 7",
+      );
+      db.execute(
+        "update tool_calls set output_preview = 'beta shared' where id = 9",
+      );
+
+      List<Object?> hits(String table, String word) => db
+          .select('select rowid from $table where $table match ?', [word])
+          .map((row) => row['rowid'])
+          .toList();
+      expect(hits('message_search', 'shared'), [7]);
+      expect(hits('message_search', 'beta'), [7]);
+      expect(hits('message_search', 'alpha'), isEmpty);
+      expect(hits('tool_output_search', 'shared'), [9]);
+      expect(hits('tool_output_search', 'beta'), [9]);
+      expect(hits('tool_output_search', 'alpha'), isEmpty);
+      // The strict check reports "database disk image is malformed" when an
+      // index entry and its document disagree.
+      db.execute(
+        "insert into message_search(message_search, rank) values ('integrity-check', 1)",
+      );
+      db.execute(
+        "insert into tool_output_search(tool_output_search, rank) values ('integrity-check', 1)",
       );
     },
   );

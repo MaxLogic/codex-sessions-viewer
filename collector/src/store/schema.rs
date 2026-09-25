@@ -14,7 +14,7 @@ use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 26;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 27;
 
 pub struct Migration {
     pub version: i64,
@@ -85,6 +85,7 @@ pub const MIGRATIONS: &[Migration] = &[
     ),
     migration!(25, "migration", "025_session_change_journal_precision.sql"),
     migration!(26, "migration", "026_retire_misread_codex_files.sql"),
+    migration!(27, "migration", "027_fix_search_update_triggers.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
