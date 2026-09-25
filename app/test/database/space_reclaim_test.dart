@@ -142,6 +142,42 @@ void main() {
     },
   );
 
+  test(
+    'a complete scan with the new parser lets stale rows outside the roots stop blocking',
+    () async {
+      freeSomePages();
+      // A row the collector never revisits, for example under a Codex home
+      // that is no longer configured.
+      addCodexSession(collectorCodexParserVersion - 1, id: 'outside-roots');
+      final maintenance = await scheduler();
+      await maintenance.runDueJobs();
+      expect(reclaimJobs(), isEmpty);
+
+      db.execute(
+        'insert into app_metadata(key, value, updated_at_utc) values (?, ?, ?)',
+        [
+          completeCodexScanKey,
+          '${collectorCodexParserVersion - 1}',
+          '2026-09-25',
+        ],
+      );
+      await (await scheduler()).runDueJobs();
+      expect(
+        reclaimJobs(),
+        isEmpty,
+        reason: 'a complete scan with an older parser proves nothing',
+      );
+
+      db.execute('update app_metadata set value = ? where key = ?', [
+        '$collectorCodexParserVersion',
+        completeCodexScanKey,
+      ]);
+      await (await scheduler()).runDueJobs();
+      expect(reclaimJobs(), ['succeeded']);
+      expect(marker(), '$collectorCodexParserVersion');
+    },
+  );
+
   test('a small database is recorded without compacting', () async {
     freeSomePages();
     final maintenance = await scheduler(minimumDatabaseBytes: 1 << 40);

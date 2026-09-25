@@ -549,11 +549,13 @@ void main() {
       '024_hub_delivery_and_price_confirmation.sql',
     );
     expect(versionRows[23]['success'], 1);
-    expect(versionRows.last['version'], latestSchemaVersion);
+    expect(versionRows[24]['version'], 25);
     expect(
-      versionRows.last['filename'],
+      versionRows[24]['filename'],
       '025_session_change_journal_precision.sql',
     );
+    expect(versionRows.last['version'], latestSchemaVersion);
+    expect(versionRows.last['filename'], '026_retire_misread_codex_files.sql');
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -904,6 +906,111 @@ void main() {
       1,
     );
   });
+
+  test(
+    'migration 026 removes empty Codex rows read from non-session files',
+    () async {
+      final sqlRoot = await _copySqlRoot(tempDir);
+      final migration = File(
+        p.join(sqlRoot.path, 'migration', '026_retire_misread_codex_files.sql'),
+      );
+      final migrationBytes = await migration.readAsBytes();
+      await migration.delete();
+      final legacyResult = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+        supportedSchemaVersion: 25,
+      ).openAndMigrate(dbFile);
+      expect(legacyResult.canStartNormalUi, isTrue);
+      final db = openFileBackedDatabase(dbFile);
+      const now = '2026-09-25T08:00:00Z';
+      void session(String id, String harness, String path) => db.execute(
+        '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        created_at_utc, updated_at_utc, harness
+      ) values (?, 'windows', ?, ?, ?, ?, ?, ?)
+      ''',
+        [id, path, path, path, now, now, harness],
+      );
+      session(
+        'plugin',
+        'codex',
+        r'C:\Users\u\.codex\plugins\cache\x\.codex-plugin\plugin.json',
+      );
+      session(
+        'package',
+        'codex',
+        '/home/u/.codex/.tmp/node_modules/p/package.json',
+      );
+      session(
+        'paginated',
+        'codex',
+        r'C:\Users\u\.codex\sessions\2026\07\14\.rollout-1.jsonl.paginated.tmp',
+      );
+      session(
+        'legacy',
+        'codex',
+        r'C:\Users\u\.codex\sessions\2025\01\01\rollout-2025-01-01.json',
+      );
+      session('rollout', 'codex', '/home/u/.codex/sessions/rollout-2026.jsonl');
+      session('imported', 'codex', r'C:\imports\renamed.jsonl');
+      session('no-path', 'codex', '');
+      session('with-text', 'codex', r'C:\imports\notes.json');
+      session('claude', 'claude', r'C:\Users\u\.claude\projects\p\abc.jsonl');
+      db.execute(
+        '''
+      insert into messages (
+        session_id, message_index, author_type, first_line, content_plain,
+        content_preview, created_at_db_utc, updated_at_db_utc
+      ) values ('with-text', 0, 'user', 'kept', 'kept', 'kept', ?, ?)
+      ''',
+        [now, now],
+      );
+      db.execute(
+        "insert into tags (name, created_at_utc, updated_at_utc) values ('t', ?, ?)",
+        [now, now],
+      );
+      db.execute('''
+      insert into session_search (rowid, title)
+      select rowid, id from sessions where id in ('plugin', 'rollout')
+    ''');
+      db.execute('''
+      insert into session_tags (session_id, tag_id, created_at_utc)
+      select 'plugin', id, created_at_utc from tags
+    ''');
+      db.close();
+
+      await migration.writeAsBytes(migrationBytes);
+      final result = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.details,
+      );
+      final migrated = openFileBackedDatabase(dbFile);
+      addTearDown(migrated.close);
+      expect(
+        migrated
+            .select('select id from sessions order by id')
+            .map((row) => row['id'])
+            .toList(),
+        ['claude', 'imported', 'legacy', 'no-path', 'rollout', 'with-text'],
+      );
+      expect(
+        migrated.select('select count(*) as n from session_tags').single['n'],
+        0,
+      );
+      expect(
+        migrated
+            .select('select title from session_search order by title')
+            .map((row) => row['title'])
+            .toList(),
+        ['rollout'],
+      );
+    },
+  );
 
   test('marks interrupted scan runs failed on the next startup', () async {
     final migrator = DatabaseMigrator(sqlRoot: Directory('../sql'));

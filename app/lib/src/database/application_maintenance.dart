@@ -20,6 +20,11 @@ import 'maintenance_job.dart';
 /// freed space reclaimed (or found too little to be worth a VACUUM).
 const spaceReclaimMarkerKey = 'space_reclaim.codex_parser_version';
 
+/// `app_metadata` key the collector writes after a scan that listed every
+/// configured Codex root (`COMPLETE_CODEX_SCAN_KEY` in
+/// `collector/src/store/writer.rs`).
+const completeCodexScanKey = 'codex_scan.completed_parser_version';
+
 /// Application-owned schedules; the coordinator is also shared by UI writers.
 class ApplicationMaintenance extends ChangeNotifier {
   ApplicationMaintenance({
@@ -767,7 +772,8 @@ final class SpaceReclaimPlan {
 }
 
 /// Null until reclaiming is due: [codexParserVersion] has not been reclaimed
-/// yet and no available Codex session still awaits that parser.
+/// yet, and either a complete collector scan ran with that parser or no
+/// available Codex session still awaits it.
 @visibleForTesting
 SpaceReclaimPlan? spaceReclaimPlan(
   Database db, {
@@ -780,6 +786,16 @@ SpaceReclaimPlan? spaceReclaimPlan(
   if (marker.isNotEmpty && marker.single['value'] == '$codexParserVersion') {
     return null;
   }
+  // The collector records a scan that listed every configured root with
+  // this parser: a row still on an older one lies outside those roots and is
+  // never reparsed, so it must not keep the compaction waiting.
+  final completeScan = db.select(
+    'select value from app_metadata where key = ?',
+    [completeCodexScanKey],
+  );
+  final scanned =
+      completeScan.isNotEmpty &&
+      completeScan.single['value'] == '$codexParserVersion';
   // Sessions collected on other machines are never reparsed here.
   final pending = db.select(
     '''
@@ -793,7 +809,7 @@ SpaceReclaimPlan? spaceReclaimPlan(
     ''',
     [codexParserVersion],
   );
-  if (pending.single['pending'] == 1) return null;
+  if (!scanned && pending.single['pending'] == 1) return null;
   final pages = db.select('''
     select page_count, freelist_count, page_size
     from pragma_page_count, pragma_freelist_count, pragma_page_size

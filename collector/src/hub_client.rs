@@ -71,24 +71,26 @@ fn record_key(record: &Record) -> Option<(String, bool)> {
 
 /// Called while the local record transaction is open. No destination or
 /// credential is stored with a record; hubs remain opt-in.
-pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> {
-    let table_exists: bool = conn.query_row(
-        "select exists(select 1 from sqlite_schema where type = 'table' and name = 'collector_hub_state')",
-        [],
-        |row| row.get(0),
-    )?;
+/// Whether records are queued for a hub. Callers that queue many records
+/// check once instead of paying two queries per record.
+pub fn queue_enabled(conn: &Connection) -> StoreResult<bool> {
+    let table_exists: bool = conn
+        .prepare_cached(
+            "select exists(select 1 from sqlite_schema where type = 'table' and name = 'collector_hub_state')",
+        )?
+        .query_row([], |row| row.get(0))?;
     if !table_exists {
-        return Ok(());
+        return Ok(false);
     }
-    let enabled: bool = conn
-        .query_row(
-            "select enabled from collector_hub_state where id = 1",
-            [],
-            |row| row.get(0),
-        )
+    Ok(conn
+        .prepare_cached("select enabled from collector_hub_state where id = 1")?
+        .query_row([], |row| row.get(0))
         .optional()?
-        .unwrap_or(false);
-    if !enabled {
+        .unwrap_or(false))
+}
+
+pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> {
+    if !queue_enabled(conn)? {
         return Ok(());
     }
     let key = record_key(&record);

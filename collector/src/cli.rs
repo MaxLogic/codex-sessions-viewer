@@ -485,9 +485,12 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
             options.positional[0]
         )));
     }
+    let mut phases = crate::timing::Phases::start();
     let settings = load_settings(options)?;
     let store = open_store(options)?;
+    phases.mark("open store");
     let scan = scan_options(options, &settings, configured_roots(&settings));
+    phases.mark("read thread names");
     let mut report = scan_transport(options, out, |cancel, progress, gate| {
         codex::collect_coordinated(
             &store,
@@ -513,7 +516,11 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
         repair.pruned_backups = pruned.deleted;
         repair.prune_failures = pruned.failed;
     }
-    print_report(out, "codex scan", &store, &report, options.json)
+    phases.mark("collect and prune");
+    crate::timing::report_totals();
+    let printed = print_report(out, "codex scan", &store, &report, options.json);
+    phases.mark("report");
+    printed
 }
 
 /// The shortest gap between two progress events unless a batch committed.

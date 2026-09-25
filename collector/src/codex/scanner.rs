@@ -1,18 +1,19 @@
 //! Codex session discovery and parallel parsing, originally ported from the
 //! viewer's retired Dart scanner.
 //!
-//! Discovery and skip decisions run on the calling thread. Changed files are
+//! Folders are listed by a small thread pool; skip decisions run on the
+//! calling thread. Changed files are
 //! parsed by a fixed pool of worker threads connected through bounded
 //! channels, so memory stays proportional to the pool, not to the history.
 //! Parsed sessions reach the caller's sink in completion order; the sink
 //! persists them in small batches.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::codex::parser::{
@@ -141,6 +142,10 @@ struct Candidate {
     path: String,
     source_type: SourceType,
     source_state: &'static str,
+    /// From the directory listing. On Windows the listing already carries
+    /// size and modification time, so no further request per file is made,
+    /// which matters for `\wsl.localhost` paths.
+    metadata: Option<std::fs::Metadata>,
 }
 
 fn status(path: &str, status: &str, state: &str, message: Option<String>) -> SourceStatus {
@@ -210,7 +215,7 @@ fn snapshot_keys(source: &CachedSource) -> Vec<String> {
 }
 
 /// `_parseDecision`.
-fn should_parse(path: &str, cached: &CachedIndex) -> bool {
+fn should_parse(path: &str, listed: Option<&std::fs::Metadata>, cached: &CachedIndex) -> bool {
     let Some(cached) = cached.lookup(path) else {
         return true;
     };
@@ -222,13 +227,13 @@ fn should_parse(path: &str, cached: &CachedIndex) -> bool {
     if cached.scan_status != "available" || version != crate::codex::parser::PARSER_VERSION {
         return true;
     }
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let Some(metadata) = listed else {
         return true;
     };
     if metadata.len() as i64 != size {
         return true;
     }
-    let Ok(current) = crate::codex::parser::file_modified_utc(&metadata) else {
+    let Ok(current) = crate::codex::parser::file_modified_utc(metadata) else {
         return true;
     };
     (current.micros() - modified.micros()).abs() > CACHE_MODIFIED_TOLERANCE_MICROS
@@ -359,74 +364,180 @@ fn discover(
         ));
     }
 
-    while let Some((directory, owner_path, source_type, source_state)) = directories.pop() {
+    walk(directories, &mut discovery, cancel, progress);
+    discovery
+}
+
+type WalkDirectory = (String, String, SourceType, &'static str);
+
+/// Listing threads. The walk waits on the file system, and a
+/// `\wsl.localhost` folder costs a round trip, so folders are listed
+/// concurrently.
+const DISCOVERY_WORKERS: usize = 8;
+
+#[derive(Default)]
+struct Walked {
+    candidates: Vec<Candidate>,
+    unsupported: Vec<SourceStatus>,
+    failures: Vec<(String, String, &'static str, std::io::Error)>,
+}
+
+/// Lists every folder under `roots`. The result does not depend on thread
+/// timing: candidates are sorted by path.
+fn walk(
+    roots: Vec<WalkDirectory>,
+    discovery: &mut Discovery,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(&ScanCounts),
+) {
+    if roots.is_empty() {
+        return;
+    }
+    // Pending folders and the number of folders being listed right now.
+    let queue = Mutex::new((roots, 0usize));
+    let changed = Condvar::new();
+    let scanned = AtomicU64::new(0);
+    let (finished, done) = std::sync::mpsc::channel::<Walked>();
+    let mut results = Vec::with_capacity(DISCOVERY_WORKERS);
+    std::thread::scope(|scope| {
+        for _ in 0..DISCOVERY_WORKERS {
+            let finished = finished.clone();
+            let (queue, changed, scanned) = (&queue, &changed, &scanned);
+            scope.spawn(move || {
+                let mut walked = Walked::default();
+                loop {
+                    let next = {
+                        let mut state = queue.lock().expect("discovery queue");
+                        loop {
+                            if cancel.load(Ordering::Relaxed) {
+                                break None;
+                            }
+                            if let Some(directory) = state.0.pop() {
+                                state.1 += 1;
+                                break Some(directory);
+                            }
+                            if state.1 == 0 {
+                                break None;
+                            }
+                            state = changed
+                                .wait_timeout(state, Duration::from_millis(50))
+                                .expect("discovery queue")
+                                .0;
+                        }
+                    };
+                    let Some(directory) = next else {
+                        changed.notify_all();
+                        break;
+                    };
+                    let subdirectories = list_directory(directory, cancel, &mut walked);
+                    scanned.fetch_add(1, Ordering::Relaxed);
+                    let mut state = queue.lock().expect("discovery queue");
+                    state.0.extend(subdirectories);
+                    state.1 -= 1;
+                    drop(state);
+                    changed.notify_all();
+                }
+                let _ = finished.send(walked);
+            });
+        }
+        drop(finished);
+        while results.len() < DISCOVERY_WORKERS {
+            match done.recv_timeout(Duration::from_millis(50)) {
+                Ok(walked) => results.push(walked),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            discovery.counts.directories_scanned = scanned.load(Ordering::Relaxed);
+            progress(&discovery.counts);
+        }
+    });
+    discovery.counts.directories_scanned = scanned.load(Ordering::Relaxed);
+    let mut candidates = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut failures = Vec::new();
+    for walked in results {
+        candidates.extend(walked.candidates);
+        unsupported.extend(walked.unsupported);
+        failures.extend(walked.failures);
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    unsupported.sort_by(|left, right| left.path.cmp(&right.path));
+    failures.sort_by(|left, right| left.0.cmp(&right.0));
+    for (directory, owner_path, state, error) in failures {
+        directory_failed(discovery, &directory, &owner_path, state, &error);
+    }
+    discovery.counts.files_skipped += unsupported.len() as u64;
+    discovery.errors.extend(unsupported.iter().cloned());
+    discovery.statuses.extend(unsupported);
+    discovery.counts.files_found += candidates.len() as u64;
+    discovery.candidates = candidates;
+}
+
+/// Lists one folder into `walked` and returns its subfolders.
+fn list_directory(
+    (directory, owner_path, source_type, source_state): WalkDirectory,
+    cancel: &AtomicBool,
+    walked: &mut Walked,
+) -> Vec<WalkDirectory> {
+    let mut subdirectories = Vec::new();
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            walked
+                .failures
+                .push((directory, owner_path, source_state, error));
+            return subdirectories;
+        }
+    };
+    for entry in entries {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        discovery.counts.directories_scanned += 1;
-        progress(&discovery.counts);
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(error) => {
-                directory_failed(
-                    &mut discovery,
-                    &directory,
-                    &owner_path,
-                    source_state,
-                    &error,
-                );
-                continue;
-            }
-        };
-        for entry in entries {
-            if cancel.load(Ordering::Relaxed) {
+                walked
+                    .failures
+                    .push((directory.clone(), owner_path.clone(), source_state, error));
                 break;
             }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    directory_failed(
-                        &mut discovery,
-                        &directory,
-                        &owner_path,
-                        source_state,
-                        &error,
-                    );
-                    break;
-                }
-            };
-            let path = join(&directory, &entry.file_name().to_string_lossy());
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                directories.push((path, owner_path.clone(), source_type, source_state));
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            if !(path.ends_with(".json") || path.ends_with(".jsonl")) {
-                discovery.counts.files_skipped += 1;
-                let entry = status(
-                    &path,
-                    "unsupported_format",
-                    source_state,
-                    Some("Unsupported session file format.".to_owned()),
-                );
-                discovery.errors.push(entry.clone());
-                discovery.statuses.push(entry);
-                continue;
-            }
-            discovery.counts.files_found += 1;
-            discovery.candidates.push(Candidate {
-                path,
-                source_type,
-                source_state,
-            });
+        };
+        let path = join(&directory, &entry.file_name().to_string_lossy());
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            subdirectories.push((path, owner_path.clone(), source_type, source_state));
+            continue;
         }
+        if !file_type.is_file() {
+            continue;
+        }
+        if !(path.ends_with(".json") || path.ends_with(".jsonl")) {
+            walked.unsupported.push(status(
+                &path,
+                "unsupported_format",
+                source_state,
+                Some("Unsupported session file format.".to_owned()),
+            ));
+            continue;
+        }
+        // NTFS updates a listed file's size and time lazily while another
+        // process holds it open, so local files are checked directly; the
+        // WSL file server lists current values.
+        let metadata = if source_type == SourceType::Wsl {
+            entry.metadata().ok()
+        } else {
+            std::fs::metadata(&path).ok()
+        };
+        walked.candidates.push(Candidate {
+            path,
+            source_type,
+            source_state,
+            metadata,
+        });
     }
-    discovery
+    subdirectories
 }
 
 fn directory_failed(
@@ -472,7 +583,9 @@ pub fn scan_controlled<E>(
     mut progress: impl FnMut(&ScanCounts),
 ) -> Result<ScanOutcome, E> {
     progress(&ScanCounts::default());
+    let mut phases = crate::timing::Phases::start();
     let discovery = discover(options, cancel, &mut progress);
+    phases.mark("discover files");
     let mut counts = discovery.counts;
     progress(&counts);
     let mut statuses = discovery.statuses;
@@ -483,7 +596,7 @@ pub fn scan_controlled<E>(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if options.force || should_parse(&candidate.path, &index) {
+        if options.force || should_parse(&candidate.path, candidate.metadata.as_ref(), &index) {
             to_parse.push(position);
         } else {
             counts.files_skipped += 1;
@@ -496,6 +609,7 @@ pub fn scan_controlled<E>(
         }
     }
 
+    phases.mark("skip decisions");
     let workers = options.parser_workers.max(1);
     let (job_sender, job_receiver) = sync_channel::<ParseJob>(workers * 2);
     let (result_sender, result_receiver) = sync_channel::<ParseResult>(workers * 2);
@@ -575,6 +689,7 @@ pub fn scan_controlled<E>(
     for handle in handles {
         let _ = handle.join();
     }
+    phases.mark("parse and sink");
     if let Some(error) = sink_error {
         return Err(error);
     }

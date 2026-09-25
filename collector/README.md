@@ -63,6 +63,15 @@ expected and how to fix it.
 Tests can set `CODEX_SESSIONS_COLLECTOR_EXE` to an explicitly built executable.
 Installed applications use the collector next to the viewer executable.
 
+An unchanged scan does little work. Folders are listed on several threads, and
+WSL files are judged by the size and time in the listing; local Windows files
+are checked directly, because NTFS updates a listed file's size lazily while
+Codex still has it open. Unchanged files leave their session rows untouched.
+After a scan that listed every configured root, the collector records
+`codex_scan.completed_parser_version`; the viewer compacts the database after
+a parser change once that matches, even if rows outside the roots remain.
+Set `CODEX_SESSIONS_COLLECTOR_TIMINGS=1` to print per-phase timings to stderr.
+
 ## Who owns the database
 
 - **Viewer database (`--db`)**: the viewer creates and migrates it. The

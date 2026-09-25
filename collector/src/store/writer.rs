@@ -189,7 +189,9 @@ pub fn apply_session_batch(
                     .iter()
                     .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
             );
-            upsert_session(conn, id, snapshot, &now, &resolver)?;
+            crate::timing::timed("write: session total", || {
+                upsert_session(conn, id, snapshot, &now, &resolver)
+            })?;
             hub_client::enqueue(
                 conn,
                 Record::SessionSnapshot(Box::new(snapshot.clone())),
@@ -198,7 +200,7 @@ pub fn apply_session_batch(
         }
         Ok(())
     })();
-    finish(conn, result)?;
+    crate::timing::timed("write: commit", || finish(conn, result))?;
     Ok(count)
 }
 
@@ -321,8 +323,12 @@ fn upsert_session(
     resolver: &ProjectResolver,
 ) -> StoreResult<()> {
     let session = &snapshot.session;
-    let identity_merge = capture_identity_merge(conn, id, snapshot)?;
-    if !candidate_should_replace(conn, id, snapshot)? {
+    let identity_merge = crate::timing::timed("write: identity capture", || {
+        capture_identity_merge(conn, id, snapshot)
+    })?;
+    if !crate::timing::timed("write: replace decision", || {
+        candidate_should_replace(conn, id, snapshot)
+    })? {
         if let Some(merge) = identity_merge {
             apply_identity_merge(conn, id, &merge)?;
             let affected = reconcile_affected_legacy_usage(
@@ -354,38 +360,40 @@ fn upsert_session(
     };
     let (user_tokens, assistant_tokens, tool_tokens) = message_token_buckets(snapshot);
     let usage = Usage::from(session.usage);
-    upsert_search_document(
-        conn,
-        &SearchDocument {
-            id,
-            source_type: source_type.wire_name(),
-            source_file_path: &snapshot.source.path,
-            display_path: &snapshot.source.display_path,
-            platform_path: &snapshot.source.platform_path,
-            title: clean_display_title(session.title.as_deref()),
-            summary: clean_display_summary(session.summary.as_deref()),
-            thread_name: &resolved_thread_name,
-            tool_names: snapshot
-                .tool_calls
-                .iter()
-                .map(|tool| tool.tool_name.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            normalized_path_keys: snapshot.source.normalized_path_keys.join(" "),
-            started_at_utc: iso_or_null(session.started_at_utc.as_deref()),
-            last_message_at_utc: iso_or_null(session.last_message_at_utc.as_deref()),
-            models_used: &session.models,
-            scan_status: &snapshot.source.status,
-            has_code_blocks: snapshot
-                .messages
-                .iter()
-                .any(|message| message.content_plain.contains("```")),
-            has_tool_calls: !snapshot.tool_calls.is_empty(),
-            has_errors,
-            total_tokens: usage.total_tokens(),
-            project_name: auto_project.as_deref().unwrap_or(""),
-        },
-    )?;
+    crate::timing::timed("write: search document", || {
+        upsert_search_document(
+            conn,
+            &SearchDocument {
+                id,
+                source_type: source_type.wire_name(),
+                source_file_path: &snapshot.source.path,
+                display_path: &snapshot.source.display_path,
+                platform_path: &snapshot.source.platform_path,
+                title: clean_display_title(session.title.as_deref()),
+                summary: clean_display_summary(session.summary.as_deref()),
+                thread_name: &resolved_thread_name,
+                tool_names: snapshot
+                    .tool_calls
+                    .iter()
+                    .map(|tool| tool.tool_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                normalized_path_keys: snapshot.source.normalized_path_keys.join(" "),
+                started_at_utc: iso_or_null(session.started_at_utc.as_deref()),
+                last_message_at_utc: iso_or_null(session.last_message_at_utc.as_deref()),
+                models_used: &session.models,
+                scan_status: &snapshot.source.status,
+                has_code_blocks: snapshot
+                    .messages
+                    .iter()
+                    .any(|message| message.content_plain.contains("```")),
+                has_tool_calls: !snapshot.tool_calls.is_empty(),
+                has_errors,
+                total_tokens: usage.total_tokens(),
+                project_name: auto_project.as_deref().unwrap_or(""),
+            },
+        )
+    })?;
     let modified_utc = DartDateTime::try_parse(&snapshot.source.modified_utc)
         .map(DartDateTime::to_iso8601)
         .unwrap_or_else(|| snapshot.source.modified_utc.clone());
@@ -455,21 +463,30 @@ fn upsert_session(
         snapshot.machine_id,
         id,
     ])?;
-    replace_messages(conn, id, snapshot, now)?;
-    replace_tool_calls(conn, id, snapshot)?;
-    replace_usage_events(conn, id, snapshot, now, resolver, source_type)?;
-    replace_source_extras(conn, id, snapshot, now)?;
+    crate::timing::timed("write: messages", || {
+        replace_messages(conn, id, snapshot, now)
+    })?;
+    crate::timing::timed("write: tool calls", || {
+        replace_tool_calls(conn, id, snapshot)
+    })?;
+    crate::timing::timed("write: usage events", || {
+        replace_usage_events(conn, id, snapshot, now, resolver, source_type)
+    })?;
+    crate::timing::timed("write: source extras", || {
+        replace_source_extras(conn, id, snapshot, now)
+    })?;
     if let Some(merge) = identity_merge {
         apply_identity_merge(conn, id, &merge)?;
     }
-    refresh_session_project(conn, id)?;
-    let affected = reconcile_affected_legacy_usage(
-        conn,
-        &snapshot.harness,
-        id,
-        session.session_id.as_deref(),
-    )?;
-    replace_daily_projections(conn, &affected)
+    crate::timing::timed("write: project refresh", || {
+        refresh_session_project(conn, id)
+    })?;
+    let affected = crate::timing::timed("write: legacy usage", || {
+        reconcile_affected_legacy_usage(conn, &snapshot.harness, id, session.session_id.as_deref())
+    })?;
+    crate::timing::timed("write: daily projections", || {
+        replace_daily_projections(conn, &affected)
+    })
 }
 
 struct SearchDocument<'a> {
@@ -1612,24 +1629,23 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
                 ])?;
             }
         }
+        // `in (...)` lets each session probe the temporary key; an `or` over
+        // the two path columns scanned the whole table for every session.
+        // An unchanged available file changes nothing, so its row is skipped.
         conn.execute(
             "update sessions set
-               scan_status = (select t.status from temp_scan_statuses t
-                 where t.harness = sessions.harness and (t.source_path = sessions.source_file_path or t.source_path = sessions.source_file_unc_path) limit 1),
-               source_state = (select t.source_state from temp_scan_statuses t
-                 where t.harness = sessions.harness and (t.source_path = sessions.source_file_path or t.source_path = sessions.source_file_unc_path) limit 1),
-               parse_status = case when (select t.status from temp_scan_statuses t
-                 where t.harness = sessions.harness and (t.source_path = sessions.source_file_path or t.source_path = sessions.source_file_unc_path) limit 1)
-                 = 'parse_error' then 'parse_error' else parse_status end,
-               updated_at_utc = case when (select t.status from temp_scan_statuses t
-                 where t.harness = sessions.harness and (t.source_path = sessions.source_file_path or t.source_path = sessions.source_file_unc_path) limit 1)
-                 = 'available' then updated_at_utc else ? end,
-               last_scanned_utc = case when (select t.status from temp_scan_statuses t
-                 where t.harness = sessions.harness and (t.source_path = sessions.source_file_path or t.source_path = sessions.source_file_unc_path) limit 1)
-                 = 'available' then last_scanned_utc else ? end
-             where exists (select 1 from temp_scan_statuses t
-               where t.harness = sessions.harness and (t.source_path = sessions.source_file_path or t.source_path = sessions.source_file_unc_path))",
-            params![now, now],
+               scan_status = t.status,
+               source_state = t.source_state,
+               parse_status = case when t.status = 'parse_error' then 'parse_error' else sessions.parse_status end,
+               updated_at_utc = case when t.status = 'available' then sessions.updated_at_utc else ?1 end,
+               last_scanned_utc = case when t.status = 'available' then sessions.last_scanned_utc else ?1 end
+             from temp_scan_statuses t
+             where t.harness = sessions.harness
+               and t.source_path in (sessions.source_file_path, sessions.source_file_unc_path)
+               and (t.status <> 'available'
+                 or sessions.scan_status is not t.status
+                 or sessions.source_state is not t.source_state)",
+            params![now],
         )?;
         let missing: Vec<(String, String, String, String)> = {
             let mut statement = conn.prepare(
@@ -1676,8 +1692,10 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
             }
         }
         conn.execute_batch("delete from temp_scan_statuses")?;
-        for status in statuses {
-            hub_client::enqueue(conn, Record::SourceStatus(status.clone()), &now)?;
+        if hub_client::queue_enabled(conn)? {
+            for status in statuses {
+                hub_client::enqueue(conn, Record::SourceStatus(status.clone()), &now)?;
+            }
         }
         Ok(())
     })();
@@ -1931,6 +1949,26 @@ pub struct CachedSource {
     pub file_size: Option<i64>,
     pub modified_utc: Option<DartDateTime>,
     pub parser_version: Option<i64>,
+}
+
+/// Written after a scan that listed every configured root and was not
+/// cancelled: every reachable session file has been parsed with this parser
+/// version, so a row still on an older one is outside the scanned roots or
+/// unreadable, and the viewer need not wait for it.
+pub const COMPLETE_CODEX_SCAN_KEY: &str = "codex_scan.completed_parser_version";
+
+pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
+    conn.execute(
+        "insert into app_metadata (key, value, updated_at_utc) values (?, ?, ?)
+         on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc
+         where value is not excluded.value",
+        params![
+            COMPLETE_CODEX_SCAN_KEY,
+            crate::codex::parser::PARSER_VERSION.to_string(),
+            DartDateTime::now().to_iso8601()
+        ],
+    )?;
+    Ok(())
 }
 
 /// `_cachedSessions`, limited to one harness.

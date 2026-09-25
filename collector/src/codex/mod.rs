@@ -103,6 +103,7 @@ pub fn collect_coordinated(
     batching: CollectionBatching,
 ) -> StoreResult<CollectReport> {
     let is_cancelled = || cancel.load(Ordering::Relaxed);
+    let mut phases = crate::timing::Phases::start();
     // Count first: a lease that would find nothing to clean only makes the
     // GUI's writers wait.
     if writer::session_metadata_placeholder_count(&store.conn)? > 0
@@ -113,7 +114,9 @@ pub fn collect_coordinated(
     {
         cancel.store(true, Ordering::Relaxed);
     }
+    phases.mark("metadata placeholders");
     let cached = writer::cached_sources(&store.conn, "codex")?;
+    phases.mark("load cached sources");
     let mut pending: Vec<SessionSnapshot> = Vec::new();
     let mut pending_bytes = 0u64;
     let mut applied = ApplySummary::default();
@@ -159,6 +162,7 @@ pub fn collect_coordinated(
         flushes.set(flushes.get() + 1);
     }
     outcome.counts.persistence_flushes = flushes.get();
+    phases.mark("scan and write sessions");
     if !is_cancelled() {
         let hints = refined_project_hints(&outcome.parsed, resolve_wsl_projects);
         applied.project_updates += gated(&mut gate, || {
@@ -166,13 +170,22 @@ pub fn collect_coordinated(
         })?
         .unwrap_or(0);
     }
+    phases.mark("project hints");
+    // Every parsed batch is already written, so a complete, uncancelled
+    // discovery means every reachable file now carries this parser version.
+    let complete = outcome.discovery_complete && !is_cancelled();
     if gated(&mut gate, || {
-        writer::apply_source_statuses(&store.conn, &outcome.statuses)
+        writer::apply_source_statuses(&store.conn, &outcome.statuses)?;
+        if complete {
+            writer::record_complete_codex_scan(&store.conn)?;
+        }
+        Ok(())
     })?
     .is_some()
     {
         applied.statuses = outcome.statuses.len();
     }
+    phases.mark("source statuses");
     let mut cache_repair = None;
     if !is_cancelled() {
         let names: Vec<ThreadName> = thread_name_records(&options.thread_names);
@@ -180,7 +193,9 @@ pub fn collect_coordinated(
             writer::apply_thread_names(&store.conn, &names)
         })?
         .unwrap_or(0);
+        phases.mark("thread names");
         applied.project_updates += backfill_projects(store, &mut gate, resolve_wsl_projects)?;
+        phases.mark("project backfill");
         // Only unreachable or unlisted roots make discovery incomplete; a
         // file that fails to parse under a reachable root does not.
         let discovery_complete = outcome.discovery_complete;
@@ -193,6 +208,7 @@ pub fn collect_coordinated(
                 &mut gate,
             )?);
         }
+        phases.mark("cache repair check");
     }
     outcome.counts.cancelled |= is_cancelled();
     Ok(CollectReport {

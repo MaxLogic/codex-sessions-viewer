@@ -570,6 +570,89 @@ fn deleted_rollouts_become_missing_but_keep_their_history() {
 }
 
 #[test]
+fn an_unchanged_rescan_rewrites_no_session_rows_and_records_a_complete_scan() {
+    let temp = TempDir::new("quiet");
+    let home = support::codex_home(&temp, &["rich_session.jsonl", "subagent_session.jsonl"]);
+    let db = viewer_database(&temp);
+    assert!(support::scan(&db, &home, &[]).status.success());
+    let conn = open(&db);
+    let complete: String = conn
+        .query_row(
+            "select value from app_metadata where key = 'codex_scan.completed_parser_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        complete,
+        codex_sessions_collector::codex::parser::PARSER_VERSION.to_string()
+    );
+    conn.execute_batch(
+        "create table session_updates(id text not null);
+         create trigger count_session_updates after update on sessions
+         begin insert into session_updates values (new.id); end;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let output = support::scan(&db, &home, &["--json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["files_skipped"], 2);
+    let conn = open(&db);
+    assert_eq!(
+        count(&conn, "select count(*) from session_updates"),
+        0,
+        "an unchanged file must not rewrite its session row"
+    );
+    drop(conn);
+
+    std::fs::remove_file(support::day_folder(&home).join("rich_session.jsonl")).unwrap();
+    assert!(support::scan(&db, &home, &[]).status.success());
+    let conn = open(&db);
+    assert_eq!(
+        count(
+            &conn,
+            "select count(*) from sessions where id = 'session:parity-rich-001' and scan_status = 'missing'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "select count(distinct id) from session_updates where id <> 'session:parity-rich-001'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_scan_with_an_unreachable_root_does_not_claim_completeness() {
+    let temp = TempDir::new("incomplete");
+    let db = viewer_database(&temp);
+    let output = collector()
+        .args(["codex", "scan", "--json", "--no-wsl-projects", "--db"])
+        .arg(&db)
+        .arg("--windows-root")
+        .arg(temp.path().join("no-such-codex-home"))
+        .args(["--wsl-root", ""])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let conn = open(&db);
+    assert_eq!(
+        count(
+            &conn,
+            "select count(*) from app_metadata where key = 'codex_scan.completed_parser_version'"
+        ),
+        0
+    );
+}
+
+#[test]
 fn a_single_file_ingest_matches_a_scan_of_that_file() {
     let temp = TempDir::new("single");
     let home = support::codex_home(&temp, &["rich_session.jsonl"]);
