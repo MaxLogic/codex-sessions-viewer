@@ -38,7 +38,7 @@ void main() {
     db.close();
   });
 
-  test('repricing visits dirty partitions in model day session order', () {
+  test('repricing visits dirty partitions in session day model order', () {
     final day = DateTime.utc(2026, 9, 7);
     for (final id in ['a', 'b']) {
       _insertSession(db, id: id, sourceType: 'windows', startedAtUtc: day);
@@ -71,12 +71,12 @@ void main() {
       ),
       overrides: const {},
     );
-    // Empty partitions still need clearing after source deletion. Their order
-    // deliberately differs from the session-first deduplication key.
+    // Empty partitions still need clearing after source deletion. A session's
+    // partitions come together so one pass over its events serves them all.
     for (final (session, day, model) in [
-      ('b', '2026-09-06', 'a-model'),
-      ('a', '2026-09-07', 'a-model'),
       ('a', '2026-09-06', 'z-model'),
+      ('a', '2026-09-07', 'a-model'),
+      ('b', '2026-09-06', 'a-model'),
     ]) {
       expect(
         UsageCostProjectionRepository(db).repriceNextBatch(

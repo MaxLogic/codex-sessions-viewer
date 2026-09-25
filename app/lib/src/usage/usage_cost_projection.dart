@@ -52,10 +52,11 @@ class UsageCostProjectionRepository {
     } else if (active.targetSchemaVersion < 16) {
       throw StateError('Cost repricing requires active daily projections.');
     }
+    // A session's partitions travel together, so its events are read once.
     final partitions = db.select(
       '''
       select * from usage_cost_dirty_partitions
-      order by model_key, day_utc, session_id limit ?
+      order by session_id, day_utc, model_key limit ?
     ''',
       [partitionLimit < 1 ? 1 : partitionLimit],
     );
@@ -136,11 +137,18 @@ class UsageCostProjectionRepository {
             then 'partial_unsupported_units' else 'complete' end,
         updated_at_utc = excluded.updated_at_utc
     ''');
+    // One ordered pass over a session's events on the batch's days serves
+    // all of its partitions; the day and model of each event pick the one.
     final events = db.prepare('''
-      select * from ${shadow ? 'usage_events_next' : 'usage_events'}
-      where session_row_id = ? and strftime('%Y-%m-%d', occurred_at_utc) = ?
-        and coalesce(model, '') = ? and source_record_ordinal > ?
-      order by source_record_ordinal limit 512
+      select occurred_at_utc, model, path_context_id, branch_scope,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens,
+        strftime('%Y-%m-%d', occurred_at_utc) as day_utc,
+        coalesce(model, '') as model_key
+      from ${shadow ? 'usage_events_next' : 'usage_events'}
+      where session_row_id = ?
+        and strftime('%Y-%m-%d', occurred_at_utc) in (select value from json_each(?))
+      order by source_record_ordinal
     ''');
     final deleteDaily = db.prepare('''
       delete from usage_session_daily where session_id = ? and day_utc = ? and model_key = ?
@@ -153,85 +161,91 @@ class UsageCostProjectionRepository {
     final pricing = HistoricalUsageCostResolver(db, settings);
     final now = DateTime.now().toUtc().toIso8601String();
     try {
-      for (final partition in partitions) {
-        final key = [
-          partition['session_id'],
-          partition['day_utc'],
-          partition['model_key'],
-        ];
-        deleteDaily.execute(key);
-        // Events with the same pricing basis land in the same daily row;
-        // summing them here in event order gives exactly the totals that one
-        // upsert per event produced.
-        final rows = <String, _DailyRow>{};
-        var ordinal = -1;
-        while (true) {
-          final page = events.select([...key, ordinal]);
-          if (page.isEmpty) break;
-          for (final event in page) {
-            final cost = pricing.resolve(
-              occurredAtUtc: DateTime.parse(event['occurred_at_utc'] as String),
+      var next = 0;
+      while (next < partitions.length) {
+        final sessionId = partitions[next]['session_id'];
+        final wanted = <String, _Partition>{};
+        while (next < partitions.length &&
+            partitions[next]['session_id'] == sessionId) {
+          final partition = partitions[next++];
+          final day = partition['day_utc'] as String;
+          final model = partition['model_key'] as String;
+          wanted['$day\u0000$model'] = _Partition(
+            day: day,
+            modelKey: model,
+            targetVersion: partition['target_cost_projection_version'],
+          );
+          deleteDaily.execute([sessionId, day, model]);
+        }
+        // Events with the same pricing basis land in the same daily row.
+        // Their token counts are summed here and priced once per row, which
+        // gives exactly the totals that pricing every event and adding the
+        // exact decimal results produced.
+        final days = jsonEncode(
+          wanted.values.map((partition) => partition.day).toSet().toList(),
+        );
+        final cursor = events.selectCursor([sessionId, days]);
+        while (cursor.moveNext()) {
+          final event = cursor.current;
+          final partition =
+              wanted['${event['day_utc']}\u0000${event['model_key']}'];
+          if (partition == null) continue;
+          final inputTokens = event['input_tokens'] as int;
+          final cachedInputTokens = event['cached_input_tokens'] as int;
+          final cacheWriteInputTokens =
+              event['cache_write_input_tokens'] as int;
+          final outputTokens = event['output_tokens'] as int;
+          final reasoningOutputTokens = event['reasoning_output_tokens'] as int;
+          final basis = pricing.resolveBasis(
+            occurredAtUtc: DateTime.parse(event['occurred_at_utc'] as String),
+            model: event['model'] as String?,
+            inputTokens: inputTokens,
+          );
+          final row = partition.rows.putIfAbsent(
+            (event['path_context_id'], event['branch_scope'], basis),
+            () => _DailyRow(
               model: event['model'] as String?,
-              inputTokens: event['input_tokens'] as int,
-              cachedInputTokens: event['cached_input_tokens'] as int,
-              cacheWriteInputTokens: event['cache_write_input_tokens'] as int,
-              outputTokens: event['output_tokens'] as int,
-              reasoningOutputTokens: event['reasoning_output_tokens'] as int,
-            );
-            final ruleIds = jsonEncode(cost.providerRuleIds);
-            final basis = jsonEncode([
-              event['path_context_id'],
-              event['branch_scope'],
-              cost.providerPricePeriodId ?? 0,
-              ruleIds,
-              cost.localOverridePeriodId ?? 0,
+              pathContextId: event['path_context_id'],
+              branchScope: event['branch_scope'],
+              basis: basis,
+            ),
+          );
+          row.add(
+            inputTokens: inputTokens,
+            cachedInputTokens: cachedInputTokens,
+            cacheWriteInputTokens: cacheWriteInputTokens,
+            outputTokens: outputTokens,
+            reasoningOutputTokens: reasoningOutputTokens,
+          );
+        }
+        for (final partition in wanted.values) {
+          for (final row in partition.rows.values) {
+            final cost = row.price();
+            insert.execute([
+              sessionId,
+              partition.day,
+              partition.modelKey,
+              row.pathContextId,
+              row.branchScope,
+              row.inputTokens,
+              row.cachedInputTokens,
+              row.cacheWriteInputTokens,
+              row.outputTokens,
+              row.reasoningOutputTokens,
+              row.totalTokens,
+              cost.estimatedCostText,
+              cost.costStatus,
+              cost.providerPricePeriodId,
+              jsonEncode(cost.providerRuleIds),
+              cost.localOverridePeriodId,
               cost.resolutionMethod,
+              cost.catalogSnapshotId,
+              partition.targetVersion,
+              now,
             ]);
-            final tokens = [
-              for (final bucket in _buckets.take(5)) event[bucket] as int,
-              _tokenAdd(
-                event['input_tokens'] as int,
-                event['output_tokens'] as int,
-              ),
-            ];
-            final row = rows[basis];
-            if (row == null) {
-              rows[basis] = _DailyRow(
-                pathContextId: event['path_context_id'],
-                branchScope: event['branch_scope'],
-                tokens: tokens,
-                costText: cost.estimatedCostText,
-                costStatus: cost.costStatus,
-                providerPricePeriodId: cost.providerPricePeriodId,
-                providerRuleIdsJson: ruleIds,
-                localOverridePeriodId: cost.localOverridePeriodId,
-                resolutionMethod: cost.resolutionMethod,
-                catalogSnapshotId: cost.catalogSnapshotId,
-              );
-            } else {
-              row.add(tokens, cost.estimatedCostText, cost.costStatus);
-            }
           }
-          ordinal = page.last['source_record_ordinal'] as int;
+          deleteDirty.execute([sessionId, partition.day, partition.modelKey]);
         }
-        for (final row in rows.values) {
-          insert.execute([
-            ...key,
-            row.pathContextId,
-            row.branchScope,
-            ...row.tokens,
-            row.costText,
-            row.costStatus,
-            row.providerPricePeriodId,
-            row.providerRuleIdsJson,
-            row.localOverridePeriodId,
-            row.resolutionMethod,
-            row.catalogSnapshotId,
-            partition['target_cost_projection_version'],
-            now,
-          ]);
-        }
-        deleteDirty.execute(key);
       }
     } finally {
       insert.close();
@@ -251,50 +265,106 @@ const _buckets = [
   'total_tokens',
 ];
 
+/// Adds token counts, refusing a total outside SQLite's integer range.
 int _tokenAdd(int left, int right) {
-  final sum = BigInt.from(left) + BigInt.from(right);
-  if (sum.isNegative || sum.bitLength > 63) {
+  final sum = left + right;
+  // A sum past 2^63 wraps negative; two negative counts cannot be a total.
+  if (sum < 0 || (left < 0 && right < 0)) {
     throw StateError('Projected token total exceeds SQLite integer range.');
   }
-  return sum.toInt();
+  return sum;
 }
 
-/// One daily row being summed; the first event supplies the pricing basis.
-final class _DailyRow {
-  _DailyRow({
-    required this.pathContextId,
-    required this.branchScope,
-    required this.tokens,
-    required this.costText,
-    required this.costStatus,
-    required this.providerPricePeriodId,
-    required this.providerRuleIdsJson,
-    required this.localOverridePeriodId,
-    required this.resolutionMethod,
-    required this.catalogSnapshotId,
+/// One dirty partition of a session and the daily rows being summed for it.
+final class _Partition {
+  _Partition({
+    required this.day,
+    required this.modelKey,
+    required this.targetVersion,
   });
 
+  final String day;
+  final String modelKey;
+  final Object? targetVersion;
+  final rows = <(Object?, Object?, UsagePricingBasis), _DailyRow>{};
+}
+
+/// One daily row being summed. Every event in it shares [basis], so the
+/// row is priced once from its totals.
+final class _DailyRow {
+  _DailyRow({
+    required this.model,
+    required this.pathContextId,
+    required this.branchScope,
+    required this.basis,
+  });
+
+  final String? model;
   final Object? pathContextId;
   final Object? branchScope;
-  final List<int> tokens;
-  String? costText;
-  String costStatus;
-  final int? providerPricePeriodId;
-  final String providerRuleIdsJson;
-  final int? localOverridePeriodId;
-  final String resolutionMethod;
-  final int? catalogSnapshotId;
+  final UsagePricingBasis basis;
+  int inputTokens = 0;
+  int cachedInputTokens = 0;
+  int cacheWriteInputTokens = 0;
+  int outputTokens = 0;
+  int reasoningOutputTokens = 0;
+  int totalTokens = 0;
 
-  void add(List<int> more, String? cost, String status) {
-    for (var index = 0; index < tokens.length; index++) {
-      tokens[index] = _tokenAdd(tokens[index], more[index]);
-    }
-    costText = sumEstimatedCostTexts([costText, cost]);
-    costStatus = costStatus == 'unknown' || status == 'unknown'
-        ? 'unknown'
-        : costStatus == 'partial_unsupported_units' ||
-              status == 'partial_unsupported_units'
-        ? 'partial_unsupported_units'
-        : 'complete';
+  /// Whether every event so far could be priced on its own. A request whose
+  /// counts contradict each other makes the whole row's cost unknown, as
+  /// pricing it alone would have.
+  bool priceable = true;
+
+  void add({
+    required int inputTokens,
+    required int cachedInputTokens,
+    required int cacheWriteInputTokens,
+    required int outputTokens,
+    required int reasoningOutputTokens,
+  }) {
+    priceable =
+        priceable &&
+        tokenCountsArePriceable(
+          inputTokens: inputTokens,
+          outputTokens: outputTokens,
+          cachedInputTokens: cachedInputTokens,
+          cacheWriteInputTokens: cacheWriteInputTokens,
+          reasoningOutputTokens: reasoningOutputTokens,
+        );
+    this.inputTokens = _tokenAdd(this.inputTokens, inputTokens);
+    this.cachedInputTokens = _tokenAdd(
+      this.cachedInputTokens,
+      cachedInputTokens,
+    );
+    this.cacheWriteInputTokens = _tokenAdd(
+      this.cacheWriteInputTokens,
+      cacheWriteInputTokens,
+    );
+    this.outputTokens = _tokenAdd(this.outputTokens, outputTokens);
+    this.reasoningOutputTokens = _tokenAdd(
+      this.reasoningOutputTokens,
+      reasoningOutputTokens,
+    );
+    totalTokens = _tokenAdd(totalTokens, _tokenAdd(inputTokens, outputTokens));
+  }
+
+  HistoricalUsageCost price() {
+    final cost = basis.price(
+      model: model,
+      inputTokens: inputTokens,
+      cachedInputTokens: cachedInputTokens,
+      cacheWriteInputTokens: cacheWriteInputTokens,
+      outputTokens: outputTokens,
+      reasoningOutputTokens: reasoningOutputTokens,
+    );
+    if (priceable || cost.estimatedCostText == null) return cost;
+    return HistoricalUsageCost(
+      costStatus: 'unknown',
+      providerPricePeriodId: cost.providerPricePeriodId,
+      providerRuleIds: cost.providerRuleIds,
+      localOverridePeriodId: cost.localOverridePeriodId,
+      catalogSnapshotId: cost.catalogSnapshotId,
+      resolutionMethod: cost.resolutionMethod,
+    );
   }
 }

@@ -1379,14 +1379,13 @@ _DecimalAmount? _costForTokenUsage({
       reasoningOutputTokens == null) {
     return null;
   }
-  if (inputTokens < 0 ||
-      outputTokens < 0 ||
-      cachedInputTokens < 0 ||
-      cacheWriteInputTokens < 0 ||
-      reasoningOutputTokens < 0 ||
-      cachedInputTokens > inputTokens ||
-      cacheWriteInputTokens > inputTokens - cachedInputTokens ||
-      reasoningOutputTokens > outputTokens) {
+  if (!tokenCountsArePriceable(
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+    cachedInputTokens: cachedInputTokens,
+    cacheWriteInputTokens: cacheWriteInputTokens,
+    reasoningOutputTokens: reasoningOutputTokens,
+  )) {
     return null;
   }
   final pricing = pricingCatalog[model];
@@ -1424,6 +1423,26 @@ _DecimalAmount? _costForTokenUsage({
   }
   return prompt + completion + reasoning + cached + cacheWrite;
 }
+
+/// Whether these token counts of one request can be priced at all.
+/// [estimateUsageCost] reports an unknown cost when they cannot, whatever
+/// the rates are: a cached or cache-write count above the input count, or
+/// reasoning above the output count, describes no real request.
+bool tokenCountsArePriceable({
+  required int inputTokens,
+  required int outputTokens,
+  required int cachedInputTokens,
+  required int cacheWriteInputTokens,
+  required int reasoningOutputTokens,
+}) =>
+    inputTokens >= 0 &&
+    outputTokens >= 0 &&
+    cachedInputTokens >= 0 &&
+    cacheWriteInputTokens >= 0 &&
+    reasoningOutputTokens >= 0 &&
+    cachedInputTokens <= inputTokens &&
+    cacheWriteInputTokens <= inputTokens - cachedInputTokens &&
+    reasoningOutputTokens <= outputTokens;
 
 _DecimalAmount? _pricedTokens(int tokens, String? pricePerToken) {
   if (tokens == 0) {

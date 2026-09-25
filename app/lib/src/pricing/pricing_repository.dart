@@ -1611,8 +1611,30 @@ class HistoricalUsageCostResolver {
     required int cacheWriteInputTokens,
     required int outputTokens,
     required int reasoningOutputTokens,
+  }) =>
+      resolveBasis(
+        occurredAtUtc: occurredAtUtc,
+        model: model,
+        inputTokens: inputTokens,
+      ).price(
+        model: model,
+        inputTokens: inputTokens,
+        cachedInputTokens: cachedInputTokens,
+        cacheWriteInputTokens: cacheWriteInputTokens,
+        outputTokens: outputTokens,
+        reasoningOutputTokens: reasoningOutputTokens,
+      );
+
+  /// The period and rules that price a request of [model] at
+  /// [occurredAtUtc] with [inputTokens] prompt tokens, or
+  /// [UsagePricingBasis.unknown]. Equal bases are the same object, so
+  /// callers can group requests by basis and price each group once.
+  UsagePricingBasis resolveBasis({
+    required DateTime occurredAtUtc,
+    required String? model,
+    required int inputTokens,
   }) {
-    if (model == null || model.isEmpty) return const HistoricalUsageCost();
+    if (model == null || model.isEmpty) return UsagePricingBasis.unknown;
     final at = occurredAtUtc.toUtc();
     final stamp = _priceTimestamp(at);
     final keys = [
@@ -1651,59 +1673,54 @@ class HistoricalUsageCostResolver {
       }
       if (period != null) break;
     }
-    if (period == null) return const HistoricalUsageCost();
-    final rates = Map<String, String?>.of(period.rates);
-    final additional = Map<String, String>.of(period.additional);
+    if (period == null) return UsagePricingBasis.unknown;
     final ruleIds = <int>[];
     if (provider) {
       for (final rule in _rulesFor(period.id)) {
-        if (!rule.rule.matches(promptTokens: inputTokens, occurredAtUtc: at)) {
-          continue;
+        if (rule.rule.matches(promptTokens: inputTokens, occurredAtUtc: at)) {
+          ruleIds.add(rule.id);
         }
-        ruleIds.add(rule.id);
-        for (final entry in rule.rates.entries) {
-          if (entry.value != null) rates[entry.key] = entry.value;
-        }
-        additional.addAll(rule.additional);
       }
     }
-    final estimate = estimateUsageCost(
-      inputTokens: inputTokens,
-      cachedInputTokens: cachedInputTokens,
-      cacheWriteInputTokens: cacheWriteInputTokens,
-      outputTokens: outputTokens,
-      reasoningOutputTokens: reasoningOutputTokens,
-      model: model,
-      pricing: UsagePricingCatalog({
-        model: UsageModelPricing(
-          promptPricePerToken: rates['prompt'],
-          completionPricePerToken: rates['completion'],
-          cachedInputPricePerToken: rates['input_cache_read'],
-          cacheWriteInputPricePerToken: rates['input_cache_write'],
-          internalReasoningPricePerToken: rates['internal_reasoning'],
-        ),
-      }),
-    );
-    final excluded = [
-      rates['request'],
-      rates['image'],
-      rates['web_search'],
-      ...additional.values,
-    ].any((rate) => rate != null && rate != '0');
-    return HistoricalUsageCost(
-      estimatedCostText: estimate.estimatedCostText,
-      costStatus: estimate.costUnknown
-          ? 'unknown'
-          : excluded
-          ? 'partial_unsupported_units'
-          : 'complete',
-      providerPricePeriodId: provider ? period.id : null,
-      providerRuleIds: List.unmodifiable(ruleIds),
-      localOverridePeriodId: provider ? null : period.id,
-      catalogSnapshotId: provider ? period.firstSnapshotId : null,
-      resolutionMethod: method,
+    final chosen = period;
+    final chosenMethod = method;
+    final byProvider = provider;
+    return _bases.putIfAbsent(
+      '${byProvider ? 'p' : 'l'}${chosen.id}:${ruleIds.join(',')}',
+      () {
+        final rates = Map<String, String?>.of(chosen.rates);
+        final additional = Map<String, String>.of(chosen.additional);
+        if (byProvider) {
+          final rules = {
+            for (final rule in _rulesFor(chosen.id)) rule.id: rule,
+          };
+          for (final id in ruleIds) {
+            final rule = rules[id]!;
+            for (final entry in rule.rates.entries) {
+              if (entry.value != null) rates[entry.key] = entry.value;
+            }
+            additional.addAll(rule.additional);
+          }
+        }
+        return UsagePricingBasis._(
+          rates: rates,
+          excluded: [
+            rates['request'],
+            rates['image'],
+            rates['web_search'],
+            ...additional.values,
+          ].any((rate) => rate != null && rate != '0'),
+          providerPricePeriodId: byProvider ? chosen.id : null,
+          providerRuleIds: List.unmodifiable(ruleIds),
+          localOverridePeriodId: byProvider ? null : chosen.id,
+          catalogSnapshotId: byProvider ? chosen.firstSnapshotId : null,
+          resolutionMethod: chosenMethod,
+        );
+      },
     );
   }
+
+  final _bases = <String, UsagePricingBasis>{};
 
   /// Periods newest first, with the canonical source ahead of OpenRouter.
   List<_PricePeriod> _periodsFor(bool useProvider, String key) =>
@@ -1825,6 +1842,89 @@ final class _PriceRule {
   final OpenRouterPriceRule rule;
   final Map<String, String?> rates;
   final Map<String, String> additional;
+}
+
+/// The rates one price period and its matching rules give a request, and
+/// the identifiers the daily cost rows record for them. Requests with the
+/// same basis are priced at the same rates, and the cost arithmetic is exact
+/// decimal, so their token counts can be summed and priced once.
+class UsagePricingBasis {
+  const UsagePricingBasis._({
+    required this.rates,
+    required this.excluded,
+    required this.providerPricePeriodId,
+    required this.providerRuleIds,
+    required this.localOverridePeriodId,
+    required this.catalogSnapshotId,
+    required this.resolutionMethod,
+  });
+
+  /// No period prices the request: every cost is unknown.
+  static const unknown = UsagePricingBasis._(
+    rates: {},
+    excluded: false,
+    providerPricePeriodId: null,
+    providerRuleIds: [],
+    localOverridePeriodId: null,
+    catalogSnapshotId: null,
+    resolutionMethod: 'unknown',
+  );
+
+  final Map<String, String?> rates;
+
+  /// Whether the period also charges units the estimate leaves out, such as
+  /// requests or images.
+  final bool excluded;
+  final int? providerPricePeriodId;
+  final List<int> providerRuleIds;
+  final int? localOverridePeriodId;
+  final int? catalogSnapshotId;
+  final String resolutionMethod;
+
+  bool get isUnknown => identical(this, unknown);
+
+  /// Prices the token counts of one request, or of several requests with
+  /// this basis added together.
+  HistoricalUsageCost price({
+    required String? model,
+    required int inputTokens,
+    required int cachedInputTokens,
+    required int cacheWriteInputTokens,
+    required int outputTokens,
+    required int reasoningOutputTokens,
+  }) {
+    if (isUnknown) return const HistoricalUsageCost();
+    final estimate = estimateUsageCost(
+      inputTokens: inputTokens,
+      cachedInputTokens: cachedInputTokens,
+      cacheWriteInputTokens: cacheWriteInputTokens,
+      outputTokens: outputTokens,
+      reasoningOutputTokens: reasoningOutputTokens,
+      model: model,
+      pricing: UsagePricingCatalog({
+        model!: UsageModelPricing(
+          promptPricePerToken: rates['prompt'],
+          completionPricePerToken: rates['completion'],
+          cachedInputPricePerToken: rates['input_cache_read'],
+          cacheWriteInputPricePerToken: rates['input_cache_write'],
+          internalReasoningPricePerToken: rates['internal_reasoning'],
+        ),
+      }),
+    );
+    return HistoricalUsageCost(
+      estimatedCostText: estimate.estimatedCostText,
+      costStatus: estimate.costUnknown
+          ? 'unknown'
+          : excluded
+          ? 'partial_unsupported_units'
+          : 'complete',
+      providerPricePeriodId: providerPricePeriodId,
+      providerRuleIds: providerRuleIds,
+      localOverridePeriodId: localOverridePeriodId,
+      catalogSnapshotId: catalogSnapshotId,
+      resolutionMethod: resolutionMethod,
+    );
+  }
 }
 
 class HistoricalUsageCost {
