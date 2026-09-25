@@ -626,6 +626,220 @@ fn an_unchanged_rescan_rewrites_no_session_rows_and_records_a_complete_scan() {
 }
 
 #[test]
+fn a_reparse_rewrites_only_changed_messages_and_keeps_search_consistent() {
+    let temp = TempDir::new("message-diff");
+    let home = support::codex_home(&temp, &[]);
+    let file = support::day_folder(&home).join("rollout-diff.jsonl");
+    let write = |texts: &[&str]| {
+        let mut lines = vec![
+            r#"{"timestamp":"2026-09-03T10:00:00Z","type":"session_meta","payload":{"id":"diff-001","timestamp":"2026-09-03T10:00:00Z","cwd":"C:\\nonexistent\\diff"}}"#.to_owned(),
+        ];
+        for (index, text) in texts.iter().enumerate() {
+            let kind = if index % 2 == 0 {
+                "user_message"
+            } else {
+                "agent_message"
+            };
+            lines.push(format!(
+                r#"{{"timestamp":"2026-09-03T10:00:0{}Z","type":"event_msg","payload":{{"type":"{kind}","message":"{text}"}}}}"#,
+                index + 1
+            ));
+        }
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+    };
+    let db = viewer_database(&temp);
+    let scan = || {
+        let output = support::scan(&db, &home, &["--force"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let ids = || -> Vec<(i64, i64)> {
+        let conn = open(&db);
+        let mut statement = conn
+            .prepare("select message_index, id from messages order by message_index")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let matches = |term: &str| {
+        count(
+            &open(&db),
+            &format!("select count(*) from message_search where message_search match '{term}'"),
+        )
+    };
+    let consistent = || {
+        open(&db)
+            .execute(
+                // `rank = 1` also compares the index with the message text.
+                "insert into message_search(message_search, rank) values('integrity-check', 1)",
+                [],
+            )
+            .expect("the search index matches the stored messages");
+    };
+
+    write(&["alpha question", "bravo answer"]);
+    scan();
+    let first = ids();
+    assert_eq!(first.len(), 2);
+    consistent();
+
+    write(&["alpha question", "bravo answer", "charlie followup"]);
+    scan();
+    let appended = ids();
+    assert_eq!(
+        &appended[..2],
+        &first[..],
+        "unchanged messages keep their rows"
+    );
+    assert_eq!(matches("charlie"), 1);
+    consistent();
+
+    write(&["alpha question", "delta answer", "charlie followup"]);
+    scan();
+    let edited = ids();
+    assert_eq!(edited, appended, "a changed message is updated in place");
+    assert_eq!(matches("bravo"), 0);
+    assert_eq!(matches("delta"), 1);
+    assert_eq!(matches("answer"), 1, "words both texts share stay indexed");
+    consistent();
+
+    write(&["alpha question"]);
+    scan();
+    assert_eq!(ids(), first[..1].to_vec());
+    assert_eq!(matches("charlie") + matches("delta"), 0);
+    assert_eq!(matches("alpha"), 1);
+    consistent();
+}
+
+#[test]
+fn rewriting_a_message_keeps_its_tool_calls_linked() {
+    let temp = TempDir::new("tool-links");
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let db = viewer_database(&temp);
+    assert!(support::scan(&db, &home, &[]).status.success());
+    let links = || -> Vec<(i64, Option<i64>, Option<i64>)> {
+        let conn = open(&db);
+        let mut statement = conn
+            .prepare(
+                "select t.tool_index, t.message_id, m.message_index
+                 from tool_calls t left join messages m on m.id = t.message_id
+                 order by t.tool_index",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = links();
+    let linked = before
+        .iter()
+        .find_map(|(_, message_id, _)| *message_id)
+        .expect("the fixture links a tool call to a message");
+    // Pretend the stored text is stale, so the reparse must rewrite that
+    // message row; the cascade removes its tool calls on the way.
+    open(&db)
+        .execute(
+            "update messages set content_plain = 'stale text' where id = ?",
+            [linked],
+        )
+        .unwrap();
+    assert!(support::scan(&db, &home, &["--force"]).status.success());
+    assert_eq!(links(), before);
+}
+
+#[test]
+fn new_usage_rebuilds_and_reprices_only_the_changed_days() {
+    let temp = TempDir::new("daily-diff");
+    let home = support::codex_home(&temp, &[]);
+    let file = support::day_folder(&home).join("rollout-daily.jsonl");
+    let token_count = |time: &str, total: u64, last: u64| {
+        format!(
+            r#"{{"timestamp":"{time}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{total},"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":{}}},"last_token_usage":{{"input_tokens":{last},"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":{}}}}}}}}}"#,
+            total + 1,
+            last + 1
+        )
+    };
+    let mut lines = vec![
+        r#"{"timestamp":"2026-09-03T10:00:00Z","type":"session_meta","payload":{"id":"daily-001","timestamp":"2026-09-03T10:00:00Z","cwd":"C:\\nonexistent\\daily"}}"#.to_owned(),
+        r#"{"timestamp":"2026-09-03T10:00:01Z","type":"turn_context","payload":{"cwd":"C:\\nonexistent\\daily","model":"model-a"}}"#.to_owned(),
+        r#"{"timestamp":"2026-09-03T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"day one"}}"#.to_owned(),
+        token_count("2026-09-03T10:00:03Z", 100, 100),
+        r#"{"timestamp":"2026-09-04T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"day two"}}"#.to_owned(),
+        token_count("2026-09-04T10:00:03Z", 150, 50),
+    ];
+    std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+    let db = viewer_database(&temp);
+    assert!(support::scan(&db, &home, &["--force"]).status.success());
+    let conn = open(&db);
+    assert_eq!(
+        count(&conn, "select count(*) from usage_session_daily"),
+        2,
+        "one row per day"
+    );
+    // Repricing ran: nothing is waiting, and each row carries a marker.
+    conn.execute_batch(
+        "delete from usage_cost_dirty_partitions;
+         update usage_session_daily set updated_at_utc = 'priced-' || day_utc;",
+    )
+    .unwrap();
+    drop(conn);
+
+    lines.push(token_count("2026-09-04T11:00:00Z", 170, 20));
+    std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+    assert!(support::scan(&db, &home, &["--force"]).status.success());
+    let conn = open(&db);
+    let dirty: Vec<String> = conn
+        .prepare("select day_utc from usage_cost_dirty_partitions order by day_utc")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        dirty,
+        ["2026-09-04"],
+        "only the changed day waits for repricing"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "select count(*) from usage_session_daily where updated_at_utc = 'priced-2026-09-03'"
+        ),
+        1,
+        "the unchanged day keeps its priced row"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "select count(*) from (
+               select strftime('%Y-%m-%d', occurred_at_utc) day, coalesce(model, '') model,
+                 path_context_id, branch_scope, sum(input_tokens) input, sum(output_tokens) output
+               from usage_events group by 1, 2, 3, 4
+               except
+               select day_utc, model_key, path_context_id, branch_scope, input_tokens, output_tokens
+               from usage_session_daily)"
+        ),
+        0,
+        "daily rows match the events"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "select input_tokens from usage_session_daily where day_utc = '2026-09-04'"
+        ),
+        70
+    );
+}
+
+#[test]
 fn a_scan_with_an_unreachable_root_does_not_claim_completeness() {
     let temp = TempDir::new("incomplete");
     let db = viewer_database(&temp);

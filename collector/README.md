@@ -72,6 +72,12 @@ After a scan that listed every configured root, the collector records
 a parser change once that matches, even if rows outside the roots remain.
 Set `CODEX_SESSIONS_COLLECTOR_TIMINGS=1` to print per-phase timings to stderr.
 
+A changed session is written in place: messages, tool calls and usage events
+that are unchanged keep their rows, and unchanged text keeps its search entry.
+Only the daily usage partitions whose events changed are rebuilt and marked for
+repricing; merged identities and legacy forks or subagents rebuild all of their
+days.
+
 ## Who owns the database
 
 - **Viewer database (`--db`)**: the viewer creates and migrates it. The

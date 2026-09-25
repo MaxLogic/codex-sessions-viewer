@@ -8,12 +8,13 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::codex::parser::{AuthorType, SourceType, Usage};
 use crate::contract::{
-    ProjectHint, ProjectHints, Record, SessionRef, SessionSnapshot, SourceStatus, ThreadName,
-    UsageRecord, parse_time,
+    MessageRecord, ProjectHint, ProjectHints, Record, SessionRef, SessionSnapshot, SourceStatus,
+    ThreadName, UsageRecord, parse_time,
 };
 use crate::dart::{DartDateTime, compare_utf16, to_lower, trim};
 use crate::hub_client;
@@ -182,6 +183,7 @@ pub fn apply_session_batch(
             }
         }
         let now = DartDateTime::now().to_iso8601();
+        let lookup = IdentityLookup::for_batch(conn)?;
         for (id, snapshot) in &canonical {
             let resolver = ProjectResolver::new(
                 snapshot
@@ -190,7 +192,7 @@ pub fn apply_session_batch(
                     .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
             );
             crate::timing::timed("write: session total", || {
-                upsert_session(conn, id, snapshot, &now, &resolver)
+                upsert_session(conn, id, snapshot, &now, &resolver, lookup)
             })?;
             hub_client::enqueue(
                 conn,
@@ -321,10 +323,11 @@ fn upsert_session(
     snapshot: &SessionSnapshot,
     now: &str,
     resolver: &ProjectResolver,
+    lookup: IdentityLookup,
 ) -> StoreResult<()> {
     let session = &snapshot.session;
     let identity_merge = crate::timing::timed("write: identity capture", || {
-        capture_identity_merge(conn, id, snapshot)
+        capture_identity_merge(conn, id, snapshot, lookup)
     })?;
     if !crate::timing::timed("write: replace decision", || {
         candidate_should_replace(conn, id, snapshot)
@@ -337,7 +340,7 @@ fn upsert_session(
                 id,
                 session.session_id.as_deref(),
             )?;
-            replace_daily_projections(conn, &affected)?;
+            replace_daily_projections(conn, &affected, None)?;
         }
         return Ok(());
     }
@@ -469,9 +472,18 @@ fn upsert_session(
     crate::timing::timed("write: tool calls", || {
         replace_tool_calls(conn, id, snapshot)
     })?;
-    crate::timing::timed("write: usage events", || {
+    let partitions = crate::timing::timed("write: usage events", || {
         replace_usage_events(conn, id, snapshot, now, resolver, source_type)
     })?;
+    // A merged identity or a legacy fork/subagent (whose inherited usage the
+    // reconciliation below rescopes) may change this session's usage beyond
+    // the events that changed here: rebuild all of its days.
+    let legacy = session.history_base_thread_id.is_none()
+        && session.subagent_history_start_ordinal.is_none()
+        && [&session.forked_from_id, &session.parent_thread_id]
+            .iter()
+            .any(|value| value.as_deref().is_some_and(|value| !value.is_empty()));
+    let partitions = partitions.filter(|_| identity_merge.is_none() && !legacy);
     crate::timing::timed("write: source extras", || {
         replace_source_extras(conn, id, snapshot, now)
     })?;
@@ -485,7 +497,14 @@ fn upsert_session(
         reconcile_affected_legacy_usage(conn, &snapshot.harness, id, session.session_id.as_deref())
     })?;
     crate::timing::timed("write: daily projections", || {
-        replace_daily_projections(conn, &affected)
+        replace_daily_projections(
+            conn,
+            &affected,
+            Some(WrittenSession {
+                id,
+                partitions: partitions.as_deref(),
+            }),
+        )
     })
 }
 
@@ -628,49 +647,275 @@ fn upsert_search_document(conn: &Connection, document: &SearchDocument<'_>) -> S
     Ok(())
 }
 
+/// The stored message columns a snapshot sets, in this order.
+const MESSAGE_COLUMNS: [&str; 14] = [
+    "author_type",
+    "created_at_utc",
+    "first_line",
+    "content_plain",
+    "content_preview",
+    "content_truncated",
+    "token_input",
+    "token_output",
+    "token_cached",
+    "token_total",
+    "model",
+    "has_tool_calls",
+    "has_error",
+    "raw_type",
+];
+const CONTENT_PLAIN: usize = 3;
+
+fn message_values(message: &MessageRecord) -> Vec<Value> {
+    let usage = Usage::from(message.usage);
+    let flag = |value: bool| Value::Integer(i64::from(value));
+    let text = |value: Option<String>| value.map_or(Value::Null, Value::Text);
+    let number = |value: Option<i64>| value.map_or(Value::Null, Value::Integer);
+    vec![
+        Value::Text(message.author().name().to_owned()),
+        text(iso_or_null(message.created_at_utc.as_deref())),
+        Value::Text(message.first_line.clone()),
+        Value::Text(message.content_plain.clone()),
+        Value::Text(message.content_preview.clone()),
+        flag(message.content_truncated),
+        number(usage.input_tokens),
+        number(usage.output_tokens),
+        number(usage.cached_input_tokens),
+        number(usage.total_tokens()),
+        text(message.model.clone()),
+        flag(message.has_tool_calls),
+        flag(message.has_error),
+        text(message.raw_type.clone()),
+    ]
+}
+
+/// One table's rows of one session, keyed by a per-session index.
+struct SessionRows<'a> {
+    table: &'a str,
+    session_column: &'a str,
+    key: &'a str,
+    columns: &'a [&'a str],
+    /// The column a search trigger watches (`after update of ...`).
+    indexed: Option<usize>,
+    /// Stamps written with `now`: on insert, and on update.
+    inserted_stamps: &'a [&'a str],
+    updated_stamps: &'a [&'a str],
+}
+
+/// A row [`sync_session_rows`] deleted, updated or added: its old and new
+/// columns.
+struct RowChange {
+    old: Option<Vec<Value>>,
+    new: Option<Vec<Value>>,
+}
+
+/// Brings one session's stored rows in line with `rows` (key, values). A
+/// row whose columns are unchanged is left alone, and one whose indexed text
+/// is unchanged keeps its search entry: rewriting every row of a session
+/// that grew by one line rewrote and reindexed its whole history. Returns
+/// the changes, or `None`, having written nothing, when a key repeats and
+/// rows cannot be matched.
+fn sync_session_rows(
+    conn: &Connection,
+    shape: &SessionRows<'_>,
+    session_id: &str,
+    now: &str,
+    rows: &[(i64, Vec<Value>)],
+) -> StoreResult<Option<Vec<RowChange>>> {
+    let mut stored: HashMap<i64, Vec<Value>> = HashMap::new();
+    {
+        let mut select = conn.prepare_cached(&format!(
+            "select {}, {} from {} where {} = ?",
+            shape.key,
+            shape.columns.join(", "),
+            shape.table,
+            shape.session_column
+        ))?;
+        let mut cursor = select.query([session_id])?;
+        while let Some(row) = cursor.next()? {
+            let values = (0..shape.columns.len())
+                .map(|column| row.get::<_, Value>(column + 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            if stored.insert(row.get(0)?, values).is_some() {
+                return Ok(None);
+            }
+        }
+    }
+    let mut keys = HashSet::new();
+    if !rows.iter().all(|(key, _)| keys.insert(*key)) {
+        return Ok(None);
+    }
+    let mut updated = Vec::new();
+    let mut added = Vec::new();
+    for (key, values) in rows {
+        match stored.remove(key) {
+            Some(old) if old == *values => {}
+            Some(old) => updated.push((*key, old, values)),
+            None => added.push((*key, values)),
+        }
+    }
+    let mut changes = Vec::new();
+    // Rows the snapshot no longer has go first, so their keys are free
+    // before any row is added.
+    let mut delete = conn.prepare_cached(&format!(
+        "delete from {} where {} = ? and {} = ?",
+        shape.table, shape.session_column, shape.key
+    ))?;
+    for (key, old) in stored {
+        delete.execute(params![session_id, key])?;
+        changes.push(RowChange {
+            old: Some(old),
+            new: None,
+        });
+    }
+    // A search trigger fires on any update that names its column, so an
+    // unchanged text is left out of the update. A row whose text changed is
+    // deleted and inserted again under the same row id instead: the schema's
+    // two update triggers run add-then-remove, which would drop the new
+    // entry from the index.
+    for (key, old, values) in updated {
+        if let Some(indexed) = shape.indexed
+            && old[indexed] != values[indexed]
+        {
+            let row_id: i64 = conn
+                .prepare_cached(&format!(
+                    "select rowid from {} where {} = ? and {} = ?",
+                    shape.table, shape.session_column, shape.key
+                ))?
+                .query_row(params![session_id, key], |row| row.get(0))?;
+            delete.execute(params![session_id, key])?;
+            let mut parameters = vec![
+                Value::Integer(row_id),
+                Value::Text(session_id.to_owned()),
+                Value::Integer(key),
+            ];
+            parameters.extend(values.iter().cloned());
+            parameters.extend(
+                shape
+                    .inserted_stamps
+                    .iter()
+                    .map(|_| Value::Text(now.to_owned())),
+            );
+            conn.prepare_cached(&format!(
+                "insert into {} (rowid, {}, {}, {}{}) values (?, ?, ?, {}{})",
+                shape.table,
+                shape.session_column,
+                shape.key,
+                shape.columns.join(", "),
+                shape
+                    .inserted_stamps
+                    .iter()
+                    .map(|stamp| format!(", {stamp}"))
+                    .collect::<String>(),
+                vec!["?"; shape.columns.len()].join(", "),
+                ", ?".repeat(shape.inserted_stamps.len()),
+            ))?
+            .execute(params_from_iter(parameters))?;
+            changes.push(RowChange {
+                old: Some(old),
+                new: Some(values.clone()),
+            });
+            continue;
+        }
+        let columns: Vec<usize> = (0..shape.columns.len())
+            .filter(|column| Some(*column) != shape.indexed || old[*column] != values[*column])
+            .collect();
+        let assignments: Vec<String> = columns
+            .iter()
+            .map(|column| format!("{} = ?", shape.columns[*column]))
+            .chain(
+                shape
+                    .updated_stamps
+                    .iter()
+                    .map(|stamp| format!("{stamp} = ?")),
+            )
+            .collect();
+        let mut parameters: Vec<Value> = columns
+            .iter()
+            .map(|column| values[*column].clone())
+            .collect();
+        parameters.extend(
+            shape
+                .updated_stamps
+                .iter()
+                .map(|_| Value::Text(now.to_owned())),
+        );
+        parameters.push(Value::Text(session_id.to_owned()));
+        parameters.push(Value::Integer(key));
+        conn.prepare_cached(&format!(
+            "update {} set {} where {} = ? and {} = ?",
+            shape.table,
+            assignments.join(", "),
+            shape.session_column,
+            shape.key
+        ))?
+        .execute(params_from_iter(parameters))?;
+        changes.push(RowChange {
+            old: Some(old),
+            new: Some(values.clone()),
+        });
+    }
+    let mut insert = conn.prepare_cached(&format!(
+        "insert into {} ({}, {}, {}{}) values (?, ?, {}{})",
+        shape.table,
+        shape.session_column,
+        shape.key,
+        shape.columns.join(", "),
+        shape
+            .inserted_stamps
+            .iter()
+            .map(|stamp| format!(", {stamp}"))
+            .collect::<String>(),
+        vec!["?"; shape.columns.len()].join(", "),
+        ", ?".repeat(shape.inserted_stamps.len()),
+    ))?;
+    for (key, values) in added {
+        let mut parameters = vec![Value::Text(session_id.to_owned()), Value::Integer(key)];
+        parameters.extend(values.iter().cloned());
+        parameters.extend(
+            shape
+                .inserted_stamps
+                .iter()
+                .map(|_| Value::Text(now.to_owned())),
+        );
+        insert.execute(params_from_iter(parameters))?;
+        changes.push(RowChange {
+            old: None,
+            new: Some(values.clone()),
+        });
+    }
+    Ok(Some(changes))
+}
+
 fn replace_messages(
     conn: &Connection,
     id: &str,
     snapshot: &SessionSnapshot,
     now: &str,
 ) -> StoreResult<()> {
-    conn.prepare_cached("delete from messages where session_id = ?")?
-        .execute([id])?;
-    let mut insert = conn.prepare_cached(
-        "insert into messages (
-           session_id, message_index, author_type, created_at_utc, first_line, content_plain,
-           content_preview, content_truncated, token_input, token_output, token_cached,
-           token_total, model, has_tool_calls, has_error, raw_type, created_at_db_utc,
-           updated_at_db_utc
-         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )?;
-    for message in &snapshot.messages {
-        let usage = Usage::from(message.usage);
-        insert.execute(params![
-            id,
-            message.index,
-            message.author().name(),
-            iso_or_null(message.created_at_utc.as_deref()),
-            message.first_line,
-            message.content_plain,
-            message.content_preview,
-            message.content_truncated,
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cached_input_tokens,
-            usage.total_tokens(),
-            message.model,
-            message.has_tool_calls,
-            message.has_error,
-            message.raw_type,
-            now,
-            now,
-        ])?;
+    let shape = SessionRows {
+        table: "messages",
+        session_column: "session_id",
+        key: "message_index",
+        columns: &MESSAGE_COLUMNS,
+        indexed: Some(CONTENT_PLAIN),
+        inserted_stamps: &["created_at_db_utc", "updated_at_db_utc"],
+        updated_stamps: &["updated_at_db_utc"],
+    };
+    let rows: Vec<(i64, Vec<Value>)> = snapshot
+        .messages
+        .iter()
+        .map(|message| (message.index, message_values(message)))
+        .collect();
+    if sync_session_rows(conn, &shape, id, now, &rows)?.is_none() {
+        // Unreachable while `(session_id, message_index)` is unique.
+        return Err(StoreError::Refused(
+            "a session has two messages with the same index".to_owned(),
+        ));
     }
     Ok(())
 }
 
-/// Unmodeled source fields, kept as evidence (see migration 020).
 fn replace_source_extras(
     conn: &Connection,
     id: &str,
@@ -698,33 +943,84 @@ fn replace_source_extras(
 /// Stores the calls after `replace_messages`. `message_id` links the last
 /// message stored before the call's `message_index` (the message that issued
 /// it); it is null when the record has no index or no message precedes it.
+/// The stored tool call columns a snapshot sets, in this order.
+const TOOL_CALL_COLUMNS: [&str; 9] = [
+    "message_id",
+    "tool_name",
+    "status",
+    "started_at_utc",
+    "finished_at_utc",
+    "input_preview",
+    "output_preview",
+    "output_truncated",
+    "error_message",
+];
+const OUTPUT_PREVIEW: usize = 6;
+
 fn replace_tool_calls(conn: &Connection, id: &str, snapshot: &SessionSnapshot) -> StoreResult<()> {
+    // Each call links to the last stored message before its index; the
+    // messages are already in place.
+    let messages: Vec<(i64, i64)> = conn
+        .prepare_cached(
+            "select message_index, id from messages where session_id = ? order by message_index",
+        )?
+        .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let text =
+        |value: Option<&str>| value.map_or(Value::Null, |value| Value::Text(value.to_owned()));
+    let rows: Vec<(i64, Vec<Value>)> = snapshot
+        .tool_calls
+        .iter()
+        .map(|tool| {
+            // Without an index the old `message_index < null` matched nothing.
+            let message_id = tool
+                .message_index
+                .and_then(|limit| {
+                    messages
+                        .partition_point(|(index, _)| *index < limit)
+                        .checked_sub(1)
+                })
+                .map_or(Value::Null, |position| Value::Integer(messages[position].1));
+            (
+                tool.tool_index,
+                vec![
+                    message_id,
+                    Value::Text(tool.tool_name.clone()),
+                    Value::Text(tool.status.clone()),
+                    text(iso_or_null(tool.started_at_utc.as_deref()).as_deref()),
+                    text(iso_or_null(tool.finished_at_utc.as_deref()).as_deref()),
+                    Value::Text(tool.input_preview.clone()),
+                    Value::Text(tool.output_preview.clone()),
+                    Value::Integer(i64::from(tool.output_truncated)),
+                    text(tool.error_message.as_deref()),
+                ],
+            )
+        })
+        .collect();
+    let shape = SessionRows {
+        table: "tool_calls",
+        session_column: "session_id",
+        key: "tool_index",
+        columns: &TOOL_CALL_COLUMNS,
+        indexed: Some(OUTPUT_PREVIEW),
+        inserted_stamps: &[],
+        updated_stamps: &[],
+    };
+    if sync_session_rows(conn, &shape, id, "", &rows)?.is_some() {
+        return Ok(());
+    }
+    // Repeated tool indexes cannot be matched row by row: replace them all.
     conn.prepare_cached("delete from tool_calls where session_id = ?")?
         .execute([id])?;
-    let mut insert = conn.prepare_cached(
-        "insert into tool_calls (
-           session_id, message_id, tool_index, tool_name, status, started_at_utc, finished_at_utc,
-           input_preview, output_preview, output_truncated, error_message
-         ) values (
-           ?1,
-           (select m.id from messages m where m.session_id = ?1 and m.message_index < ?2
-            order by m.message_index desc limit 1),
-           ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-    )?;
-    for tool in &snapshot.tool_calls {
-        insert.execute(params![
-            id,
-            tool.message_index,
-            tool.tool_index,
-            tool.tool_name,
-            tool.status,
-            iso_or_null(tool.started_at_utc.as_deref()),
-            iso_or_null(tool.finished_at_utc.as_deref()),
-            tool.input_preview,
-            tool.output_preview,
-            tool.output_truncated,
-            tool.error_message,
-        ])?;
+    let mut insert = conn.prepare_cached(&format!(
+        "insert into tool_calls (session_id, tool_index, {}) values (?, ?, {})",
+        TOOL_CALL_COLUMNS.join(", "),
+        vec!["?"; TOOL_CALL_COLUMNS.len()].join(", ")
+    ))?;
+    for (key, values) in rows {
+        let mut parameters = vec![Value::Text(id.to_owned()), Value::Integer(key)];
+        parameters.extend(values);
+        insert.execute(params_from_iter(parameters))?;
     }
     Ok(())
 }
@@ -742,6 +1038,75 @@ fn usage_bucket(record: &UsageRecord) -> [i64; 6] {
 }
 
 /// `_replaceUsageEvents` for a context-based (schema 16+) database.
+/// The stored usage event columns a snapshot sets, in this order.
+const USAGE_EVENT_COLUMNS: [&str; 15] = [
+    "rollout_ordinal",
+    "turn_ordinal",
+    "epoch",
+    "occurred_at_utc",
+    "model",
+    "path_context_id",
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "branch_scope",
+    "derivation",
+    "event_fingerprint",
+];
+const OCCURRED_AT: usize = 3;
+const MODEL: usize = 4;
+
+const USAGE_INPUT_COLUMNS: [&str; 4] = [
+    "provider",
+    "request_input_tokens",
+    "model_context_window",
+    "billable_units_json",
+];
+
+/// Daily partitions (`day_utc`, `model_key`) whose usage events changed;
+/// `None` when a changed event's day cannot be read the way SQLite's
+/// `strftime('%Y-%m-%d', ...)` would, so every partition is rebuilt.
+type ChangedPartitions = Option<Vec<DailyPartition>>;
+
+/// A daily usage partition: `day_utc` and `model_key`.
+type DailyPartition = (String, String);
+
+/// The session a batch just wrote, and the partitions whose events changed
+/// when they are known.
+#[derive(Clone, Copy)]
+struct WrittenSession<'a> {
+    id: &'a str,
+    partitions: Option<&'a [DailyPartition]>,
+}
+
+/// `strftime('%Y-%m-%d', value)` for the stored ISO-8601 UTC times. `Err`
+/// for any other shape.
+fn usage_day(value: &Value) -> Result<Option<String>, ()> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => {
+            let bytes = text.as_bytes();
+            let shaped = bytes.len() > 10
+                && bytes[..4].iter().all(u8::is_ascii_digit)
+                && bytes[4] == b'-'
+                && bytes[5..7].iter().all(u8::is_ascii_digit)
+                && bytes[7] == b'-'
+                && bytes[8..10].iter().all(u8::is_ascii_digit)
+                && bytes[10] == b'T'
+                && text.ends_with('Z');
+            if shaped {
+                Ok(Some(text[..10].to_owned()))
+            } else {
+                Err(())
+            }
+        }
+        _ => Err(()),
+    }
+}
+
 fn replace_usage_events(
     conn: &Connection,
     id: &str,
@@ -749,16 +1114,14 @@ fn replace_usage_events(
     now: &str,
     resolver: &ProjectResolver,
     source_type: SourceType,
-) -> StoreResult<()> {
-    conn.prepare_cached("delete from usage_events where session_row_id = ?")?
-        .execute([id])?;
-    conn.prepare_cached("delete from usage_event_inputs where session_row_id = ?")?
-        .execute([id])?;
-    if snapshot.usage_events.is_empty() {
-        return Ok(());
-    }
+) -> StoreResult<ChangedPartitions> {
     let mut project_ids: HashMap<String, i64> = HashMap::new();
     let mut context_ids: HashMap<(Option<String>, Option<String>), i64> = HashMap::new();
+    let text =
+        |value: Option<&str>| value.map_or(Value::Null, |value| Value::Text(value.to_owned()));
+    let number = |value: Option<i64>| value.map_or(Value::Null, Value::Integer);
+    let mut events: Vec<(i64, Vec<Value>)> = Vec::with_capacity(snapshot.usage_events.len());
+    let mut inputs: Vec<(i64, Vec<Value>)> = Vec::new();
     for event in &snapshot.usage_events {
         let project_id = match resolver.resolve(event.working_directory.as_deref(), source_type) {
             Some(name) => match project_ids.get(&name) {
@@ -790,59 +1153,78 @@ fn replace_usage_events(
             }
         };
         let buckets = usage_bucket(&event.usage);
+        let mut values = vec![
+            number(event.rollout_ordinal),
+            number(event.turn_ordinal),
+            Value::Integer(event.counter_epoch),
+            text(iso_or_null(event.occurred_at_utc.as_deref()).as_deref()),
+            text(event.model.as_deref()),
+            Value::Integer(context_id),
+        ];
+        values.extend(buckets.iter().map(|bucket| Value::Integer(*bucket)));
+        values.push(Value::Text(event.branch_scope.clone()));
+        values.push(Value::Text(event.derivation.clone()));
+        values.push(Value::Text(event.event_fingerprint.clone()));
+        events.push((event.source_record_ordinal, values));
         let units = event
             .billable_units
             .as_ref()
             .map(|units| serde_json::Value::Object(units.clone()).to_string());
-        conn.prepare_cached(
-            "insert into usage_events (
-               session_row_id, source_record_ordinal, rollout_ordinal, turn_ordinal, epoch,
-               occurred_at_utc, model, path_context_id, input_tokens, cached_input_tokens,
-               cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-               branch_scope, derivation, event_fingerprint
-             ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )?
-        .execute(params![
-            id,
-            event.source_record_ordinal,
-            event.rollout_ordinal,
-            event.turn_ordinal,
-            event.counter_epoch,
-            iso_or_null(event.occurred_at_utc.as_deref()),
-            event.model,
-            context_id,
-            buckets[0],
-            buckets[1],
-            buckets[2],
-            buckets[3],
-            buckets[4],
-            buckets[5],
-            event.branch_scope,
-            event.derivation,
-            event.event_fingerprint,
-        ])?;
         if event.provider.is_some()
             || event.request_input_tokens.is_some()
             || event.model_context_window.is_some()
             || units.is_some()
         {
-            conn.prepare_cached(
-                "insert into usage_event_inputs (
-                   session_row_id, source_record_ordinal, provider, request_input_tokens,
-                   model_context_window, billable_units_json
-                 ) values (?, ?, ?, ?, ?, ?)",
-            )?
-            .execute(params![
-                id,
+            inputs.push((
                 event.source_record_ordinal,
-                event.provider,
-                event.request_input_tokens,
-                event.model_context_window,
-                units,
-            ])?;
+                vec![
+                    text(event.provider.as_deref()),
+                    number(event.request_input_tokens),
+                    number(event.model_context_window),
+                    text(units.as_deref()),
+                ],
+            ));
         }
     }
-    Ok(())
+    let event_shape = SessionRows {
+        table: "usage_events",
+        session_column: "session_row_id",
+        key: "source_record_ordinal",
+        columns: &USAGE_EVENT_COLUMNS,
+        indexed: None,
+        inserted_stamps: &[],
+        updated_stamps: &[],
+    };
+    let input_shape = SessionRows {
+        table: "usage_event_inputs",
+        session_column: "session_row_id",
+        key: "source_record_ordinal",
+        columns: &USAGE_INPUT_COLUMNS,
+        indexed: None,
+        inserted_stamps: &[],
+        updated_stamps: &[],
+    };
+    // Both tables are keyed by (session, ordinal), so keys never repeat.
+    let changes = sync_session_rows(conn, &event_shape, id, now, &events)?.unwrap_or_default();
+    sync_session_rows(conn, &input_shape, id, now, &inputs)?;
+    let mut partitions: Vec<DailyPartition> = Vec::new();
+    for values in changes
+        .iter()
+        .flat_map(|change| change.old.iter().chain(change.new.iter()))
+    {
+        let Ok(day) = usage_day(&values[OCCURRED_AT]) else {
+            return Ok(None);
+        };
+        let Some(day) = day else { continue };
+        let model = match &values[MODEL] {
+            Value::Text(model) => model.clone(),
+            _ => String::new(),
+        };
+        if !partitions.contains(&(day.clone(), model.clone())) {
+            partitions.push((day, model));
+        }
+    }
+    Ok(Some(partitions))
 }
 
 // ---------------------------------------------------------------------------
@@ -945,10 +1327,34 @@ fn latest_metadata(
 }
 
 /// `_captureIdentityMergeState`.
+/// How [`capture_identity_merge`] finds a session's other rows.
+#[derive(Clone, Copy)]
+enum IdentityLookup {
+    /// Every stored session ID is trimmed, so an exact match through the
+    /// `(harness, session_id)` index finds the same rows as `trim(...)`.
+    Indexed,
+    /// Some stored ID has surrounding spaces: compare every row.
+    Scan,
+}
+
+impl IdentityLookup {
+    fn for_batch(conn: &Connection) -> StoreResult<Self> {
+        let untrimmed: bool = conn
+            .prepare_cached(
+                "select exists(select 1 from sessions
+                 where session_id <> trim(session_id) or session_id = ''
+                   or (session_id is not null and trim(session_id) = ''))",
+            )?
+            .query_row([], |row| row.get(0))?;
+        Ok(if untrimmed { Self::Scan } else { Self::Indexed })
+    }
+}
+
 fn capture_identity_merge(
     conn: &Connection,
     canonical_id: &str,
     snapshot: &SessionSnapshot,
+    lookup: IdentityLookup,
 ) -> StoreResult<Option<IdentityMerge>> {
     let stable = snapshot
         .session
@@ -999,20 +1405,13 @@ fn capture_identity_merge(
             format!("replace(lower(substr(id, {offset})), '\\', '/')")
         }
     };
-    let sql = format!(
-        "select rowid as session_rowid, * from sessions
-         where id = ?
-            or (id <> ? and harness = ? and (
-              trim(coalesce(session_id, '')) = ?
-              or (trim(coalesce(session_id, '')) = '' and source_type = ? and (
-                {} in ({placeholders})
+    let path_match = format!(
+        "{} in ({placeholders})
                 or {} in ({placeholders})
                 or {} in ({placeholders})
                 or {} in ({placeholders})
                 or (id like 'source:%' and source_type = 'windows' and {} in ({placeholders}))
-                or (id like 'source-status:%' and source_type = 'windows' and {} in ({placeholders}))
-              ))
-            ))",
+                or (id like 'source-status:%' and source_type = 'windows' and {} in ({placeholders}))",
         column("source_file_path"),
         column("source_file_unc_path"),
         column("display_path"),
@@ -1020,6 +1419,33 @@ fn capture_identity_merge(
         id_suffix(8),
         id_suffix(15),
     );
+    // Both forms select the same rows. The scan form wraps `session_id` in
+    // `trim(...)`, which no index covers, so it reads every session; with
+    // trimmed IDs each branch uses the key, the `(harness, session_id)`
+    // index, or the few rows without a session ID.
+    let sql = match lookup {
+        IdentityLookup::Scan => format!(
+            "select rowid as session_rowid, * from sessions
+         where id = ?1
+            or (id <> ?2 and harness = ?3 and (
+              trim(coalesce(session_id, '')) = ?4
+              or (trim(coalesce(session_id, '')) = '' and source_type = ?5 and (
+                {path_match}
+              ))
+            ))"
+        ),
+        IdentityLookup::Indexed => format!(
+            "select rowid as session_rowid, * from sessions where id = ?1
+         union
+         select rowid as session_rowid, * from sessions
+         where harness = ?3 and session_id = ?4 and id <> ?2
+         union
+         select rowid as session_rowid, * from sessions
+         where session_id is null and id <> ?2 and harness = ?3 and source_type = ?5 and (
+                {path_match}
+              )"
+        ),
+    };
     let mut values: Vec<rusqlite::types::Value> = vec![
         canonical_id.to_owned().into(),
         canonical_id.to_owned().into(),
@@ -1499,9 +1925,26 @@ fn is_current_parser(harness: &str, version: i64) -> bool {
 /// `UsageSummaryRepository.replaceDailyProjectionsInCurrentTransaction` for
 /// the active (schema 16+) generation. New rows start with unknown cost; the
 /// viewer's pricing maintenance fills in prices from the dirty partitions.
-fn replace_daily_projections(conn: &Connection, session_ids: &[String]) -> StoreResult<()> {
+/// Rebuilds the daily usage rows of `session_ids` and marks them for
+/// repricing. For `written` (a session and the partitions whose events
+/// changed, when known) only those partitions are rebuilt: the others keep
+/// their priced rows instead of all waiting for repricing again.
+fn replace_daily_projections(
+    conn: &Connection,
+    session_ids: &[String],
+    written: Option<WrittenSession<'_>>,
+) -> StoreResult<()> {
     let now = DartDateTime::now().to_iso8601();
     for id in session_ids {
+        if let Some(WrittenSession {
+            id: written_id,
+            partitions: Some(partitions),
+        }) = written
+            && written_id == id
+        {
+            replace_daily_partitions(conn, id, partitions, &now)?;
+            continue;
+        }
         conn.prepare_cached("delete from usage_session_daily where session_id = ?")?
             .execute([id])?;
         conn.prepare_cached(
@@ -1552,6 +1995,69 @@ fn replace_daily_projections(conn: &Connection, session_ids: &[String]) -> Store
 
 // ---------------------------------------------------------------------------
 // Scan outcomes, thread names, and resolved projects
+
+fn replace_daily_partitions(
+    conn: &Connection,
+    id: &str,
+    partitions: &[DailyPartition],
+    now: &str,
+) -> StoreResult<()> {
+    if !partitions.is_empty() {
+        let keys = serde_json::to_string(partitions).expect("partition keys serialize");
+        let chosen = "exists (select 1 from json_each(?2) j
+            where json_extract(j.value, '$[0]') = day_utc
+              and json_extract(j.value, '$[1]') = model_key)";
+        conn.prepare_cached(&format!(
+            "delete from usage_session_daily where session_id = ?1 and {chosen}"
+        ))?
+        .execute(params![id, keys])?;
+        conn.prepare_cached(&format!(
+            "insert into usage_session_daily (
+               session_id, day_utc, model_key, path_context_id, branch_scope,
+               input_tokens, cached_input_tokens, cache_write_input_tokens,
+               output_tokens, reasoning_output_tokens, total_tokens, estimated_cost_text,
+               cost_status, pricing_resolution_method, cost_projection_version, updated_at_utc)
+             select * from (
+               select session_row_id, strftime('%Y-%m-%d', occurred_at_utc) as day_utc,
+                 coalesce(model, '') as model_key, path_context_id, branch_scope,
+                 sum(input_tokens), sum(cached_input_tokens), sum(cache_write_input_tokens),
+                 sum(output_tokens), sum(reasoning_output_tokens), sum(input_tokens + output_tokens),
+                 null, 'unknown', 'pending_history', ?3, ?4
+               from usage_events where session_row_id = ?1
+                 and strftime('%Y-%m-%d', occurred_at_utc) is not null
+               group by session_row_id, strftime('%Y-%m-%d', occurred_at_utc),
+                 coalesce(model, ''), path_context_id, branch_scope
+             ) where {chosen}"
+        ))?
+        .execute(params![id, keys, USAGE_COST_PROJECTION_VERSION, now])?;
+        conn.prepare_cached(&format!(
+            "insert into usage_cost_dirty_partitions (session_id, day_utc, model_key, reason,
+               target_cost_projection_version, created_at_utc, updated_at_utc)
+             select distinct session_id, day_utc, model_key, 'usage_ingestion', ?3, ?4, ?4
+             from usage_session_daily where session_id = ?1 and {chosen}
+             on conflict(session_id, day_utc, model_key) do update set
+               target_cost_projection_version = max(usage_cost_dirty_partitions.target_cost_projection_version,
+                 excluded.target_cost_projection_version),
+               updated_at_utc = excluded.updated_at_utc"
+        ))?
+        .execute(params![id, keys, USAGE_COST_PROJECTION_VERSION, now])?;
+    }
+    conn.prepare_cached(
+        "update sessions set usage_local_event_count = (
+           select count(*) from usage_events where session_row_id = ? and branch_scope = 'local'
+         ) where id = ?",
+    )?
+    .execute(params![id, id])?;
+    conn.prepare_cached(
+        "delete from usage_cost_dirty_partitions where session_id = ?
+           and not exists (select 1 from usage_session_daily daily
+             where daily.session_id = usage_cost_dirty_partitions.session_id
+               and daily.day_utc = usage_cost_dirty_partitions.day_utc
+               and daily.model_key = usage_cost_dirty_partitions.model_key)",
+    )?
+    .execute([id])?;
+    Ok(())
+}
 
 fn status_index(status: &str) -> i32 {
     match status {
