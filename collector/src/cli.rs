@@ -450,9 +450,7 @@ fn scan_options(
 ) -> ScanOptions {
     ScanOptions {
         roots,
-        mapper: PathMapper {
-            wsl_unc_root: settings.wsl_linux_root_unc.clone(),
-        },
+        mapper: PathMapper::new(settings.wsl_linux_root_unc.clone()),
         parser: ParserOptions {
             max_tool_output_preview_chars: settings.max_tool_output_preview_chars,
             ..ParserOptions::default()
@@ -861,9 +859,7 @@ fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
     let store = open_store(options)?;
     let scan = crate::claude::ClaudeScanOptions {
         roots: claude_roots(options),
-        mapper: PathMapper {
-            wsl_unc_root: settings.wsl_linux_root_unc.clone(),
-        },
+        mapper: PathMapper::new(settings.wsl_linux_root_unc.clone()),
         parser: claude_parser_options(&settings),
         workers: options
             .parser_workers
@@ -908,9 +904,7 @@ fn claude_ingest(options: &Options, out: &mut impl Write) -> Result<(), CliError
         &store,
         std::path::Path::new(file),
         claude_source_type(options, file),
-        &PathMapper {
-            wsl_unc_root: settings.wsl_linux_root_unc.clone(),
-        },
+        &PathMapper::new(settings.wsl_linux_root_unc.clone()),
         &claude_parser_options(&settings),
     )?;
     print_report(out, "claude ingest", &store, &report, options.json)?;
@@ -933,9 +927,7 @@ fn claude_parse(options: &Options, out: &mut impl Write) -> Result<(), CliError>
     let snapshot = crate::claude::snapshot(
         file,
         claude_source_type(options, file),
-        &PathMapper {
-            wsl_unc_root: settings.wsl_linux_root_unc.clone(),
-        },
+        &PathMapper::new(settings.wsl_linux_root_unc.clone()),
         transcript,
     );
     let line = serde_json::to_string(&Envelope::new(Record::SessionSnapshot(Box::new(snapshot))))
@@ -1039,9 +1031,7 @@ fn drain(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     let queue = crate::hooks::queue_dir();
     crate::hooks::reclaim_stale(&queue);
     let settings = load_settings(options)?;
-    let mapper = PathMapper {
-        wsl_unc_root: settings.wsl_linux_root_unc.clone(),
-    };
+    let mapper = PathMapper::new(settings.wsl_linux_root_unc.clone());
     let codex_homes: Vec<String> = [&settings.windows_codex_path, &settings.wsl_codex_unc_path]
         .into_iter()
         .filter(|home| !home.trim().is_empty())
@@ -1161,16 +1151,12 @@ fn drain_one(
                 .transcript_path
                 .as_deref()
                 .ok_or("the hook named no transcript")?;
-            // Claude Code in WSL reports a Linux path.
-            let mapped = if reported.starts_with('/') {
-                mapper.linux_to_windows_access_path(reported).ok_or_else(|| {
-                    format!(
-                        "transcript {reported} is a WSL path; configure the WSL root (wsl_linux_root_unc or --wsl-unc-root)"
-                    )
-                })?
-            } else {
-                reported.to_owned()
-            };
+            // On Windows, Claude Code in WSL reports a Linux path.
+            let mapped = mapper.hook_access_path(reported).ok_or_else(|| {
+                format!(
+                    "transcript {reported} is a WSL path; configure the WSL root (wsl_linux_root_unc or --wsl-unc-root)"
+                )
+            })?;
             let path = mapped.as_str();
             if !std::path::Path::new(path).is_file() {
                 return Err(format!("transcript {path} does not exist yet"));

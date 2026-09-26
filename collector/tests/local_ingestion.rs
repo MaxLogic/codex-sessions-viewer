@@ -2336,9 +2336,7 @@ fn coordinated_scan(db: &Path, home: &Path) -> (usize, Vec<bool>) {
     let store = Store::open(db, OwnerMode::Viewer).unwrap();
     let options = ScanOptions {
         roots: session_scan_roots(home.to_str().unwrap(), SourceType::Windows),
-        mapper: PathMapper {
-            wsl_unc_root: String::new(),
-        },
+        mapper: PathMapper::new(String::new()),
         parser: ParserOptions::default(),
         parser_workers: 1,
         wsl_root_retry_delays: vec![],
@@ -2480,9 +2478,7 @@ fn stored_claude_tool_calls_link_the_message_that_issued_them() {
         &store,
         &transcript,
         SourceType::Windows,
-        &PathMapper {
-            wsl_unc_root: String::new(),
-        },
+        &PathMapper::new(String::new()),
         &codex_sessions_collector::claude::parser::ClaudeOptions::default(),
     )
     .unwrap();

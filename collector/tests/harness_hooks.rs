@@ -393,6 +393,10 @@ fn a_transcript_caught_mid_write_is_retried_until_complete() {
     assert_eq!(status(), "available");
 }
 
+/// End to end through the executable's default, which has a WSL bridge only
+/// on Windows; the mapping itself is unit-tested on every platform in
+/// `path_mapping.rs`.
+#[cfg(windows)]
 #[test]
 fn a_hook_from_wsl_reads_the_transcript_through_the_wsl_root() {
     let env = Env::new("claude-wsl");

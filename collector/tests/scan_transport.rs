@@ -32,9 +32,7 @@ fn cancellation_flushes_completed_sessions_without_marking_missing_sources() {
     let store = Store::open(&db, OwnerMode::Viewer).unwrap();
     let options = ScanOptions {
         roots: session_scan_roots(home.to_str().unwrap(), SourceType::Windows),
-        mapper: PathMapper {
-            wsl_unc_root: String::new(),
-        },
+        mapper: PathMapper::new(String::new()),
         parser: ParserOptions::default(),
         parser_workers: 1,
         wsl_root_retry_delays: vec![],

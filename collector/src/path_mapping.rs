@@ -7,6 +7,9 @@ use crate::dart::{to_lower, trim};
 #[derive(Clone, Debug)]
 pub struct PathMapper {
     pub wsl_unc_root: String,
+    /// Whether a Linux path from a hook names a file inside WSL, reached
+    /// through the WSL bridge (Windows), rather than a local file.
+    pub maps_wsl_hook_paths: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +34,14 @@ fn ordered_set(values: impl IntoIterator<Item = String>) -> Vec<String> {
 }
 
 impl PathMapper {
+    /// A mapper with this platform's defaults: only Windows has a WSL bridge.
+    pub fn new(wsl_unc_root: impl Into<String>) -> Self {
+        Self {
+            wsl_unc_root: wsl_unc_root.into(),
+            maps_wsl_hook_paths: cfg!(windows),
+        }
+    }
+
     pub fn map_windows_path(&self, path: &str) -> MappedSessionPath {
         MappedSessionPath {
             source_type: SourceType::Windows,
@@ -59,6 +70,17 @@ impl PathMapper {
             source_file_unc_path: Some(unc_path.to_owned()),
             platform_path: linux_path,
             normalized_path_keys: ordered_set(keys),
+        }
+    }
+
+    /// A transcript path reported by a hook, as a path this machine can open.
+    /// With a WSL bridge a Linux path comes from a program in WSL and is
+    /// mapped; otherwise it is already a local path.
+    pub fn hook_access_path(&self, reported: &str) -> Option<String> {
+        if self.maps_wsl_hook_paths && reported.starts_with('/') {
+            self.linux_to_windows_access_path(reported)
+        } else {
+            Some(reported.to_owned())
         }
     }
 
@@ -299,7 +321,8 @@ pub fn dirname(path: &str) -> String {
     }
 }
 
-/// `p.join` on Windows: adds a backslash unless the base already ends in one.
+/// `p.join`: adds this platform's separator unless the base already ends in
+/// one.
 pub fn join(base: &str, name: &str) -> String {
     if base.is_empty() {
         return name.to_owned();
@@ -307,7 +330,42 @@ pub fn join(base: &str, name: &str) -> String {
     if base.ends_with(['\\', '/']) {
         format!("{base}{name}")
     } else {
-        format!("{base}\\{name}")
+        format!("{base}{}{name}", std::path::MAIN_SEPARATOR)
+    }
+}
+
+/// `p.normalize` for a path of this platform: Windows paths on Windows,
+/// POSIX paths elsewhere.
+pub fn normalize_native_path(path: &str) -> String {
+    if cfg!(windows) {
+        normalize_windows_path(path)
+    } else {
+        normalize_posix_path(path)
+    }
+}
+
+/// `package:path` `p.normalize` for POSIX paths.
+pub fn normalize_posix_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    match (absolute, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".to_owned(),
+        (false, false) => joined,
     }
 }
 
@@ -316,9 +374,7 @@ mod tests {
     use super::*;
 
     fn mapper() -> PathMapper {
-        PathMapper {
-            wsl_unc_root: "\\\\wsl.localhost\\Ubuntu\\".to_owned(),
-        }
+        PathMapper::new("\\\\wsl.localhost\\Ubuntu\\".to_owned())
     }
 
     #[test]
@@ -335,13 +391,54 @@ mod tests {
                 .as_deref(),
             Some(r"C:\x\s.jsonl")
         );
-        let unconfigured = PathMapper {
-            wsl_unc_root: String::new(),
-        };
+        let unconfigured = PathMapper::new(String::new());
         assert_eq!(
             unconfigured.linux_to_windows_access_path("/home/dev/s.jsonl"),
             None
         );
+    }
+
+    #[test]
+    fn hook_paths_are_mapped_through_wsl_only_with_a_wsl_bridge() {
+        let reported = "/home/dev/.claude/projects/p/s.jsonl";
+        let bridged = PathMapper {
+            maps_wsl_hook_paths: true,
+            ..mapper()
+        };
+        assert_eq!(
+            bridged.hook_access_path(reported).as_deref(),
+            Some(r"\\wsl.localhost\Ubuntu\home\dev\.claude\projects\p\s.jsonl")
+        );
+        let unconfigured = PathMapper {
+            maps_wsl_hook_paths: true,
+            ..PathMapper::new("")
+        };
+        assert_eq!(unconfigured.hook_access_path(reported), None);
+        let local = PathMapper {
+            maps_wsl_hook_paths: false,
+            ..mapper()
+        };
+        assert_eq!(local.hook_access_path(reported).as_deref(), Some(reported));
+        for mapper in [bridged, local] {
+            assert_eq!(
+                mapper.hook_access_path(r"C:\x\s.jsonl").as_deref(),
+                Some(r"C:\x\s.jsonl")
+            );
+        }
+    }
+
+    #[test]
+    fn only_windows_maps_hook_paths_through_wsl_by_default() {
+        assert_eq!(PathMapper::new("").maps_wsl_hook_paths, cfg!(windows));
+    }
+
+    #[test]
+    fn posix_paths_normalize_like_package_path() {
+        assert_eq!(normalize_posix_path("/tmp//a/./b/../c/"), "/tmp/a/c");
+        assert_eq!(normalize_posix_path("/../x"), "/x");
+        assert_eq!(normalize_posix_path("a/../../b"), "../b");
+        assert_eq!(normalize_posix_path("./"), ".");
+        assert_eq!(normalize_posix_path("/"), "/");
     }
 
     #[test]

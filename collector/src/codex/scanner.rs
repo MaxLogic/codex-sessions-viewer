@@ -24,7 +24,7 @@ use crate::contract::{CodexSource, ProjectHint, SessionSnapshot, SourceStatus, c
 use crate::dart::{to_lower, trim};
 use crate::path_mapping::{
     PathMapper, basename, canonical_scan_path, dirname, is_path_under_root, join,
-    normalize_windows_path,
+    normalize_native_path,
 };
 use crate::store::projects::resolve_windows_project;
 use crate::store::writer::CachedSource;
@@ -55,7 +55,7 @@ pub fn session_scan_roots(configured_path: &str, source_type: SourceType) -> Vec
     if trimmed.is_empty() {
         return Vec::new();
     }
-    let normalized = normalize_windows_path(trimmed);
+    let normalized = normalize_native_path(trimmed);
     let leaf = to_lower(basename(&normalized));
     let is_named_root = leaf == "sessions" || leaf == "archived_sessions";
     let codex_root = if is_named_root {
