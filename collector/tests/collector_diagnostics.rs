@@ -603,6 +603,38 @@ fn setup_backs_up_an_existing_configuration_before_replacing_it() {
 }
 
 #[test]
+#[cfg(unix)]
+fn setup_keeps_a_secret_configurations_mode_and_owner_on_unix() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for harness in ["codex", "claude"] {
+        let f = Fixture::new(harness);
+        let original = if harness == "codex" {
+            "api_key = 'private-test-secret'\n".to_owned()
+        } else {
+            r#"{"api_key":"private-test-secret"}"#.to_owned()
+        };
+        std::fs::write(&f.config, &original).unwrap();
+        std::fs::set_permissions(&f.config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&f.config).unwrap();
+        let applied = f.run("setup", &["--apply"], 0);
+        let after = std::fs::metadata(&f.config).unwrap();
+        assert_ne!(std::fs::read_to_string(&f.config).unwrap(), original);
+        assert_eq!(after.permissions().mode() & 0o7777, 0o600, "{harness}");
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        let backup = std::path::PathBuf::from(applied["backup"].as_str().unwrap());
+        let backup = std::fs::metadata(backup).unwrap();
+        assert_eq!(backup.permissions().mode() & 0o7777, 0o600, "{harness}");
+
+        // A group-readable file keeps its wider mode; setup does not guess.
+        std::fs::set_permissions(&f.config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::write(&f.config, &original).unwrap();
+        f.setup();
+        let after = std::fs::metadata(&f.config).unwrap();
+        assert_eq!(after.permissions().mode() & 0o7777, 0o640, "{harness}");
+    }
+}
+
+#[test]
 fn setup_accepts_and_preserves_a_utf8_byte_order_mark() {
     for harness in ["codex", "claude"] {
         let f = Fixture::new(harness);

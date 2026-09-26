@@ -96,7 +96,8 @@ pub fn log_error(dir: &Path, message: &str) {
     }
 }
 
-/// Start a program without waiting and without a console window.
+/// Start a program without waiting and without a console window, outside the
+/// harness's job (Windows) or process group (Unix).
 pub fn spawn_detached(program: &Path, args: &[String]) -> std::io::Result<()> {
     let mut command = Command::new(program);
     command
@@ -121,6 +122,13 @@ pub fn spawn_detached(program: &Path, args: &[String]) -> std::io::Result<()> {
             }
             Err(error) => return Err(error),
         }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Lead a new process group, so a harness that kills the hook's group
+        // once the hook returns does not kill the detached work with it.
+        command.process_group(0);
     }
     command.spawn().map(|_| ())
 }

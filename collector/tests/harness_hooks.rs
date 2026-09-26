@@ -611,6 +611,44 @@ fn codex_notify_keeps_the_previous_notify_command_running() {
     );
 }
 
+/// A harness may kill its whole process group once a hook returns. Detached
+/// work (the drain, a chained notify) must run in its own group and survive.
+#[test]
+#[cfg(unix)]
+fn detached_work_outlives_the_hook_process_group_on_unix() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new("detached-group");
+    let marker = env.temp.path().join("survived");
+    let script = format!("sleep 1; echo alive > '{}'", marker.display());
+    let previous = json!(["/bin/sh", "-c", script, "sh"]).to_string();
+    let mut hook = env.command(&[
+        "codex",
+        "notify",
+        "--no-drain",
+        "--previous-notify",
+        &previous,
+        &notify_payload("01a0cccc-0000-7000-8000-000000000009"),
+    ]);
+    // The hook leads a fresh group (numbered after its pid), as a
+    // harness-started hook would; the harness then kills that group.
+    let child = hook
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let group = format!("-{}", child.id());
+    assert!(child.wait_with_output().unwrap().status.success());
+    // With the detached work in its own group the hook's group is already
+    // empty, so `kill` may report that nothing matched.
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .stderr(Stdio::null())
+        .status();
+    wait_until("the detached command", || marker.is_file());
+}
+
 #[test]
 fn hooks_return_promptly_while_the_database_is_locked() {
     let env = Env::new("hook-latency");

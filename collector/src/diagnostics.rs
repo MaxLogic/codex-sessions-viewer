@@ -543,9 +543,16 @@ fn write_config(path: &Path, original: &str, updated: &str) -> Result<Option<Pat
         nonce()
     ));
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            // Owner-only until the original's mode is copied, so a secret
+            // never sits in a world-readable staging file.
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temporary)
             .map_err(|_| "cannot create configuration staging file")?;
         file.write_all(updated.as_bytes())
@@ -553,7 +560,9 @@ fn write_config(path: &Path, original: &str, updated: &str) -> Result<Option<Pat
             .map_err(|_| "cannot write configuration staging file")?;
         drop(file);
         if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&temporary, meta.permissions())
+            let permissions = preserve_owner(&meta, &temporary)
+                .map_err(|_| "cannot preserve configuration ownership")?;
+            std::fs::set_permissions(&temporary, permissions)
                 .map_err(|_| "cannot preserve configuration permissions")?;
         }
         if read_config(path)? != original {
@@ -570,6 +579,57 @@ fn write_config(path: &Path, original: &str, updated: &str) -> Result<Option<Pat
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Gives the staged file the original's owner and group where allowed, and
+/// returns the permissions to apply to it.
+///
+/// Only a privileged user may change the owner; otherwise the file stays the
+/// current user's, who runs setup, and the original group is kept when the
+/// user belongs to it. When the group cannot be kept either, the original's
+/// group and other bits would grant them to the wrong group, so only the
+/// owner bits survive.
+#[cfg(unix)]
+fn preserve_owner(
+    original: &std::fs::Metadata,
+    staged: &Path,
+) -> std::io::Result<std::fs::Permissions> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+    let denied = |result: &std::io::Result<()>| matches!(result, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied);
+    let mut result = chown(staged, Some(original.uid()), Some(original.gid()));
+    if denied(&result) {
+        result = chown(staged, None, Some(original.gid()));
+    }
+    let group_kept = if denied(&result) {
+        false
+    } else {
+        result?;
+        true
+    };
+    Ok(std::fs::Permissions::from_mode(staged_mode(
+        original.permissions().mode(),
+        group_kept,
+    )))
+}
+
+/// The staged file's mode: the original's, or only its owner bits when the
+/// original group could not be kept.
+#[cfg(unix)]
+fn staged_mode(original_mode: u32, group_kept: bool) -> u32 {
+    if group_kept {
+        original_mode & 0o7777
+    } else {
+        original_mode & 0o700
+    }
+}
+
+/// Windows keeps the owner and ACL through `ReplaceFileW`.
+#[cfg(not(unix))]
+fn preserve_owner(
+    original: &std::fs::Metadata,
+    _staged: &Path,
+) -> std::io::Result<std::fs::Permissions> {
+    Ok(original.permissions())
 }
 
 #[cfg(not(windows))]
@@ -881,5 +941,18 @@ fn hub_check(url: Option<&str>) -> Value {
         Err(_) => {
             json!({"state":"failed","error":"hub connection failed; check URL, service and network; local ingestion is unaffected"})
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::staged_mode;
+
+    #[test]
+    fn a_lost_group_keeps_only_the_owner_bits() {
+        assert_eq!(staged_mode(0o100640, true), 0o640);
+        assert_eq!(staged_mode(0o100640, false), 0o600);
+        assert_eq!(staged_mode(0o100604, false), 0o600);
+        assert_eq!(staged_mode(0o100600, false), 0o600);
     }
 }
