@@ -4113,15 +4113,21 @@ void main() {
     final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
 
+    // A fake resolver keeps the scan off the real wsl.exe (T-169).
+    final resolver = _RecordingWslProjectResolver({});
     final controller = RuntimeSessionController(
       settingsFile: settingsFile,
       databaseFile: databaseFile,
+      wslProjectResolver: resolver,
     );
     final result = await controller.refresh();
     final wslRow = result.rows.singleWhere(
       (row) => row.platform == SessionRowPlatform.wsl,
     );
 
+    expect(resolver.calls, [
+      {'/home/pawel/project'},
+    ]);
     expect(wslRow.path, '/home/pawel/project');
     expect(wslRow.openablePath, r'\\wsl.localhost\Ubuntu\home\pawel\project');
   });
@@ -4214,15 +4220,21 @@ void main() {
       final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
+      // A fake resolver keeps the scan off the real wsl.exe (T-169).
+      final resolver = _RecordingWslProjectResolver({});
       final controller = RuntimeSessionController(
         settingsFile: settingsFile,
         databaseFile: databaseFile,
+        wslProjectResolver: resolver,
       );
       final result = await controller.refresh();
       final wslRow = result.rows.singleWhere(
         (row) => row.platform == SessionRowPlatform.wsl,
       );
 
+      expect(resolver.calls, [
+        {'/mnt/f/projects/oec/te5/maxtdb'},
+      ]);
       expect(wslRow.path, '/mnt/f/projects/oec/te5/maxtdb');
       expect(wslRow.openablePath, isEmpty);
       expect(wslRow.canOpenContainingFolder, isFalse);
