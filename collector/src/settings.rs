@@ -21,18 +21,54 @@ pub struct CollectorSettings {
 
 impl Default for CollectorSettings {
     fn default() -> Self {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
         Self {
-            windows_codex_path: if home.is_empty() {
-                String::new()
-            } else {
-                format!("{home}\\.codex")
-            },
+            windows_codex_path: DefaultFolders::current().codex_home,
+            // The viewer fills the WSL folders from the detected default
+            // distribution when it creates settings.toml; without that they
+            // stay empty rather than naming one distribution.
             wsl_codex_unc_path: String::new(),
-            wsl_linux_root_unc: "\\\\wsl.localhost\\Ubuntu\\".to_owned(),
+            wsl_linux_root_unc: String::new(),
             max_tool_output_preview_chars: DEFAULT_MAX_TOOL_OUTPUT_PREVIEW_CHARS,
             backup_retention_days: crate::backup_retention::DEFAULT_RETENTION_DAYS,
         }
+    }
+}
+
+/// Session folders used when neither settings nor flags name them, derived
+/// from the current user like the viewer's `DefaultSessionFolders`
+/// (`app/lib/src/config/default_session_folders.dart`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DefaultFolders {
+    /// `CODEX_HOME` when set, else `<home>/.codex`; empty without a home.
+    pub codex_home: String,
+    /// `<home>/.claude/projects`; empty without a home.
+    pub claude_projects_root: String,
+}
+
+impl DefaultFolders {
+    /// The home folder is `USERPROFILE`, falling back to `HOME`.
+    pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        let non_empty = |name: &str| {
+            var(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let home = non_empty("USERPROFILE").or_else(|| non_empty("HOME"));
+        let under_home = |parts: &[&str]| {
+            home.as_ref().map_or_else(String::new, |home| {
+                let mut path = PathBuf::from(home);
+                path.extend(parts);
+                path.to_string_lossy().into_owned()
+            })
+        };
+        Self {
+            codex_home: non_empty("CODEX_HOME").unwrap_or_else(|| under_home(&[".codex"])),
+            claude_projects_root: under_home(&[".claude", "projects"]),
+        }
+    }
+
+    pub fn current() -> Self {
+        Self::from_env(|name| std::env::var(name).ok())
     }
 }
 
@@ -105,6 +141,71 @@ pub fn default_viewer_database() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    fn joined(home: &str, parts: &[&str]) -> String {
+        let mut path = PathBuf::from(home);
+        path.extend(parts);
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn default_folders_follow_the_user_profile() {
+        let folders = DefaultFolders::from_env(env(&[("USERPROFILE", r"D:\Profiles\ada")]));
+        assert_eq!(folders.codex_home, joined(r"D:\Profiles\ada", &[".codex"]));
+        assert_eq!(
+            folders.claude_projects_root,
+            joined(r"D:\Profiles\ada", &[".claude", "projects"])
+        );
+        assert!(!folders.codex_home.contains("pawel"));
+    }
+
+    #[test]
+    fn default_folders_prefer_codex_home_and_fall_back_to_home() {
+        let folders = DefaultFolders::from_env(env(&[
+            ("USERPROFILE", r"C:\Users\ada"),
+            ("CODEX_HOME", r"E:\codex-home"),
+        ]));
+        assert_eq!(folders.codex_home, r"E:\codex-home");
+        let posix = DefaultFolders::from_env(env(&[("USERPROFILE", " "), ("HOME", "/Users/ada")]));
+        assert_eq!(posix.codex_home, joined("/Users/ada", &[".codex"]));
+        assert_eq!(
+            posix.claude_projects_root,
+            joined("/Users/ada", &[".claude", "projects"])
+        );
+        assert_eq!(
+            DefaultFolders::from_env(env(&[])),
+            DefaultFolders::default()
+        );
+    }
+
+    #[test]
+    fn default_settings_name_no_particular_user_or_distribution() {
+        let settings = CollectorSettings::default();
+        assert_eq!(
+            settings.windows_codex_path,
+            DefaultFolders::current().codex_home
+        );
+        assert!(settings.wsl_codex_unc_path.is_empty());
+        assert!(settings.wsl_linux_root_unc.is_empty());
+        let parsed = CollectorSettings::parse(
+            r#"
+[paths]
+windows_codex_path = 'X:\explicit'
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.windows_codex_path, r"X:\explicit");
+        assert!(parsed.wsl_linux_root_unc.is_empty());
+    }
 
     #[test]
     fn reads_scan_roots_and_limits() {

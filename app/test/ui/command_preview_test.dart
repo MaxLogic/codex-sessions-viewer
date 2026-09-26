@@ -1,15 +1,15 @@
 import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
-import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/command_preview.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import '../support/fixture_settings.dart';
 
 void main() {
   testWidgets('shows plain, platform, and terminal launch command variants', (
     tester,
   ) async {
-    final commandSet = ResumeCommandGenerator(settings: AppSettings.defaults())
-        .build(
+    final commandSet =
+        ResumeCommandGenerator(settings: fixtureDefaultSettings()).build(
           const ResumeCommandSession(
             sessionId: 'abc123',
             sourceType: ResumeSessionSourceType.wsl,
@@ -75,8 +75,8 @@ void main() {
   testWidgets('runs and edits terminal launch command through callbacks', (
     tester,
   ) async {
-    final commandSet = ResumeCommandGenerator(settings: AppSettings.defaults())
-        .build(
+    final commandSet =
+        ResumeCommandGenerator(settings: fixtureDefaultSettings()).build(
           const ResumeCommandSession(
             sessionId: 'abc123',
             sourceType: ResumeSessionSourceType.windows,

@@ -1,12 +1,12 @@
-import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/export/session_list_exporter.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/models/session_row_view_model.dart';
 import 'package:flutter_test/flutter_test.dart';
+import '../support/fixture_settings.dart';
 
 void main() {
   test('exports every supplied session as a compact Markdown overview', () {
-    final exporter = SessionListExporter(settings: AppSettings.defaults());
+    final exporter = SessionListExporter(settings: fixtureDefaultSettings());
 
     final markdown = exporter.exportMarkdown([
       _row(
@@ -66,7 +66,7 @@ void main() {
   });
 
   test('exports supplied sessions as Excel-friendly CSV rows', () {
-    final exporter = SessionListExporter(settings: AppSettings.defaults());
+    final exporter = SessionListExporter(settings: fixtureDefaultSettings());
 
     final csv = exporter.exportCsv([
       _row(
@@ -107,7 +107,7 @@ void main() {
   });
 
   test('includes requested first and last messages in Markdown', () {
-    final exporter = SessionListExporter(settings: AppSettings.defaults());
+    final exporter = SessionListExporter(settings: fixtureDefaultSettings());
     final row = _row(
       id: 'messages',
       sessionId: 'session-messages',
@@ -145,7 +145,7 @@ void main() {
     expect(firstOnly, isNot(contains('### Last message')));
   });
   test('skips lifecycle noise and unwraps completion text', () {
-    final exporter = SessionListExporter(settings: AppSettings.defaults());
+    final exporter = SessionListExporter(settings: fixtureDefaultSettings());
     final row = _row(
       id: 'events',
       sessionId: 'events',
@@ -200,7 +200,7 @@ void main() {
     expect(exporter.exportMarkdown([row]), isNot(contains('Legend')));
   });
   test('first message is the earliest user prompt, or absent without one', () {
-    final exporter = SessionListExporter(settings: AppSettings.defaults());
+    final exporter = SessionListExporter(settings: fixtureDefaultSettings());
     final preamble = [
       _message(1, ConversationAuthor.system, 'System instructions.'),
       _message(2, ConversationAuthor.assistant, 'Assistant introduction.'),
@@ -234,7 +234,7 @@ void main() {
   });
 
   test('large list formatting on a worker preserves exact Markdown', () async {
-    final settings = AppSettings.defaults();
+    final settings = fixtureDefaultSettings();
     final rows = [
       for (var index = 0; index < 100; index++)
         _row(

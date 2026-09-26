@@ -1,9 +1,9 @@
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/commands/remote_session_actions.dart';
-import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
+import '../support/fixture_settings.dart';
 
 void main() {
   late Directory root;
@@ -41,7 +41,7 @@ void main() {
     bool harness = true,
   }) => RemoteSessionActions(
     databaseFile: file,
-    settings: AppSettings.defaults(),
+    settings: fixtureDefaultSettings(),
     fileExists: (_) async => sourceExists,
     directoryExists: (_) async => true,
     harnessAvailable: (_, _) async => harness,

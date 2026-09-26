@@ -4,10 +4,10 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 
-import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart' show sqlite3, OpenMode;
 
 import '../config/app_settings.dart';
+import '../config/default_session_folders.dart';
 import '../database/collector_versions.dart';
 import '../database/database_connection.dart';
 import '../database/database_maintenance.dart';
@@ -2356,9 +2356,8 @@ int? _journalRevision(Database db) {
 }
 
 List<String> _existingDefaultClaudeProjectRoots() {
-  final home = Platform.environment['USERPROFILE'] ?? '';
-  if (home.isEmpty) return const [];
-  final root = p.join(home, '.claude', 'projects');
+  final root = DefaultSessionFolders.current().claudeProjectsRoot;
+  if (root.isEmpty) return const [];
   return Directory(root).existsSync() ? [root] : const [];
 }
 

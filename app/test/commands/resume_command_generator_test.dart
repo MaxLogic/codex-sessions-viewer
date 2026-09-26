@@ -1,6 +1,7 @@
 import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
+import '../support/fixture_settings.dart';
 
 void main() {
   group('Claude Code resume changes to the session folder', () {
@@ -352,7 +353,7 @@ void main() {
   });
 }
 
-AppSettings _settings() => AppSettings.defaults().copyWith(
+AppSettings _settings() => fixtureDefaultSettings().copyWith(
   terminal: const TerminalSettings(
     defaultTerminal: 'alacritty',
     profiles: {

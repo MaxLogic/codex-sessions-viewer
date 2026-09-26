@@ -1,7 +1,10 @@
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/config/default_session_folders.dart';
+import 'package:codex_sessions_viewer/src/platform/wsl_default_distro_detector.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 import 'package:toml/toml.dart';
 
 void main() {
@@ -146,8 +149,12 @@ void main() {
     final settings = await repository.loadOrCreate();
 
     expect(settingsFile.existsSync(), isTrue);
-    expect(settings.paths.windowsCodexPath, r'C:\Users\pawel\.codex');
-    expect(settings.wsl.distro, 'Ubuntu');
+    expect(
+      settings.paths.windowsCodexPath,
+      DefaultSessionFolders.current().windowsCodexPath,
+    );
+    // Without a detector the WSL defaults stay empty.
+    expect(settings.wsl.distro, isEmpty);
     expect(settings.app.startWithWindows, isTrue);
 
     final tomlText = await settingsFile.readAsString();
@@ -477,4 +484,133 @@ prompt = '0.5'
       expect(stored['hub_machine_id'], 'laptop-1');
     },
   );
+
+  group('default session folders', () {
+    final windows = p.windows;
+
+    test('follow USERPROFILE and name no particular user', () {
+      final folders = DefaultSessionFolders.fromEnvironment({
+        'USERPROFILE': r'D:\Profiles\ada',
+      }, pathContext: windows);
+      expect(folders.windowsCodexPath, r'D:\Profiles\ada\.codex');
+      expect(folders.claudeProjectsRoot, r'D:\Profiles\ada\.claude\projects');
+      expect(folders.wslDistro, isEmpty);
+      expect(folders.wslLinuxHome, isEmpty);
+      expect(folders.wslLinuxRootUnc, isEmpty);
+      expect(folders.wslCodexUncPath, isEmpty);
+
+      final settings = AppSettings.defaults(folders: folders);
+      expect(settings.paths.windowsCodexPath, r'D:\Profiles\ada\.codex');
+      expect(settings.paths.wslCodexUncPath, isEmpty);
+      expect(settings.wsl.distro, isEmpty);
+      expect(settings.wsl.linuxHome, isEmpty);
+      expect(settings.wsl.linuxRootUnc, isEmpty);
+      final toml = settings.toTomlMap().toString().toLowerCase();
+      expect(toml, isNot(contains('pawel')));
+      expect(toml, isNot(contains('ubuntu')));
+    });
+
+    test('CODEX_HOME wins over the profile folder; HOME is the fallback', () {
+      expect(
+        DefaultSessionFolders.fromEnvironment({
+          'USERPROFILE': r'C:\Users\ada',
+          'CODEX_HOME': r'E:\codex-home',
+        }, pathContext: windows).windowsCodexPath,
+        r'E:\codex-home',
+      );
+      final posix = DefaultSessionFolders.fromEnvironment({
+        'HOME': '/Users/ada',
+      }, pathContext: p.posix);
+      expect(posix.windowsCodexPath, '/Users/ada/.codex');
+      expect(posix.claudeProjectsRoot, '/Users/ada/.claude/projects');
+      final none = DefaultSessionFolders.fromEnvironment(
+        const {},
+        pathContext: windows,
+      );
+      expect(none.windowsCodexPath, isEmpty);
+      expect(none.claudeProjectsRoot, isEmpty);
+    });
+
+    test('a detected WSL distribution fills the WSL defaults', () {
+      final folders = DefaultSessionFolders.fromEnvironment(
+        {'USERPROFILE': r'C:\Users\ada'},
+        wsl: const WslDistroDefaults(distro: 'Debian', linuxHome: '/home/ada'),
+        pathContext: windows,
+      );
+      final settings = AppSettings.defaults(folders: folders);
+      expect(settings.wsl.distro, 'Debian');
+      expect(settings.wsl.linuxHome, '/home/ada');
+      expect(settings.wsl.linuxRootUnc, r'\\wsl.localhost\Debian\');
+      expect(
+        settings.paths.wslCodexUncPath,
+        r'\\wsl.localhost\Debian\home\ada\.codex',
+      );
+      expect(folders.withWsl(null).wslCodexUncPath, isEmpty);
+    });
+
+    test('the environment defaults are built once', () {
+      expect(identical(AppSettings.defaults(), AppSettings.defaults()), isTrue);
+    });
+
+    test('parses the WSL environment probe and rejects unusable output', () {
+      final parsed = WslDistroDefaults.parse('Debian\r\n/home/ada\r\n');
+      expect(parsed?.distro, 'Debian');
+      expect(parsed?.linuxHome, '/home/ada');
+      expect(WslDistroDefaults.parse(''), isNull);
+      expect(WslDistroDefaults.parse('/home/ada\n'), isNull);
+      expect(WslDistroDefaults.parse('Debian\nrelative\n'), isNull);
+      expect(
+        WslDistroDefaults.parse(
+          r'bad\name'
+          '\n/home/ada\n',
+        ),
+        isNull,
+      );
+    });
+
+    test('explicit settings still win over the derived defaults', () {
+      final loaded = AppSettings.fromTomlMap({
+        'paths': {
+          'windows_codex_path': r'X:\explicit\.codex',
+          'wsl_codex_unc_path': '',
+        },
+        'wsl': {'distro': 'Alpine'},
+      });
+      expect(loaded.paths.windowsCodexPath, r'X:\explicit\.codex');
+      expect(loaded.paths.wslCodexUncPath, isEmpty);
+      expect(loaded.wsl.distro, 'Alpine');
+    });
+
+    test('a new settings file stores the detected WSL defaults', () async {
+      final temp = await Directory.systemTemp.createTemp('default_folders_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File(p.join(temp.path, 'settings.toml'));
+      final created = await SettingsRepository(
+        file,
+        wslDetector: const _FixedWslDetector(
+          WslDistroDefaults(distro: 'Debian', linuxHome: '/home/ada'),
+        ),
+      ).loadOrCreate();
+      expect(created.wsl.distro, 'Debian');
+      expect(
+        created.paths.wslCodexUncPath,
+        r'\\wsl.localhost\Debian\home\ada\.codex',
+      );
+      final reloaded = await SettingsRepository(file).loadOrCreate();
+      expect(reloaded.wsl.distro, 'Debian');
+      expect(
+        reloaded.paths.windowsCodexPath,
+        DefaultSessionFolders.current().windowsCodexPath,
+      );
+    });
+  });
+}
+
+final class _FixedWslDetector implements WslDefaultDistroDetector {
+  const _FixedWslDetector(this.result);
+
+  final WslDistroDefaults? result;
+
+  @override
+  Future<WslDistroDefaults?> detect() async => result;
 }

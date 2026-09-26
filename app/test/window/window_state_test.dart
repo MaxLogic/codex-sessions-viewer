@@ -1,6 +1,8 @@
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/config/default_session_folders.dart';
+import 'package:codex_sessions_viewer/src/platform/wsl_default_distro_detector.dart';
 import 'package:codex_sessions_viewer/src/window/window_state.dart';
 import 'package:codex_sessions_viewer/main.dart' as app;
 import 'package:flutter/widgets.dart';
@@ -18,6 +20,7 @@ void main() {
     });
 
     final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(AppSettings.defaults());
     final store = WindowStateStore(SettingsRepository(settingsFile));
     final state = PersistedWindowState(
       x: 40,
@@ -32,6 +35,49 @@ void main() {
     expect(await store.load(), state);
     expect(File(p.join(temp.path, 'window_state.json')).existsSync(), isFalse);
     expect(await settingsFile.readAsString(), contains('[ui.window]'));
+  });
+
+  test('restoring the window before the first frame never creates settings '
+      'or runs WSL detection', () async {
+    final temp = await Directory.systemTemp.createTemp('csv_window_first_');
+    addTearDown(() => temp.delete(recursive: true));
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    final detector = _CountingWslDetector();
+    final store = WindowStateStore(
+      SettingsRepository(settingsFile, wslDetector: detector),
+    );
+
+    expect(await store.load(), isNull);
+    await store.save(
+      const PersistedWindowState(
+        x: 1,
+        y: 2,
+        width: 800,
+        height: 600,
+        isMaximized: false,
+      ),
+    );
+    expect(settingsFile.existsSync(), isFalse);
+    expect(detector.calls, 0);
+
+    // The settings startup after the first frame creates the file, runs the
+    // detection once, and later window moves are saved.
+    await SettingsRepository(
+      settingsFile,
+      wslDetector: detector,
+    ).loadOrCreate();
+    expect(detector.calls, 1);
+    await store.save(
+      const PersistedWindowState(
+        x: 1,
+        y: 2,
+        width: 800,
+        height: 600,
+        isMaximized: false,
+      ),
+    );
+    expect((await store.load())?.width, 800);
+    expect(detector.calls, 1);
   });
 
   test('window state storage ignores missing window placement', () async {
@@ -394,5 +440,15 @@ class _FakeWindowManager implements AppWindowManager {
   Future<void> setSize(Size size) async {
     this.size = size;
     sizes.add(size);
+  }
+}
+
+final class _CountingWslDetector implements WslDefaultDistroDetector {
+  int calls = 0;
+
+  @override
+  Future<WslDistroDefaults?> detect() async {
+    calls++;
+    return const WslDistroDefaults(distro: 'Debian', linuxHome: '/home/ada');
   }
 }

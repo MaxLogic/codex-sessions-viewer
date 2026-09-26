@@ -32,13 +32,12 @@ pub struct ClaudeRoot {
     pub source_type: SourceType,
 }
 
-/// `%USERPROFILE%\.claude\projects`.
+/// `<home>/.claude/projects` for the current user; see
+/// [`crate::settings::DefaultFolders`].
 pub fn default_root() -> Option<ClaudeRoot> {
-    let home = std::env::var("USERPROFILE")
-        .ok()
-        .filter(|home| !home.is_empty())?;
-    Some(ClaudeRoot {
-        path: format!("{home}\\.claude\\projects"),
+    let path = crate::settings::DefaultFolders::current().claude_projects_root;
+    (!path.is_empty()).then_some(ClaudeRoot {
+        path,
         source_type: SourceType::Windows,
     })
 }

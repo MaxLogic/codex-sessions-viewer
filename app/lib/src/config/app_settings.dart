@@ -5,6 +5,8 @@ import 'package:path/path.dart' as p;
 import 'package:toml/toml.dart';
 
 import '../platform/application_working_directory.dart';
+import '../platform/wsl_default_distro_detector.dart';
+import 'default_session_folders.dart';
 
 File defaultSettingsFile() {
   final executableDirectory = applicationExecutableDirectory();
@@ -92,9 +94,15 @@ class SettingsValidationException implements Exception {
 }
 
 class SettingsRepository {
-  SettingsRepository(this.file);
+  SettingsRepository(
+    this.file, {
+    this.wslDetector = const NoWslDefaultDistroDetector(),
+  });
 
   final File file;
+
+  /// Fills the WSL defaults when the settings file is first created.
+  final WslDefaultDistroDetector wslDetector;
 
   /// Pending operations per settings file. Window placement, table layout,
   /// and the Settings screen all write the same file; each load-modify-save
@@ -119,6 +127,23 @@ class SettingsRepository {
 
   Future<AppSettings> loadOrCreate() => _serialized(_loadOrCreate);
 
+  /// The saved settings, or null while no settings file exists. Never creates
+  /// the file, so it never runs first-run detection.
+  Future<AppSettings?> loadIfPresent() => _serialized(() async {
+    if (!await file.exists()) return null;
+    return AppSettings.fromTomlMap(
+      TomlDocument.parse(await file.readAsString()).toMap(),
+    );
+  });
+
+  /// Like [update], but does nothing while no settings file exists.
+  Future<void> updateIfPresent(
+    AppSettings Function(AppSettings current) change,
+  ) => _serialized(() async {
+    if (!await file.exists()) return;
+    await _save(change(await _loadOrCreate()));
+  });
+
   Future<void> save(AppSettings settings) => _serialized(() => _save(settings));
 
   /// Loads the current file, applies [change], and saves the result as one
@@ -133,7 +158,11 @@ class SettingsRepository {
 
   Future<AppSettings> _loadOrCreate() async {
     if (!await file.exists()) {
-      final settings = AppSettings.defaults();
+      final settings = AppSettings.defaults(
+        folders: DefaultSessionFolders.current().withWsl(
+          await wslDetector.detect(),
+        ),
+      );
       await _save(settings);
       return settings;
     }
@@ -208,17 +237,36 @@ class AppSettings {
   final DatabaseSettings database;
   final HubSettings hub;
 
-  factory AppSettings.defaults() => const AppSettings(
+  /// Defaults for the current user; [folders] replaces the session folders
+  /// derived from this process's environment.
+  factory AppSettings.defaults({DefaultSessionFolders? folders}) =>
+      folders == null
+      ? _currentDefaults ??= AppSettings._forFolders(
+          DefaultSessionFolders.current(),
+        )
+      : AppSettings._forFolders(folders);
+
+  /// The environment-derived defaults, built once; widgets read them often.
+  static AppSettings? _currentDefaults;
+
+  factory AppSettings._forFolders(DefaultSessionFolders session) {
+    return _defaults.copyWith(
+      paths: PathSettings(
+        windowsCodexPath: session.windowsCodexPath,
+        wslCodexUncPath: session.wslCodexUncPath,
+      ),
+      wsl: WslSettings(
+        distro: session.wslDistro,
+        linuxHome: session.wslLinuxHome,
+        linuxRootUnc: session.wslLinuxRootUnc,
+      ),
+    );
+  }
+
+  static const _defaults = AppSettings(
     app: GeneralAppSettings(firstRun: false, startWithWindows: true),
-    paths: PathSettings(
-      windowsCodexPath: r'C:\Users\pawel\.codex',
-      wslCodexUncPath: r'\\wsl.localhost\Ubuntu\home\pawel\.codex',
-    ),
-    wsl: WslSettings(
-      distro: 'Ubuntu',
-      linuxHome: '/home/pawel',
-      linuxRootUnc: r'\\wsl.localhost\Ubuntu\',
-    ),
+    paths: PathSettings(windowsCodexPath: '', wslCodexUncPath: ''),
+    wsl: WslSettings(distro: '', linuxHome: '', linuxRootUnc: ''),
     scanner: ScannerSettings(
       backgroundRescanEnabled: true,
       backgroundRescanIntervalSeconds: 300,

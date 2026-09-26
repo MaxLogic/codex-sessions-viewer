@@ -13,6 +13,7 @@ import 'src/platform/application_working_directory.dart';
 import 'src/platform/app_instance_lock.dart';
 import 'src/window/window_state.dart';
 import 'src/platform/windows_startup_registration.dart';
+import 'src/platform/wsl_default_distro_detector.dart';
 
 final _processLifetimeInstanceLocks = <AppInstanceLock>[];
 
@@ -35,6 +36,8 @@ Future<void> main(List<String> arguments) async {
     exit(0);
   }
   _processLifetimeInstanceLocks.add(instanceLock);
+  // The window store never creates settings.toml; the settings startup after
+  // the first frame does, and fills the WSL defaults then.
   final windowStateController = AppWindowStateController(
     store: WindowStateStore(SettingsRepository(defaultSettingsFile())),
   );
@@ -46,7 +49,10 @@ Future<void> main(List<String> arguments) async {
     coordinator: DatabaseMaintenanceCoordinator(databaseFile),
   );
   final settingsStartup = _afterFirstFrame(
-    () => SettingsRepository(defaultSettingsFile()).loadOrCreate(),
+    () => SettingsRepository(
+      defaultSettingsFile(),
+      wslDetector: WslDefaultDistroDetector.forCurrentPlatform(),
+    ).loadOrCreate(),
   );
   runApp(
     CodexSessionsViewerApp(

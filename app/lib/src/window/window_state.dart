@@ -44,9 +44,13 @@ class WindowStateStore implements WindowStatePersistence {
 
   final SettingsRepository repository;
 
+  /// Window placement is restored before the first frame, so it never
+  /// creates the settings file: creation may run first-run WSL detection,
+  /// which belongs to the settings startup after the first frame. Until
+  /// then there is no placement to restore and moves are not saved.
   @override
   Future<PersistedWindowState?> load() async {
-    final placement = (await repository.loadOrCreate()).ui.window;
+    final placement = (await repository.loadIfPresent())?.ui.window;
     if (placement == null) {
       return null;
     }
@@ -61,7 +65,7 @@ class WindowStateStore implements WindowStatePersistence {
 
   @override
   Future<void> save(PersistedWindowState state) async {
-    await repository.update(
+    await repository.updateIfPresent(
       (settings) => settings.copyWith(
         ui: settings.ui.copyWith(
           window: WindowPlacementSettings(
