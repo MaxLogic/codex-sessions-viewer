@@ -133,6 +133,18 @@ void main() {
           expect((await source.usage('gui-machine'))['days'], isA<List>());
         }, _RealHttp()),
       );
+      // The refresh button is disabled while the annotation save is still
+      // running; under full-suite load that can outlast settleNetwork, and a
+      // tap on a disabled button is silently dropped.
+      final refresh = find.widgetWithText(TextButton, 'Search / refresh hub');
+      final idleBy = DateTime.now().add(const Duration(seconds: 30));
+      while (tester.widget<TextButton>(refresh).onPressed == null) {
+        if (DateTime.now().isAfter(idleBy)) fail('Hub stayed busy.');
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await tester.pump();
+      }
       await tester.runAsync(
         () => tester.tap(find.text('Search / refresh hub')),
       );
