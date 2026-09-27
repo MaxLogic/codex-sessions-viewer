@@ -1852,6 +1852,91 @@ fn claude_subagent_usage_is_reconciled_against_the_claude_parser_version() {
     );
 }
 
+#[test]
+fn child_usage_scope_follows_the_history_shared_with_its_parent() {
+    use codex_sessions_collector::codex::parser::PARSER_VERSION;
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let temp = TempDir::new("legacy-shared-prefix");
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    let parent = snapshot_for("codex", "fork-parent", PARSER_VERSION);
+    let parent_fingerprints: Vec<String> = parent
+        .usage_events
+        .iter()
+        .map(|event| event.event_fingerprint.clone())
+        .collect();
+    apply_snapshot(&store, parent).unwrap();
+    // Each child's fingerprints: `Some(n)` repeats the parent's n-th event,
+    // `None` is the child's own event.
+    // (session, shared parent event per child event, status, scopes)
+    type Case = (
+        &'static str,
+        &'static [Option<usize>],
+        &'static str,
+        &'static [&'static str],
+    );
+    let cases: [Case; 3] = [
+        ("fork-within", &[Some(0)], "complete", &["inherited"]),
+        (
+            "fork-beyond",
+            &[Some(0), Some(1), None],
+            "complete",
+            &["inherited", "inherited", "local"],
+        ),
+        (
+            "fork-diverged",
+            &[None, Some(1)],
+            "ambiguous",
+            &["ambiguous", "ambiguous"],
+        ),
+    ];
+    for (session_id, events, _, _) in cases {
+        let mut child = snapshot_for("codex", session_id, PARSER_VERSION);
+        child.source.path = format!("C:\\synthetic\\{session_id}.jsonl");
+        child.session.forked_from_id = Some("fork-parent".to_owned());
+        let template = child.usage_events[0].clone();
+        child.usage_events = events
+            .iter()
+            .enumerate()
+            .map(|(position, shared)| {
+                let mut event = template.clone();
+                event.source_record_ordinal = position as i64 + 1;
+                event.event_fingerprint = match shared {
+                    Some(index) => parent_fingerprints[*index].clone(),
+                    None => codex_sessions_collector::dart::sha256_hex(
+                        format!("{session_id}-own-{position}").as_bytes(),
+                    ),
+                };
+                event
+            })
+            .collect();
+        apply_snapshot(&store, child).unwrap();
+    }
+    let conn = open(&db);
+    for (session_id, _, status, scopes) in cases {
+        let id = format!("session:{session_id}");
+        let stored: String = conn
+            .query_row(
+                "select usage_projection_status from sessions where id = ?",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, status, "{session_id}");
+        let stored: Vec<String> = conn
+            .prepare(
+                "select branch_scope from usage_events where session_row_id = ?
+                 order by source_record_ordinal",
+            )
+            .unwrap()
+            .query_map([&id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(stored, scopes, "{session_id}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The session change journal
 

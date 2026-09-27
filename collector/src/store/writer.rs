@@ -188,6 +188,9 @@ pub fn apply_session_batch(
         }
         let now = DartDateTime::now().to_iso8601();
         let lookup = IdentityLookup::for_batch(conn)?;
+        // Checked once: the write lock keeps the setting fixed for the batch,
+        // and a disabled queue must not pay for a copy of every snapshot.
+        let queue_hub_records = hub_client::queue_enabled(conn)?;
         for (id, snapshot) in &canonical {
             let resolver = ProjectResolver::new(
                 snapshot
@@ -198,11 +201,13 @@ pub fn apply_session_batch(
             crate::timing::timed("write: session total", || {
                 upsert_session(conn, id, snapshot, &now, &resolver, lookup)
             })?;
-            hub_client::enqueue(
-                conn,
-                Record::SessionSnapshot(Box::new(snapshot.clone())),
-                &now,
-            )?;
+            if queue_hub_records {
+                hub_client::enqueue(
+                    conn,
+                    Record::SessionSnapshot(Box::new(snapshot.clone())),
+                    &now,
+                )?;
+            }
         }
         Ok(())
     })();
@@ -1895,7 +1900,6 @@ fn reconcile_affected_legacy_usage(
     }
 
     let mut parent_cache: HashMap<String, Vec<LegacyUsageSession>> = HashMap::new();
-    let mut fingerprint_cache: HashMap<String, Vec<String>> = HashMap::new();
     let parents_for = |conn: &Connection,
                        cache: &mut HashMap<String, Vec<LegacyUsageSession>>,
                        parent: &str|
@@ -1920,21 +1924,6 @@ fn reconcile_affected_legacy_usage(
                 )
             })
             .collect())
-    };
-    let fingerprints_for = |conn: &Connection,
-                            cache: &mut HashMap<String, Vec<String>>,
-                            row_id: &str|
-     -> StoreResult<Vec<String>> {
-        if !cache.contains_key(row_id) {
-            let mut statement = conn.prepare_cached(
-                "select event_fingerprint from usage_events where session_row_id = ? order by source_record_ordinal",
-            )?;
-            let rows = statement
-                .query_map([row_id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            cache.insert(row_id.to_owned(), rows);
-        }
-        Ok(cache[row_id].clone())
     };
     let parent_logical_of = |conn: &Connection,
                              cache: &mut HashMap<String, Vec<LegacyUsageSession>>,
@@ -1980,8 +1969,10 @@ fn reconcile_affected_legacy_usage(
             }
             continue;
         }
-        let child_fingerprints = fingerprints_for(conn, &mut fingerprint_cache, &child.row_id)?;
-        if child_fingerprints.is_empty() {
+        let child_has_usage: bool = conn
+            .prepare_cached("select exists(select 1 from usage_events where session_row_id = ?)")?
+            .query_row([&child.row_id], |row| row.get(0))?;
+        if !child_has_usage {
             if !child.has_aggregate_usage {
                 set_projection_status(conn, &child.row_id, "complete")?;
             } else {
@@ -2011,19 +2002,14 @@ fn reconcile_affected_legacy_usage(
             }
             continue;
         }
-        let parent_fingerprints = fingerprints_for(conn, &mut fingerprint_cache, &parent_row)?;
-        if parent_fingerprints.is_empty() && (parent_status != "complete" || parent_aggregate) {
+        let (parent_has_usage, prefix) = shared_usage_prefix(conn, &parent_row, &child.row_id)?;
+        if !parent_has_usage && (parent_status != "complete" || parent_aggregate) {
             if mark_unresolved(conn, &child.row_id, "ambiguous")? > 0 {
                 rescoped.insert(child.row_id.clone());
             }
             continue;
         }
-        let prefix = parent_fingerprints
-            .iter()
-            .zip(&child_fingerprints)
-            .take_while(|(left, right)| left == right)
-            .count();
-        if !parent_fingerprints.is_empty() && prefix == 0 {
+        if parent_has_usage && prefix == 0 {
             if mark_unresolved(conn, &child.row_id, "ambiguous")? > 0 {
                 rescoped.insert(child.row_id.clone());
             }
@@ -2065,6 +2051,40 @@ fn reconcile_affected_legacy_usage(
         }
     }
     Ok((result, rescoped.contains(replaced_row_id)))
+}
+
+/// Whether session `parent_row` has usage events, and how many of its first
+/// event fingerprints equal the first of `child_row`'s. Both histories are
+/// read side by side only up to the first difference: a parent's history is
+/// usually far longer than what a child shares with it.
+fn shared_usage_prefix(
+    conn: &Connection,
+    parent_row: &str,
+    child_row: &str,
+) -> StoreResult<(bool, usize)> {
+    let mut parent_statement = conn.prepare_cached(
+        "select event_fingerprint from usage_events as parent_events
+         where session_row_id = ? order by source_record_ordinal",
+    )?;
+    let mut child_statement = conn.prepare_cached(
+        "select event_fingerprint from usage_events as child_events
+         where session_row_id = ? order by source_record_ordinal",
+    )?;
+    let mut parent_events = parent_statement.query([parent_row])?;
+    let mut child_events = child_statement.query([child_row])?;
+    let mut parent_has_usage = false;
+    let mut prefix = 0;
+    while let Some(parent) = parent_events.next()? {
+        parent_has_usage = true;
+        let Some(child) = child_events.next()? else {
+            break;
+        };
+        if parent.get_ref(0)? != child.get_ref(0)? {
+            break;
+        }
+        prefix += 1;
+    }
+    Ok((parent_has_usage, prefix))
 }
 
 /// Whether `version` is this collector's parser version for `harness`.
