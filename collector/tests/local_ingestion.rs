@@ -2670,6 +2670,69 @@ fn scans_backfill_projects_and_clean_placeholders_the_viewer_no_longer_writes() 
 }
 
 #[test]
+fn wsl_git_root_hints_never_replace_a_manual_project() {
+    use codex_sessions_collector::contract::{ProjectHint, SessionRef};
+    use codex_sessions_collector::store::{OwnerMode, Store, writer};
+    let temp = TempDir::new("override-hints");
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let db = viewer_database(&temp);
+    assert!(support::scan(&db, &home, &[]).status.success());
+    let conn = open(&db);
+    let directory = "/mnt/f/projects/repo-root/src";
+    conn.execute(
+        "update sessions set source_type = 'wsl', working_directory_display = ?",
+        [directory],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "insert into projects (name, description, is_active, created_at_utc, updated_at_utc)
+           values ('Manual', '', 1, '2026-09-27T00:00:00.000Z', '2026-09-27T00:00:00.000Z');
+         update sessions set project_override = 1,
+           project_id = (select id from projects where name = 'Manual'),
+           project_name_snapshot = 'Manual';",
+    )
+    .unwrap();
+    let (session_id, source_path): (Option<String>, String) = conn
+        .query_row(
+            "select session_id, source_file_path from sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let sessions = [SessionRef {
+        session_id,
+        source_path,
+    }];
+    let hints = [ProjectHint {
+        working_directory: directory.to_owned(),
+        project_name: "repo-root".to_owned(),
+    }];
+    let project = |conn: &Connection| {
+        support::rows(
+            conn,
+            "select s.project_override, s.project_name_snapshot, p.name as project
+             from sessions s left join projects p on p.id = s.project_id",
+        )
+    };
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    writer::apply_project_hints(&store.conn, "codex", &sessions, &hints).unwrap();
+    assert_eq!(
+        project(&conn),
+        [json!({"project_override": 1, "project_name_snapshot": "Manual", "project": "Manual"})]
+    );
+    // Control: without the override the same hint does rename the session.
+    conn.execute("update sessions set project_override = 0", [])
+        .unwrap();
+    writer::apply_project_hints(&store.conn, "codex", &sessions, &hints).unwrap();
+    assert_eq!(
+        project(&conn),
+        [
+            json!({"project_override": 0, "project_name_snapshot": "repo-root", "project": "repo-root"})
+        ]
+    );
+}
+
+#[test]
 fn a_reparse_of_the_same_file_replaces_the_row_even_if_it_now_ends_earlier() {
     // A newer parser can drop trailing records (for example bookkeeping
     // events), so the reparse of the very same file ends earlier than the

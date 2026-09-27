@@ -122,10 +122,22 @@ pub fn collect_coordinated(
     let mut applied = ApplySummary::default();
     let committed = Cell::new(0);
     let flushes = Cell::new(0u64);
+    // Started at the first WSL session and fed each parsed WSL working
+    // directory, so WSL start-up and the git lookups overlap parsing.
+    let mut wsl_resolver: Option<wsl::ProjectResolver> = None;
     let mut outcome = scanner::scan_controlled(
         options,
         &cached,
         |snapshot| {
+            if resolve_wsl_projects
+                && snapshot.source.environment == SourceType::Wsl.wire_name()
+                && let Some(directory) = snapshot.session.working_directory_display.as_deref()
+                && !crate::dart::trim(directory).is_empty()
+            {
+                wsl_resolver
+                    .get_or_insert_with(wsl::ProjectResolver::for_current_platform)
+                    .push(directory);
+            }
             pending_bytes += snapshot.source.size;
             pending.push(snapshot);
             if pending.len() >= batching.sessions.max(1)
@@ -164,7 +176,12 @@ pub fn collect_coordinated(
     outcome.counts.persistence_flushes = flushes.get();
     phases.mark("scan and write sessions");
     if !is_cancelled() {
-        let hints = refined_project_hints(&outcome.parsed, resolve_wsl_projects);
+        let hints = refined_project_hints_with(
+            &outcome.parsed,
+            resolve_wsl_projects,
+            wsl_resolver.take(),
+            cancel,
+        );
         applied.project_updates += gated(&mut gate, || {
             writer::apply_project_hints(&store.conn, &hints.harness, &hints.sessions, &hints.hints)
         })?
@@ -303,6 +320,16 @@ pub fn thread_name_records(
 /// `_applyResolvedProjectsForParsedCandidates`: names for every parsed
 /// session's working directory, with WSL names from `git` inside WSL.
 pub fn refined_project_hints(parsed: &[ParsedRef], resolve_wsl_projects: bool) -> ProjectHints {
+    refined_project_hints_with(parsed, resolve_wsl_projects, None, &AtomicBool::new(false))
+}
+
+/// [`refined_project_hints`] with an already started WSL resolver, if any.
+fn refined_project_hints_with(
+    parsed: &[ParsedRef],
+    resolve_wsl_projects: bool,
+    wsl_resolver: Option<wsl::ProjectResolver>,
+    cancel: &AtomicBool,
+) -> ProjectHints {
     let mut hints: Vec<ProjectHint> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
     let mut wsl_paths: Vec<String> = Vec::new();
@@ -333,7 +360,13 @@ pub fn refined_project_hints(parsed: &[ParsedRef], resolve_wsl_projects: bool) -
         }
     }
     if resolve_wsl_projects {
-        for (path, name) in wsl::resolve_project_names(&wsl_paths) {
+        let resolver = wsl_resolver
+            .or_else(|| (!wsl_paths.is_empty()).then(wsl::ProjectResolver::for_current_platform));
+        let names = crate::timing::timed("project hints: wsl resolve", || match resolver {
+            Some(resolver) => resolver.resolve(&wsl_paths, cancel, wsl::RESOLVE_TIMEOUT),
+            None => HashMap::new(),
+        });
+        for (path, name) in names {
             hints.push(ProjectHint {
                 working_directory: path,
                 project_name: name,

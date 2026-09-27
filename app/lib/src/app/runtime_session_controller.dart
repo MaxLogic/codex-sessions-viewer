@@ -1126,7 +1126,10 @@ class ProcessWslProjectResolver extends WslProjectResolver {
 
     Process process;
     try {
+      // `-e` runs sh directly; without it the default shell reparses the
+      // script and nothing resolves (T-171). Scans use the collector's copy.
       process = await Process.start('wsl.exe', [
+        '-e',
         'sh',
         '-lc',
         _wslProjectResolutionScript,
