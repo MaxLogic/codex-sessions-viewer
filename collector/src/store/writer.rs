@@ -19,7 +19,10 @@ use crate::contract::{
 };
 use crate::dart::{DartDateTime, compare_utf16, to_lower, trim};
 use crate::hub_client;
-use crate::path_mapping::{canonical_scan_path, normalize_identity_path, normalize_windows_path};
+use crate::path_mapping::{
+    HOST_PATHS_ARE_CASE_SENSITIVE, canonical_scan_path, normalize_identity_path,
+    normalize_windows_path,
+};
 
 use super::projects::{
     ProjectResolver, refresh_session_project, resolve_usage_path_context, upsert_auto_project,
@@ -2219,12 +2222,16 @@ fn status_index(status: &str) -> i32 {
     }
 }
 
-/// `'source-status:${p.normalize(sourcePath).toLowerCase()}'`.
+/// `'source-status:${p.normalize(sourcePath).toLowerCase()}'`, keeping the
+/// case where the host's paths are case-sensitive: there, case-variant paths
+/// are different files. Windows ids stay lower-case, as existing rows have them.
 pub fn source_status_id(source_path: &str) -> String {
-    format!(
-        "source-status:{}",
-        to_lower(&normalize_windows_path(source_path))
-    )
+    let normalized = normalize_windows_path(source_path);
+    if HOST_PATHS_ARE_CASE_SENSITIVE {
+        format!("source-status:{normalized}")
+    } else {
+        format!("source-status:{}", to_lower(&normalized))
+    }
 }
 
 /// Placeholder row for a source that produced no session. Codex keeps the

@@ -4,6 +4,10 @@
 use crate::codex::parser::SourceType;
 use crate::dart::{to_lower, trim};
 
+/// Whether this host's file system tells paths apart by letter case. Linux
+/// does; Windows and macOS (by default) do not. Decide it here, not per caller.
+pub const HOST_PATHS_ARE_CASE_SENSITIVE: bool = !cfg!(any(windows, target_os = "macos"));
+
 #[derive(Clone, Debug)]
 pub struct PathMapper {
     pub wsl_unc_root: String,
@@ -430,6 +434,11 @@ mod tests {
     #[test]
     fn only_windows_maps_hook_paths_through_wsl_by_default() {
         assert_eq!(PathMapper::new("").maps_wsl_hook_paths, cfg!(windows));
+    }
+
+    #[test]
+    fn only_linux_paths_are_case_sensitive_by_default() {
+        assert_eq!(HOST_PATHS_ARE_CASE_SENSITIVE, cfg!(target_os = "linux"));
     }
 
     #[test]

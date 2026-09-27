@@ -1651,6 +1651,61 @@ fn source_statuses_only_touch_their_own_harness() {
     }
 }
 
+#[test]
+fn source_status_ids_follow_host_path_case_sensitivity() {
+    let temp = TempDir::new("status-case");
+    let db = viewer_database(&temp);
+    let lines: Vec<String> = ["/synthetic/Case.jsonl", "/synthetic/case.jsonl"]
+        .into_iter()
+        .map(|path| {
+            serde_json::to_string(&Envelope::new(Record::SourceStatus(
+                contract::SourceStatus {
+                    harness: "codex".to_owned(),
+                    path: path.to_owned(),
+                    status: "parse_error".to_owned(),
+                    state: "active".to_owned(),
+                    message: None,
+                },
+            )))
+            .unwrap()
+        })
+        .collect();
+    let input = temp.path().join("statuses.jsonl");
+    std::fs::write(&input, lines.join("\n")).unwrap();
+    let output = collector()
+        .args(["apply", "--db"])
+        .arg(&db)
+        .arg("--input")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ids: Vec<String> = support::rows(
+        &open(&db),
+        "select id from sessions where id like 'source-status:%' order by id",
+    )
+    .iter()
+    .map(|row| row["id"].as_str().unwrap().to_owned())
+    .collect();
+    if cfg!(target_os = "linux") {
+        // Case-variant files are two files here, so they keep two rows.
+        assert_eq!(
+            ids,
+            [
+                r"source-status:\synthetic\Case.jsonl",
+                r"source-status:\synthetic\case.jsonl"
+            ]
+        );
+    } else if cfg!(windows) {
+        // Windows keeps its case-insensitive ids, so no migration is needed.
+        assert_eq!(ids, [r"source-status:\synthetic\case.jsonl"]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Writer version agreement per harness
 
