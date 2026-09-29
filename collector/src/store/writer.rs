@@ -373,7 +373,10 @@ fn upsert_session(
             .tool_calls
             .iter()
             .any(|tool| tool.error_message.is_some() || tool.status == "error");
-    let auto_project = resolver.resolve(session.working_directory_display.as_deref(), source_type);
+    let resolved =
+        resolver.resolve_marked(session.working_directory_display.as_deref(), source_type);
+    let project_refined = resolved.as_ref().is_some_and(|(_, hinted)| *hinted);
+    let auto_project = resolved.map(|(name, _)| name);
     let detected_project_id = match &auto_project {
         Some(name) => Some(upsert_auto_project(conn, name, now)?),
         None => None,
@@ -439,7 +442,7 @@ fn upsert_session(
            user_message_count = ?, assistant_message_count = ?, tool_call_count = ?,
            input_tokens = ?, output_tokens = ?, cached_input_tokens = ?,
            user_message_tokens = ?, assistant_response_tokens = ?, tool_call_tokens = ?,
-           detected_project_id = ?, last_scanned_utc = ?, last_parsed_utc = ?,
+           detected_project_id = ?, project_refined = ?, last_scanned_utc = ?, last_parsed_utc = ?,
            harness = ?, machine_id = coalesce(?, machine_id)
          where id = ?",
     )?
@@ -477,6 +480,7 @@ fn upsert_session(
         assistant_tokens,
         tool_tokens,
         detected_project_id,
+        project_refined,
         now,
         now,
         snapshot.harness,
@@ -2422,6 +2426,30 @@ pub fn apply_thread_names(conn: &Connection, names: &[ThreadName]) -> StoreResul
     finish(conn, result)
 }
 
+/// The project name a resolver already found for a stored WSL session whose
+/// working directory is still `working_directory`, so a reingest can keep it
+/// without asking WSL again. `None` for a folder-name fallback (`project_refined
+/// = 0`), which must be resolved again.
+pub fn stored_refined_project(
+    conn: &Connection,
+    session: &SessionRef,
+    harness: &str,
+    working_directory: &str,
+) -> StoreResult<Option<String>> {
+    let id = session_row_id(harness, session.session_id.as_deref(), &session.source_path);
+    Ok(conn
+        .prepare_cached(
+            "select p.name from sessions s join projects p on p.id = s.detected_project_id
+             where s.id = ? and s.source_type = 'wsl' and s.project_refined = 1
+               and s.working_directory_display = ?",
+        )?
+        .query_row(params![id, working_directory], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .filter(|name| !trim(name).is_empty()))
+}
+
 /// `_applyResolvedProjectsForParsedCandidates`: re-resolve the detected
 /// project of the listed sessions with names found on the source machine.
 pub fn apply_project_hints(
@@ -2448,7 +2476,7 @@ pub fn apply_project_hints(
     // Read and write under one write lock so the rows cannot change between.
     begin_write(conn)?;
     let result = (|| -> StoreResult<usize> {
-        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut rows: Vec<(String, String, bool)> = Vec::new();
         for chunk in ids.chunks(500) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let mut statement = conn.prepare(&format!(
@@ -2468,21 +2496,24 @@ pub fn apply_project_hints(
                 } else {
                     SourceType::Windows
                 };
-                if let Some(name) = resolver.resolve(working_directory.as_deref(), source_type) {
+                if let Some((name, refined)) =
+                    resolver.resolve_marked(working_directory.as_deref(), source_type)
+                {
                     let name = trim(&name).to_owned();
                     if !name.is_empty() {
-                        rows.push((id, name));
+                        rows.push((id, name, refined));
                     }
                 }
             }
         }
         let now = DartDateTime::now().to_iso8601();
-        for (id, name) in &rows {
+        for (id, name, refined) in &rows {
             let project_id = upsert_auto_project(conn, name, &now)?;
             conn.prepare_cached(
-                "update sessions set detected_project_id = ?, updated_at_utc = ? where id = ?",
+                "update sessions set detected_project_id = ?, project_refined = ?,
+                   updated_at_utc = ? where id = ?",
             )?
-            .execute(params![project_id, now, id])?;
+            .execute(params![project_id, refined, now, id])?;
             refresh_session_project(conn, id)?;
         }
         hub_client::enqueue(
@@ -2549,8 +2580,8 @@ pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> Store
         let now = DartDateTime::now().to_iso8601();
         let mut updated = 0;
         for candidate in project_backfill_candidates(conn)? {
-            let Some(name) =
-                resolver.resolve(Some(&candidate.working_directory), candidate.source_type)
+            let Some((name, refined)) =
+                resolver.resolve_marked(Some(&candidate.working_directory), candidate.source_type)
             else {
                 continue;
             };
@@ -2560,9 +2591,10 @@ pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> Store
             }
             let project_id = upsert_auto_project(conn, &name, &now)?;
             conn.prepare_cached(
-                "update sessions set detected_project_id = ?, updated_at_utc = ? where id = ?",
+                "update sessions set detected_project_id = ?, project_refined = ?,
+                   updated_at_utc = ? where id = ?",
             )?
-            .execute(params![project_id, now, candidate.id])?;
+            .execute(params![project_id, refined, now, candidate.id])?;
             refresh_session_project(conn, &candidate.id)?;
             updated += 1;
         }

@@ -2669,6 +2669,286 @@ fn scans_backfill_projects_and_clean_placeholders_the_viewer_no_longer_writes() 
     );
 }
 
+/// T-172: reloading one WSL session keeps a project a resolver really found
+/// while the working directory is unchanged, so the ingest does not wait for a
+/// cold WSL start. A folder-name fallback or a changed directory is resolved
+/// again. The resolver is a recording fake: no test here reaches `wsl.exe`.
+#[test]
+fn a_wsl_reingest_reuses_only_a_project_a_resolver_found() {
+    use codex_sessions_collector::codex::scanner::{ScanOptions, ScanRoot};
+    use codex_sessions_collector::codex::{self, parser::SourceType};
+    use codex_sessions_collector::path_mapping::PathMapper;
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    let temp = TempDir::new("wsl-reingest");
+    let home = support::codex_home(&temp, &[]);
+    let file = support::day_folder(&home).join("wsl-session.jsonl");
+    let write_session = |directory: &str| {
+        support::write_generated_session(&file, "wsl-reingest", 3);
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace(r"C:\\nonexistent\\generated", directory);
+        std::fs::write(&file, text).unwrap();
+    };
+    let repo = "/home/dev/t172-no-such-dir/repo-root/app";
+    let other = "/home/dev/t172-no-such-dir/other";
+    write_session(repo);
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    let options = ScanOptions {
+        roots: vec![],
+        mapper: PathMapper::new(String::new()),
+        parser: ParserOptions::default(),
+        parser_workers: 1,
+        wsl_root_retry_delays: vec![],
+        thread_names: HashMap::new(),
+        force: true,
+    };
+    let root = ScanRoot {
+        path: file.to_string_lossy().into_owned(),
+        availability_root_path: None,
+        source_type: SourceType::Wsl,
+        source_state: "active",
+    };
+    let asked: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    // Ingest with a fake resolver that knows `answers` and records the paths.
+    let ingest = |answers: &[(&str, &str)]| {
+        let answers: HashMap<String, String> = answers
+            .iter()
+            .map(|(path, name)| ((*path).to_owned(), (*name).to_owned()))
+            .collect();
+        codex::collect_file_with(&store, &options, &root, |paths| {
+            asked.borrow_mut().extend(paths.iter().cloned());
+            paths
+                .iter()
+                .filter_map(|path| Some((path.clone(), answers.get(path)?.clone())))
+                .collect()
+        })
+        .unwrap();
+        std::mem::take(&mut *asked.borrow_mut())
+    };
+    let conn = open(&db);
+    let project = || {
+        support::rows(
+            &conn,
+            "select detected.name as detected, s.project_refined as refined,
+                    s.project_override as manual, s.project_name_snapshot as shown,
+                    f.project_name as search
+             from sessions s
+             left join projects detected on detected.id = s.detected_project_id
+             join session_search f on f.rowid = s.rowid",
+        )
+    };
+    let state = |name: &str, refined: i64| json!({"detected": name, "refined": refined, "manual": 0, "shown": name, "search": name});
+
+    // A new row is resolved, and the git root is marked.
+    assert_eq!(ingest(&[(repo, "repo-root")]), [repo]);
+    assert_eq!(project(), [state("repo-root", 1)]);
+    // Same directory, marked: reused without asking.
+    assert_eq!(ingest(&[]), Vec::<String>::new());
+    assert_eq!(project(), [state("repo-root", 1)]);
+
+    // A manual project stays, and the marked name is still reused.
+    conn.execute_batch(
+        "insert into projects (name, description, is_active, created_at_utc, updated_at_utc)
+           values ('Manual', '', 1, '2026-09-27T00:00:00.000Z', '2026-09-27T00:00:00.000Z');
+         update sessions set project_override = 1,
+           project_id = (select id from projects where name = 'Manual'),
+           project_name_snapshot = 'Manual';",
+    )
+    .unwrap();
+    assert_eq!(ingest(&[]), Vec::<String>::new());
+    assert_eq!(
+        project(),
+        [json!({"detected": "repo-root", "refined": 1, "manual": 1,
+            "shown": "Manual", "search": "Manual"})]
+    );
+    conn.execute("update sessions set project_override = 0", [])
+        .unwrap();
+    conn.execute(
+        "update sessions set project_name_snapshot = 'repo-root'",
+        [],
+    )
+    .unwrap();
+
+    // A changed directory is resolved again; no answer leaves the folder name
+    // unmarked.
+    write_session(other);
+    assert_eq!(ingest(&[]), [other]);
+    assert_eq!(project(), [state("other", 0)]);
+    // An unmarked folder-name row is resolved again, not reused.
+    assert_eq!(ingest(&[]), [other]);
+    assert_eq!(project(), [state("other", 0)]);
+    assert_eq!(ingest(&[(other, "other-root")]), [other]);
+    assert_eq!(project(), [state("other-root", 1)]);
+    // A row that lost its marker (a pre-migration row) is resolved again.
+    conn.execute("update sessions set project_refined = 0", [])
+        .unwrap();
+    assert_eq!(ingest(&[(other, "other-root")]), [other]);
+    assert_eq!(project(), [state("other-root", 1)]);
+    // The marker only counts for a WSL row.
+    conn.execute("update sessions set source_type = 'windows'", [])
+        .unwrap();
+    assert_eq!(ingest(&[]), [other]);
+}
+
+/// A generated session whose working directory is `directory`.
+fn write_session_in(file: &Path, id: &str, directory: &str) {
+    support::write_generated_session(file, id, 3);
+    let text = std::fs::read_to_string(file)
+        .unwrap()
+        .replace(r"C:\\nonexistent\\generated", directory);
+    std::fs::write(file, text).unwrap();
+}
+
+fn refined_scan_options(
+    roots: Vec<codex_sessions_collector::codex::scanner::ScanRoot>,
+) -> codex_sessions_collector::codex::scanner::ScanOptions {
+    use codex_sessions_collector::path_mapping::PathMapper;
+    codex_sessions_collector::codex::scanner::ScanOptions {
+        roots,
+        mapper: PathMapper::new(String::new()),
+        parser: ParserOptions::default(),
+        parser_workers: 1,
+        wsl_root_retry_delays: vec![],
+        thread_names: std::collections::HashMap::new(),
+        force: true,
+    }
+}
+
+/// T-172: a scan that rewrites a WSL session but is cancelled before its
+/// project hints must not leave the previous `project_refined = 1` behind.
+#[test]
+fn a_cancelled_scan_leaves_a_reparsed_wsl_session_unmarked() {
+    use codex_sessions_collector::codex::scanner::{ScanRoot, session_scan_roots};
+    use codex_sessions_collector::codex::{self, CollectionBatching, parser::SourceType};
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let temp = TempDir::new("cancelled-refined");
+    let home = support::codex_home(&temp, &[]);
+    let file = support::day_folder(&home).join("wsl-session.jsonl");
+    let directory = "/home/dev/t172-no-such-dir/repo-root/app";
+    write_session_in(&file, "cancelled-refined", directory);
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    let root = ScanRoot {
+        path: file.to_string_lossy().into_owned(),
+        availability_root_path: None,
+        source_type: SourceType::Wsl,
+        source_state: "active",
+    };
+    let options = refined_scan_options(session_scan_roots(home.to_str().unwrap(), SourceType::Wsl));
+    codex::collect_file_with(&store, &options, &root, |paths| {
+        paths
+            .iter()
+            .map(|path| (path.clone(), "repo-root".to_owned()))
+            .collect()
+    })
+    .unwrap();
+    let conn = open(&db);
+    let project = || {
+        support::rows(
+            &conn,
+            "select d.name as detected, s.project_refined as refined, s.source_type
+             from sessions s left join projects d on d.id = s.detected_project_id",
+        )
+    };
+    assert_eq!(
+        project(),
+        [json!({"detected": "repo-root", "refined": 1, "source_type": "wsl"})]
+    );
+
+    // The scan writes the batch (first lease) and is refused the project-hints
+    // lease (second lease).
+    let mut leases = 0;
+    let report = codex::collect_coordinated(
+        &store,
+        &options,
+        false,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_, _| {},
+        |acquire| {
+            if acquire {
+                leases += 1;
+                Ok(leases < 2)
+            } else {
+                Ok(true)
+            }
+        },
+        CollectionBatching::default(),
+    )
+    .unwrap();
+    assert_eq!(report.counts.files_parsed, 1);
+    assert!(leases >= 2);
+    assert_eq!(
+        project(),
+        [json!({"detected": "app", "refined": 0, "source_type": "wsl"})]
+    );
+}
+
+/// T-172: only a resolved WSL name is marked. Backfill sets the marker with a
+/// hint and clears it without one; a Windows session never carries it.
+#[test]
+fn backfill_and_windows_hints_mark_only_resolved_wsl_names() {
+    use codex_sessions_collector::codex::scanner::ScanRoot;
+    use codex_sessions_collector::codex::{self, parser::SourceType};
+    use codex_sessions_collector::contract::{ProjectHint, SessionRef};
+    use codex_sessions_collector::store::{OwnerMode, Store, writer};
+    let temp = TempDir::new("backfill-refined");
+    let home = support::codex_home(&temp, &[]);
+    let file = support::day_folder(&home).join("wsl-session.jsonl");
+    let directory = "/home/dev/t172-no-such-dir/repo-root/app";
+    write_session_in(&file, "backfill-refined", directory);
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    let options = refined_scan_options(vec![]);
+    let root = ScanRoot {
+        path: file.to_string_lossy().into_owned(),
+        availability_root_path: None,
+        source_type: SourceType::Wsl,
+        source_state: "active",
+    };
+    codex::collect_file_with(&store, &options, &root, |_| Default::default()).unwrap();
+    let conn = open(&db);
+    let project = || {
+        support::rows(
+            &conn,
+            "select d.name as detected, s.project_refined as refined
+             from sessions s left join projects d on d.id = s.detected_project_id",
+        )
+    };
+    let hint = [ProjectHint {
+        working_directory: directory.to_owned(),
+        project_name: "repo-root".to_owned(),
+    }];
+    let session = [SessionRef {
+        session_id: Some("backfill-refined".to_owned()),
+        source_path: root.path.clone(),
+    }];
+    let clear = || {
+        conn.execute("update sessions set detected_project_id = null", [])
+            .unwrap();
+    };
+    assert_eq!(project(), [json!({"detected": "app", "refined": 0})]);
+
+    // Backfill with a resolver hint marks the row; without one it clears it.
+    clear();
+    writer::apply_project_backfill(&store.conn, &hint).unwrap();
+    assert_eq!(project(), [json!({"detected": "repo-root", "refined": 1})]);
+    clear();
+    writer::apply_project_backfill(&store.conn, &[]).unwrap();
+    assert_eq!(project(), [json!({"detected": "app", "refined": 0})]);
+
+    // A Windows session takes the hinted name but is never marked.
+    conn.execute("update sessions set source_type = 'windows'", [])
+        .unwrap();
+    writer::apply_project_hints(&store.conn, "codex", &session, &hint).unwrap();
+    assert_eq!(project(), [json!({"detected": "repo-root", "refined": 0})]);
+    clear();
+    writer::apply_project_backfill(&store.conn, &hint).unwrap();
+    assert_eq!(project(), [json!({"detected": "repo-root", "refined": 0})]);
+}
+
 #[test]
 fn wsl_git_root_hints_never_replace_a_manual_project() {
     use codex_sessions_collector::contract::{ProjectHint, SessionRef};
@@ -2710,7 +2990,8 @@ fn wsl_git_root_hints_never_replace_a_manual_project() {
     let project = |conn: &Connection| {
         support::rows(
             conn,
-            "select s.project_override, s.project_name_snapshot, p.name as project
+            "select s.project_override, s.project_name_snapshot, p.name as project,
+                    s.project_refined
              from sessions s left join projects p on p.id = s.project_id",
         )
     };
@@ -2718,7 +2999,9 @@ fn wsl_git_root_hints_never_replace_a_manual_project() {
     writer::apply_project_hints(&store.conn, "codex", &sessions, &hints).unwrap();
     assert_eq!(
         project(&conn),
-        [json!({"project_override": 1, "project_name_snapshot": "Manual", "project": "Manual"})]
+        [
+            json!({"project_override": 1, "project_name_snapshot": "Manual", "project": "Manual", "project_refined": 1})
+        ]
     );
     // Control: without the override the same hint does rename the session.
     conn.execute("update sessions set project_override = 0", [])
@@ -2727,7 +3010,7 @@ fn wsl_git_root_hints_never_replace_a_manual_project() {
     assert_eq!(
         project(&conn),
         [
-            json!({"project_override": 0, "project_name_snapshot": "repo-root", "project": "repo-root"})
+            json!({"project_override": 0, "project_name_snapshot": "repo-root", "project": "repo-root", "project_refined": 1})
         ]
     );
 }

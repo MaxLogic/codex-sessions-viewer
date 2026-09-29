@@ -32,8 +32,21 @@ impl ProjectResolver {
     pub fn resolve(
         &self,
         working_directory: Option<&str>,
-        _source_type: SourceType,
+        source_type: SourceType,
     ) -> Option<String> {
+        self.resolve_marked(working_directory, source_type)
+            .map(|(name, _)| name)
+    }
+
+    /// [`Self::resolve`] plus whether a WSL session's name came from a hint
+    /// the resolver found (a git root), not the folder-name fallback. Only WSL
+    /// names are marked (`sessions.project_refined`): a Windows name is always
+    /// resolved in-process, so it needs no marker.
+    pub fn resolve_marked(
+        &self,
+        working_directory: Option<&str>,
+        source_type: SourceType,
+    ) -> Option<(String, bool)> {
         let path = trim(working_directory?);
         if path.is_empty() {
             return None;
@@ -41,9 +54,9 @@ impl ProjectResolver {
         if let Some(name) = self.hints.get(path)
             && !trim(name).is_empty()
         {
-            return Some(name.clone());
+            return Some((name.clone(), source_type == SourceType::Wsl));
         }
-        project_from_path(path)
+        project_from_path(path).map(|name| (name, false))
     }
 }
 

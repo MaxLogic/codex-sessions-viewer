@@ -406,12 +406,53 @@ pub fn snapshot_for(
     )
 }
 
+/// The project a resolver already found for a WSL session, as a hint, while
+/// its working directory is unchanged. A folder-name fallback is not kept.
+fn stored_wsl_project(store: &Store, parsed: &ParsedRef) -> StoreResult<Option<ProjectHint>> {
+    let Some(directory) = parsed.working_directory.as_deref() else {
+        return Ok(None);
+    };
+    if parsed.source_type != SourceType::Wsl || crate::dart::trim(directory).is_empty() {
+        return Ok(None);
+    }
+    let session = SessionRef {
+        session_id: parsed.session_id.clone(),
+        source_path: parsed.source_path.clone(),
+    };
+    Ok(
+        writer::stored_refined_project(&store.conn, &session, "codex", directory)?.map(|name| {
+            ProjectHint {
+                working_directory: crate::dart::trim(directory).to_owned(),
+                project_name: name,
+            }
+        }),
+    )
+}
+
 /// Ingest one Codex file, as if a scan had found only that file changed.
 pub fn collect_file(
     store: &Store,
     options: &ScanOptions,
     root: &ScanRoot,
     resolve_wsl_projects: bool,
+) -> StoreResult<CollectReport> {
+    collect_file_with(store, options, root, |paths| {
+        if resolve_wsl_projects {
+            wsl::resolve_project_names(paths)
+        } else {
+            HashMap::new()
+        }
+    })
+}
+
+/// [`collect_file`] with the WSL git-root lookup supplied by the caller. It
+/// runs only for a WSL session whose stored project cannot be reused, so a
+/// reload does not wait for a cold WSL start (T-172).
+pub fn collect_file_with(
+    store: &Store,
+    options: &ScanOptions,
+    root: &ScanRoot,
+    resolve_wsl: impl FnOnce(&[String]) -> HashMap<String, String>,
 ) -> StoreResult<CollectReport> {
     writer::clean_session_metadata_placeholders(&store.conn)?;
     let mut counts = ScanCounts {
@@ -438,8 +479,33 @@ pub fn collect_file(
                 source_type: root.source_type,
             };
             let session_id = success.session.session_id.clone();
+            // A WSL session whose working directory did not change keeps the
+            // git-root project a resolver found: asking `wsl.exe` again can
+            // wait ~12 s for a stopped distro to start (T-172). A changed
+            // directory or a folder-name fallback is resolved again.
+            let kept = stored_wsl_project(store, &parsed)?;
             applied.sessions = writer::apply_session_batch(&store.conn, vec![snapshot])?;
-            let hints = refined_project_hints(std::slice::from_ref(&parsed), resolve_wsl_projects);
+            let mut hints = refined_project_hints(std::slice::from_ref(&parsed), false);
+            match kept {
+                Some(hint) => hints.hints.push(hint),
+                None => {
+                    if let Some(directory) =
+                        parsed.working_directory.as_deref().map(crate::dart::trim)
+                        && parsed.source_type == SourceType::Wsl
+                        && !directory.is_empty()
+                    {
+                        let names = crate::timing::timed("project hints: wsl resolve", || {
+                            resolve_wsl(&[directory.to_owned()])
+                        });
+                        hints
+                            .hints
+                            .extend(names.into_iter().map(|(path, name)| ProjectHint {
+                                working_directory: path,
+                                project_name: name,
+                            }));
+                    }
+                }
+            }
             applied.project_updates = writer::apply_project_hints(
                 &store.conn,
                 &hints.harness,

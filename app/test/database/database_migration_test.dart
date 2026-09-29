@@ -555,7 +555,7 @@ void main() {
       '025_session_change_journal_precision.sql',
     );
     expect(versionRows.last['version'], latestSchemaVersion);
-    expect(versionRows.last['filename'], '027_fix_search_update_triggers.sql');
+    expect(versionRows.last['filename'], '028_session_project_refined.sql');
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -1087,6 +1087,39 @@ void main() {
       );
       db.execute(
         "insert into tool_output_search(tool_output_search, rank) values ('integrity-check', 1)",
+      );
+    },
+  );
+
+  test(
+    'migration 028 adds an unmarked, checked project_refined column',
+    () async {
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(dbFile);
+      expect(result.canStartNormalUi, isTrue);
+      final db = openFileBackedDatabase(dbFile);
+      addTearDown(db.close);
+      const now = '2026-09-29T08:00:00Z';
+      db.execute(
+        '''
+      insert into sessions (
+        id, source_type, source_file_path, display_path, platform_path,
+        created_at_utc, updated_at_utc, harness
+      ) values ('s', 'wsl', 'p', 'p', 'p', ?, ?, 'codex')
+      ''',
+        [now, now],
+      );
+      expect(
+        db.select("select project_refined from sessions where id = 's'").single,
+        {'project_refined': 0},
+      );
+      db.execute("update sessions set project_refined = 1 where id = 's'");
+      expect(
+        () => db.execute(
+          "update sessions set project_refined = 2 where id = 's'",
+        ),
+        throwsA(anything),
       );
     },
   );
