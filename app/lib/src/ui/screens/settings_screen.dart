@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../accessibility/announcement_service.dart';
+import '../../background_collection/background_collection.dart';
 import '../../config/app_settings.dart';
 import '../../config/settings_diagnostics.dart';
 import '../../database/maintenance_job.dart';
@@ -8,6 +9,7 @@ import '../../database/database_maintenance.dart';
 import '../motion.dart';
 import '../widgets/svg_icon.dart';
 import '../widgets/app_button.dart';
+import '../widgets/background_collection_panel.dart';
 
 typedef SettingsSaveCallback = Future<void> Function(AppSettings settings);
 typedef SettingsReloadCallback = Future<AppSettings> Function();
@@ -23,6 +25,8 @@ class SettingsScreen extends StatefulWidget {
     this.diagnostics = const DefaultSettingsDiagnostics(),
     this.maintenanceSchedules = const [],
     this.maintenanceProgress,
+    this.backgroundCollection,
+    this.onOpenFolder,
     DateTime Function()? clock,
   }) : clock = clock ?? DateTime.now;
 
@@ -34,6 +38,12 @@ class SettingsScreen extends StatefulWidget {
   final SettingsDiagnostics diagnostics;
   final List<MaintenanceScheduleRecord> maintenanceSchedules;
   final DatabaseMaintenanceProgress? maintenanceProgress;
+
+  /// Hidden when null, so screens that cannot reach the collector omit it.
+  final BackgroundCollection? backgroundCollection;
+
+  /// Opens a folder in the file manager for the background collection panel.
+  final Future<void> Function(String folder)? onOpenFolder;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -641,6 +651,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                       ],
                     ),
+                    if (widget.backgroundCollection != null)
+                      _Section(
+                        title: 'Background collection',
+                        children: [
+                          BackgroundCollectionPanel(
+                            collection: widget.backgroundCollection!,
+                            announcer: widget.announcer,
+                            onOpenFolder: widget.onOpenFolder,
+                          ),
+                        ],
+                      ),
                     _Section(
                       title: 'Data and cache',
                       children: [

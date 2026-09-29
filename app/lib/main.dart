@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'src/background_collection/background_collection.dart';
 import 'src/benchmark/scan_memory_benchmark.dart';
 import 'src/database/database_migrator.dart';
 import 'src/database/database_maintenance.dart';
@@ -14,6 +15,7 @@ import 'src/platform/app_instance_lock.dart';
 import 'src/window/window_state.dart';
 import 'src/platform/windows_startup_registration.dart';
 import 'src/platform/wsl_default_distro_detector.dart';
+import 'src/scanner/collector_process.dart';
 
 final _processLifetimeInstanceLocks = <AppInstanceLock>[];
 
@@ -58,6 +60,11 @@ Future<void> main(List<String> arguments) async {
     CodexSessionsViewerApp(
       databaseFile: databaseFile,
       applicationMaintenance: maintenance,
+      backgroundCollection: CollectorBackgroundCollection(
+        collectorExecutable: CollectorProcess.defaultExecutable(),
+        databaseFile: databaseFile.absolute.path,
+        settingsFile: defaultSettingsFile().absolute.path,
+      ),
       settingsStartup: settingsStartup,
       databaseStartup: _afterFirstFrame(
         () => DatabaseMigrator(

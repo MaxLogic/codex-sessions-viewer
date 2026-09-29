@@ -22,6 +22,7 @@ The release folder contains:
 - `codex_session_viewer.exe`
 - `codex-sessions-collector.exe`
 - `codex-sessions-hub.exe`
+- `codex-sessions-scan-launcher.exe` (windowless runner for the scheduled background scan)
 - Flutter runtime files, including `flutter_windows.dll`, `sqlite3.dll`,
   `native_assets.json`, and `data`
 - `README.md`

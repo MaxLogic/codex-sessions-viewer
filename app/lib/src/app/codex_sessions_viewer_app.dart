@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
+import '../background_collection/background_collection.dart';
 import '../config/app_settings.dart';
 import '../config/settings_diagnostics.dart';
 import '../commands/resume_command_generator.dart';
@@ -78,6 +79,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
     this.databaseMaintenanceStartup,
     this.writerCoordinator,
     this.applicationMaintenance,
+    this.backgroundCollection,
     this.startupPreferenceApplier = _ignoreStartupPreference,
     this.terminalLaunch = _launchTerminal,
     this.now = DateTime.now,
@@ -110,6 +112,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
   final DatabaseMaintenanceStartup? databaseMaintenanceStartup;
   final DatabaseMaintenanceCoordinator? writerCoordinator;
   final ApplicationMaintenance? applicationMaintenance;
+  final BackgroundCollection? backgroundCollection;
   final StartupPreferenceApplier startupPreferenceApplier;
   final TerminalLaunchCallback terminalLaunch;
   final DateTime Function() now;
@@ -541,6 +544,8 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                               const [],
                           maintenanceProgress:
                               widget.applicationMaintenance?.progress,
+                          backgroundCollection: widget.backgroundCollection,
+                          onOpenFolder: _openPath,
                           onSave: _saveSettings,
                           onReload: _reloadSettings,
                         ),

@@ -17,12 +17,13 @@ struct Options {
     db: Option<PathBuf>,
     standalone: bool,
     apply: bool,
+    remove: bool,
     local_proof: bool,
     check_hub: bool,
     hub_url: Option<String>,
 }
 
-const HELP: &str = "setup previews hook registration; add --apply to write it. verify checks configuration and database read-only; --local-proof ingests synthetic data in an isolated temporary database; --check-hub checks machine authentication without uploading history. Options: --config FILE, --root DIR (repeatable), --db FILE or --standalone FILE, --json, --hub-url URL.";
+const HELP: &str = "setup previews hook registration; add --apply to write it. setup --remove previews removing the managed hooks and restoring any hook they replaced; add --apply to write it. verify checks configuration and database read-only; --local-proof ingests synthetic data in an isolated temporary database; --check-hub checks machine authentication without uploading history. Options: --config FILE, --root DIR (repeatable), --db FILE or --standalone FILE, --json, --hub-url URL.";
 
 fn options(harness: &str, action: &str, args: &[String]) -> Result<Options, String> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
@@ -47,6 +48,7 @@ fn options(harness: &str, action: &str, args: &[String]) -> Result<Options, Stri
         db: crate::settings::default_viewer_database(),
         standalone: false,
         apply: false,
+        remove: false,
         local_proof: false,
         check_hub: false,
         hub_url: None,
@@ -57,6 +59,7 @@ fn options(harness: &str, action: &str, args: &[String]) -> Result<Options, Stri
         match arg.as_str() {
             "--json" | "--preview" => {}
             "--apply" if action == "setup" => o.apply = true,
+            "--remove" if action == "setup" => o.remove = true,
             "--local-proof" if action == "verify" => o.local_proof = true,
             "--check-hub" if action == "verify" => o.check_hub = true,
             "--config" | "--root" | "--windows-root" | "--claude-root" | "--wsl-root"
@@ -467,6 +470,131 @@ fn plan_body(harness: &str, original: &str, args: &[String]) -> Result<Plan, Str
     }
 }
 
+/// Plans removing this collector's managed hooks and restoring the hook they
+/// chained to, leaving every other setting untouched.
+fn plan_removal(harness: &str, original: &str) -> Result<Plan, String> {
+    match original.strip_prefix('\u{feff}') {
+        Some(body) => plan_removal_body(harness, body).map(|plan| Plan {
+            contents: format!("\u{feff}{}", plan.contents),
+            ..plan
+        }),
+        None => plan_removal_body(harness, original),
+    }
+}
+
+fn plan_removal_body(harness: &str, original: &str) -> Result<Plan, String> {
+    let unchanged = |state| Plan {
+        contents: original.into(),
+        state,
+        preserves_previous: false,
+    };
+    if harness == "codex" {
+        let mut doc = original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| "invalid Codex TOML; repair configuration before setup")?;
+        let previous = match doc.get("notify") {
+            None => return Ok(unchanged(HookState::Absent)),
+            Some(item) => item
+                .as_array()
+                .ok_or("Codex notify must be an array of strings")?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or("Codex notify must be an array of strings")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if !is_managed(&previous, "codex", "notify") {
+            return Ok(unchanged(HookState::Absent));
+        }
+        let restored = match previous_notify(&previous)? {
+            Some(value) => Some(serde_json::from_str::<Vec<String>>(&value).map_err(|_| {
+                "the notify command this hook replaced is unreadable; edit the configuration by hand"
+            })?),
+            None => None,
+        };
+        match &restored {
+            Some(command) => {
+                let mut array = toml_edit::Array::new();
+                for arg in command {
+                    array.push(arg.as_str());
+                }
+                doc["notify"] = toml_edit::value(array);
+            }
+            None => {
+                doc.remove("notify");
+            }
+        }
+        Ok(Plan {
+            contents: doc.to_string(),
+            state: HookState::Registered,
+            preserves_previous: restored.is_some(),
+        })
+    } else {
+        if original.trim().is_empty() {
+            return Ok(unchanged(HookState::Absent));
+        }
+        let mut doc: Value = serde_json::from_str(original)
+            .map_err(|_| "invalid Claude JSON; repair configuration before setup")?;
+        let object = doc
+            .as_object_mut()
+            .ok_or("Claude settings must be a JSON object")?;
+        let Some(hooks) = object.get_mut("hooks") else {
+            return Ok(unchanged(HookState::Absent));
+        };
+        let hooks = hooks
+            .as_object_mut()
+            .ok_or("Claude hooks must be an object")?;
+        let is_ours = |item: &Value| {
+            item["type"] == "command"
+                && item["command"]
+                    .as_str()
+                    .is_some_and(|c| is_managed(&command_tokens(c, 3), "claude", "hook"))
+        };
+        let mut removed = false;
+        for event in ["Stop", "SessionEnd"] {
+            let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let mut touched = false;
+            for entry in entries.iter_mut() {
+                let Some(items) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                let before = items.len();
+                items.retain(|item| !is_ours(item));
+                touched |= items.len() != before;
+            }
+            if touched {
+                removed = true;
+                entries.retain(|entry| {
+                    entry
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_none_or(|items| !items.is_empty())
+                });
+                if entries.is_empty() {
+                    hooks.remove(event);
+                }
+            }
+        }
+        if !removed {
+            return Ok(unchanged(HookState::Absent));
+        }
+        if hooks.is_empty() {
+            object.remove("hooks");
+        }
+        Ok(Plan {
+            contents: format!("{}\n", serde_json::to_string_pretty(&doc).unwrap()),
+            state: HookState::Registered,
+            // Claude hooks are only added on install, never chained, so
+            // nothing is restored; other hooks merely stay.
+            preserves_previous: false,
+        })
+    }
+}
+
 fn roots(o: &Options) -> (Vec<Value>, bool) {
     let reports: Vec<_> = o.roots.iter().map(|root| {
         let readable = std::fs::read_dir(root).is_ok();
@@ -479,10 +607,15 @@ fn roots(o: &Options) -> (Vec<Value>, bool) {
 fn setup(harness: &str, o: &Options) -> Result<Value, String> {
     let original = read_config(&o.config)?;
     let args = hook_args(harness, o)?;
-    let plan = plan(harness, &original, &args)?;
+    let plan = if o.remove {
+        plan_removal(harness, &original)?
+    } else {
+        plan(harness, &original, &args)?
+    };
     let (roots, detected) = roots(o);
     let changed = original != plan.contents;
-    if o.apply && !detected {
+    // Removing a hook never needs the session folders.
+    if o.apply && !o.remove && !detected {
         return Err("harness session roots are missing or unreadable; create/select the correct --root before applying setup".into());
     }
     let backup = if o.apply && changed {
@@ -507,7 +640,7 @@ fn setup(harness: &str, o: &Options) -> Result<Value, String> {
         crate::backup_retention::PruneOutcome::default()
     };
     Ok(
-        json!({"command":"setup","harness":harness,"ok":true,"detected":detected,"roots":roots,"config":o.config,"changed":changed,"applied":o.apply,"backup":backup,"pruned_backups":pruned.deleted,"backup_prune_failures":pruned.failed,"hook_state_before":plan.state.name(),"planned_sha256":crate::dart::sha256_hex(plan.contents.as_bytes()),"hook_command":args,"preserves_existing_hook":plan.preserves_previous,"notice":"Preview contains the managed command only; existing notify arguments and unrelated configuration are never printed. Rerun with --apply to write this plan."}),
+        json!({"command":"setup","harness":harness,"ok":true,"detected":detected,"roots":roots,"config":o.config,"changed":changed,"applied":o.apply,"removal":o.remove,"backup":backup,"pruned_backups":pruned.deleted,"backup_prune_failures":pruned.failed,"hook_state_before":plan.state.name(),"planned_sha256":crate::dart::sha256_hex(plan.contents.as_bytes()),"hook_command":args,"preserves_existing_hook":plan.preserves_previous,"notice":"Preview contains the managed command only; existing notify arguments and unrelated configuration are never printed. Rerun with --apply to write this plan."}),
     )
 }
 

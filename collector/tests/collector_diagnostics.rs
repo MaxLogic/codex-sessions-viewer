@@ -684,3 +684,126 @@ fn claude_setup_refuses_paths_that_git_bash_would_expand() {
         assert!(!f.config.exists());
     }
 }
+
+fn removal_fixture(
+    harness: &str,
+    original: &str,
+) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let temp = TempDir::new(&format!("remove-{harness}"));
+    let root = temp.path().join("sessions");
+    std::fs::create_dir(&root).unwrap();
+    let config = temp.path().join(if harness == "codex" {
+        "config.toml"
+    } else {
+        "settings.json"
+    });
+    std::fs::write(&config, original).unwrap();
+    (temp, root, config)
+}
+
+fn setup_run(
+    harness: &str,
+    root: &std::path::Path,
+    config: &std::path::Path,
+    flags: &[&str],
+) -> Value {
+    let output = collector()
+        .args([harness, "setup", "--json", "--root"])
+        .arg(root)
+        .arg("--config")
+        .arg(config)
+        .args(flags)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!text.contains("private-hook-secret"));
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn codex_remove_restores_the_previous_notify_and_keeps_other_settings() {
+    let original = "# keep this comment\napi_key = 'private-test-secret'\nnotify = ['previous-command', 'private-hook-secret']\n[other]\nvalue = 42\n";
+    let (_temp, root, config) = removal_fixture("codex", original);
+    setup_run("codex", &root, &config, &["--apply"]);
+    assert_eq!(notify_args(&config)[1], "codex");
+    let preview = setup_run("codex", &root, &config, &["--remove"]);
+    assert_eq!(preview["changed"], true);
+    assert_eq!(preview["applied"], false);
+    assert_eq!(notify_args(&config)[1], "codex");
+    let applied = setup_run("codex", &root, &config, &["--remove", "--apply"]);
+    assert_eq!(preview["planned_sha256"], applied["planned_sha256"]);
+    assert_eq!(applied["hook_state_before"], "registered");
+    assert_eq!(applied["preserves_existing_hook"], true);
+    assert!(applied["backup"].is_string());
+    assert_eq!(
+        notify_args(&config),
+        ["previous-command", "private-hook-secret"]
+    );
+    let restored = std::fs::read_to_string(&config).unwrap();
+    assert!(restored.contains("# keep this comment"));
+    assert!(restored.contains("api_key = 'private-test-secret'"));
+    let again = setup_run("codex", &root, &config, &["--remove", "--apply"]);
+    assert_eq!(again["changed"], false);
+    assert_eq!(again["hook_state_before"], "absent");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), restored);
+}
+
+#[test]
+fn codex_remove_drops_a_notify_that_had_no_predecessor() {
+    let (_temp, root, config) = removal_fixture("codex", "model = 'x'\n");
+    setup_run("codex", &root, &config, &["--apply"]);
+    setup_run("codex", &root, &config, &["--remove", "--apply"]);
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(!text.contains("notify"), "{text}");
+    assert!(text.contains("model = 'x'"));
+}
+
+#[test]
+fn removal_works_when_session_folders_are_gone_and_never_touches_a_foreign_hook() {
+    let foreign = "notify = ['other-tool', 'notify']\n";
+    let (_temp, root, config) = removal_fixture("codex", foreign);
+    let applied = setup_run("codex", &root, &config, &["--remove", "--apply"]);
+    assert_eq!(applied["changed"], false);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), foreign);
+    setup_run("codex", &root, &config, &["--apply"]);
+    std::fs::remove_dir(&root).unwrap();
+    setup_run("codex", &root, &config, &["--remove", "--apply"]);
+    assert_eq!(notify_args(&config), ["other-tool", "notify"]);
+}
+
+#[test]
+fn claude_remove_deletes_only_managed_hooks_and_prunes_what_it_created() {
+    let original = r#"{"api_key":"private-test-secret","hooks":{"Stop":[{"hooks":[{"type":"command","command":"old-hook private-hook-secret"}]}]},"other":{"value":42}}"#;
+    let (_temp, root, config) = removal_fixture("claude", original);
+    setup_run("claude", &root, &config, &["--apply"]);
+    assert_eq!(claude_commands(&config, "Stop").len(), 2);
+    let applied = setup_run("claude", &root, &config, &["--remove", "--apply"]);
+    // Other hooks stay, but nothing was chained or restored.
+    assert_eq!(applied["preserves_existing_hook"], false);
+    assert_eq!(applied["changed"], true);
+    let restored: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored, serde_json::from_str::<Value>(original).unwrap());
+    // A configuration that only held the managed hooks loses the empty object.
+    let (_temp, root, config) = removal_fixture("claude", r#"{"model":"x"}"#);
+    setup_run("claude", &root, &config, &["--apply"]);
+    setup_run("claude", &root, &config, &["--remove", "--apply"]);
+    let restored: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored, serde_json::json!({"model":"x"}));
+}
+
+#[test]
+fn claude_remove_does_not_claim_a_restore_when_unrelated_hooks_merely_remain() {
+    let original = r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"guard private-hook-secret"}]}]}}"#;
+    let (_temp, root, config) = removal_fixture("claude", original);
+    setup_run("claude", &root, &config, &["--apply"]);
+    let applied = setup_run("claude", &root, &config, &["--remove", "--apply"]);
+    assert_eq!(applied["changed"], true);
+    assert_eq!(applied["preserves_existing_hook"], false);
+    let restored: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored, serde_json::from_str::<Value>(original).unwrap());
+}

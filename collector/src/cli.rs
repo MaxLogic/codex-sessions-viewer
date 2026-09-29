@@ -24,7 +24,7 @@ const USAGE: &str = "\
 codex-sessions-collector: collect local coding-agent sessions into the Codex Sessions Viewer database.
 
 USAGE:
-  codex-sessions-collector <codex|claude> setup [--apply] [DIAGNOSTIC OPTIONS]
+  codex-sessions-collector <codex|claude> setup [--apply] [--remove] [DIAGNOSTIC OPTIONS]
   codex-sessions-collector <codex|claude> verify [--local-proof] [--check-hub] [DIAGNOSTIC OPTIONS]
   codex-sessions-collector <codex|claude> status [DIAGNOSTIC OPTIONS]
   codex-sessions-collector codex scan   [OPTIONS]         Scan the configured Codex homes

@@ -11,6 +11,7 @@ $collectorRoot = Join-Path $repoRoot 'collector'
 $collectorManifest = Join-Path $collectorRoot 'Cargo.toml'
 $collectorExeName = 'codex-sessions-collector.exe'
 $hubExeName = 'codex-sessions-hub.exe'
+$launcherExeName = 'codex-sessions-scan-launcher.exe'
 $sqlRoot = Join-Path $repoRoot 'sql'
 $assetsRoot = Join-Path $repoRoot 'assets'
 $settingsFile = Join-Path $repoRoot 'settings.sample.toml'
@@ -131,6 +132,10 @@ $hubBuildExe = Join-Path $collectorRoot "target\release\$hubExeName"
 if (-not (Test-Path -LiteralPath $hubBuildExe -PathType Leaf)) {
     throw "Expected hub build output not found at '$hubBuildExe'."
 }
+$launcherBuildExe = Join-Path $collectorRoot "target\release\$launcherExeName"
+if (-not (Test-Path -LiteralPath $launcherBuildExe -PathType Leaf)) {
+    throw "Expected scan launcher build output not found at '$launcherBuildExe'."
+}
 
 Push-Location $appRoot
 try {
@@ -175,6 +180,8 @@ $releaseCollector = Join-Path $OutputDirectory $collectorExeName
 Copy-Item -LiteralPath $collectorBuildExe -Destination $releaseCollector -Force
 $releaseHub = Join-Path $OutputDirectory $hubExeName
 Copy-Item -LiteralPath $hubBuildExe -Destination $releaseHub -Force
+$releaseLauncher = Join-Path $OutputDirectory $launcherExeName
+Copy-Item -LiteralPath $launcherBuildExe -Destination $releaseLauncher -Force
 
 $releaseReadme = Join-Path $OutputDirectory 'README.md'
 if (Test-Path -LiteralPath $readmeFile -PathType Leaf) {

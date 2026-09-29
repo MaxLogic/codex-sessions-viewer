@@ -45,6 +45,7 @@ class AppButton extends StatelessWidget {
     required this.label,
     this.style,
     this.autofocus = false,
+    this.focusNode,
   }) : _kind = _AppButtonKind.outlined;
 
   const AppButton.text({
@@ -54,6 +55,7 @@ class AppButton extends StatelessWidget {
     required this.label,
     this.style,
     this.autofocus = false,
+    this.focusNode,
   }) : _kind = _AppButtonKind.text;
 
   const AppButton.filled({
@@ -63,6 +65,7 @@ class AppButton extends StatelessWidget {
     required this.label,
     this.style,
     this.autofocus = false,
+    this.focusNode,
   }) : _kind = _AppButtonKind.filled;
 
   const AppButton.elevated({
@@ -72,6 +75,7 @@ class AppButton extends StatelessWidget {
     required this.label,
     this.style,
     this.autofocus = false,
+    this.focusNode,
   }) : _kind = _AppButtonKind.elevated;
 
   final VoidCallback? onPressed;
@@ -79,6 +83,7 @@ class AppButton extends StatelessWidget {
   final Widget label;
   final ButtonStyle? style;
   final bool autofocus;
+  final FocusNode? focusNode;
   final _AppButtonKind _kind;
 
   @override
@@ -90,6 +95,7 @@ class AppButton extends StatelessWidget {
           onPressed: onPressed,
           style: style,
           autofocus: autofocus,
+          focusNode: focusNode,
           icon: icon,
           label: label,
         ),
@@ -97,6 +103,7 @@ class AppButton extends StatelessWidget {
           onPressed: onPressed,
           style: style,
           autofocus: autofocus,
+          focusNode: focusNode,
           icon: icon,
           label: label,
         ),
@@ -104,6 +111,7 @@ class AppButton extends StatelessWidget {
           onPressed: onPressed,
           style: style,
           autofocus: autofocus,
+          focusNode: focusNode,
           icon: icon,
           label: label,
         ),
@@ -111,6 +119,7 @@ class AppButton extends StatelessWidget {
           onPressed: onPressed,
           style: style,
           autofocus: autofocus,
+          focusNode: focusNode,
           icon: icon,
           label: label,
         ),
@@ -139,24 +148,28 @@ class AppButton extends StatelessWidget {
         onPressed: onPressed,
         style: style,
         autofocus: autofocus,
+        focusNode: focusNode,
         child: child,
       ),
       _AppButtonKind.text => TextButton(
         onPressed: onPressed,
         style: style,
         autofocus: autofocus,
+        focusNode: focusNode,
         child: child,
       ),
       _AppButtonKind.filled => FilledButton(
         onPressed: onPressed,
         style: style,
         autofocus: autofocus,
+        focusNode: focusNode,
         child: child,
       ),
       _AppButtonKind.elevated => ElevatedButton(
         onPressed: onPressed,
         style: style,
         autofocus: autofocus,
+        focusNode: focusNode,
         child: child,
       ),
     };

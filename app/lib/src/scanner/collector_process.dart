@@ -47,14 +47,17 @@ class CollectorProcess {
     String? executable,
     CollectorProcessStarter? start,
     this.leaseTimeout = defaultLeaseTimeout,
-  }) : executable =
-           executable ??
-           Platform.environment['CODEX_SESSIONS_COLLECTOR_EXE'] ??
-           p.join(
-             p.dirname(Platform.resolvedExecutable),
-             'codex-sessions-collector.exe',
-           ),
+  }) : executable = executable ?? defaultExecutable(),
        _start = start ?? _startProcess;
+
+  /// The collector that sits next to the viewer, or the one named by
+  /// `CODEX_SESSIONS_COLLECTOR_EXE`.
+  static String defaultExecutable() =>
+      Platform.environment['CODEX_SESSIONS_COLLECTOR_EXE'] ??
+      p.join(
+        p.dirname(Platform.resolvedExecutable),
+        'codex-sessions-collector.exe',
+      );
 
   /// A write batch holds the lease for well under a second. The one-time
   /// cache repair copies the database between two leases, not under one,

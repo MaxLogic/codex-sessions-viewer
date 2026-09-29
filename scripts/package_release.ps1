@@ -53,6 +53,7 @@ foreach ($item in @(
         'codex_session_viewer.exe',
         'codex-sessions-collector.exe',
         'codex-sessions-hub.exe',
+        'codex-sessions-scan-launcher.exe',
         'flutter_windows.dll',
         'data',
         'README.md',

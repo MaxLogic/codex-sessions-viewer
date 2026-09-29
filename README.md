@@ -32,7 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_release.ps1
 
 `build_windows.ps1` checks Flutter and Rust, runs formatting, analysis, unit and integration tests, and the
 Windows release build. It prepares `release\windows` with
-`codex_session_viewer.exe`, `codex-sessions-collector.exe`, `codex-sessions-hub.exe`, Flutter runtime files, `README.md`, `settings.toml`,
+`codex_session_viewer.exe`, `codex-sessions-collector.exe`, `codex-sessions-hub.exe`, `codex-sessions-scan-launcher.exe`, Flutter runtime files, `README.md`, `settings.toml`,
 `sql`, and `assets`.
 
 Independent harness collectors can emit the [version 1 ingestion contract](docs/collectors/contract-v1.md).

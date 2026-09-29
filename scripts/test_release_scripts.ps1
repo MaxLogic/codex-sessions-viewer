@@ -37,6 +37,7 @@ foreach ($needle in @(
         'cargo build --locked --release',
         'codex-sessions-collector.exe',
         'codex-sessions-hub.exe',
+        'codex-sessions-scan-launcher.exe',
         'codex_session_viewer.exe',
         'flutter_windows.dll',
         'data',
@@ -52,6 +53,7 @@ foreach ($needle in @(
         'build_windows.ps1',
         'codex-sessions-collector.exe',
         'codex-sessions-hub.exe',
+        'codex-sessions-scan-launcher.exe',
         'codex_session_viewer.exe',
         'flutter_windows.dll',
         'data',
@@ -88,7 +90,7 @@ $global:LASTEXITCODE = 0
     $fixturePackage = Join-Path $fixtureRoot 'package'
     $fixtureArchive = Join-Path $fixtureRoot 'release.zip'
     New-Item -ItemType Directory -Path $fixtureBuild | Out-Null
-    foreach ($name in @('codex_session_viewer.exe', 'codex-sessions-collector.exe', 'codex-sessions-hub.exe', 'flutter_windows.dll', 'README.md')) {
+    foreach ($name in @('codex_session_viewer.exe', 'codex-sessions-collector.exe', 'codex-sessions-hub.exe', 'codex-sessions-scan-launcher.exe', 'flutter_windows.dll', 'README.md')) {
         Set-Content -LiteralPath (Join-Path $fixtureBuild $name) -Value 'fixture'
     }
     foreach ($name in @('data', 'sql', 'assets')) {
