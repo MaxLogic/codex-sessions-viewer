@@ -649,6 +649,8 @@ void main() {
       final controller = RuntimeSessionController(
         settingsFile: settingsFile,
         databaseFile: databaseFile,
+        // A fake resolver keeps the scan off the real wsl.exe (T-173).
+        wslProjectResolver: _RecordingWslProjectResolver({}),
       );
       final progressEvents = <SessionsRefreshProgress>[];
       final profilingEvents = <ProfilingEvent>[];
@@ -1286,6 +1288,8 @@ void main() {
       final controller = RuntimeSessionController(
         settingsFile: settingsFile,
         databaseFile: databaseFile,
+        // A fake resolver keeps the scan off the real wsl.exe (T-173).
+        wslProjectResolver: _RecordingWslProjectResolver({}),
       );
       await controller.refresh();
 

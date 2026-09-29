@@ -62,6 +62,8 @@ void main() {
       settingsFile: settingsFile,
       databaseFile: dbFile,
       claudeProjectRoots: const [],
+      // A fake resolver keeps the scan off the real wsl.exe (T-173).
+      wslProjectResolver: const _NoWslProjects(),
     );
     final firstScan = await controller.refresh();
     expect(
@@ -197,4 +199,13 @@ SessionRowViewModel _row(
     tags: const [],
     status: 'Available',
   );
+}
+
+class _NoWslProjects extends WslProjectResolver {
+  const _NoWslProjects();
+
+  @override
+  Future<Map<String, String>> resolveProjectNames(
+    Iterable<String> workingDirectories,
+  ) async => const {};
 }
