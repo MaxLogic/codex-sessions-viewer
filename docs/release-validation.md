@@ -26,13 +26,13 @@ The release folder contains:
 - Flutter runtime files, including `flutter_windows.dll`, `sqlite3.dll`,
   `native_assets.json`, and `data`
 - `README.md`
-- `settings.toml`
+- `settings.sample.toml`
 - `sql`
 - `assets`
 
 If root `README.md` is not present, the script writes a short packaged fallback.
-The build preserves an existing local `release\windows\settings.toml`; when it
-is missing, the script starts it from `settings.sample.toml`.
+The build preserves an existing local `release\windows\settings.toml` and copies
+`settings.sample.toml` separately. It does not create a runtime settings file.
 
 ## Package Script
 
@@ -43,11 +43,12 @@ is missing, the script starts it from `settings.sample.toml`.
 release\codex_session_viewer_windows.zip
 ```
 
-The package includes the built executable and Flutter runtime files. It always
-replaces the copied `settings.toml` with `settings.sample.toml`. Before sharing
-the ZIP, verify that both `release\package\settings.toml` and the archived
-`settings.toml` match the sample, while `release\windows\settings.toml` retains
-its local contents. A package that contains only the executable is incomplete.
+The package includes the built executable and Flutter runtime files. It excludes
+the local `settings.toml` and contains `settings.sample.toml`. Before sharing
+the ZIP, verify that neither the package nor archive contains `settings.toml`,
+that both sample copies match the repository sample, and that
+`release\windows\settings.toml` retains its local contents. A package that
+contains only the executable is incomplete.
 
 Run the native UI Automation filter smoke check against the packaged executable
 and complete the separate NVDA keyboard and speech pass in

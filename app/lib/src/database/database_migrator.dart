@@ -6,21 +6,17 @@ import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart' show sqlite3;
 
 import '../platform/application_working_directory.dart';
+import '../platform/app_locations.dart';
 import 'database_connection.dart';
 import 'database_maintenance_cancelled.dart';
 import 'writer_version_agreement.dart';
 
 File defaultDatabaseFile() {
-  final appData = Platform.environment['APPDATA'];
-  final basePath = appData == null || appData.isEmpty
-      ? applicationExecutableDirectory().path
-      : p.join(appData, 'CodexSessionViewer');
-  return File(p.join(basePath, 'codex_sessions_viewer.sqlite'));
+  return AppLocations.current().databaseFile;
 }
 
 Directory defaultSqlRoot() {
-  final executableDir = applicationExecutableDirectory();
-  final releaseSqlRoot = Directory(p.join(executableDir.path, 'sql'));
+  final releaseSqlRoot = AppLocations.current().sqlDirectory;
   if (releaseSqlRoot.existsSync()) {
     return releaseSqlRoot;
   }

@@ -52,7 +52,7 @@ FILTERS:
   --machine ID     repeatable machine ID
 
 COMMON:
-  --db FILE        database (default: %APPDATA%\\CodexSessionViewer\\codex_sessions_viewer.sqlite)
+  --db FILE        database (default: platform user data folder)
   --format json|text   json (default) or readable text
   --hub URL        optional personal hub (HTTPS or loopback)
   --hub-machine ID  machine on the hub; owner token from CODEX_SESSIONS_HUB_OWNER_TOKEN
@@ -237,7 +237,7 @@ pub fn run(args: &[String], out: &mut impl Write, err: &mut impl Write) -> i32 {
         let database = match &options.db {
             Some(path) => path.clone(),
             None => default_viewer_database().ok_or_else(|| {
-                QueryError::Usage("APPDATA is not set; pass --db FILE".to_owned())
+                QueryError::Usage("Cannot locate user database; pass --db FILE".to_owned())
             })?,
         };
         let conn = open_read_only(&database)?;

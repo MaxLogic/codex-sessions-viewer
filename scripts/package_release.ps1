@@ -42,12 +42,18 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if (Test-Path -LiteralPath $PackageDirectory) {
+    $volumeRoot = [IO.Path]::GetPathRoot($packageFullPath).TrimEnd('\', '/')
+    if ($packageFullPath.Equals($volumeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to replace a volume root as the package directory.'
+    }
     Remove-Item -LiteralPath $PackageDirectory -Recurse -Force
 }
 New-Item -ItemType Directory -Path $PackageDirectory -Force | Out-Null
-Copy-Item -Path (Join-Path $BuildOutputDirectory '*') -Destination $PackageDirectory -Recurse -Force
-# Local build settings belong to this machine. Always replace the packaged copy.
-Copy-Item -LiteralPath $sampleSettings -Destination (Join-Path $PackageDirectory 'settings.toml') -Force
+# Keep local runtime settings in the build folder; copy only distributable files.
+Get-ChildItem -LiteralPath $BuildOutputDirectory -Force |
+    Where-Object { $_.Name -ne 'settings.toml' -and $_.Name -ne 'settings.sample.toml' } |
+    ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $PackageDirectory -Recurse -Force }
+Copy-Item -LiteralPath $sampleSettings -Destination (Join-Path $PackageDirectory 'settings.sample.toml') -Force
 
 foreach ($item in @(
         'codex_session_viewer.exe',
@@ -57,7 +63,7 @@ foreach ($item in @(
         'flutter_windows.dll',
         'data',
         'README.md',
-        'settings.toml',
+        'settings.sample.toml',
         'sql',
         'assets'
     )) {

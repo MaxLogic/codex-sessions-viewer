@@ -32,7 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_release.ps1
 
 `build_windows.ps1` checks Flutter and Rust, runs formatting, analysis, unit and integration tests, and the
 Windows release build. It prepares `release\windows` with
-`codex_session_viewer.exe`, `codex-sessions-collector.exe`, `codex-sessions-hub.exe`, `codex-sessions-scan-launcher.exe`, Flutter runtime files, `README.md`, `settings.toml`,
+`codex_session_viewer.exe`, `codex-sessions-collector.exe`, `codex-sessions-hub.exe`, `codex-sessions-scan-launcher.exe`, Flutter runtime files, `README.md`, `settings.sample.toml`,
 `sql`, and `assets`.
 
 Independent harness collectors can emit the [version 1 ingestion contract](docs/collectors/contract-v1.md).
@@ -44,8 +44,8 @@ normalized records while local collection and browsing remain available.
 `package_release.ps1` rebuilds through the build script, creates
 `release\package`, and writes `release\codex_session_viewer_windows.zip`.
 The local `release\windows\settings.toml` is preserved across builds. The
-package and ZIP always contain `settings.sample.toml` as `settings.toml`, so
-local paths and credentials are not distributed.
+package and ZIP contain `settings.sample.toml` and omit the local runtime
+`settings.toml`, so local paths and credentials are not distributed.
 
 The Rust collector parses every session file; the viewer reads only what it
 stored. To time a refresh through the collector on a local corpus, run the
@@ -57,9 +57,11 @@ only.
 
 ## Configuration
 
-Configuration lives in `settings.toml`. The package starts with safe sample
-settings; configure paths for each machine after installation. Keep the local
-runtime file out of any package you share.
+Configuration lives in a writable per-user `settings.toml`. On first launch the
+viewer creates it from the packaged `settings.sample.toml` and fills blank session
+roots from the current user. An existing Windows
+`settings.toml` beside the executable remains supported. Configure paths for
+each machine after installation; keep the local runtime file out of packages.
 
 Windows Codex sessions:
 

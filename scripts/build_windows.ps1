@@ -167,7 +167,9 @@ if (-not (Test-Path -LiteralPath $buildExe -PathType Leaf)) {
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-Copy-Item -Path (Join-Path $buildReleaseRoot '*') -Destination $OutputDirectory -Recurse -Force
+Get-ChildItem -LiteralPath $buildReleaseRoot -Force |
+    Where-Object { $_.Name -ne 'settings.toml' } |
+    ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $OutputDirectory -Recurse -Force }
 
 $releaseExe = Join-Path $OutputDirectory 'codex_session_viewer.exe'
 Copy-Item -LiteralPath $buildExe -Destination $releaseExe -Force
@@ -191,12 +193,8 @@ else {
     Write-FallbackReadme -Destination $releaseReadme
 }
 
-$releaseSettings = Join-Path $OutputDirectory 'settings.toml'
-$hasUsableReleaseSettings = (Test-Path -LiteralPath $releaseSettings -PathType Leaf) -and
-    ((Get-Item -LiteralPath $releaseSettings).Length -gt 0)
-if (-not $hasUsableReleaseSettings) {
-    Copy-Item -LiteralPath $settingsFile -Destination $releaseSettings -Force
-}
+$releaseSampleSettings = Join-Path $OutputDirectory 'settings.sample.toml'
+Copy-Item -LiteralPath $settingsFile -Destination $releaseSampleSettings -Force
 
 Copy-DirectoryClean -Source $sqlRoot -Destination (Join-Path $OutputDirectory 'sql')
 Copy-DirectoryClean -Source $assetsRoot -Destination (Join-Path $OutputDirectory 'assets')
@@ -208,7 +206,7 @@ foreach ($requiredOutput in @(
         (Join-Path $OutputDirectory 'flutter_windows.dll'),
         (Join-Path $OutputDirectory 'data'),
         $releaseReadme,
-        $releaseSettings,
+        $releaseSampleSettings,
         (Join-Path $OutputDirectory 'sql'),
         (Join-Path $OutputDirectory 'assets')
     )) {

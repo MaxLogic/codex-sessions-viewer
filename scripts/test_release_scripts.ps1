@@ -21,6 +21,23 @@ function Assert-True {
     }
 }
 
+function Get-ContentHash {
+    param([string] $Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        try {
+            return [BitConverter]::ToString($sha.ComputeHash($stream))
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
 Assert-True (Test-Path -LiteralPath $buildScript -PathType Leaf) 'Missing scripts/build_windows.ps1'
 Assert-True (Test-Path -LiteralPath $packageScript -PathType Leaf) 'Missing scripts/package_release.ps1'
 
@@ -41,7 +58,7 @@ foreach ($needle in @(
         'codex_session_viewer.exe',
         'flutter_windows.dll',
         'data',
-        'settings.toml',
+        'settings.sample.toml',
         'README.md',
         'sql',
         'assets'
@@ -58,7 +75,7 @@ foreach ($needle in @(
         'flutter_windows.dll',
         'data',
         'README.md',
-        'settings.toml',
+        'settings.sample.toml',
         'sql',
         'assets',
         'Compress-Archive',
@@ -99,14 +116,17 @@ $global:LASTEXITCODE = 0
     }
     $localSettings = Join-Path $fixtureBuild 'settings.toml'
     Set-Content -LiteralPath $localSettings -Value '[pricing.openrouter]', 'api_key = "private-test-marker"'
-    $localHash = (Get-FileHash -LiteralPath $localSettings).Hash
-    $sampleHash = (Get-FileHash -LiteralPath $sampleSettings).Hash
+    Copy-Item -LiteralPath $sampleSettings -Destination (Join-Path $fixtureBuild 'settings.sample.toml')
+    $localHash = Get-ContentHash $localSettings
+    $sampleHash = Get-ContentHash $sampleSettings
     & (Join-Path $fixtureScripts 'package_release.ps1') -BuildOutputDirectory $fixtureBuild -PackageDirectory $fixturePackage -ArchivePath $fixtureArchive
-    Assert-True ((Get-FileHash -LiteralPath $localSettings).Hash -eq $localHash) 'Packaging changed local settings'
-    Assert-True ((Get-FileHash -LiteralPath (Join-Path $fixturePackage 'settings.toml')).Hash -eq $sampleHash) 'Package settings differ from safe sample'
+    Assert-True ((Get-ContentHash $localSettings) -eq $localHash) 'Packaging changed local settings'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixturePackage 'settings.toml'))) 'Package contains runtime settings'
+    Assert-True ((Get-ContentHash (Join-Path $fixturePackage 'settings.sample.toml')) -eq $sampleHash) 'Package sample differs from safe sample'
     $expanded = Join-Path $fixtureRoot 'expanded'
     Expand-Archive -LiteralPath $fixtureArchive -DestinationPath $expanded
-    Assert-True ((Get-FileHash -LiteralPath (Join-Path $expanded 'settings.toml')).Hash -eq $sampleHash) 'ZIP settings differ from safe sample'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $expanded 'settings.toml'))) 'ZIP contains runtime settings'
+    Assert-True ((Get-ContentHash (Join-Path $expanded 'settings.sample.toml')) -eq $sampleHash) 'ZIP sample differs from safe sample'
     $overlapRejected = $false
     try {
         & (Join-Path $fixtureScripts 'package_release.ps1') -BuildOutputDirectory $fixtureBuild -PackageDirectory $fixtureBuild -ArchivePath $fixtureArchive
@@ -115,7 +135,7 @@ $global:LASTEXITCODE = 0
         $overlapRejected = $_.Exception.Message -like '*separate, non-nested*'
     }
     Assert-True $overlapRejected 'Packaging must reject overlapping build/package directories'
-    Assert-True ((Get-FileHash -LiteralPath $localSettings).Hash -eq $localHash) 'Overlap rejection changed local settings'
+    Assert-True ((Get-ContentHash $localSettings) -eq $localHash) 'Overlap rejection changed local settings'
 }
 finally {
     $resolvedFixture = [IO.Path]::GetFullPath($fixtureRoot)

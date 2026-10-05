@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::codex::parser::DEFAULT_MAX_TOOL_OUTPUT_PREVIEW_CHARS;
+use crate::platform_locations::PlatformLocations;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectorSettings {
@@ -120,22 +121,16 @@ impl CollectorSettings {
     }
 }
 
-/// The viewer looks for `settings.toml` next to its executable; the bundled
-/// collector sits in the same folder.
+/// Uses the viewer's per-user settings, with adjacent Windows settings for
+/// existing installations. A missing file leaves scan roots at their defaults.
 pub fn default_settings_file() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join("settings.toml");
+    let candidate = PlatformLocations::current()?.settings_file;
     candidate.is_file().then_some(candidate)
 }
 
-/// `%APPDATA%\CodexSessionViewer\codex_sessions_viewer.sqlite`, like the viewer.
+/// The same platform user database path as the viewer.
 pub fn default_viewer_database() -> Option<PathBuf> {
-    let app_data = std::env::var_os("APPDATA").filter(|value| !value.is_empty())?;
-    Some(
-        PathBuf::from(app_data)
-            .join("CodexSessionViewer")
-            .join("codex_sessions_viewer.sqlite"),
-    )
+    Some(PlatformLocations::current()?.database_file)
 }
 
 #[cfg(test)]

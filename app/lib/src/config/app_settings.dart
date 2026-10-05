@@ -4,28 +4,12 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:toml/toml.dart';
 
-import '../platform/application_working_directory.dart';
+import '../platform/app_locations.dart';
 import '../platform/wsl_default_distro_detector.dart';
 import 'default_session_folders.dart';
 
 File defaultSettingsFile() {
-  final executableDirectory = applicationExecutableDirectory();
-  final executableSettings = File(
-    p.join(executableDirectory.path, 'settings.toml'),
-  );
-  if (executableSettings.existsSync()) {
-    return executableSettings;
-  }
-  final developmentRoot = findDevelopmentRepositoryRoot();
-  if (developmentRoot != null) {
-    final repoRootSettings = File(
-      p.join(developmentRoot.path, 'settings.toml'),
-    );
-    if (repoRootSettings.existsSync()) {
-      return repoRootSettings;
-    }
-  }
-  return executableSettings;
+  return AppLocations.current().settingsFile;
 }
 
 enum AppThemeMode {
@@ -97,12 +81,16 @@ class SettingsRepository {
   SettingsRepository(
     this.file, {
     this.wslDetector = const NoWslDefaultDistroDetector(),
+    this.locations,
   });
 
   final File file;
 
   /// Fills the WSL defaults when the settings file is first created.
   final WslDefaultDistroDetector wslDetector;
+
+  /// An injected resolver keeps first-run location tests off the user's disk.
+  final AppLocations? locations;
 
   /// Pending operations per settings file. Window placement, table layout,
   /// and the Settings screen all write the same file; each load-modify-save
@@ -158,6 +146,42 @@ class SettingsRepository {
 
   Future<AppSettings> _loadOrCreate() async {
     if (!await file.exists()) {
+      final resolvedLocations = locations ?? AppLocations.current();
+      final sample =
+          file.absolute.path == resolvedLocations.settingsFile.absolute.path
+          ? resolvedLocations.sampleSettingsFile
+          : null;
+      if (sample != null && await sample.exists()) {
+        final copied = AppSettings.fromTomlMap(
+          TomlDocument.parse(await sample.readAsString()).toMap(),
+        );
+        final folders = DefaultSessionFolders.current().withWsl(
+          await wslDetector.detect(),
+        );
+        final populated = copied.copyWith(
+          paths: PathSettings(
+            windowsCodexPath: copied.paths.windowsCodexPath.isEmpty
+                ? folders.windowsCodexPath
+                : copied.paths.windowsCodexPath,
+            wslCodexUncPath: copied.paths.wslCodexUncPath.isEmpty
+                ? folders.wslCodexUncPath
+                : copied.paths.wslCodexUncPath,
+          ),
+          wsl: WslSettings(
+            distro: copied.wsl.distro.isEmpty
+                ? folders.wslDistro
+                : copied.wsl.distro,
+            linuxHome: copied.wsl.linuxHome.isEmpty
+                ? folders.wslLinuxHome
+                : copied.wsl.linuxHome,
+            linuxRootUnc: copied.wsl.linuxRootUnc.isEmpty
+                ? folders.wslLinuxRootUnc
+                : copied.wsl.linuxRootUnc,
+          ),
+        );
+        await _save(populated);
+        return populated;
+      }
       final settings = AppSettings.defaults(
         folders: DefaultSessionFolders.current().withWsl(
           await wslDetector.detect(),
@@ -250,6 +274,10 @@ class AppSettings {
   static AppSettings? _currentDefaults;
 
   factory AppSettings._forFolders(DefaultSessionFolders session) {
+    final locations = AppLocations.current();
+    final assets = AppLocations.currentPlatform == AppHostPlatform.windows
+        ? 'assets'
+        : locations.assetsDirectory.path;
     return _defaults.copyWith(
       paths: PathSettings(
         windowsCodexPath: session.windowsCodexPath,
@@ -259,6 +287,27 @@ class AppSettings {
         distro: session.wslDistro,
         linuxHome: session.wslLinuxHome,
         linuxRootUnc: session.wslLinuxRootUnc,
+      ),
+      voiceOver: VoiceOverSettings(
+        enabled: _defaults.voiceOver.enabled,
+        preferWav: _defaults.voiceOver.preferWav,
+        fallbackToScreenReader: _defaults.voiceOver.fallbackToScreenReader,
+        events: {
+          for (final entry in _defaults.voiceOver.events.entries)
+            entry.key: VoiceOverEventSettings(
+              text: entry.value.text,
+              wav: p.join(assets, 'voice', '${entry.key}.wav'),
+            ),
+        },
+      ),
+      logging: LoggingSettings(
+        level: _defaults.logging.level,
+        logFile: p.join(
+          locations.logDirectory.path,
+          'codex-session-viewer.log',
+        ),
+        maxLogFiles: _defaults.logging.maxLogFiles,
+        maxLogSizeMb: _defaults.logging.maxLogSizeMb,
       ),
     );
   }
@@ -322,27 +371,27 @@ class AppSettings {
       events: {
         'scan_started': VoiceOverEventSettings(
           text: 'Scanning started',
-          wav: r'assets\voice\scan_started.wav',
+          wav: 'assets/voice/scan_started.wav',
         ),
         'scan_finished': VoiceOverEventSettings(
           text: 'Scanning finished',
-          wav: r'assets\voice\scan_finished.wav',
+          wav: 'assets/voice/scan_finished.wav',
         ),
         'copied': VoiceOverEventSettings(
           text: 'Copied',
-          wav: r'assets\voice\copied.wav',
+          wav: 'assets/voice/copied.wav',
         ),
         'export_finished': VoiceOverEventSettings(
           text: 'Export finished',
-          wav: r'assets\voice\export_finished.wav',
+          wav: 'assets/voice/export_finished.wav',
         ),
         'parse_error': VoiceOverEventSettings(
           text: 'Some sessions could not be parsed',
-          wav: r'assets\voice\parse_error.wav',
+          wav: 'assets/voice/parse_error.wav',
         ),
         'database_error': VoiceOverEventSettings(
           text: 'Database error',
-          wav: r'assets\voice\database_error.wav',
+          wav: 'assets/voice/database_error.wav',
         ),
       },
     ),
@@ -368,7 +417,7 @@ class AppSettings {
     ),
     logging: LoggingSettings(
       level: 'info',
-      logFile: r'logs\codex-session-viewer.log',
+      logFile: 'logs/codex-session-viewer.log',
       maxLogFiles: 5,
       maxLogSizeMb: 10,
     ),

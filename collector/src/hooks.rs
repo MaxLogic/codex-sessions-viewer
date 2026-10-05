@@ -47,19 +47,20 @@ pub struct WorkItem {
 }
 
 /// `CODEX_SESSIONS_COLLECTOR_QUEUE`, else
-/// `%LOCALAPPDATA%\CodexSessionViewer\collector\queue`.
+/// The platform's per-user cache queue.
 pub fn queue_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("CODEX_SESSIONS_COLLECTOR_QUEUE").filter(|v| !v.is_empty())
     {
         return PathBuf::from(dir);
     }
-    let base = std::env::var_os("LOCALAPPDATA")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("CodexSessionViewer")
-        .join("collector")
-        .join("queue")
+    crate::platform_locations::PlatformLocations::current()
+        .map(|locations| locations.queue_dir)
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("CodexSessionViewer")
+                .join("collector")
+                .join("queue")
+        })
 }
 
 fn unique_name() -> String {

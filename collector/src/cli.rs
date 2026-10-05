@@ -47,7 +47,7 @@ USAGE:
   codex-sessions-collector version
 
 DATABASE OPTIONS:
-  --db <FILE>           Viewer database (default: %APPDATA%\\CodexSessionViewer\\codex_sessions_viewer.sqlite)
+  --db <FILE>           Viewer database (default: platform user data folder)
   --standalone <FILE>   Collector-owned database; created and migrated by the collector
 
 DIAGNOSTIC OPTIONS:
@@ -57,7 +57,7 @@ DIAGNOSTIC OPTIONS:
   --hub-url <URL>      Explicit verify endpoint; only --check-hub makes a request
 
 SCAN OPTIONS:
-  --settings <FILE>     Viewer settings.toml (default: next to this executable)
+  --settings <FILE>     Viewer settings.toml (default: platform user config folder)
   --windows-root <DIR>  Windows Codex home or sessions folder (overrides settings)
   --wsl-root <DIR>      WSL Codex home as a \\\\wsl.localhost path (overrides settings)
   --wsl-unc-root <DIR>  WSL file-system root, e.g. \\\\wsl.localhost\\Ubuntu\\
@@ -80,7 +80,7 @@ HOOK OPTIONS:
   --no-drain                Queue the work but do not start a drain
   --no-wait                 drain: handle what is due now instead of waiting for retries
 Hooks exit 0 even when they fail; problems go to errors.log in the queue folder
-(CODEX_SESSIONS_COLLECTOR_QUEUE, default %LOCALAPPDATA%\\CodexSessionViewer\\collector\\queue).
+(CODEX_SESSIONS_COLLECTOR_QUEUE, default: platform user cache folder).
 Hub sync reads CODEX_SESSIONS_HUB_MACHINE_TOKEN from the environment. Schedule it
 separately; local collection never waits for network delivery.
 ";
@@ -328,8 +328,9 @@ fn open_store(options: &Options) -> Result<Store, CliError> {
     }
     let path = match &options.db {
         Some(path) => path.clone(),
-        None => default_viewer_database()
-            .ok_or_else(|| CliError::Usage("APPDATA is not set; pass --db <FILE>".to_owned()))?,
+        None => default_viewer_database().ok_or_else(|| {
+            CliError::Usage("Cannot locate user database; pass --db <FILE>".to_owned())
+        })?,
     };
     Ok(Store::open(&path, OwnerMode::Viewer)?)
 }
