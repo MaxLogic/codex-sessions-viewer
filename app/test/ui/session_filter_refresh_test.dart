@@ -1486,6 +1486,9 @@ void main() {
     await _enterSessionSearch(tester, 'Alpha');
     expect(find.text('Beta row'), findsNothing);
 
+    await tester.ensureVisible(
+      find.widgetWithText(OutlinedButton, 'Clear filters'),
+    );
     await tester.tap(find.widgetWithText(OutlinedButton, 'Clear filters'));
     await tester.pump();
 
@@ -1857,9 +1860,7 @@ void main() {
 
     await tester.tap(find.text('More filters'));
     await tester.pumpAndSettle();
-    await tester.tap(
-      find.bySemanticsLabel('Newest session per project filter'),
-    );
+    await tester.tap(find.text('Limit sessions per project'));
     await tester.pumpAndSettle();
 
     expect(tableStates.last.newestPerProjectOnly, isTrue);

@@ -10,6 +10,7 @@ import '../../commands/windows_command_line.dart';
 import '../../config/app_settings.dart';
 import '../../export/session_list_exporter.dart';
 import '../dialogs/delayed_export_progress.dart';
+import '../dialogs/exclude_projects_dialog.dart';
 import '../../voice_over/voice_over_service.dart';
 import '../copy_shortcut.dart';
 import '../../usage/usage_summary.dart';
@@ -21,6 +22,7 @@ import '../number_formatting.dart';
 import '../widgets/command_preview.dart';
 import '../widgets/conversation_view.dart';
 import '../widgets/session_detail_pane.dart';
+import '../widgets/session_project_limit.dart';
 import '../widgets/svg_icon.dart';
 import '../widgets/app_button.dart';
 import '../widgets/menu_header_entry.dart';
@@ -240,6 +242,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   );
   final _pathController = TextEditingController();
   final _threadNameController = TextEditingController();
+  final _filterScrollController = ScrollController();
   var _platformFilter = SessionsPlatformFilter.both;
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
   var _originFilter = _defaultOriginFilter;
@@ -261,7 +264,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
   List<String> _projectOptionsCache = const [];
   List<String> _modelOptionsCache = const [];
   List<String> _tagOptionsCache = const [];
-  var _newestPerProjectOnly = false;
+  int? _maxSessionsPerProject;
+  Set<String> _excludedProjects = const {};
+  Set<String> _excludedProjectKeys = const {};
   var _namedOnly = false;
   String? _projectFilter;
   var _handledProjectFilterSerial = 0;
@@ -324,7 +329,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _columnWidths = Map.of(tableState.columnWidths);
     _sorts = _normalizedSorts(tableState.sorts);
     _tablePaneFraction = tableState.paneFraction;
-    _newestPerProjectOnly = tableState.newestPerProjectOnly;
+    _maxSessionsPerProject = tableState.maxSessionsPerProject;
+    _setExcludedProjects(tableState.excludedProjects);
     _scanAnnouncement = widget.initialStatusMessage;
     _handledAutoRefreshToken = widget.autoRefreshToken;
     _handledOpenTargetSerial = -1;
@@ -431,6 +437,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _searchFocusNode.dispose();
     _screenFocusNode.dispose();
     _filterAreaFocusNode.dispose();
+    _filterScrollController.dispose();
     super.dispose();
   }
 
@@ -517,85 +524,109 @@ class _SessionsScreenState extends State<SessionsScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          _FilterBar(
-                            searchController: _searchController,
-                            searchFocusNode: _searchFocusNode,
-                            filterAreaFocusNode: _filterAreaFocusNode,
-                            pathController: _pathController,
-                            threadNameController: _threadNameController,
-                            platformFilter: _platformFilter,
-                            timeFilter: _timeFilter,
-                            archivedFilter: _archivedFilter,
-                            originFilter: _originFilter,
-                            harnessFilter: _harnessFilter,
-                            onHarnessChanged: (value) =>
-                                _updateFilter(() => _harnessFilter = value),
-                            newestPerProjectOnly: _newestPerProjectOnly,
-                            namedOnly: _namedOnly,
-                            projectFilter: _projectFilter,
-                            modelFilter: _modelFilter,
-                            tagFilter: _tagFilter,
-                            projectOptions: _facets.projects,
-                            modelOptions: _facets.models,
-                            tagOptions: _facets.tags,
-                            visibleCount: visibleDisplayRows
-                                .where((displayRow) => displayRow.depth == 0)
-                                .length,
-                            totalCount: _originScopedRowCount,
-                            onProjectChanged: (value) =>
-                                _updateFilter(() => _projectFilter = value),
-                            onModelChanged: (value) =>
-                                _updateFilter(() => _modelFilter = value),
-                            onTagChanged: (value) =>
-                                _updateFilter(() => _tagFilter = value),
-                            isScanning: _isScanning,
-                            isCancellingRefresh: _isCancellingRefresh,
-                            onPlatformChanged: (value) {
-                              setState(() {
-                                _platformFilter = value;
-                                _retainSelection();
-                                _markVisibleRowsForMotion();
-                              });
-                            },
-                            onTimeChanged: (value) {
-                              setState(() {
-                                _timeFilter = value;
-                                _retainSelection();
-                                _markVisibleRowsForMotion();
-                              });
-                            },
-                            onArchivedChanged: (value) {
-                              setState(() {
-                                _archivedFilter = value;
-                                _retainSelection();
-                                _markVisibleRowsForMotion();
-                              });
-                            },
-                            onOriginChanged: (value) {
-                              setState(() {
-                                _originFilter = value;
-                                _retainSelection();
-                                _markVisibleRowsForMotion();
-                              });
-                            },
-                            onNewestPerProjectOnlyChanged: (value) {
-                              setState(() {
-                                _newestPerProjectOnly = value;
-                                _retainSelection();
-                                _markVisibleRowsForMotion();
-                              });
-                              _emitTableState();
-                            },
-                            onNamedOnlyChanged: (value) {
-                              setState(() {
-                                _namedOnly = value;
-                                _retainSelection();
-                                _markVisibleRowsForMotion();
-                              });
-                            },
-                            onClearFilters: _clearFilters,
-                            onRefresh: () =>
-                                unawaited(_refresh(userInitiated: true)),
+                          ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxHeight: constraints.maxHeight * 0.55,
+                            ),
+                            child: Scrollbar(
+                              controller: _filterScrollController,
+                              thumbVisibility: true,
+                              child: SingleChildScrollView(
+                                controller: _filterScrollController,
+                                child: _FilterBar(
+                                  searchController: _searchController,
+                                  searchFocusNode: _searchFocusNode,
+                                  filterAreaFocusNode: _filterAreaFocusNode,
+                                  pathController: _pathController,
+                                  threadNameController: _threadNameController,
+                                  platformFilter: _platformFilter,
+
+                                  timeFilter: _timeFilter,
+                                  archivedFilter: _archivedFilter,
+                                  originFilter: _originFilter,
+                                  harnessFilter: _harnessFilter,
+                                  onHarnessChanged: (value) => _updateFilter(
+                                    () => _harnessFilter = value,
+                                  ),
+                                  maxSessionsPerProject: _maxSessionsPerProject,
+                                  excludedProjects: _excludedProjects,
+                                  namedOnly: _namedOnly,
+                                  projectFilter: _projectFilter,
+                                  modelFilter: _modelFilter,
+                                  tagFilter: _tagFilter,
+                                  projectOptions: _facets.projects,
+                                  modelOptions: _facets.models,
+                                  tagOptions: _facets.tags,
+                                  visibleCount: visibleDisplayRows
+                                      .where(
+                                        (displayRow) => displayRow.depth == 0,
+                                      )
+                                      .length,
+                                  totalCount: _originScopedRowCount,
+                                  onProjectChanged: (value) => _updateFilter(
+                                    () => _projectFilter = value,
+                                  ),
+                                  onModelChanged: (value) =>
+                                      _updateFilter(() => _modelFilter = value),
+                                  onTagChanged: (value) =>
+                                      _updateFilter(() => _tagFilter = value),
+                                  isScanning: _isScanning,
+                                  isCancellingRefresh: _isCancellingRefresh,
+                                  onPlatformChanged: (value) {
+                                    setState(() {
+                                      _platformFilter = value;
+                                      _retainSelection();
+                                      _markVisibleRowsForMotion();
+                                    });
+                                  },
+                                  onTimeChanged: (value) {
+                                    setState(() {
+                                      _timeFilter = value;
+                                      _retainSelection();
+                                      _markVisibleRowsForMotion();
+                                    });
+                                  },
+                                  onArchivedChanged: (value) {
+                                    setState(() {
+                                      _archivedFilter = value;
+                                      _retainSelection();
+                                      _markVisibleRowsForMotion();
+                                    });
+                                  },
+                                  onOriginChanged: (value) {
+                                    setState(() {
+                                      _originFilter = value;
+                                      _retainSelection();
+                                      _markVisibleRowsForMotion();
+                                    });
+                                  },
+                                  onMaxSessionsPerProjectChanged: (value) {
+                                    setState(() {
+                                      _maxSessionsPerProject = value;
+                                      _retainSelection();
+                                      _markVisibleRowsForMotion();
+                                    });
+                                    _emitTableState();
+                                  },
+                                  onExcludedProjectsChanged: (projects) {
+                                    _updateFilter(
+                                      () => _setExcludedProjects(projects),
+                                    );
+                                    _emitTableState();
+                                  },
+                                  onNamedOnlyChanged: (value) {
+                                    setState(() {
+                                      _namedOnly = value;
+                                      _retainSelection();
+                                      _markVisibleRowsForMotion();
+                                    });
+                                  },
+                                  onClearFilters: _clearFilters,
+                                  onRefresh: () =>
+                                      unawaited(_refresh(userInitiated: true)),
+                                ),
+                              ),
+                            ),
                           ),
                           Expanded(
                             child: visibleDisplayRows.isEmpty
@@ -790,7 +821,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _timeFilter,
       if (_timeFilter != SessionsTimeFilter.allTime)
         widget.now().microsecondsSinceEpoch ~/ Duration.microsecondsPerMinute,
-      _newestPerProjectOnly,
+      _maxSessionsPerProject,
+      _excludedProjects,
       _namedOnly,
       _projectFilter,
       _modelFilter,
@@ -858,7 +890,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
           threadName: threadName,
         );
       case SessionsOriginFilter.subagent:
-        final rows = _newestPerProjectOnly
+        final rows = _maxSessionsPerProject != null
             ? _newestRowsPerProject(
                 hierarchy.subagents
                     .where(
@@ -894,6 +926,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }) {
     final groups = <List<_SessionDisplayRow>>[];
     for (final parent in _sortedRows(parents)) {
+      if (_isProjectExcluded(parent)) continue;
       final childRows = childrenByParentId[parent.id];
       final children = childRows == null
           ? const <SessionRowViewModel>[]
@@ -947,12 +980,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
           _compareRowsByActiveSorts(left.first.row, right.first.row),
     );
     final reducedGroups =
-        applyNewestPerProject &&
-            _newestPerProjectOnly &&
-            search.isEmpty &&
-            path.isEmpty &&
-            threadName.isEmpty &&
-            !_namedOnly
+        applyNewestPerProject && _maxSessionsPerProject != null
         ? _newestDisplayGroupsPerProject(groups)
         : groups;
     return [
@@ -1043,12 +1071,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
       (left, right) =>
           _compareRowsByActiveSorts(left.first.row, right.first.row),
     );
-    final reducedGroups =
-        _newestPerProjectOnly &&
-            search.isEmpty &&
-            path.isEmpty &&
-            threadName.isEmpty &&
-            !_namedOnly
+    final reducedGroups = _maxSessionsPerProject != null
         ? _newestDisplayGroupsPerProject(groups)
         : groups;
     return [
@@ -1076,16 +1099,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   List<List<_SessionDisplayRow>> _newestDisplayGroupsPerProject(
     List<List<_SessionDisplayRow>> groups,
   ) {
-    final newestByProject = <String, List<_SessionDisplayRow>>{};
-    for (final group in groups) {
-      final key = _projectGroupKey(group.first.row);
-      final current = newestByProject[key];
-      if (current == null ||
-          _isNewerProjectRow(group.first.row, current.first.row)) {
-        newestByProject[key] = group;
-      }
-    }
-    return newestByProject.values.toList(growable: false)..sort(
+    return _latestRowsPerProject(groups, (group) => group.first.row)..sort(
       (left, right) =>
           _compareRowsByActiveSorts(left.first.row, right.first.row),
     );
@@ -1179,6 +1193,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   bool _matchesFacets(SessionRowViewModel row) {
+    if (_isProjectExcluded(row)) return false;
+    final parent = _buildSessionHierarchy().parentByChildId[row.id];
+    if (parent != null && _isProjectExcluded(parent)) return false;
     if (_harnessFilter != null && row.harness != _harnessFilter) return false;
     final project = _projectFilter;
     if (project != null && row.project.trim() != project) {
@@ -1240,36 +1257,52 @@ class _SessionsScreenState extends State<SessionsScreen> {
   List<SessionRowViewModel> _newestRowsPerProject(
     List<SessionRowViewModel> rows,
   ) {
-    final newestByProject = <String, SessionRowViewModel>{};
-    for (final row in rows) {
-      final key = _projectGroupKey(row);
-      final current = newestByProject[key];
-      if (current == null || _isNewerProjectRow(row, current)) {
-        newestByProject[key] = row;
-      }
-    }
-    return newestByProject.values.toList(growable: false);
+    return _latestRowsPerProject(rows, (row) => row);
   }
+
+  List<T> _latestRowsPerProject<T>(
+    List<T> items,
+    SessionRowViewModel Function(T) rowOf,
+  ) {
+    final limit = _maxSessionsPerProject;
+    if (limit == null) return items;
+    final byProject = <String, List<T>>{};
+    for (final item in items) {
+      (byProject[_projectGroupKey(rowOf(item))] ??= []).add(item);
+    }
+    return [
+      for (final group in byProject.values)
+        ...((group..sort((left, right) {
+              final a = rowOf(left);
+              final b = rowOf(right);
+              final byActivity = b.lastMessageAtUtc.compareTo(
+                a.lastMessageAtUtc,
+              );
+              return byActivity != 0 ? byActivity : a.id.compareTo(b.id);
+            }))
+            .take(limit)),
+    ];
+  }
+
+  void _setExcludedProjects(Iterable<String> projects) {
+    final names = <String, String>{};
+    for (final project in projects) {
+      final name = project.trim();
+      if (name.isNotEmpty) names.putIfAbsent(name.toLowerCase(), () => name);
+    }
+    _excludedProjects = Set.unmodifiable(names.values);
+    _excludedProjectKeys = Set.unmodifiable(names.keys);
+  }
+
+  bool _isProjectExcluded(SessionRowViewModel row) =>
+      _excludedProjectKeys.contains(row.project.trim().toLowerCase());
 
   String _projectGroupKey(SessionRowViewModel row) {
     final project = row.project.trim().toLowerCase();
     if (project.isNotEmpty) {
-      return project;
+      return 'project:$project';
     }
     return 'session:${row.id}';
-  }
-
-  bool _isNewerProjectRow(
-    SessionRowViewModel candidate,
-    SessionRowViewModel current,
-  ) {
-    final timestampOrder = candidate.lastMessageAtUtc.compareTo(
-      current.lastMessageAtUtc,
-    );
-    if (timestampOrder != 0) {
-      return timestampOrder > 0;
-    }
-    return candidate.id.compareTo(current.id) < 0;
   }
 
   List<SessionRowViewModel> _sortedRows(List<SessionRowViewModel> rows) {
@@ -1432,7 +1465,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _timeFilter != _defaultTimeFilter ||
         _archivedFilter != SessionsArchivedFilter.activeOnly ||
         _originFilter != _defaultOriginFilter ||
-        _newestPerProjectOnly ||
+        _maxSessionsPerProject != null ||
+        _excludedProjects.isNotEmpty ||
         _namedOnly ||
         _projectFilter != null ||
         _modelFilter != null ||
@@ -1590,7 +1624,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _timeFilter = SessionsTimeFilter.allTime;
         _archivedFilter = SessionsArchivedFilter.all;
         _originFilter = SessionsOriginFilter.all;
-        _newestPerProjectOnly = false;
+        _maxSessionsPerProject = null;
+        _setExcludedProjects(const []);
         _namedOnly = false;
         _projectFilter = null;
         _modelFilter = null;
@@ -1853,7 +1888,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _timeFilter = _defaultTimeFilter;
         _archivedFilter = SessionsArchivedFilter.activeOnly;
         _originFilter = _defaultOriginFilter;
-        _newestPerProjectOnly = false;
+        _maxSessionsPerProject = null;
+        _setExcludedProjects(const []);
         _namedOnly = false;
         _projectFilter = null;
         _modelFilter = null;
@@ -1894,7 +1930,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _timeFilter = SessionsTimeFilter.allTime;
       _archivedFilter = SessionsArchivedFilter.all;
       _originFilter = SessionsOriginFilter.all;
-      _newestPerProjectOnly = false;
+      _maxSessionsPerProject = null;
+      _setExcludedProjects(const []);
       _namedOnly = false;
       _projectFilter = project;
       _modelFilter = null;
@@ -2591,7 +2628,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
       SessionTableSettings(
         columnWidths: Map.unmodifiable(_columnWidths),
         sorts: List.unmodifiable(_sorts),
-        newestPerProjectOnly: _newestPerProjectOnly,
+        maxSessionsPerProject: _maxSessionsPerProject,
+        excludedProjects: List.unmodifiable(_excludedProjects),
         paneFraction: _tablePaneFraction,
       ),
     );
@@ -3381,7 +3419,9 @@ class _FilterBar extends StatefulWidget {
     required this.originFilter,
     required this.harnessFilter,
     required this.onHarnessChanged,
-    required this.newestPerProjectOnly,
+    required this.maxSessionsPerProject,
+    required this.excludedProjects,
+    required this.onExcludedProjectsChanged,
     required this.namedOnly,
     required this.projectFilter,
     required this.modelFilter,
@@ -3397,7 +3437,7 @@ class _FilterBar extends StatefulWidget {
     required this.onTimeChanged,
     required this.onArchivedChanged,
     required this.onOriginChanged,
-    required this.onNewestPerProjectOnlyChanged,
+    required this.onMaxSessionsPerProjectChanged,
     required this.onNamedOnlyChanged,
     required this.onProjectChanged,
     required this.onModelChanged,
@@ -3417,7 +3457,9 @@ class _FilterBar extends StatefulWidget {
   final SessionsOriginFilter originFilter;
   final String? harnessFilter;
   final ValueChanged<String?> onHarnessChanged;
-  final bool newestPerProjectOnly;
+  final int? maxSessionsPerProject;
+  final Set<String> excludedProjects;
+  final ValueChanged<Set<String>> onExcludedProjectsChanged;
   final bool namedOnly;
   final String? projectFilter;
   final String? modelFilter;
@@ -3433,7 +3475,7 @@ class _FilterBar extends StatefulWidget {
   final ValueChanged<SessionsTimeFilter> onTimeChanged;
   final ValueChanged<SessionsArchivedFilter> onArchivedChanged;
   final ValueChanged<SessionsOriginFilter> onOriginChanged;
-  final ValueChanged<bool> onNewestPerProjectOnlyChanged;
+  final ValueChanged<int?> onMaxSessionsPerProjectChanged;
   final ValueChanged<bool> onNamedOnlyChanged;
   final ValueChanged<String?> onProjectChanged;
   final ValueChanged<String?> onModelChanged;
@@ -3447,13 +3489,29 @@ class _FilterBar extends StatefulWidget {
 
 class _FilterBarState extends State<_FilterBar> {
   late bool _showMore;
+  final _excludeProjectsFocusNode = FocusNode(debugLabel: 'Exclude projects');
+
+  Future<void> _editExcludedProjects() async {
+    final projects = await showDialog<Set<String>>(
+      context: context,
+      builder: (context) => ExcludeProjectsDialog(
+        projects: widget.projectOptions,
+        excludedProjects: widget.excludedProjects,
+      ),
+    );
+    if (!mounted) return;
+    if (projects != null) widget.onExcludedProjectsChanged(projects);
+    _excludeProjectsFocusNode.requestFocus();
+  }
 
   @override
   void initState() {
     super.initState();
     _showMore =
         widget.pathController.text.isNotEmpty ||
-        widget.threadNameController.text.isNotEmpty;
+        widget.threadNameController.text.isNotEmpty ||
+        widget.maxSessionsPerProject != null ||
+        widget.excludedProjects.isNotEmpty;
     widget.searchController.addListener(_textChanged);
     widget.pathController.addListener(_textChanged);
     widget.threadNameController.addListener(_textChanged);
@@ -3461,6 +3519,7 @@ class _FilterBarState extends State<_FilterBar> {
 
   @override
   void dispose() {
+    _excludeProjectsFocusNode.dispose();
     widget.searchController.removeListener(_textChanged);
     widget.pathController.removeListener(_textChanged);
     widget.threadNameController.removeListener(_textChanged);
@@ -3486,7 +3545,8 @@ class _FilterBarState extends State<_FilterBar> {
     final hiddenActiveCount = [
       widget.archivedFilter != SessionsArchivedFilter.activeOnly,
       widget.namedOnly,
-      widget.newestPerProjectOnly,
+      widget.maxSessionsPerProject != null,
+      widget.excludedProjects.isNotEmpty,
       widget.pathController.text.trim().isNotEmpty,
       widget.threadNameController.text.trim().isNotEmpty,
     ].where((active) => active).length;
@@ -3680,12 +3740,15 @@ class _FilterBarState extends State<_FilterBar> {
                 value: widget.namedOnly,
                 onChanged: widget.onNamedOnlyChanged,
               ),
-              _ToggleFilterChip(
-                semanticsLabel: 'Newest session per project filter',
-                label: 'Newest per project',
-                tooltip: 'Only the most recent session of each project',
-                value: widget.newestPerProjectOnly,
-                onChanged: widget.onNewestPerProjectOnlyChanged,
+              SessionProjectLimit(
+                limit: widget.maxSessionsPerProject,
+                onChanged: widget.onMaxSessionsPerProjectChanged,
+              ),
+              AppButton.outlined(
+                focusNode: _excludeProjectsFocusNode,
+                onPressed: _editExcludedProjects,
+                icon: const Icon(Icons.filter_alt_off, size: 18),
+                label: const Text('Exclude projects...'),
               ),
             ],
           ),
@@ -3864,11 +3927,18 @@ class _FilterBarState extends State<_FilterBar> {
         ),
       if (widget.namedOnly)
         _ActiveFilterChip('Named only', () => widget.onNamedOnlyChanged(false)),
-      if (widget.newestPerProjectOnly)
+      if (widget.maxSessionsPerProject case final limit?)
         _ActiveFilterChip(
-          'Newest per project',
-          () => widget.onNewestPerProjectOnlyChanged(false),
+          'Latest $limit per project',
+          () => widget.onMaxSessionsPerProjectChanged(null),
         ),
+      for (final project in widget.excludedProjects)
+        _ActiveFilterChip('Excluded: $project', () {
+          widget.onExcludedProjectsChanged(
+            {...widget.excludedProjects}..remove(project),
+          );
+          _excludeProjectsFocusNode.requestFocus();
+        }),
       if (path.isNotEmpty)
         _ActiveFilterChip('Path: $path', widget.pathController.clear),
       if (threadName.isNotEmpty)
@@ -4000,8 +4070,8 @@ class _FilterMenuButtonState<T> extends State<_FilterMenuButton<T>> {
             ),
         ],
         child: Container(
-          height: 32,
-          padding: const EdgeInsets.only(left: 10, right: 4),
+          constraints: const BoxConstraints(minHeight: 32),
+          padding: const EdgeInsets.fromLTRB(10, 5, 4, 5),
           decoration: BoxDecoration(
             color: widget.isActive ? scheme.secondaryContainer : null,
             border: Border.all(
@@ -4020,15 +4090,19 @@ class _FilterMenuButtonState<T> extends State<_FilterMenuButton<T>> {
                       : scheme.onSurfaceVariant,
                 ),
               ),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 180),
-                child: Text(
-                  valueLabel,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    fontWeight: widget.isActive ? FontWeight.w600 : null,
-                    color: widget.isActive ? scheme.onSecondaryContainer : null,
+              Flexible(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 180),
+                  child: Text(
+                    valueLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      fontWeight: widget.isActive ? FontWeight.w600 : null,
+                      color: widget.isActive
+                          ? scheme.onSecondaryContainer
+                          : null,
+                    ),
                   ),
                 ),
               ),
@@ -4511,7 +4585,12 @@ class _SessionsTable extends StatelessWidget {
   final VoidCallback? onTestWslPath;
   final DateTime Function() now;
 
-  static const _rowHeight = 48.0;
+  static double _rowHeightFor(BuildContext context) =>
+      48.0 *
+      (MediaQuery.textScalerOf(context).scale(14) / 14).clamp(
+        1.0,
+        double.infinity,
+      );
   static const _columns = <_SessionColumn>[
     _SessionColumn(
       key: 'last_message_at',
@@ -4579,7 +4658,7 @@ class _SessionsTable extends StatelessWidget {
                     _header(context),
                     Expanded(
                       child: ListView.builder(
-                        itemExtent: _rowHeight,
+                        itemExtent: _rowHeightFor(context),
                         itemCount: rows.length,
                         itemBuilder: (context, index) =>
                             _sessionRow(context, rows[index]),
@@ -4637,7 +4716,7 @@ class _SessionsTable extends StatelessWidget {
         excludeFromSemantics: true,
         onTap: () => onSelect(row.id),
         child: Container(
-          height: _rowHeight,
+          height: _rowHeightFor(context),
           color: color,
           child: Row(
             children: [

@@ -881,13 +881,21 @@ class SessionTableSettings {
   const SessionTableSettings({
     required this.columnWidths,
     required this.sorts,
-    this.newestPerProjectOnly = false,
+    bool newestPerProjectOnly = false,
+    int? maxSessionsPerProject,
+    this.excludedProjects = const [],
     this.paneFraction,
-  });
+  }) : assert(maxSessionsPerProject == null || maxSessionsPerProject > 0),
+       maxSessionsPerProject =
+           maxSessionsPerProject ?? (newestPerProjectOnly ? 1 : null);
 
   final Map<String, double> columnWidths;
   final List<SessionTableSortSettings> sorts;
-  final bool newestPerProjectOnly;
+
+  /// Null means unlimited. The boolean getter retains the legacy caller API.
+  final int? maxSessionsPerProject;
+  bool get newestPerProjectOnly => maxSessionsPerProject == 1;
+  final List<String> excludedProjects;
 
   /// Table share of the space beside the detail pane. Null uses the default.
   final double? paneFraction;
@@ -916,18 +924,15 @@ class SessionTableSettings {
         final num value when value > 0 && value < 1 => value.toDouble(),
         _ => null,
       },
-      newestPerProjectOnly: _bool(
-        map,
-        'newest_per_project_only',
-        defaults.newestPerProjectOnly,
-        'ui.session_table.newest_per_project_only',
-      ),
+      maxSessionsPerProject: _projectLimit(map, defaults),
+      excludedProjects: _excludedProjects(map, defaults),
     );
   }
 
   Map<String, Object?> toTomlMap() => {
     'column_widths': columnWidths,
-    'newest_per_project_only': newestPerProjectOnly,
+    'max_sessions_per_project': maxSessionsPerProject ?? 0,
+    'excluded_projects': excludedProjects,
     if (paneFraction != null) 'pane_fraction': paneFraction,
     'sorts': [for (final sort in sorts) sort.toTomlMap()],
   };
@@ -937,16 +942,63 @@ class SessionTableSettings {
       other is SessionTableSettings &&
       _mapEquals(columnWidths, other.columnWidths) &&
       _listEquals(sorts, other.sorts) &&
-      newestPerProjectOnly == other.newestPerProjectOnly &&
+      maxSessionsPerProject == other.maxSessionsPerProject &&
+      _listEquals(excludedProjects, other.excludedProjects) &&
       paneFraction == other.paneFraction;
 
   @override
   int get hashCode => Object.hash(
     _mapHash(columnWidths),
     Object.hashAll(sorts),
-    newestPerProjectOnly,
+    maxSessionsPerProject,
+    Object.hashAll(excludedProjects),
     paneFraction,
   );
+
+  static int? _projectLimit(
+    Map<String, dynamic> map,
+    SessionTableSettings defaults,
+  ) {
+    if (!map.containsKey('max_sessions_per_project')) {
+      if (!map.containsKey('newest_per_project_only')) {
+        return defaults.maxSessionsPerProject;
+      }
+      return _bool(
+            map,
+            'newest_per_project_only',
+            defaults.newestPerProjectOnly,
+            'ui.session_table.newest_per_project_only',
+          )
+          ? 1
+          : null;
+    }
+    final value = map['max_sessions_per_project'];
+    if (value is int && value >= 0) return value == 0 ? null : value;
+    throw SettingsValidationException(
+      'ui.session_table.max_sessions_per_project',
+      'Expected zero (unlimited) or a positive integer.',
+    );
+  }
+
+  static List<String> _excludedProjects(
+    Map<String, dynamic> map,
+    SessionTableSettings defaults,
+  ) {
+    if (!map.containsKey('excluded_projects')) return defaults.excludedProjects;
+    final value = map['excluded_projects'];
+    if (value is! List || value.any((entry) => entry is! String)) {
+      throw SettingsValidationException(
+        'ui.session_table.excluded_projects',
+        'Expected a list of project names.',
+      );
+    }
+    final names = <String, String>{};
+    for (final entry in value.cast<String>()) {
+      final name = entry.trim();
+      if (name.isNotEmpty) names.putIfAbsent(name.toLowerCase(), () => name);
+    }
+    return List.unmodifiable(names.values);
+  }
 }
 
 class SessionTableSortSettings {

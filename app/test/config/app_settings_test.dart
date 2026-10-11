@@ -8,6 +8,35 @@ import 'package:path/path.dart' as p;
 import 'package:toml/toml.dart';
 
 void main() {
+  test('project view settings migrate legacy limits and round trip', () {
+    for (final legacy in [false, true]) {
+      final settings = AppSettings.fromTomlMap({
+        'ui': {
+          'session_table': {'newest_per_project_only': legacy},
+        },
+      });
+      final encoded =
+          ((settings.toTomlMap()['ui'] as Map)['session_table'] as Map);
+      expect(encoded['max_sessions_per_project'], legacy ? 1 : 0);
+      expect(encoded.containsKey('newest_per_project_only'), isFalse);
+      expect(AppSettings.fromTomlMap(settings.toTomlMap()), settings);
+    }
+    final settings = AppSettings.fromTomlMap({
+      'ui': {
+        'session_table': {
+          'newest_per_project_only': true,
+          'max_sessions_per_project': 3,
+          'excluded_projects': ['Tools', 'Viewer'],
+        },
+      },
+    });
+    final encoded =
+        ((settings.toTomlMap()['ui'] as Map)['session_table'] as Map);
+    expect(encoded['max_sessions_per_project'], 3);
+    expect(encoded['excluded_projects'], ['Tools', 'Viewer']);
+    expect(AppSettings.fromTomlMap(settings.toTomlMap()), settings);
+  });
+
   test('session pane split fraction round trips through settings', () {
     final settings = AppSettings.fromTomlMap({
       'ui': {
