@@ -279,6 +279,7 @@ void main() {
         writerCoordinator: coordinator,
         sessionRefresh: () async =>
             SessionsRefreshResult.scanFinished([_row()]),
+        now: () => DateTime.utc(2026, 9, 8),
         deferInitialSessionLoad: (_) {},
         usageSummaryLoader: (_, _) async => null,
       ),
