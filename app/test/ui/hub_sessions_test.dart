@@ -306,7 +306,7 @@ void main() {
             };
             response = {
               'contract': 'codex-sessions-viewer.query',
-              'version': 1,
+              'version': 2,
               'machine': 'foreign',
               if (args.first == 'session')
                 'session': session

@@ -3,10 +3,41 @@ import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
 import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
+import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets(
+    'native settings omit WSL controls and preserve copied WSL configuration',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 1600));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final original = AppSettings.defaults();
+      AppSettings? saved;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SettingsScreen(
+            hostPlatform: AppHostPlatform.linux,
+            initialSettings: original,
+            onSave: (value) async {
+              saved = value;
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Native Codex path'), findsOneWidget);
+      expect(find.text('WSL Codex UNC path'), findsNothing);
+      expect(find.text('WSL distro name'), findsNothing);
+      expect(find.text('WSL Linux home path'), findsNothing);
+      await tester.ensureVisible(find.text('Save settings'));
+      await tester.tap(find.text('Save settings'));
+      await tester.pumpAndSettle();
+      expect(saved?.paths, original.paths);
+      expect(saved?.wsl, original.wsl);
+    },
+  );
   testWidgets('maintenance progress is bounded, accessible and non-modal', (
     tester,
   ) async {
@@ -427,7 +458,7 @@ void main() {
     }
 
     for (final label in const [
-      'Start with Windows',
+      'Start at login',
       'Windows Codex path',
       'WSL Codex UNC path',
       'WSL distro name',
@@ -455,8 +486,8 @@ void main() {
     }
 
     for (final helper in const [
-      'Launch Codex Session Viewer after signing in to Windows.',
-      'Folder containing native Windows Codex session files.',
+      'Launch Codex Session Viewer after signing in.',
+      'Folder containing native Codex session files.',
       'UNC folder used to read WSL Codex sessions from Windows.',
       'Command profile used when launching resume commands.',
       'One voice-over event WAV path per line.',
@@ -477,7 +508,7 @@ void main() {
     expect(announcer.messages, contains('Settings saved.'));
   });
 
-  testWidgets('settings screen edits start with Windows preference', (
+  testWidgets('settings screen edits start at login preference', (
     tester,
   ) async {
     AppSettings? saved;
@@ -493,10 +524,10 @@ void main() {
       ),
     );
 
-    expect(find.text('Start with Windows'), findsOneWidget);
+    expect(find.text('Start at login'), findsOneWidget);
 
     final startupRow = find.ancestor(
-      of: find.text('Start with Windows'),
+      of: find.text('Start at login'),
       matching: find.byType(Row),
     );
     final startupSwitch = find.descendant(

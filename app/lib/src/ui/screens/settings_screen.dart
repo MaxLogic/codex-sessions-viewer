@@ -6,6 +6,7 @@ import '../../config/app_settings.dart';
 import '../../config/settings_diagnostics.dart';
 import '../../database/maintenance_job.dart';
 import '../../database/database_maintenance.dart';
+import '../../platform/app_locations.dart';
 import '../motion.dart';
 import '../widgets/svg_icon.dart';
 import '../widgets/app_button.dart';
@@ -27,10 +28,12 @@ class SettingsScreen extends StatefulWidget {
     this.maintenanceProgress,
     this.backgroundCollection,
     this.onOpenFolder,
+    this.hostPlatform,
     DateTime Function()? clock,
   }) : clock = clock ?? DateTime.now;
 
   final DateTime Function() clock;
+  final AppHostPlatform? hostPlatform;
   final AppSettings? initialSettings;
   final SettingsSaveCallback? onSave;
   final SettingsReloadCallback? onReload;
@@ -350,9 +353,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       title: 'Application',
                       children: [
                         _SwitchSetting(
-                          label: 'Start with Windows',
+                          label: 'Start at login',
                           helperText:
-                              'Launch Codex Session Viewer after signing in to Windows.',
+                              'Launch Codex Session Viewer after signing in.',
                           value: _settings.app.startWithWindows,
                           onChanged: (value) {
                             setState(() {
@@ -370,38 +373,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       title: 'Paths',
                       children: [
                         _TextSetting(
-                          label: 'Windows Codex path',
-                          semanticsLabel: 'Windows Codex path input',
+                          label:
+                              (widget.hostPlatform ??
+                                      AppLocations.currentPlatform) ==
+                                  AppHostPlatform.windows
+                              ? 'Windows Codex path'
+                              : 'Native Codex path',
+                          semanticsLabel:
+                              (widget.hostPlatform ??
+                                      AppLocations.currentPlatform) ==
+                                  AppHostPlatform.windows
+                              ? 'Windows Codex path input'
+                              : 'Native Codex path input',
                           helperText:
-                              'Folder containing native Windows Codex session files.',
+                              'Folder containing native Codex session files.',
                           controller: _windowsCodexPath,
                         ),
-                        _TextSetting(
-                          label: 'WSL Codex UNC path',
-                          semanticsLabel: 'WSL Codex UNC path input',
-                          helperText:
-                              'UNC folder used to read WSL Codex sessions from Windows.',
-                          controller: _wslCodexUncPath,
-                        ),
+                        if ((widget.hostPlatform ??
+                                AppLocations.currentPlatform) ==
+                            AppHostPlatform.windows)
+                          _TextSetting(
+                            label: 'WSL Codex UNC path',
+                            semanticsLabel: 'WSL Codex UNC path input',
+                            helperText:
+                                'UNC folder used to read WSL Codex sessions from Windows.',
+                            controller: _wslCodexUncPath,
+                          ),
                       ],
                     ),
-                    _Section(
-                      title: 'WSL',
-                      children: [
-                        _TextSetting(
-                          label: 'WSL distro name',
-                          controller: _wslDistro,
-                        ),
-                        _TextSetting(
-                          label: 'WSL Linux home path',
-                          controller: _wslLinuxHome,
-                        ),
-                        _TextSetting(
-                          label: 'WSL UNC root',
-                          controller: _wslUncRoot,
-                        ),
-                      ],
-                    ),
+                    if ((widget.hostPlatform ?? AppLocations.currentPlatform) ==
+                        AppHostPlatform.windows)
+                      _Section(
+                        title: 'WSL',
+                        children: [
+                          _TextSetting(
+                            label: 'WSL distro name',
+                            controller: _wslDistro,
+                          ),
+                          _TextSetting(
+                            label: 'WSL Linux home path',
+                            controller: _wslLinuxHome,
+                          ),
+                          _TextSetting(
+                            label: 'WSL UNC root',
+                            controller: _wslUncRoot,
+                          ),
+                        ],
+                      ),
                     _Section(
                       title: 'Terminal',
                       children: [

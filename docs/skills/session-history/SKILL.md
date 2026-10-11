@@ -16,7 +16,7 @@ Resolve deployment links before locating bundled scripts.
 
 `scripts/session_history.py` is a standard-library launcher for the collector's
 read-only query contract (`codex-sessions-collector.exe query`, contract
-`codex-sessions-viewer.query` version 1). The executable opens the existing
+`codex-sessions-viewer.query` version 2). The executable opens the existing
 database read-only with `query_only`; nothing scans or imports sessions,
 migrates schemas, starts the app, or contacts a server or model. The launcher
 finds the executable through `--exe PATH`, `CODEX_SESSIONS_COLLECTOR`, the

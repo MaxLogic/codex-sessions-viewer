@@ -90,6 +90,23 @@ pub fn queue_enabled(conn: &Connection) -> StoreResult<bool> {
 }
 
 pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> {
+    // A legacy status has no provenance to add. Keep it in v1 rather than
+    // inventing an environment while moving it to a new outbox row.
+    let version = if matches!(&record, Record::SourceStatus(status) if status.environment.is_none())
+    {
+        1
+    } else {
+        crate::contract::CONTRACT_VERSION
+    };
+    enqueue_versioned(conn, record, now, version)
+}
+
+pub(crate) fn enqueue_versioned(
+    conn: &Connection,
+    record: Record,
+    now: &str,
+    version: u32,
+) -> StoreResult<()> {
     if !queue_enabled(conn)? {
         return Ok(());
     }
@@ -106,8 +123,12 @@ pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> 
             )],
         )?;
     }
-    let envelope = serde_json::to_string(&Envelope::new(record))
-        .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
+    let envelope = serde_json::to_string(&Envelope {
+        contract: crate::contract::CONTRACT_NAME.to_owned(),
+        version,
+        record,
+    })
+    .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
     let Some((key, deduplicate)) = key else {
         conn.execute(
             "insert into collector_upload_outbox(record_json, created_at_utc) values (?, ?)",

@@ -269,6 +269,16 @@ pub fn backfill_projects(
                     wsl_paths.push(path);
                 }
             }
+            SourceType::Macos | SourceType::Linux => {
+                if seen.insert(format!("native|{path}"), ()).is_none()
+                    && let Some(name) = resolve_windows_project(&path)
+                {
+                    hints.push(ProjectHint {
+                        working_directory: path,
+                        project_name: name,
+                    });
+                }
+            }
         }
     }
     if resolve_wsl_projects {
@@ -355,6 +365,16 @@ fn refined_project_hints_with(
             SourceType::Wsl => {
                 if seen.insert(format!("wsl|{path}"), ()).is_none() {
                     wsl_paths.push(path);
+                }
+            }
+            SourceType::Macos | SourceType::Linux => {
+                if seen.insert(format!("native|{path}"), ()).is_none()
+                    && let Some(name) = resolve_windows_project(&path)
+                {
+                    hints.push(ProjectHint {
+                        working_directory: path,
+                        project_name: name,
+                    });
                 }
             }
         }
@@ -468,6 +488,7 @@ pub fn collect_file_with(
             let status = SourceStatus {
                 harness: "codex".to_owned(),
                 path: root.path.clone(),
+                environment: Some(root.source_type.wire_name().to_owned()),
                 status: snapshot.source.status.clone(),
                 state: root.source_state.to_owned(),
                 message: None,
@@ -531,6 +552,7 @@ pub fn collect_file_with(
             let status = SourceStatus {
                 harness: "codex".to_owned(),
                 path: root.path.clone(),
+                environment: Some(root.source_type.wire_name().to_owned()),
                 status: scanner::parse_error_status(&error).to_owned(),
                 state: root.source_state.to_owned(),
                 message: Some(error.display_message()),

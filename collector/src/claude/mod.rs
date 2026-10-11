@@ -38,7 +38,7 @@ pub fn default_root() -> Option<ClaudeRoot> {
     let path = crate::settings::DefaultFolders::current().claude_projects_root;
     (!path.is_empty()).then_some(ClaudeRoot {
         path,
-        source_type: SourceType::Windows,
+        source_type: SourceType::native(),
     })
 }
 
@@ -95,10 +95,16 @@ pub fn subagent_files(path: &Path) -> Vec<PathBuf> {
     }
 }
 
-fn status(path: &str, status: &str, message: Option<String>) -> SourceStatus {
+fn status(
+    path: &str,
+    status: &str,
+    source_type: SourceType,
+    message: Option<String>,
+) -> SourceStatus {
     SourceStatus {
         harness: HARNESS.to_owned(),
         path: path.to_owned(),
+        environment: Some(source_type.wire_name().to_owned()),
         status: status.to_owned(),
         state: "active".to_owned(),
         message,
@@ -139,16 +145,19 @@ pub fn snapshot(
     let mapped = match source_type {
         SourceType::Windows => mapper.map_windows_path(path),
         SourceType::Wsl => mapper.map_wsl_unc_path(path),
+        native @ (SourceType::Macos | SourceType::Linux) => mapper.map_native_path(path, native),
     };
     let project_hints = match (&transcript.session.working_directory_display, source_type) {
-        (Some(cwd), SourceType::Windows) => resolve_windows_project(cwd)
-            .map(|name| {
-                vec![ProjectHint {
-                    working_directory: cwd.clone(),
-                    project_name: name,
-                }]
-            })
-            .unwrap_or_default(),
+        (Some(cwd), SourceType::Windows | SourceType::Macos | SourceType::Linux) => {
+            resolve_windows_project(cwd)
+                .map(|name| {
+                    vec![ProjectHint {
+                        working_directory: cwd.clone(),
+                        project_name: name,
+                    }]
+                })
+                .unwrap_or_default()
+        }
         _ => Vec::new(),
     };
     SessionSnapshot {
@@ -247,6 +256,7 @@ pub fn collect_coordinated(
             let entry = status(
                 &root.path,
                 "path_unreachable",
+                root.source_type,
                 Some("Claude projects folder is unreachable.".to_owned()),
             );
             errors.push(entry.clone());
@@ -262,7 +272,7 @@ pub fn collect_coordinated(
             found.insert(canonical_scan_path(&path));
             if !options.force && is_unchanged(&path, &cached) {
                 counts.files_skipped += 1;
-                statuses.push(status(&path, "available", None));
+                statuses.push(status(&path, "available", root.source_type, None));
             } else {
                 work.push((path, root.source_type));
             }
@@ -322,7 +332,7 @@ pub fn collect_coordinated(
                 Ok(transcript) => {
                     counts.files_parsed += 1;
                     let snapshot = snapshot(&path, source_type, &options.mapper, transcript);
-                    statuses.push(status(&path, &snapshot.source.status, None));
+                    statuses.push(status(&path, &snapshot.source.status, source_type, None));
                     pending.push(snapshot);
                     if pending.len() >= flush_sessions.max(1)
                         && let Err(error) =
@@ -336,6 +346,7 @@ pub fn collect_coordinated(
                     let entry = status(
                         &path,
                         parse_error_status(&error),
+                        source_type,
                         Some(error.display_message()),
                     );
                     errors.push(entry.clone());
@@ -378,6 +389,7 @@ pub fn collect_coordinated(
                 ..status(
                     &source.source_path,
                     "missing",
+                    source.source_type,
                     Some("Previously collected transcript is missing.".to_owned()),
                 )
             };
@@ -426,7 +438,7 @@ pub fn collect_file(
             Ok(transcript) => {
                 counts.files_parsed += 1;
                 let snapshot = snapshot(&file, source_type, mapper, transcript);
-                statuses.push(status(&file, &snapshot.source.status, None));
+                statuses.push(status(&file, &snapshot.source.status, source_type, None));
                 snapshots.push(snapshot);
             }
             Err(error) => {
@@ -434,6 +446,7 @@ pub fn collect_file(
                 let entry = status(
                     &file,
                     parse_error_status(&error),
+                    source_type,
                     Some(error.display_message()),
                 );
                 errors.push(entry.clone());

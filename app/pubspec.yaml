@@ -1,5 +1,5 @@
 name: codex_sessions_viewer
-description: "Windows desktop app for browsing local Codex session history."
+description: "Desktop app for browsing local Codex session history on Windows, macOS and Linux."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev

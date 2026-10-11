@@ -5,6 +5,36 @@ import 'package:flutter_test/flutter_test.dart';
 import '../support/fixture_settings.dart';
 
 void main() {
+  for (final platform in [SessionRowPlatform.macos, SessionRowPlatform.linux]) {
+    test(
+      'native ${platform.name} export guards Markdown CSV and isolate formatting',
+      () async {
+        final settings = fixtureDefaultSettings();
+        final exporter = SessionListExporter(settings: settings);
+        final row = _row(
+          id: 'native-row',
+          sessionId: 'native-session',
+          workingDirectory: '/home/native/project',
+          platform: platform,
+        );
+        final outputs = [
+          exporter.exportMarkdown([row]),
+          exporter.exportCsv([row]),
+          await formatSessionListMarkdown(settings, List.filled(100, row)),
+        ];
+        for (final output in outputs) {
+          expect(
+            output,
+            contains('Resume is unavailable for this source platform.'),
+          );
+          expect(output, isNot(contains('codex resume native-session')));
+          expect(output, isNot(contains('wsl.exe')));
+          expect(output, isNot(contains('```powershell')));
+        }
+      },
+    );
+  }
+
   test('exports every supplied session as a compact Markdown overview', () {
     final exporter = SessionListExporter(settings: fixtureDefaultSettings());
 

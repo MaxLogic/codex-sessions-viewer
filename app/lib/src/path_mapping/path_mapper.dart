@@ -1,4 +1,4 @@
-enum SessionSourceType { windows, wsl }
+enum SessionSourceType { windows, wsl, macos, linux }
 
 class CodexPathMapper {
   const CodexPathMapper({
@@ -14,6 +14,21 @@ class CodexPathMapper {
   MappedSessionPath mapWindowsPath(String path) {
     return MappedSessionPath(
       sourceType: SessionSourceType.windows,
+      displayPath: path,
+      sourceFilePath: path,
+      sourceFileUncPath: null,
+      platformPath: path,
+      normalizedPathKeys: {normalizePathKey(path)},
+    );
+  }
+
+  MappedSessionPath mapNativePath(String path, SessionSourceType sourceType) {
+    assert(
+      sourceType == SessionSourceType.macos ||
+          sourceType == SessionSourceType.linux,
+    );
+    return MappedSessionPath(
+      sourceType: sourceType,
       displayPath: path,
       sourceFilePath: path,
       sourceFileUncPath: null,

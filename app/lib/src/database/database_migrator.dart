@@ -29,7 +29,7 @@ Directory defaultSqlRoot() {
 
 /// The newest schema this viewer applies and the collector writes
 /// (`SUPPORTED_SCHEMA_VERSION` in `collector/src/store/schema.rs`).
-const latestSchemaVersion = 28;
+const latestSchemaVersion = 29;
 
 class DatabaseMigrator {
   DatabaseMigrator({
@@ -75,7 +75,8 @@ class DatabaseMigrator {
     }
   }
 
-  /// Uses the startup worker's connection without closing or replacing it.
+  /// Uses the startup worker's connection outside any caller-owned transaction.
+  /// Fatal cleanup closes the connection to prevent reuse of uncertain state.
   /// The caller excludes normal application access for the entire operation.
   Future<DatabaseStartupResult> migrateOpenDatabase(
     Database db,
@@ -84,6 +85,11 @@ class DatabaseMigrator {
     Future<void> Function(void Function())? runAtomic,
   }) async {
     try {
+      if (!db.autocommit) {
+        throw StateError(
+          'Database migration requires a connection without an active transaction.',
+        );
+      }
       if (sqlite3.version.versionNumber < 3046000) {
         throw StateError(
           'SQLite 3.46 or newer is required for bounded database optimization.',
@@ -370,7 +376,9 @@ class DatabaseMigrator {
           version: version,
           filename: filename,
           sql: sql,
-          checksum: sha256.convert(utf8.encode(sql)).toString(),
+          checksum: sha256
+              .convert(utf8.encode(sql.replaceAll('\r\n', '\n')))
+              .toString(),
         ),
       );
     }
@@ -400,7 +408,7 @@ class DatabaseMigrator {
           details: 'No local SQL file exists for schema version $version.',
         );
       }
-      if (row['checksum'] != migration.checksum) {
+      if (!_acceptsChecksum(migration, row['checksum'] as String)) {
         return DatabaseFatalError(
           summary: 'Applied migration checksum changed.',
           databasePath: databasePath,
@@ -412,6 +420,13 @@ class DatabaseMigrator {
       }
     }
     return null;
+  }
+
+  bool _acceptsChecksum(SqlMigration migration, String checksum) {
+    final lf = migration.sql.replaceAll('\r\n', '\n');
+    return checksum == migration.checksum ||
+        checksum ==
+            sha256.convert(utf8.encode(lf.replaceAll('\n', '\r\n'))).toString();
   }
 
   DatabaseFatalError? _validateSupportedVersion(
@@ -444,18 +459,39 @@ class DatabaseMigrator {
     String databasePath, {
     Future<void> Function(void Function())? runAtomic,
   }) async {
-    try {
-      db.execute('begin immediate');
-      db.execute('pragma defer_foreign_keys = on');
-      if (runAtomic == null) {
-        db.execute(migration.sql);
-      } else {
-        // Only native schema work is interruptible. The worker disarms its
-        // interrupt timer before commit, rollback, or failure-record SQL.
-        await runAtomic(() => db.execute(migration.sql));
+    final needsForeignKeyPause = migration.version == 29;
+    int? originalForeignKeys;
+    if (needsForeignKeyPause) {
+      originalForeignKeys =
+          db.select('pragma foreign_keys').single.values.single as int;
+      db.execute('pragma foreign_keys = off');
+      final paused =
+          db.select('pragma foreign_keys').single.values.single as int;
+      if (paused != 0) {
+        throw StateError(
+          'Native source migration requires foreign keys off before BEGIN; '
+          'the connection may already have a transaction.',
+        );
       }
-      db.execute(
-        '''
+    }
+    Object? migrationFailure;
+    Object? rollbackFailure;
+    try {
+      try {
+        db.execute('begin immediate');
+        db.execute('pragma defer_foreign_keys = on');
+        if (runAtomic == null) {
+          db.execute(migration.sql);
+        } else {
+          // Only native schema work is interruptible. The worker disarms its
+          // interrupt timer before commit, rollback, or failure-record SQL.
+          await runAtomic(() => db.execute(migration.sql));
+        }
+        if (needsForeignKeyPause) {
+          _validateNativeSourceMigration(db);
+        }
+        db.execute(
+          '''
         insert into schema_version
           (version, filename, checksum, applied_at_utc, success, error_message)
         values (?, ?, ?, ?, 1, null)
@@ -467,49 +503,147 @@ class DatabaseMigrator {
           error_message = null
         where schema_version.success = 0
         ''',
-        [
-          migration.version,
-          migration.filename,
-          migration.checksum,
-          DateTime.now().toUtc().toIso8601String(),
-        ],
-      );
-      db.execute('commit');
-      return null;
-    } on DatabaseMaintenanceCancelled {
-      try {
-        db.execute('rollback');
-      } on Object {
-        // Preserve cancellation if SQLite already rolled back.
+          [
+            migration.version,
+            migration.filename,
+            migration.checksum,
+            DateTime.now().toUtc().toIso8601String(),
+          ],
+        );
+        db.execute('commit');
+      } on DatabaseMaintenanceCancelled catch (error) {
+        migrationFailure = error;
+        try {
+          // SQLite interruption may already have rolled back the transaction.
+          if (!db.autocommit) db.execute('rollback');
+        } on Object catch (error) {
+          rollbackFailure = error;
+        }
+        rethrow;
+      } on Object catch (error) {
+        migrationFailure = error;
+        try {
+          if (!db.autocommit) db.execute('rollback');
+        } on Object catch (cleanupError) {
+          rollbackFailure = cleanupError;
+        }
       }
-      rethrow;
-    } on Object catch (error) {
-      try {
-        db.execute('rollback');
-      } on Object {
-        // If SQLite already rolled back, preserve the original failure.
+    } finally {
+      if (needsForeignKeyPause) {
+        // This runs after commit or rollback, before any failure-history write.
+        Object? restoreFailure;
+        int? restored;
+        try {
+          db.execute('pragma foreign_keys = $originalForeignKeys');
+          restored =
+              db.select('pragma foreign_keys').single.values.single as int;
+        } on Object catch (error) {
+          restoreFailure = error;
+        }
+        if (restored != originalForeignKeys ||
+            rollbackFailure != null ||
+            restoreFailure != null) {
+          Object? closeFailure;
+          try {
+            db.close();
+          } on Object catch (error) {
+            closeFailure = error;
+          }
+          throw StateError(
+            'Native source migration cleanup failed; connection must not be reused. '
+            'Original: $migrationFailure; rollback: $rollbackFailure; '
+            'foreign_keys: $restored (expected $originalForeignKeys); '
+            'restoration: $restoreFailure; close: $closeFailure.',
+          );
+        }
       }
-      db.execute(
-        '''
-        insert or replace into schema_version
-          (version, filename, checksum, applied_at_utc, success, error_message)
-        values (?, ?, ?, ?, 0, ?)
-        ''',
-        [
-          migration.version,
-          migration.filename,
-          migration.checksum,
-          DateTime.now().toUtc().toIso8601String(),
-          error.toString(),
-        ],
-      );
+    }
+    if (migrationFailure != null) {
+      try {
+        db.execute(
+          '''
+          insert or replace into schema_version
+            (version, filename, checksum, applied_at_utc, success, error_message)
+          values (?, ?, ?, ?, 0, ?)
+          ''',
+          [
+            migration.version,
+            migration.filename,
+            migration.checksum,
+            DateTime.now().toUtc().toIso8601String(),
+            migrationFailure.toString(),
+          ],
+        );
+      } on Object catch (historyError) {
+        throw StateError(
+          'Migration failed: $migrationFailure; failure-history write failed: '
+          '$historyError; connection must not be reused.',
+        );
+      }
       return DatabaseFatalError(
         summary: 'SQLite migration failed.',
         databasePath: databasePath,
         lastAppliedSchemaVersion: _lastAppliedVersion(db),
         failingMigrationFile: migration.filename,
-        details: error.toString(),
+        details: migrationFailure.toString(),
       );
+    }
+    return null;
+  }
+
+  void _validateNativeSourceMigration(Database db) {
+    final violations = db.select('pragma foreign_key_check');
+    if (violations.isNotEmpty) {
+      throw StateError(
+        'Native source migration left ${violations.length} foreign-key violations.',
+      );
+    }
+    for (final view in [
+      'history_sessions',
+      'history_messages',
+      'history_tool_calls',
+    ]) {
+      db.select('select * from $view limit 1');
+    }
+    for (final (kind, name) in [
+      ('index', 'idx_sessions_archived'),
+      ('index', 'idx_sessions_available_activity'),
+      ('index', 'idx_sessions_eval_ready'),
+      ('index', 'idx_sessions_eval_status'),
+      ('index', 'idx_sessions_forked_from_id'),
+      ('index', 'idx_sessions_harness_session_id_unique'),
+      ('index', 'idx_sessions_machine_harness_session'),
+      ('index', 'idx_sessions_parent_thread_id'),
+      ('index', 'idx_sessions_parse_status'),
+      ('index', 'idx_sessions_scan_status'),
+      ('index', 'idx_sessions_session_id'),
+      ('index', 'idx_sessions_source_type'),
+      ('trigger', 'trg_projects_change_rename'),
+      ('trigger', 'trg_session_tags_change_delete'),
+      ('trigger', 'trg_session_tags_change_insert'),
+      ('trigger', 'trg_session_tags_change_update'),
+      ('trigger', 'trg_sessions_change_delete'),
+      ('trigger', 'trg_sessions_change_insert'),
+      ('trigger', 'trg_sessions_change_update'),
+      ('trigger', 'trg_sessions_insert_activity'),
+      ('trigger', 'trg_sessions_insert_machine_id'),
+      ('trigger', 'trg_sessions_update_activity'),
+      ('trigger', 'trg_tags_change_rename'),
+      ('trigger', 'trg_usage_session_daily_change_delete'),
+      ('trigger', 'trg_usage_session_daily_change_insert'),
+      ('trigger', 'trg_usage_session_daily_change_update'),
+      ('view', 'history_sessions'),
+      ('view', 'history_messages'),
+      ('view', 'history_tool_calls'),
+    ]) {
+      if (db.select('select 1 from sqlite_schema where type = ? and name = ?', [
+        kind,
+        name,
+      ]).isEmpty) {
+        throw StateError(
+          'Native source migration did not restore $kind $name.',
+        );
+      }
     }
   }
 

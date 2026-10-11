@@ -10,10 +10,13 @@ import 'package:flutter_test/flutter_test.dart';
 
 import '../helpers/test_sessions_screen.dart';
 
-Future<void> _pressCtrlC(WidgetTester tester) async {
-  await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+Future<void> _pressCtrlC(WidgetTester tester, TargetPlatform platform) async {
+  final modifier = platform == TargetPlatform.macOS
+      ? LogicalKeyboardKey.metaLeft
+      : LogicalKeyboardKey.controlLeft;
+  await tester.sendKeyDownEvent(modifier);
   await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
-  await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+  await tester.sendKeyUpEvent(modifier);
   await tester.pumpAndSettle();
 }
 
@@ -39,144 +42,163 @@ List<String> _captureClipboard(WidgetTester tester) {
 }
 
 void main() {
-  group('sessions screen', () {
-    Future<List<SessionActionRequest>> pump(WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(5000, 900));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-      final actions = <SessionActionRequest>[];
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: TestSessionsScreen(
-              initialRows: [_row()],
-              onSessionAction: (request) async => actions.add(request),
+  for (final platform in [
+    TargetPlatform.windows,
+    TargetPlatform.linux,
+    TargetPlatform.macOS,
+  ]) {
+    group('$platform', () {
+      group('sessions screen', () {
+        Future<List<SessionActionRequest>> pump(WidgetTester tester) async {
+          await tester.binding.setSurfaceSize(const Size(5000, 900));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          final actions = <SessionActionRequest>[];
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData(platform: platform),
+              home: Scaffold(
+                body: TestSessionsScreen(
+                  initialRows: [_row()],
+                  onSessionAction: (request) async => actions.add(request),
+                ),
+              ),
             ),
-          ),
-        ),
-      );
-      await tester.pumpAndSettle();
-      return actions;
-    }
+          );
+          await tester.pumpAndSettle();
+          return actions;
+        }
 
-    testWidgets('Ctrl+C after clicking a session copies its path', (
-      tester,
-    ) async {
-      final actions = await pump(tester);
-      await tester.tap(find.bySemanticsLabel(RegExp(r'^Session .*Status')));
-      await tester.pumpAndSettle();
+        testWidgets('Primary+C after clicking a session copies its path', (
+          tester,
+        ) async {
+          final actions = await pump(tester);
+          await tester.tap(find.bySemanticsLabel(RegExp(r'^Session .*Status')));
+          await tester.pumpAndSettle();
 
-      await _pressCtrlC(tester);
+          await _pressCtrlC(tester, platform);
 
-      expect(actions.map((action) => action.action), [
-        SessionRowAction.copyPath,
-      ]);
-      expect(actions.single.payload, r'F:\projects\viewer');
-      expect(find.text('Copied session path.'), findsOneWidget);
-    });
+          expect(actions.map((action) => action.action), [
+            SessionRowAction.copyPath,
+          ]);
+          expect(actions.single.payload, r'F:\projects\viewer');
+          expect(find.text('Copied session path.'), findsOneWidget);
+        });
 
-    testWidgets('Ctrl+C in the search field stays with the field', (
-      tester,
-    ) async {
-      final actions = await pump(tester);
-      await tester.tap(find.bySemanticsLabel(RegExp(r'^Session .*Status')));
-      await tester.pumpAndSettle();
-      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
-      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
-      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
-      await tester.pumpAndSettle();
+        testWidgets('Primary+C in the search field stays with the field', (
+          tester,
+        ) async {
+          final actions = await pump(tester);
+          await tester.tap(find.bySemanticsLabel(RegExp(r'^Session .*Status')));
+          await tester.pumpAndSettle();
+          await tester.sendKeyDownEvent(
+            platform == TargetPlatform.macOS
+                ? LogicalKeyboardKey.metaLeft
+                : LogicalKeyboardKey.controlLeft,
+          );
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+          await tester.sendKeyUpEvent(
+            platform == TargetPlatform.macOS
+                ? LogicalKeyboardKey.metaLeft
+                : LogicalKeyboardKey.controlLeft,
+          );
+          await tester.pumpAndSettle();
 
-      await _pressCtrlC(tester);
+          await _pressCtrlC(tester, platform);
 
-      expect(actions, isEmpty);
-    });
-  });
+          expect(actions, isEmpty);
+        });
+      });
 
-  group('conversation', () {
-    final messages = [
-      for (var i = 1; i <= 3; i++)
-        ConversationMessageViewModel(
-          id: 'm$i',
-          number: i,
-          author: i.isOdd
-              ? ConversationAuthor.user
-              : ConversationAuthor.assistant,
-          createdAtUtc: DateTime.utc(2026, 6, 12, 9, i),
-          preview: 'Body $i',
-          body: 'Body $i',
-          tokenCount: i,
-        ),
-    ];
-
-    Future<List<String>> pump(WidgetTester tester) async {
-      await tester.binding.setSurfaceSize(const Size(1000, 900));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-      final copied = <String>[];
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: ConversationView(
-              messages: messages,
-              initialToolCallVisibility: ToolCallVisibility.hide,
-              onCopyMessageMarkdown: (text) async => copied.add(text),
+      group('conversation', () {
+        final messages = [
+          for (var i = 1; i <= 3; i++)
+            ConversationMessageViewModel(
+              id: 'm$i',
+              number: i,
+              author: i.isOdd
+                  ? ConversationAuthor.user
+                  : ConversationAuthor.assistant,
+              createdAtUtc: DateTime.utc(2026, 6, 12, 9, i),
+              preview: 'Body $i',
+              body: 'Body $i',
+              tokenCount: i,
             ),
-          ),
-        ),
-      );
-      await tester.pumpAndSettle();
-      return copied;
-    }
+        ];
 
-    testWidgets('Ctrl+C copies the selected message', (tester) async {
-      final copied = await pump(tester);
-      await tester.tap(
-        find.byKey(const Key('message-card-icon-2')),
-        warnIfMissed: false,
-      );
-      await tester.pumpAndSettle();
+        Future<List<String>> pump(WidgetTester tester) async {
+          await tester.binding.setSurfaceSize(const Size(1000, 900));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          final copied = <String>[];
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData(platform: platform),
+              home: Scaffold(
+                body: ConversationView(
+                  messages: messages,
+                  initialToolCallVisibility: ToolCallVisibility.hide,
+                  onCopyMessageMarkdown: (text) async => copied.add(text),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          return copied;
+        }
 
-      await _pressCtrlC(tester);
+        testWidgets('Primary+C copies the selected message', (tester) async {
+          final copied = await pump(tester);
+          await tester.tap(
+            find.byKey(const Key('message-card-icon-2')),
+            warnIfMissed: false,
+          );
+          await tester.pumpAndSettle();
 
-      expect(copied, [conversationMessageMarkdown(messages[1])]);
-      expect(find.text('Message 2 copied.'), findsOneWidget);
-    });
+          await _pressCtrlC(tester, platform);
 
-    testWidgets('Ctrl+C in the find field stays with the field', (
-      tester,
-    ) async {
-      final copied = await pump(tester);
-      await tester.tap(find.byKey(const Key('conversation-find-field')));
-      await tester.pumpAndSettle();
+          expect(copied, [conversationMessageMarkdown(messages[1])]);
+          expect(find.text('Message 2 copied.'), findsOneWidget);
+        });
 
-      await _pressCtrlC(tester);
+        testWidgets('Primary+C in the find field stays with the field', (
+          tester,
+        ) async {
+          final copied = await pump(tester);
+          await tester.tap(find.byKey(const Key('conversation-find-field')));
+          await tester.pumpAndSettle();
 
-      expect(copied, isEmpty);
-    });
-  });
+          await _pressCtrlC(tester, platform);
 
-  testWidgets('Ctrl+C in a command preview copies the whole command', (
-    tester,
-  ) async {
-    final copied = _captureClipboard(tester);
-    final commandSet = ResumeCommandGenerator(settings: AppSettings.defaults())
-        .build(
-          const ResumeCommandSession(
-            sessionId: 'abc123',
-            sourceType: ResumeSessionSourceType.windows,
-            workingDirectory: r'F:\projects\viewer',
+          expect(copied, isEmpty);
+        });
+      });
+
+      testWidgets('Primary+C in a command preview copies the whole command', (
+        tester,
+      ) async {
+        final copied = _captureClipboard(tester);
+        final commandSet =
+            ResumeCommandGenerator(settings: AppSettings.defaults()).build(
+              const ResumeCommandSession(
+                sessionId: 'abc123',
+                sourceType: ResumeSessionSourceType.windows,
+                workingDirectory: r'F:\projects\viewer',
+              ),
+            );
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: ThemeData(platform: platform),
+            home: Scaffold(body: CommandPreview(commandSet: commandSet)),
           ),
         );
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(body: CommandPreview(commandSet: commandSet)),
-      ),
-    );
-    await tester.tap(find.text('codex resume abc123').first);
-    await tester.pumpAndSettle();
+        await tester.tap(find.text('codex resume abc123').first);
+        await tester.pumpAndSettle();
 
-    await _pressCtrlC(tester);
+        await _pressCtrlC(tester, platform);
 
-    expect(copied, ['codex resume abc123']);
-  });
+        expect(copied, ['codex resume abc123']);
+      });
+    });
+  }
 }
 
 SessionRowViewModel _row() {

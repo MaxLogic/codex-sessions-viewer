@@ -14,9 +14,81 @@ import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
 import 'package:codex_sessions_viewer/src/database/startup_usage_migration.dart';
 import 'package:codex_sessions_viewer/src/database/usage_migration_bootstrap.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'migration checksum bootstrap and resume preserve legacy raw receipts',
+    () async {
+      final temporary = await Directory.systemTemp.createTemp(
+        'csv_checksum_bootstrap_',
+      );
+      addTearDown(() => temporary.delete(recursive: true));
+      final file = File('${temporary.path}/viewer.sqlite');
+      final initial = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(file, deferUsageMigration: true);
+      expect(initial.fatalError, isNull);
+      final before = openFileBackedDatabase(file, maintenanceWriter: true);
+      addTearDown(before.close);
+      await _seedLegacyChecksumReceipts(before);
+      final receipts15 = _checksumReceiptRows(before);
+      before.execute(
+        "insert into app_metadata values ('checksum_data_sentinel','retained','legacy')",
+      );
+      before.close();
+      final first = await DatabaseMaintenanceCoordinator(file).start(
+        jobType: 'usage_projection_migration',
+        initialPhase: 'bootstrap',
+        bootstrapWorker: _verifiedBootstrap,
+        worker: _stopBeforeMigration,
+      );
+      final firstResult = await first.result;
+      expect(
+        firstResult.state,
+        DatabaseMaintenanceState.interrupted,
+        reason: firstResult.errorMessage,
+      );
+      final upgraded = openFileBackedDatabase(file, maintenanceWriter: true);
+      addTearDown(upgraded.close);
+      expect(_checksumReceiptRows(upgraded).take(15).toList(), receipts15);
+      expect(
+        upgraded
+            .select('select max(version) v from schema_version where success=1')
+            .single['v'],
+        29,
+      );
+      await _seedLegacyChecksumReceipts(upgraded);
+      final receipts29 = _checksumReceiptRows(upgraded);
+      upgraded.close();
+      final resumed = await DatabaseMaintenanceCoordinator(file).start(
+        jobType: 'usage_projection_migration',
+        initialPhase: 'bootstrap',
+        bootstrapWorker: _verifiedBootstrap,
+        worker: _stopBeforeMigration,
+      );
+      final resumedResult = await resumed.result;
+      expect(
+        resumedResult.state,
+        DatabaseMaintenanceState.interrupted,
+        reason: resumedResult.errorMessage,
+      );
+      final checked = openFileBackedDatabase(file, maintenanceWriter: true);
+      addTearDown(checked.close);
+      expect(_checksumReceiptRows(checked), receipts29);
+      expect(
+        checked
+            .select(
+              "select value from app_metadata where key='checksum_data_sentinel'",
+            )
+            .single['value'],
+        'retained',
+      );
+      checked.close();
+    },
+  );
+
   for (final prices in [false, true]) {
     final phase = prices ? 'initialize_prices' : 'project_usage';
     final unit = prices ? 'models' : 'sessions';
@@ -983,6 +1055,26 @@ Future<DatabaseMaintenanceWorkerOutcome> _failBootstrap(
 
 Future<DiskVolumeSpace> _ampleSpace(Directory _) async =>
     const DiskVolumeSpace(volumeKey: 'fixture', availableBytes: 1 << 50);
+
+List<Map<String, Object?>> _checksumReceiptRows(Database db) => db
+    .select('select * from schema_version order by version')
+    .map((row) => Map<String, Object?>.from(row))
+    .toList();
+
+Future<void> _seedLegacyChecksumReceipts(Database db) async {
+  for (final folder in ['init', 'migration']) {
+    await for (final entry in Directory('../sql/$folder').list()) {
+      if (entry is! File || !entry.path.endsWith('.sql')) continue;
+      final version = int.parse(entry.uri.pathSegments.last.split('_').first);
+      final lf = (await entry.readAsString()).replaceAll('\r\n', '\n');
+      final raw = lf.replaceAll('\n', '\r\n');
+      db.execute(
+        "update schema_version set checksum=?,applied_at_utc='legacy checksum time',error_message='retained historical detail' where version=?",
+        [sha256.convert(utf8.encode(raw)).toString(), version],
+      );
+    }
+  }
+}
 
 Future<DatabaseMaintenanceWorkerOutcome> _verifiedBootstrap(
   DatabaseMaintenanceWorkerContext context,

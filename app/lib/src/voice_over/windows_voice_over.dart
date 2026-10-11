@@ -7,7 +7,32 @@ import 'package:flutter/semantics.dart';
 
 import '../accessibility/announcement_service.dart';
 import '../config/app_settings.dart';
+import '../platform/app_locations.dart';
+import 'process_voice_over.dart';
 import 'voice_over_service.dart';
+
+VoiceOverPlayer createVoiceOverPlayer({
+  AppHostPlatform? platform,
+  VoiceOverProcessStarter? startProcess,
+}) {
+  final AppHostPlatform host;
+  try {
+    host = platform ?? AppLocations.currentPlatform;
+  } on UnsupportedError {
+    return const UnsupportedWavPlayer();
+  }
+  return switch (host) {
+    AppHostPlatform.windows => WindowsWavPlayer(),
+    AppHostPlatform.macos => ProcessWavPlayer(
+      commands: const ['afplay'],
+      startProcess: startProcess,
+    ),
+    AppHostPlatform.linux => ProcessWavPlayer(
+      commands: const ['paplay', 'aplay'],
+      startProcess: startProcess,
+    ),
+  };
+}
 
 // PlaySound flags from mmsystem.h.
 const _sndAsync = 0x0001;
@@ -75,10 +100,14 @@ VoiceOverService createVoiceOverService(
   VoiceOverSettings settings, {
   VoiceOverPlayer? player,
   VoiceOverAnnouncer? announcer,
+  AppHostPlatform? platform,
+  VoiceOverProcessStarter? startProcess,
 }) {
   return VoiceOverService(
     settings: settings,
-    player: player ?? WindowsWavPlayer(),
+    player:
+        player ??
+        createVoiceOverPlayer(platform: platform, startProcess: startProcess),
     announcer: announcer ?? const SemanticsAnnouncer(),
     wavExists: (path) => File(path).exists(),
   );

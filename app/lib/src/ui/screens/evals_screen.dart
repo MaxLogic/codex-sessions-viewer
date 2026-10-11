@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../export/eval_dataset_exporter.dart';
+import '../../platform/app_locations.dart';
 import '../models/session_label_formatter.dart';
 import '../models/session_row_view_model.dart';
 
@@ -63,7 +64,9 @@ enum _EvalStatusFilter {
 enum _EvalSourceFilter {
   all('All sources'),
   windows('Windows'),
-  wsl('WSL');
+  wsl('WSL'),
+  macos('macOS'),
+  linux('Linux');
 
   const _EvalSourceFilter(this.label);
 
@@ -75,11 +78,13 @@ class EvalsScreen extends StatefulWidget {
     super.key,
     required this.initialRows,
     this.statusMessage = '',
+    this.hostPlatform,
     this.onUpdateEvalMetadata,
     this.onExport,
   });
 
   final List<SessionRowViewModel> initialRows;
+  final AppHostPlatform? hostPlatform;
   final String statusMessage;
   final EvalMetadataUpdateCallback? onUpdateEvalMetadata;
   final EvalsExportCallback? onExport;
@@ -267,7 +272,10 @@ class _EvalsScreenState extends State<EvalsScreen> {
               ),
               items: [
                 for (final value in _EvalSourceFilter.values)
-                  DropdownMenuItem(value: value, child: Text(value.label)),
+                  if (value != _EvalSourceFilter.wsl ||
+                      (widget.hostPlatform ?? AppLocations.currentPlatform) ==
+                          AppHostPlatform.windows)
+                    DropdownMenuItem(value: value, child: Text(value.label)),
               ],
               onChanged: (value) {
                 if (value != null) {
@@ -552,6 +560,8 @@ class _EvalsScreenState extends State<EvalsScreen> {
       _EvalSourceFilter.all => true,
       _EvalSourceFilter.windows => row.platform == SessionRowPlatform.windows,
       _EvalSourceFilter.wsl => row.platform == SessionRowPlatform.wsl,
+      _EvalSourceFilter.macos => row.platform == SessionRowPlatform.macos,
+      _EvalSourceFilter.linux => row.platform == SessionRowPlatform.linux,
     };
   }
 

@@ -191,7 +191,7 @@ fn ok(db: &Path, args: &[&str]) -> Value {
     );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["contract"], "codex-sessions-viewer.query");
-    assert_eq!(value["version"], 1);
+    assert_eq!(value["version"], 2);
     assert_eq!(value["read_only"], true);
     value
 }

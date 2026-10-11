@@ -14,7 +14,7 @@ use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 28;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 29;
 
 pub struct Migration {
     pub version: i64,
@@ -24,7 +24,13 @@ pub struct Migration {
 
 impl Migration {
     pub fn checksum(&self) -> String {
-        sha256_hex(self.sql.as_bytes())
+        sha256_hex(self.sql.replace("\r\n", "\n").as_bytes())
+    }
+
+    fn accepts_checksum(&self, checksum: &str) -> bool {
+        let lf = self.sql.replace("\r\n", "\n");
+        checksum == sha256_hex(lf.as_bytes())
+            || checksum == sha256_hex(lf.replace('\n', "\r\n").as_bytes())
     }
 }
 
@@ -87,6 +93,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(26, "migration", "026_retire_misread_codex_files.sql"),
     migration!(27, "migration", "027_fix_search_update_triggers.sql"),
     migration!(28, "migration", "028_session_project_refined.sql"),
+    migration!(29, "migration", "029_native_source_types.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,7 +320,7 @@ fn validate_applied_checksums(conn: &Connection) -> StoreResult<()> {
                 "Database schema version {version} ({filename}) is newer than this collector supports ({SUPPORTED_SCHEMA_VERSION}). Update the collector."
             )));
         };
-        if migration.checksum() != checksum {
+        if !migration.accepts_checksum(&checksum) {
             return Err(StoreError::Refused(format!(
                 "Database migration {filename} does not match this collector's copy. Use a collector from the same release as the viewer."
             )));
@@ -442,9 +449,15 @@ pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
             .optional()?
             .is_some();
         if !applied {
-            conn.execute_batch("begin immediate")?;
-            let result = apply_migration_in_transaction(conn, migration);
-            finish(conn, result)?;
+            let apply = || {
+                conn.execute_batch("begin immediate")?;
+                finish(conn, apply_migration_in_transaction(conn, migration))
+            };
+            if migration.version == 29 {
+                with_foreign_keys_disabled(conn, apply)?;
+            } else {
+                apply()?;
+            }
         }
     }
     Ok(())
@@ -464,32 +477,39 @@ fn create_standalone(conn: &Connection, path: &str, migrations: &[Migration]) ->
             "{path} already contains tables but no schema history; refusing to initialize it."
         )));
     }
-    conn.execute_batch("begin immediate")?;
-    let result = (|| -> StoreResult<()> {
-        conn.execute_batch(SCHEMA_VERSION_TABLE)?;
-        for migration in migrations {
-            apply_migration_in_transaction(conn, migration)?;
-        }
-        let now = DartDateTime::now().to_iso8601();
-        activate_empty_usage_generation(conn, &now)?;
-        record_writer_versions(conn, &ALL_VERSION_KEYS)?;
-        conn.execute(
+    let create = || -> StoreResult<()> {
+        conn.execute_batch("begin immediate")?;
+        let result = (|| -> StoreResult<()> {
+            conn.execute_batch(SCHEMA_VERSION_TABLE)?;
+            for migration in migrations {
+                apply_migration_in_transaction(conn, migration)?;
+            }
+            let now = DartDateTime::now().to_iso8601();
+            activate_empty_usage_generation(conn, &now)?;
+            record_writer_versions(conn, &ALL_VERSION_KEYS)?;
+            conn.execute(
             "insert into app_metadata (key, value, updated_at_utc) values ('database_owner', ?, ?)
              on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc",
             params![OWNER_COLLECTOR, now],
         )?;
-        conn.execute(
+            conn.execute(
             "update database_state set last_optimized_schema_version = ?, updated_at_utc = ? where id = 1",
             params![SUPPORTED_SCHEMA_VERSION, now],
         )?;
-        conn.execute(
+            conn.execute(
             "insert into app_metadata (key, value, updated_at_utc) values ('sqlite_version', ?, ?)
              on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc",
             params![rusqlite::version(), now],
         )?;
-        Ok(())
-    })();
-    finish(conn, result)
+            Ok(())
+        })();
+        finish(conn, result)
+    };
+    if migrations.iter().any(|migration| migration.version == 29) {
+        with_foreign_keys_disabled(conn, create)
+    } else {
+        create()
+    }
 }
 
 /// The end state of the viewer's usage migration for a database with no
@@ -555,6 +575,9 @@ fn activate_empty_usage_generation(conn: &Connection, now: &str) -> StoreResult<
 fn apply_migration_in_transaction(conn: &Connection, migration: &Migration) -> StoreResult<()> {
     conn.execute_batch("pragma defer_foreign_keys = on")?;
     conn.execute_batch(migration.sql)?;
+    if migration.version == 29 {
+        validate_native_migration(conn)?;
+    }
     conn.execute(
         "insert into schema_version (version, filename, checksum, applied_at_utc, success, error_message)
          values (?, ?, ?, ?, 1, null)
@@ -570,6 +593,129 @@ fn apply_migration_in_transaction(conn: &Connection, migration: &Migration) -> S
         ],
     )?;
     Ok(())
+}
+
+fn validate_native_migration(conn: &Connection) -> StoreResult<()> {
+    let violations: i64 =
+        conn.query_row("select count(*) from pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        return Err(StoreError::Refused(format!(
+            "Native source migration left {violations} foreign-key violations."
+        )));
+    }
+    for view in ["history_sessions", "history_messages", "history_tool_calls"] {
+        conn.prepare(&format!("select * from {view} limit 1"))?
+            .query([])?
+            .next()?;
+    }
+    for (kind, name) in [
+        ("index", "idx_sessions_archived"),
+        ("index", "idx_sessions_available_activity"),
+        ("index", "idx_sessions_eval_ready"),
+        ("index", "idx_sessions_eval_status"),
+        ("index", "idx_sessions_forked_from_id"),
+        ("index", "idx_sessions_harness_session_id_unique"),
+        ("index", "idx_sessions_machine_harness_session"),
+        ("index", "idx_sessions_parent_thread_id"),
+        ("index", "idx_sessions_parse_status"),
+        ("index", "idx_sessions_scan_status"),
+        ("index", "idx_sessions_session_id"),
+        ("index", "idx_sessions_source_type"),
+        ("trigger", "trg_projects_change_rename"),
+        ("trigger", "trg_session_tags_change_delete"),
+        ("trigger", "trg_session_tags_change_insert"),
+        ("trigger", "trg_session_tags_change_update"),
+        ("trigger", "trg_sessions_change_delete"),
+        ("trigger", "trg_sessions_change_insert"),
+        ("trigger", "trg_sessions_change_update"),
+        ("trigger", "trg_sessions_insert_activity"),
+        ("trigger", "trg_sessions_insert_machine_id"),
+        ("trigger", "trg_sessions_update_activity"),
+        ("trigger", "trg_tags_change_rename"),
+        ("trigger", "trg_usage_session_daily_change_delete"),
+        ("trigger", "trg_usage_session_daily_change_insert"),
+        ("trigger", "trg_usage_session_daily_change_update"),
+        ("view", "history_sessions"),
+        ("view", "history_messages"),
+        ("view", "history_tool_calls"),
+    ] {
+        let exists: bool = conn.query_row(
+            "select exists(select 1 from sqlite_schema where type = ? and name = ?)",
+            params![kind, name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Refused(format!(
+                "Native source migration did not restore {kind} {name}."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The table replacement in migration 29 must run with FK enforcement off.
+/// SQLite ignores a foreign_keys change after BEGIN, so this guard owns the
+/// setting outside the complete migration transaction, including bootstrap.
+fn with_foreign_keys_disabled<T>(
+    conn: &Connection,
+    body: impl FnOnce() -> StoreResult<T>,
+) -> StoreResult<T> {
+    if !conn.is_autocommit() {
+        return Err(StoreError::Refused(
+            "Native source migration requires an autocommit connection.".to_owned(),
+        ));
+    }
+    let original: i64 = conn.query_row("pragma foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", "off")?;
+    let disabled: i64 = conn.query_row("pragma foreign_keys", [], |row| row.get(0))?;
+    if disabled != 0 {
+        return Err(StoreError::Refused(
+            "Could not disable foreign keys before native source migration.".to_owned(),
+        ));
+    }
+    let mut result = body();
+    let mut rollback_failed = false;
+    if !conn.is_autocommit() {
+        let rollback = conn.execute_batch("rollback");
+        rollback_failed = rollback.is_err();
+        let original_error = result.err().map_or_else(
+            || "migration left a transaction open".to_owned(),
+            |error| error.to_string(),
+        );
+        result = Err(StoreError::Refused(match rollback {
+            Ok(()) => original_error,
+            Err(error) => format!("{original_error}; rollback failed: {error}"),
+        }));
+    }
+    let restore = conn
+        .pragma_update(None, "foreign_keys", original)
+        .and_then(|_| conn.query_row("pragma foreign_keys", [], |row| row.get::<_, i64>(0)));
+    let cleanup_error = match restore {
+        Ok(mode) if mode == original && !rollback_failed => return result,
+        Ok(mode) => format!(
+            "Native source migration result: {}; foreign-key mode restored to {mode}, expected {original}; connection must not be reused.",
+            result
+                .err()
+                .map_or_else(|| "success".to_owned(), |error| error.to_string())
+        ),
+        Err(error) => format!(
+            "Native source migration result: {}; foreign-key restoration failed: {error}; connection must not be reused.",
+            result
+                .err()
+                .map_or_else(|| "success".to_owned(), |error| error.to_string())
+        ),
+    };
+    // A failed cleanup leaves transaction/enforcement state uncertain. Reject
+    // reads as well as writes until the caller discards this connection.
+    let poison = conn.authorizer(Some(|_: rusqlite::hooks::AuthContext<'_>| {
+        rusqlite::hooks::Authorization::Deny
+    }));
+    Err(StoreError::Refused(match poison {
+        Ok(()) => cleanup_error,
+        Err(error) => format!("{cleanup_error}; failed to disable connection access: {error}"),
+    }))
 }
 
 thread_local! {
@@ -687,6 +833,333 @@ pub fn finish<T>(conn: &Connection, result: StoreResult<T>) -> StoreResult<T> {
 mod tests {
     use super::*;
 
+    // Independently hash the exact fixture bytes, without Migration's policy.
+    fn fixture_digest(sql: &str) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(sql.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn receipt_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn
+            .prepare("select * from schema_version order by version")
+            .unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    fn seed_raw_newline_receipts(conn: &Connection, crlf: bool) {
+        let last = last_applied_version(conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= last) {
+            let lf = migration.sql.replace("\r\n", "\n");
+            let raw = if crlf { lf.replace('\n', "\r\n") } else { lf };
+            conn.execute("update schema_version set checksum=?, applied_at_utc='legacy receipt time', error_message='retained historical detail' where version=?",
+                params![fixture_digest(&raw), migration.version]).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_checksum_accepts_legacy_newlines_without_rewriting_receipts() {
+        for crlf in [false, true] {
+            let conn = native_upgrade_fixture();
+            prepare_standalone(&conn, ":memory:").unwrap();
+            conn.execute_batch(
+                "update sessions set source_type='linux',is_pinned=1 where id='parent';",
+            )
+            .unwrap();
+            seed_raw_newline_receipts(&conn, crlf);
+            let receipts = receipt_rows(&conn);
+            let data = native_fixture_snapshot(&conn);
+            prepare_standalone(&conn, ":memory:").unwrap();
+            check_writable(&conn, OwnerMode::Standalone, ":memory:").unwrap();
+            conn.execute(
+                "update app_metadata set value=? where key='database_owner'",
+                [OWNER_VIEWER],
+            )
+            .unwrap();
+            check_writable(&conn, OwnerMode::Viewer, ":memory:").unwrap();
+            assert_eq!(receipt_rows(&conn), receipts);
+            assert_eq!(native_fixture_snapshot(&conn), data);
+        }
+    }
+
+    #[test]
+    fn migration_checksum_upgrade_preserves_legacy_21_and_populated_rows() {
+        let conn = native_upgrade_fixture();
+        seed_raw_newline_receipts(&conn, true);
+        let receipts = receipt_rows(&conn);
+        let data = native_fixture_snapshot(&conn);
+        prepare_standalone(&conn, ":memory:").unwrap();
+        assert_eq!(&receipt_rows(&conn)[..28], receipts.as_slice());
+        assert_eq!(native_fixture_snapshot(&conn), data);
+        let digest: String = conn
+            .query_row(
+                "select checksum from schema_version where version=29",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            digest,
+            fixture_digest(&MIGRATIONS[28].sql.replace("\r\n", "\n"))
+        );
+    }
+
+    #[test]
+    fn migration_checksum_fresh_bootstrap_records_canonical_lf_for_all_sql() {
+        for crlf in [false, true] {
+            let migrations: Vec<_> = MIGRATIONS
+                .iter()
+                .map(|m| {
+                    let lf = m.sql.replace("\r\n", "\n");
+                    let sql = if crlf { lf.replace('\n', "\r\n") } else { lf };
+                    Migration {
+                        version: m.version,
+                        filename: m.filename,
+                        sql: Box::leak(sql.into_boxed_str()),
+                    }
+                })
+                .collect();
+            let conn = Connection::open_in_memory().unwrap();
+            create_standalone(&conn, ":memory:", &migrations).unwrap();
+            for migration in MIGRATIONS {
+                let digest: String = conn
+                    .query_row(
+                        "select checksum from schema_version where version=?",
+                        [migration.version],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    digest,
+                    fixture_digest(&migration.sql.replace("\r\n", "\n")),
+                    "version {}",
+                    migration.version
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migration_checksum_store_open_preserves_file_backed_legacy_receipts() {
+        for crlf in [false, true] {
+            let temporary = std::env::temp_dir().join(format!(
+                "cxv_checksum_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&temporary).unwrap();
+            let path = temporary.join("legacy.sqlite");
+            let store = crate::store::Store::open(&path, OwnerMode::Standalone).unwrap();
+            store.conn.execute_batch("insert into sessions(id,source_type,source_file_path,display_path,platform_path,is_pinned,created_at_utc,updated_at_utc) values ('native','linux','/home/native','/home/native','/home/native',1,'now','now');
+                insert into messages(session_id,message_index,author_type,content_plain,content_preview,created_at_db_utc,updated_at_db_utc) values ('native',0,'user','retained','retained','now','now');
+                insert into collector_upload_outbox(record_json,created_at_utc) values (' {\"version\":1,\"retained\":true} ', 'now');").unwrap();
+            seed_raw_newline_receipts(&store.conn, crlf);
+            let receipts = receipt_rows(&store.conn);
+            let data = native_fixture_snapshot(&store.conn);
+            drop(store);
+            let reopened = crate::store::Store::open(&path, OwnerMode::Standalone).unwrap();
+            assert_eq!(receipt_rows(&reopened.conn), receipts);
+            assert_eq!(native_fixture_snapshot(&reopened.conn), data);
+            reopened
+                .conn
+                .execute(
+                    "update app_metadata set value=? where key='database_owner'",
+                    [OWNER_VIEWER],
+                )
+                .unwrap();
+            drop(reopened);
+            let viewer = crate::store::Store::open(&path, OwnerMode::Viewer).unwrap();
+            assert_eq!(receipt_rows(&viewer.conn), receipts);
+            assert_eq!(native_fixture_snapshot(&viewer.conn), data);
+            drop(viewer);
+            std::fs::remove_dir_all(&temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_checksum_rejects_changed_sql_and_unknown_hash_before_upgrade() {
+        for digest in [
+            fixture_digest(&format!("{}\n-- genuine SQL drift\n", MIGRATIONS[20].sql)),
+            "0".repeat(64),
+        ] {
+            let conn = native_upgrade_fixture();
+            conn.execute(
+                "update schema_version set checksum=? where version=21",
+                [digest],
+            )
+            .unwrap();
+            let receipts = receipt_rows(&conn);
+            let data = native_fixture_snapshot(&conn);
+            assert!(
+                prepare_standalone(&conn, ":memory:")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match")
+            );
+            assert!(
+                check_writable(&conn, OwnerMode::Standalone, ":memory:")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match")
+            );
+            assert_eq!(receipt_rows(&conn), receipts);
+            assert_eq!(native_fixture_snapshot(&conn), data);
+            assert_eq!(last_applied_version(&conn).unwrap(), 28);
+        }
+    }
+
+    fn native_upgrade_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "on").unwrap();
+        create_standalone(&conn, ":memory:", &MIGRATIONS[..28]).unwrap();
+        conn.execute_batch("insert into sessions(id,source_type,source_file_path,display_path,platform_path,created_at_utc,updated_at_utc) values ('parent','windows','C:/parent','C:/parent','C:/parent','now','now');
+            insert into messages(session_id,message_index,author_type,content_plain,content_preview,created_at_db_utc,updated_at_db_utc) values ('parent',0,'user','nativeuniquetoken','nativeuniquetoken','now','now');
+            insert into tags(name,created_at_utc,updated_at_utc) values ('retained','now','now');
+            insert into session_tags(session_id,tag_id,created_at_utc) select 'parent',id,'now' from tags;
+            insert into collector_upload_outbox(record_json,created_at_utc) values (' {\"version\":1,\"unchanged\":true} ', 'now');
+            insert into collector_hub_state(id,enabled,hub_url,machine_id,last_sequence,inflight_batch_id,inflight_last_id) values (1,1,'http://127.0.0.1:1','legacy',7,'legacy-batch',1);").unwrap();
+        conn.execute_batch(r#"
+insert into tool_calls(session_id,message_id,tool_index,tool_name,status) select 'parent',id,0,'retained-tool','finished' from messages where session_id='parent';
+insert into session_path_keys(session_id,path_key) values ('parent','c:/parent');
+insert into session_source_extras(session_row_id,extra_json,updated_at_utc) values ('parent','{"retained":true}','now');
+insert into usage_event_inputs(session_row_id,source_record_ordinal,provider,billable_units_json) values ('parent',1,'retained-provider','{"units":3}');
+insert into usage_path_contexts(id,display_path_raw,platform_path_raw,unc_path_raw,display_path_key,platform_path_key,unc_path_key,normalization_version,resolution_source,project_rules_version,created_at_utc,updated_at_utc) values (99,'C:/parent','C:/parent','','c:/parent','c:/parent','',1,'unassigned',0,'now','now');
+insert into usage_events(session_row_id,source_record_ordinal,epoch,path_context_id,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,branch_scope,derivation,event_fingerprint) values ('parent',1,0,99,10,0,0,2,0,12,'local','last_token_usage','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,branch_scope,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,cost_status,pricing_resolution_method,cost_projection_version,updated_at_utc) values ('parent','2026-10-05','retained-model',99,'local',10,0,0,2,0,12,'unknown','unknown',1,'now');
+"#).unwrap();
+        conn
+    }
+
+    fn native_fixture_snapshot(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut result = Vec::new();
+        for query in [
+            "select rowid,* from sessions",
+            "select * from messages",
+            "select * from session_source_extras",
+            "select * from tool_calls",
+            "select * from session_path_keys",
+            "select * from usage_event_inputs",
+            "select * from usage_events",
+            "select * from usage_session_daily",
+            "select * from session_tags",
+            "select * from collector_upload_outbox",
+            "select * from collector_hub_state",
+            "select * from session_change_state",
+            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') order by type,name",
+        ] {
+            let mut statement = conn.prepare(query).unwrap();
+            let columns = statement.column_count();
+            result.extend(
+                statement
+                    .query_map([], |row| {
+                        (0..columns).map(|column| row.get(column)).collect()
+                    })
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+        }
+        result
+    }
+
+    #[test]
+    fn native_migration_preserves_populated_standalone_and_upload_bytes() {
+        let conn = native_upgrade_fixture();
+        let before = native_fixture_snapshot(&conn);
+        prepare_standalone(&conn, ":memory:").unwrap();
+        assert_eq!(native_fixture_snapshot(&conn), before);
+        assert_eq!(last_applied_version(&conn).unwrap(), 29);
+        assert_eq!(
+            conn.query_row("pragma foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        validate_native_migration(&conn).unwrap();
+        assert_eq!(conn.query_row("select count(*) from message_search where message_search match 'nativeuniquetoken'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        conn.execute(
+            "update sessions set source_type='linux' where id='parent'",
+            [],
+        )
+        .unwrap();
+        conn.execute("delete from messages where session_id='parent'", [])
+            .unwrap();
+        assert_eq!(conn.query_row("select count(*) from message_search where message_search match 'nativeuniquetoken'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn native_migration_validation_failure_rolls_back_upgrade_and_bootstrap() {
+        let sql = format!(
+            "{}\ndrop trigger trg_session_tags_change_insert;",
+            MIGRATIONS[28].sql
+        );
+        let broken = Migration {
+            version: 29,
+            filename: MIGRATIONS[28].filename,
+            sql: Box::leak(sql.into_boxed_str()),
+        };
+        let conn = native_upgrade_fixture();
+        let before = native_fixture_snapshot(&conn);
+        let error = with_foreign_keys_disabled(&conn, || {
+            conn.execute_batch("begin immediate")?;
+            finish(&conn, apply_migration_in_transaction(&conn, &broken))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("trg_session_tags_change_insert"),
+            "{error}"
+        );
+        assert_eq!(native_fixture_snapshot(&conn), before);
+        assert_eq!(last_applied_version(&conn).unwrap(), 28);
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("pragma foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let mut migrations: Vec<Migration> = MIGRATIONS
+            .iter()
+            .map(|m| Migration {
+                version: m.version,
+                filename: m.filename,
+                sql: m.sql,
+            })
+            .collect();
+        migrations[28] = broken;
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.pragma_update(None, "foreign_keys", "on").unwrap();
+        assert!(
+            create_standalone(&fresh, ":memory:", &migrations)
+                .unwrap_err()
+                .to_string()
+                .contains("trg_session_tags_change_insert")
+        );
+        assert_eq!(
+            fresh
+                .query_row("select count(*) from sqlite_schema", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(fresh.is_autocommit());
+        assert_eq!(
+            fresh
+                .query_row("pragma foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        prepare_standalone(&fresh, ":memory:").unwrap();
+    }
+
     #[test]
     fn migrations_match_sql_folder() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../sql");
@@ -766,6 +1239,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(job, "succeeded");
+    }
+
+    #[test]
+    fn native_migration_fatal_cleanup_denies_connection_reads_and_writes() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let conn = native_upgrade_fixture();
+        conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Pragma {
+                pragma_name: "foreign_keys",
+                pragma_value: Some("1"),
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+        let error = prepare_standalone(&conn, ":memory:").unwrap_err();
+        assert!(
+            error.to_string().contains("foreign-key restoration failed"),
+            "{error}"
+        );
+        assert!(
+            conn.query_row("select count(*) from sessions", [], |row| row
+                .get::<_, i64>(0))
+                .is_err()
+        );
+        assert!(
+            conn.execute("update sessions set title='unsafe reuse'", [])
+                .is_err()
+        );
+
+        let conn = native_upgrade_fixture();
+        conn.pragma_update(None, "foreign_keys", "off").unwrap();
+        let error = with_foreign_keys_disabled(&conn, || -> StoreResult<()> {
+            conn.execute_batch("begin immediate")?;
+            conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Transaction {
+                    operation: rusqlite::hooks::TransactionOperation::Rollback,
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))?;
+            Err(StoreError::Refused("original migration error".to_owned()))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("original migration error"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("rollback failed"), "{error}");
+        assert!(
+            conn.query_row("select 1", [], |row| row.get::<_, i64>(0))
+                .is_err()
+        );
+        assert!(
+            conn.execute("update sessions set title='unsafe reuse'", [])
+                .is_err()
+        );
     }
 
     /// A standalone database that a newer release has moved past this

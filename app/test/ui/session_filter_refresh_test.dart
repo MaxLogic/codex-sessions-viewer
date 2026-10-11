@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
@@ -14,6 +15,70 @@ import 'package:flutter_test/flutter_test.dart';
 import '../helpers/test_sessions_screen.dart';
 
 void main() {
+  testWidgets(
+    'native platform filters hide WSL but copied rows stay readable',
+    (tester) async {
+      final semantics = tester.ensureSemantics();
+      await tester.binding.setSurfaceSize(const Size(1800, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      for (final host in [AppHostPlatform.linux, AppHostPlatform.macos]) {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SessionsScreen(
+              key: ValueKey(host),
+              hostPlatform: host,
+              now: fixedSessionsNow,
+              initialRows: [
+                _row(
+                  id: 'linux',
+                  title: 'Native Linux',
+                  project: 'Viewer',
+                  platform: SessionRowPlatform.linux,
+                ),
+                _row(
+                  id: 'macos',
+                  title: 'Native Mac',
+                  project: 'Viewer',
+                  platform: SessionRowPlatform.macos,
+                ),
+                _row(
+                  id: 'wsl',
+                  title: 'Copied WSL',
+                  project: 'Viewer',
+                  platform: SessionRowPlatform.wsl,
+                ),
+              ],
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('Copied WSL'), findsWidgets);
+        await tester.tap(find.text('More filters'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.bySemanticsLabel('Platform filter'));
+        await tester.pumpAndSettle();
+        expect(find.text('WSL only'), findsNothing);
+        expect(find.text('macOS only'), findsOneWidget);
+        final linuxItem = find.ancestor(
+          of: find.text('Linux only').last,
+          matching: find.byWidgetPredicate(
+            (widget) => widget is CheckedPopupMenuItem,
+          ),
+        );
+        await tester.ensureVisible(linuxItem);
+        await tester.tap(linuxItem);
+        await tester.pumpAndSettle();
+        expect(find.text('Native Linux'), findsWidgets);
+        expect(find.text('Native Mac'), findsNothing);
+        expect(find.text('Copied WSL'), findsNothing);
+        expect(
+          tester.getSemantics(find.bySemanticsLabel('Platform filter')).value,
+          'Linux only',
+        );
+      }
+      semantics.dispose();
+    },
+  );
   testWidgets(
     'pricing revisions update row and detail costs without source refresh',
     (tester) async {

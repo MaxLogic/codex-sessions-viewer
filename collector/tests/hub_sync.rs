@@ -191,6 +191,7 @@ fn out_of_order_and_explicit_missing_status_preserve_newer_data() {
     let status = Envelope::new(Record::SourceStatus(SourceStatus {
         harness: "codex".to_owned(),
         path: source_path,
+        environment: Some("windows".to_owned()),
         status: "missing".to_owned(),
         state: "missing".to_owned(),
         message: None,
@@ -342,6 +343,29 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
             )))])
             .unwrap();
         assert_eq!(hub_client::pending(&store.conn).unwrap(), 1);
+        // Persisted pre-upgrade v1 bytes, including unknown fields and spacing,
+        // must survive failed delivery and restart without reserialization.
+        let raw = store
+            .conn
+            .query_row(
+                "select record_json from collector_upload_outbox",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let legacy = raw.replacen(
+            "\"version\":2",
+            "\"version\":1, \"future_field\":{\"preserve\":true}",
+            1,
+        );
+        store
+            .conn
+            .execute(
+                "update collector_upload_outbox set record_json=?",
+                [&legacy],
+            )
+            .unwrap();
+        std::fs::write(temp.path().join("legacy-record.txt"), legacy).unwrap();
     }
     let _ = hub.child.kill();
     let _ = hub.child.wait();
@@ -397,6 +421,11 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
             .unwrap();
         let envelope: Value = serde_json::from_str(&queued).unwrap();
         assert_eq!(
+            queued,
+            std::fs::read_to_string(temp.path().join("legacy-record.txt")).unwrap()
+        );
+        assert_eq!(envelope["version"], 1);
+        assert_eq!(
             upload(&hub, MACHINE_A_TOKEN, 1, &batch_id, vec![envelope]).unwrap()["duplicate"],
             false
         );
@@ -435,6 +464,87 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
         (Some(0), Some(0))
     );
     assert_eq!(session_count(&hub, "machine-a"), 1);
+}
+
+#[test]
+fn typed_external_v1_and_builtin_v2_records_keep_versions_in_the_outbox() {
+    use codex_sessions_collector::contract::parse_line;
+    let temp = TempDir::new("mixed_version_outbox");
+    let db = temp.path().join("local.sqlite");
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    store.conn.execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values (1,1,'http://127.0.0.1:1','legacy')", []).unwrap();
+    let mut legacy = serde_json::to_value(Envelope::new(Record::SessionSnapshot(Box::new(
+        sample_snapshot("legacy"),
+    ))))
+    .unwrap();
+    legacy["version"] = json!(1);
+    let legacy_status = json!({"contract":"codex-sessions-viewer.ingest","version":1,"kind":"source_status","record":{"harness":"codex","path":"C:/legacy-error","status":"parse_error","state":"active","environment":"linux"}});
+    let mut native = sample_snapshot("native");
+    native.source.environment = "linux".to_owned();
+    store
+        .apply(vec![
+            parse_line(&legacy.to_string()).unwrap(),
+            parse_line(&legacy_status.to_string()).unwrap(),
+            Envelope::new(Record::SessionSnapshot(Box::new(native))),
+        ])
+        .unwrap();
+    let mut statement = store
+        .conn
+        .prepare("select record_json from collector_upload_outbox order by id")
+        .unwrap();
+    let rows: Vec<Value> = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["version"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 2]
+    );
+    assert!(rows[1]["record"].get("environment").is_none());
+    assert_eq!(rows[2]["record"]["source"]["environment"], "linux");
+}
+
+#[test]
+fn upgraded_hub_reads_v1_and_native_v2_without_changing_http_protocol() {
+    let temp = TempDir::new("native_hub_contract");
+    let hub = start(&temp);
+    let mut legacy = serde_json::to_value(Envelope::new(Record::SessionSnapshot(Box::new(
+        sample_snapshot("legacy"),
+    ))))
+    .unwrap();
+    legacy["version"] = json!(1);
+    let mut native = sample_snapshot("native");
+    native.source.environment = "macos".to_owned();
+    native.source.path = "C:/windows/wsl/native.jsonl".to_owned();
+    let native =
+        serde_json::to_value(Envelope::new(Record::SessionSnapshot(Box::new(native)))).unwrap();
+    upload(
+        &hub,
+        MACHINE_A_TOKEN,
+        1,
+        "mixed-version",
+        vec![legacy, native],
+    )
+    .unwrap();
+    let mut response = ureq::post(format!("{}/v1/query", hub.url))
+        .header("Authorization", format!("Bearer {OWNER_TOKEN}"))
+        .send_json(json!({"protocol":1,"machine":"machine-a","args":["sessions","--limit","10"]}))
+        .unwrap();
+    let data: Value = response.body_mut().read_json().unwrap();
+    assert_eq!(data["version"], 2);
+    let environments: Vec<&str> = data["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["environment"].as_str().unwrap())
+        .collect();
+    assert!(
+        environments.contains(&"windows") && environments.contains(&"macos"),
+        "{data}"
+    );
 }
 
 /// A standalone local database with machine-a's identity, paired with `url`.
@@ -483,6 +593,7 @@ fn status_record(path: &str, status: &str) -> Envelope {
     Envelope::new(Record::SourceStatus(SourceStatus {
         harness: "codex".to_owned(),
         path: path.to_owned(),
+        environment: Some("windows".to_owned()),
         status: status.to_owned(),
         state: if status == "missing" {
             "missing"
@@ -849,7 +960,11 @@ struct FakeHub {
     bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
 }
 
-fn fake_hub(mut reply: IngestReply) -> FakeHub {
+fn fake_hub(reply: IngestReply) -> FakeHub {
+    fake_hub_contract(codex_sessions_collector::contract::CONTRACT_VERSION, reply)
+}
+
+fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -889,7 +1004,7 @@ fn fake_hub(mut reply: IngestReply) -> FakeHub {
                         "protocol": codex_sessions_collector::hub_server::HUB_PROTOCOL_VERSION,
                         "schema_version": codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION,
                         "contract": codex_sessions_collector::contract::CONTRACT_NAME,
-                        "contract_version": codex_sessions_collector::contract::CONTRACT_VERSION,
+                        "contract_version": contract_version,
                         "machine_id": "machine-a",
                         "high_water": 0
                     })
@@ -911,6 +1026,53 @@ fn fake_hub(mut reply: IngestReply) -> FakeHub {
         }
     });
     FakeHub { url, bodies }
+}
+
+#[test]
+fn old_or_future_peer_contract_refusal_keeps_queued_and_inflight_bytes() {
+    for version in [1, 3] {
+        let temp = TempDir::new("peer_contract_mismatch");
+        let fake = fake_hub_contract(
+            version,
+            Box::new(|_| panic!("mismatched peers must not receive uploads")),
+        );
+        let db = paired_database(&temp, &fake.url);
+        queue_sessions(&db, &["queued", "inflight"]);
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store.conn.execute("update collector_hub_state set inflight_batch_id='retained-batch', inflight_last_id=(select min(id) from collector_upload_outbox) where id=1", []).unwrap();
+        let snapshot = || {
+            let mut statement = store
+                .conn
+                .prepare("select id,record_json from collector_upload_outbox order by id")
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let failure =
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap_err();
+        assert_eq!(
+            failure,
+            "hub protocol, schema, contract, or machine identity differs from this collector release"
+        );
+        assert_eq!(snapshot(), before);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "select inflight_batch_id from collector_hub_state",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "retained-batch"
+        );
+    }
 }
 
 fn acknowledge(body: &Value) -> (u16, String) {

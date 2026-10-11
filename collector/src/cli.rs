@@ -469,11 +469,13 @@ fn scan_options(
 }
 
 fn configured_roots(settings: &CollectorSettings) -> Vec<ScanRoot> {
-    let mut roots = session_scan_roots(&settings.windows_codex_path, SourceType::Windows);
-    roots.extend(session_scan_roots(
-        &settings.wsl_codex_unc_path,
-        SourceType::Wsl,
-    ));
+    let mut roots = session_scan_roots(&settings.windows_codex_path, SourceType::native());
+    if SourceType::native() == SourceType::Windows {
+        roots.extend(session_scan_roots(
+            &settings.wsl_codex_unc_path,
+            SourceType::Wsl,
+        ));
+    }
     roots
 }
 
@@ -641,11 +643,7 @@ fn root_for_file(settings: &CollectorSettings, file: &str) -> ScanRoot {
             };
         }
     }
-    let source_type = if file.starts_with("\\\\wsl") || file.contains("/home/") {
-        SourceType::Wsl
-    } else {
-        SourceType::Windows
-    };
+    let source_type = SourceType::native();
     let archived = file_key
         .split('/')
         .any(|segment| segment == "archived_sessions");
@@ -704,6 +702,7 @@ fn codex_parse(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
         Err(error) => Record::SourceStatus(SourceStatus {
             harness: "codex".to_owned(),
             path: file.clone(),
+            environment: Some(root.source_type.wire_name().to_owned()),
             status: codex::scanner_status_for(&error).to_owned(),
             state: root.source_state.to_owned(),
             message: Some(error.display_message()),
@@ -821,7 +820,7 @@ fn claude_roots(options: &Options) -> Vec<crate::claude::ClaudeRoot> {
         .iter()
         .map(|path| crate::claude::ClaudeRoot {
             path: path.clone(),
-            source_type: SourceType::Windows,
+            source_type: SourceType::native(),
         })
         .collect();
     if roots.is_empty()
@@ -830,15 +829,17 @@ fn claude_roots(options: &Options) -> Vec<crate::claude::ClaudeRoot> {
     {
         roots.push(root);
     }
-    roots.extend(
-        options
-            .claude_wsl_roots
-            .iter()
-            .map(|path| crate::claude::ClaudeRoot {
-                path: path.clone(),
-                source_type: SourceType::Wsl,
-            }),
-    );
+    if SourceType::native() == SourceType::Windows {
+        roots.extend(
+            options
+                .claude_wsl_roots
+                .iter()
+                .map(|path| crate::claude::ClaudeRoot {
+                    path: path.clone(),
+                    source_type: SourceType::Wsl,
+                }),
+        );
+    }
     roots
 }
 
@@ -881,15 +882,16 @@ fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
 
 fn claude_source_type(options: &Options, file: &str) -> SourceType {
     let key = canonical_scan_path(file);
-    if options
-        .claude_wsl_roots
-        .iter()
-        .any(|root| is_path_under_root(&key, root))
-        || file.starts_with("\\\\wsl")
+    if SourceType::native() == SourceType::Windows
+        && (options
+            .claude_wsl_roots
+            .iter()
+            .any(|root| is_path_under_root(&key, root))
+            || file.starts_with("\\\\wsl"))
     {
         SourceType::Wsl
     } else {
-        SourceType::Windows
+        SourceType::native()
     }
 }
 
@@ -1035,6 +1037,11 @@ fn drain(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     let mapper = PathMapper::new(settings.wsl_linux_root_unc.clone());
     let codex_homes: Vec<String> = [&settings.windows_codex_path, &settings.wsl_codex_unc_path]
         .into_iter()
+        .take(if SourceType::native() == SourceType::Windows {
+            2
+        } else {
+            1
+        })
         .filter(|home| !home.trim().is_empty())
         .cloned()
         .collect();

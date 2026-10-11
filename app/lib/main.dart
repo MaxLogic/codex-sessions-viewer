@@ -13,7 +13,7 @@ import 'src/config/app_settings.dart';
 import 'src/platform/application_working_directory.dart';
 import 'src/platform/app_instance_lock.dart';
 import 'src/window/window_state.dart';
-import 'src/platform/windows_startup_registration.dart';
+import 'src/platform/startup_registration.dart';
 import 'src/platform/wsl_default_distro_detector.dart';
 import 'src/scanner/collector_process.dart';
 
@@ -45,7 +45,7 @@ Future<void> main(List<String> arguments) async {
   );
   await restoreWindowStateBestEffort(windowStateController.restoreAndTrack);
   final sqlRoot = defaultSqlRoot();
-  final startupRegistration = WindowsStartupRegistration();
+  final startupRegistration = StartupRegistration.forCurrentPlatform();
   final maintenance = ApplicationMaintenance(
     databaseFile: databaseFile,
     coordinator: DatabaseMaintenanceCoordinator(databaseFile),
@@ -78,13 +78,13 @@ Future<void> main(List<String> arguments) async {
         coordinator: maintenance.coordinator,
       ),
       startupPreferenceApplier: (enabled) =>
-          applyWindowsStartupPreferenceBestEffort(startupRegistration, enabled),
+          applyStartupPreferenceBestEffort(startupRegistration, enabled),
     ),
   );
 }
 
-Future<void> applyWindowsStartupPreferenceBestEffort(
-  WindowsStartupRegistration startupRegistration,
+Future<void> applyStartupPreferenceBestEffort(
+  StartupRegistration startupRegistration,
   bool enabled,
 ) async {
   try {
@@ -95,9 +95,7 @@ Future<void> applyWindowsStartupPreferenceBestEffort(
         exception: error,
         stack: stack,
         library: 'codex_sessions_viewer',
-        context: ErrorDescription(
-          'while applying the Windows startup preference',
-        ),
+        context: ErrorDescription('while applying the startup preference'),
       ),
     );
   }

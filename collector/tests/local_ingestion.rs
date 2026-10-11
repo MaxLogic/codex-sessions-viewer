@@ -11,12 +11,332 @@ mod support;
 
 use std::path::Path;
 
-use codex_sessions_collector::codex::parser::{ParserOptions, Usage, parse_file};
+use codex_sessions_collector::codex::parser::{ParserOptions, SourceType, Usage, parse_file};
 use codex_sessions_collector::contract::{self, Envelope, Record};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use support::{TempDir, collector, viewer_database};
+
+fn physical_snapshot(
+    environment: &str,
+    path: &str,
+    stable: Option<&str>,
+) -> contract::SessionSnapshot {
+    let mut snapshot = support::sample_snapshot("physical-case");
+    snapshot.session.session_id = stable.map(str::to_owned);
+    snapshot.source.environment = environment.to_owned();
+    snapshot.source.path = path.to_owned();
+    snapshot.source.display_path = path.to_owned();
+    snapshot.source.mapped_source_file_path = path.to_owned();
+    snapshot.source.platform_path = path.to_owned();
+    snapshot.source.unc_path = None;
+    // Search keys are folded; they do not prove physical source equivalence.
+    snapshot.source.normalized_path_keys = vec![path.to_lowercase()];
+    snapshot
+}
+
+fn apply_physical(
+    store: &codex_sessions_collector::store::Store,
+    snapshot: contract::SessionSnapshot,
+) {
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            snapshot,
+        )))])
+        .unwrap();
+}
+
+#[test]
+fn posix_physical_case_copies_rank_evidence_without_same_file_shortcut() {
+    use codex_sessions_collector::store::writer::canonical_snapshots;
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    for environment in ["wsl", "linux", "windows", "macos"] {
+        let temp = TempDir::new("physical_case_copies");
+        let upper = temp
+            .path()
+            .join("Session.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let lower = temp
+            .path()
+            .join("session.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        if cfg!(target_os = "linux") && environment == "linux" {
+            std::fs::write(&upper, "newer physical source").unwrap();
+            std::fs::write(&lower, "older physical source").unwrap();
+            assert_ne!(
+                std::fs::read(&upper).unwrap(),
+                std::fs::read(&lower).unwrap()
+            );
+        }
+        let store = Store::open(&temp.path().join("case.sqlite"), OwnerMode::Standalone).unwrap();
+        let sensitive = matches!(environment, "wsl" | "linux");
+        let mut newer = physical_snapshot(environment, &upper, Some("shared-logical-id"));
+        newer.session.title = Some("newer evidence".to_owned());
+        let mut older = physical_snapshot(environment, &lower, Some("shared-logical-id"));
+        older.session.title = Some("older evidence".to_owned());
+        older.session.last_message_at_utc = Some("2026-09-10T10:01:00Z".to_owned());
+        older.source.modified_utc = "2026-09-10T10:01:00Z".to_owned();
+        apply_physical(&store, newer.clone());
+        apply_physical(&store, older.clone());
+        let retained: (String, String) = store
+            .conn
+            .query_row("select source_file_path,title from sessions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            retained,
+            if sensitive {
+                (upper.clone(), "newer evidence".to_owned())
+            } else {
+                (lower.clone(), "older evidence".to_owned())
+            },
+            "{environment}"
+        );
+        // Reparsing the actual same file may legitimately shorten its evidence.
+        older.source.path = retained.0.clone();
+        older.source.mapped_source_file_path = retained.0.clone();
+        older.source.display_path = retained.0.clone();
+        older.source.platform_path = retained.0;
+        apply_physical(&store, older);
+        assert_eq!(
+            store
+                .conn
+                .query_row("select title from sessions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "older evidence"
+        );
+        if sensitive {
+            let equal_upper = physical_snapshot(environment, &upper, Some("tie"));
+            let equal_lower = physical_snapshot(environment, &lower, Some("tie"));
+            for batch in [
+                vec![equal_lower.clone(), equal_upper.clone()],
+                vec![equal_upper.clone(), equal_lower.clone()],
+            ] {
+                assert_eq!(
+                    canonical_snapshots(batch)[0].1.source.path,
+                    upper,
+                    "case-sensitive physical tie-break is independent of batch order"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn posix_physical_case_null_id_fallback_keeps_its_pin_and_rows() {
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    for environment in ["wsl", "linux", "windows", "macos"] {
+        let temp = TempDir::new("physical_case_fallback");
+        let upper = temp
+            .path()
+            .join("Session.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let lower = temp
+            .path()
+            .join("session.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let store = Store::open(&temp.path().join("case.sqlite"), OwnerMode::Standalone).unwrap();
+        apply_physical(&store, physical_snapshot(environment, &upper, None));
+        store
+            .conn
+            .execute("update sessions set is_pinned=1", [])
+            .unwrap();
+        apply_physical(&store, physical_snapshot(environment, &lower, None));
+        apply_physical(
+            &store,
+            physical_snapshot(environment, &lower, Some("lower-stable")),
+        );
+        let sensitive = matches!(environment, "wsl" | "linux");
+        let rows: i64 = store
+            .conn
+            .query_row("select count(*) from sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows,
+            if sensitive { 2 } else { 1 },
+            "{environment}: folded search keys must not delete another physical fallback"
+        );
+        let pin: i64 = store
+            .conn
+            .query_row(
+                "select is_pinned from sessions where session_id='lower-stable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pin,
+            i64::from(!sensitive),
+            "{environment}: pin follows established physical source semantics"
+        );
+        if sensitive {
+            let fallback: (Option<String>, i64) = store
+                .conn
+                .query_row(
+                    "select session_id,is_pinned from sessions where source_file_path=?",
+                    [&upper],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(fallback, (None, 1));
+            apply_physical(
+                &store,
+                physical_snapshot(environment, &upper, Some("upper-stable")),
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        "select is_pinned from sessions where session_id='upper-stable'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        "select is_pinned from sessions where session_id='lower-stable'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn posix_native_mapping_and_status_identity_keep_settled_case_policy() {
+    use codex_sessions_collector::codex::parser::SourceType;
+    use codex_sessions_collector::path_mapping::{HOST_PATHS_ARE_CASE_SENSITIVE, PathMapper};
+    use codex_sessions_collector::store::writer::source_status_id;
+    let mapper = PathMapper::new("ignored WSL root");
+    for environment in [SourceType::Linux, SourceType::Macos] {
+        let path = "/mnt/c/Windows/home/Session.jsonl";
+        let mapped = mapper.map_native_path(path, environment);
+        assert_eq!(mapped.source_type, environment);
+        assert_eq!(mapped.source_file_path, path);
+        assert_eq!(mapped.platform_path, path);
+        assert_eq!(mapped.source_file_unc_path, None);
+        assert_eq!(
+            mapped.normalized_path_keys,
+            vec!["/mnt/c/windows/home/session.jsonl"]
+        );
+    }
+    assert_eq!(
+        source_status_id("/tmp/Session") == source_status_id("/tmp/session"),
+        !HOST_PATHS_ARE_CASE_SENSITIVE
+    );
+    // Source fallback IDs keep their historical raw spelling; logical identity
+    // promotion associates a stable ID with the same physical source.
+    let temp = TempDir::new("posix_case_identity");
+    let db = temp.path().join("native.sqlite");
+    let store = codex_sessions_collector::store::Store::open(
+        &db,
+        codex_sessions_collector::store::OwnerMode::Standalone,
+    )
+    .unwrap();
+    for (path, stable) in [
+        ("/tmp/Session", None),
+        ("/tmp/Session", Some("stable-native")),
+    ] {
+        let mut snapshot = support::sample_snapshot("case");
+        snapshot.session.session_id = stable.map(str::to_owned);
+        snapshot.source.environment = "linux".to_owned();
+        snapshot.source.path = path.to_owned();
+        snapshot.source.display_path = path.to_owned();
+        snapshot.source.mapped_source_file_path = path.to_owned();
+        snapshot.source.platform_path = path.to_owned();
+        snapshot.source.normalized_path_keys = Vec::new();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                snapshot,
+            )))])
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .conn
+            .query_row("select count(*) from sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("select session_id from sessions", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "stable-native"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_builtin_collection_stores_native_snapshots_and_error_statuses() {
+    use codex_sessions_collector::codex::parser::SourceType;
+    let temp = TempDir::new("posix_native_ingest");
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let bad = support::day_folder(&home).join("Windows-wsl-malformed.jsonl");
+    std::fs::write(&bad, "{broken json\n").unwrap();
+    let db = temp.path().join("native.sqlite");
+    let output = collector()
+        .args(["codex", "scan", "--standalone"])
+        .arg(&db)
+        .arg("--windows-root")
+        .arg(&home)
+        .arg("--no-wsl-projects")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let conn = Connection::open(&db).unwrap();
+    let mut statement = conn.prepare("select source_type from sessions").unwrap();
+    let types: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        types.len() >= 2,
+        "must include snapshot and parse-error placeholder"
+    );
+    assert!(
+        types
+            .iter()
+            .all(|kind| kind == SourceType::native().wire_name())
+    );
+    assert_eq!(
+        conn.query_row(
+            "select count(*) from sessions where scan_status='parse_error'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Parser goldens
@@ -1375,7 +1695,7 @@ fn contract_rejects_unsupported_versions_and_malformed_records_before_writing() 
     ))))
     .unwrap();
     let cases = [
-        good.replace("\"version\":1", "\"version\":2"),
+        good.replace("\"version\":2", "\"version\":99"),
         good.replace("codex-sessions-viewer.ingest", "other.contract"),
         good.replace(
             "\"branch_scope\":\"local\"",
@@ -1596,6 +1916,7 @@ fn source_statuses_only_touch_their_own_harness() {
             contract::SourceStatus {
                 harness: harness.to_owned(),
                 path: path.to_owned(),
+                environment: Some("windows".to_owned()),
                 status: "parse_error".to_owned(),
                 state: "active".to_owned(),
                 message: None,
@@ -1662,6 +1983,7 @@ fn source_status_ids_follow_host_path_case_sensitivity() {
                 contract::SourceStatus {
                     harness: "codex".to_owned(),
                     path: path.to_owned(),
+                    environment: Some(SourceType::native().wire_name().to_owned()),
                     status: "parse_error".to_owned(),
                     state: "active".to_owned(),
                     message: None,

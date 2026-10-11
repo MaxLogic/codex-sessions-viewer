@@ -7,6 +7,8 @@ import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
+import 'package:codex_sessions_viewer/src/third_party/sqlite_interrupt.g.dart'
+    as native;
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -26,6 +28,564 @@ void main() {
       await tempDir.delete(recursive: true);
     }
   });
+
+  for (final crlf in [false, true]) {
+    test(
+      'migration checksum legacy ${crlf ? 'CRLF' : 'LF'} receipts preserve all rows',
+      () async {
+        await _seedNativeMigration28(dbFile);
+        final sqlRoot = await _copySqlRoot(tempDir);
+        final files = await _newlineSqlFiles(sqlRoot, crlf: !crlf);
+        final before = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+        addTearDown(before.close);
+        await _seedRawNewlineReceipts(before, files, crlf: crlf);
+        final receipts = _migrationReceiptRows(before);
+        final rows = _nativeMigrationRows(before);
+        before.close();
+        final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
+        final upgraded = await migrator.openAndMigrate(dbFile);
+        expect(
+          upgraded.canStartNormalUi,
+          isTrue,
+          reason: upgraded.fatalError?.details,
+        );
+        final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+        addTearDown(db.close);
+        expect(_migrationReceiptRows(db).take(28).toList(), receipts);
+        expect(_nativeMigrationRows(db), rows);
+        db.execute(
+          "update sessions set source_type='linux',is_pinned=1 where id='native-migration-parent'",
+        );
+        await _seedRawNewlineReceipts(db, files, crlf: crlf);
+        final nativeRows = _nativeMigrationRows(db);
+        final finalReceipts = _migrationReceiptRows(db);
+        db.close();
+        final reopened = await migrator.openAndMigrate(dbFile);
+        expect(
+          reopened.canStartNormalUi,
+          isTrue,
+          reason: reopened.fatalError?.details,
+        );
+        final checked = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+        addTearDown(checked.close);
+        expect(_migrationReceiptRows(checked), finalReceipts);
+        expect(_nativeMigrationRows(checked), nativeRows);
+        checked.close();
+      },
+    );
+
+    test(
+      'migration checksum fresh ${crlf ? 'CRLF' : 'LF'} SQL records canonical receipts',
+      () async {
+        final sqlRoot = await _copySqlRoot(tempDir);
+        final files = await _newlineSqlFiles(sqlRoot, crlf: crlf);
+        final result = await DatabaseMigrator(
+          sqlRoot: sqlRoot,
+        ).openAndMigrate(dbFile);
+        expect(
+          result.canStartNormalUi,
+          isTrue,
+          reason: result.fatalError?.details,
+        );
+        final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+        addTearDown(db.close);
+        for (final file in files) {
+          final lf = (await file.readAsString()).replaceAll('\r\n', '\n');
+          final version = int.parse(p.basename(file.path).split('_').first);
+          expect(
+            db.select('select checksum from schema_version where version=?', [
+              version,
+            ]).single['checksum'],
+            sha256.convert(utf8.encode(lf)).toString(),
+            reason: 'version $version',
+          );
+        }
+        db.close();
+      },
+    );
+  }
+
+  test(
+    'migration checksum failed CRLF receipt and retry use canonical LF',
+    () async {
+      await _seedNativeMigration28(dbFile);
+      final sqlRoot = await _copySqlRoot(tempDir);
+      final files = await _newlineSqlFiles(sqlRoot, crlf: true);
+      final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(db.close);
+      await _seedRawNewlineReceipts(db, files, crlf: true);
+      final receipts = _migrationReceiptRows(db);
+      final rows = _nativeMigrationRows(db);
+      db.close();
+      final file = files.singleWhere(
+        (f) => p.basename(f.path).startsWith('029_'),
+      );
+      final original = await file.readAsString();
+      final broken =
+          '$original\r\ndrop trigger trg_session_tags_change_insert;\r\n';
+      await file.writeAsString(broken);
+      final failed = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+      expect(failed.canStartNormalUi, isFalse);
+      final failedDb = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(failedDb.close);
+      expect(_migrationReceiptRows(failedDb).take(28).toList(), receipts);
+      expect(_nativeMigrationRows(failedDb), rows);
+      final failure = failedDb
+          .select('select * from schema_version where version=29')
+          .single;
+      expect(failure['success'], 0);
+      expect(
+        failure['checksum'],
+        sha256.convert(utf8.encode(broken.replaceAll('\r\n', '\n'))).toString(),
+      );
+      failedDb.close();
+      await file.writeAsString(original);
+      final retry = await DatabaseMigrator(
+        sqlRoot: sqlRoot,
+      ).openAndMigrate(dbFile);
+      expect(retry.canStartNormalUi, isTrue, reason: retry.fatalError?.details);
+      final retriedDb = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(retriedDb.close);
+      expect(_migrationReceiptRows(retriedDb).take(28).toList(), receipts);
+      expect(_nativeMigrationRows(retriedDb), rows);
+      expect(
+        retriedDb
+            .select(
+              'select checksum,success from schema_version where version=29',
+            )
+            .single,
+        {
+          'checksum': sha256
+              .convert(utf8.encode(original.replaceAll('\r\n', '\n')))
+              .toString(),
+          'success': 1,
+        },
+      );
+      retriedDb.close();
+    },
+  );
+
+  test(
+    'migration checksum unknown digest blocks before receipt or data changes',
+    () async {
+      await _seedNativeMigration28(dbFile);
+      final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(db.close);
+      db.execute("update schema_version set checksum=? where version=21", [
+        '0' * 64,
+      ]);
+      final receipts = _migrationReceiptRows(db);
+      final rows = _nativeMigrationRows(db);
+      db.close();
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(dbFile);
+      expect(result.canStartNormalUi, isFalse);
+      expect(result.fatalError?.summary, contains('checksum'));
+      final checked = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(checked.close);
+      expect(_migrationReceiptRows(checked), receipts);
+      expect(_nativeMigrationRows(checked), rows);
+      checked.close();
+    },
+  );
+
+  test(
+    'migration 29 preserves populated sessions and dependent state',
+    () async {
+      await _seedNativeMigration28(dbFile);
+      final before = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      final objects = _nativeMigrationObjects(before);
+      final rows = _nativeMigrationRows(before);
+      final rawOutbox = before
+          .select(
+            'select record_json from collector_upload_outbox where id = 1',
+          )
+          .single['record_json'];
+      final revision = before
+          .select('select revision from session_change_state where id = 1')
+          .single['revision'];
+      before.close();
+
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(dbFile);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.details,
+      );
+      final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(db.close);
+      expect(db.select('pragma foreign_keys').single.values.single, 1);
+      expect(db.select('pragma foreign_key_check'), isEmpty);
+      expect(_nativeMigrationObjects(db), objects);
+      expect(_nativeMigrationRows(db), rows);
+      expect(
+        db.select('select id, source_type, rowid from sessions where id = ? ', [
+          'native-migration-parent',
+        ]).single['source_type'],
+        'windows',
+      );
+      expect(
+        db.select('select count(*) n from messages where session_id = ?', [
+          'native-migration-parent',
+        ]).single['n'],
+        1,
+      );
+      expect(
+        db.select('select count(*) n from session_tags where session_id = ?', [
+          'native-migration-parent',
+        ]).single['n'],
+        1,
+      );
+      expect(
+        db.select(
+          'select count(*) n from message_search where message_search match ?',
+          ['nativeuniquetoken'],
+        ).single['n'],
+        1,
+      );
+      expect(
+        db
+            .select('select revision from session_change_state where id = 1')
+            .single['revision'],
+        revision,
+      );
+      expect(
+        db
+            .select(
+              'select record_json from collector_upload_outbox where id = 1',
+            )
+            .single['record_json'],
+        rawOutbox,
+      );
+      expect(
+        db
+            .select(
+              'select inflight_batch_id from collector_hub_state where id = 1',
+            )
+            .single['inflight_batch_id'],
+        'legacy-batch',
+      );
+      expect(
+        db.select('select count(*) n from history_sessions').single['n'],
+        1,
+      );
+      db.execute('''
+      insert into sessions (id, source_type, source_file_path, display_path,
+        platform_path, created_at_utc, updated_at_utc)
+      values ('native-linux', 'linux', '/tmp/windows/home/native',
+        '/tmp/windows/home/native', '/tmp/windows/home/native', 'now', 'now')
+    ''');
+      expect(
+        db.select('select source_type from sessions where id = ?', [
+          'native-linux',
+        ]).single['source_type'],
+        'linux',
+      );
+    },
+  );
+
+  test('migration 29 rolls back replacement and restores foreign keys', () async {
+    await _seedNativeMigration28(dbFile);
+    final sqlCopy = await _copySqlRoot(tempDir);
+    final failing = File(
+      p.join(sqlCopy.path, 'migration', '029_native_source_types.sql'),
+    );
+    await failing.writeAsString(
+      '${await failing.readAsString()}\ninsert into cxv29_missing_table values (1);\n',
+    );
+    final result = await DatabaseMigrator(
+      sqlRoot: sqlCopy,
+    ).openAndMigrate(dbFile);
+    expect(result.canStartNormalUi, isFalse);
+    final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+    addTearDown(db.close);
+    expect(db.select('pragma foreign_keys').single.values.single, 1);
+    expect(db.select('pragma foreign_key_check'), isEmpty);
+    expect(
+      db
+          .select('select max(version) v from schema_version where success = 1')
+          .single['v'],
+      28,
+    );
+    expect(
+      db.select('select count(*) n from messages where session_id = ?', [
+        'native-migration-parent',
+      ]).single['n'],
+      1,
+    );
+    expect(db.select('select count(*) n from history_sessions').single['n'], 1);
+    expect(
+      _schemaSql(db, 'table', 'sessions'),
+      contains("source_type in ('windows', 'wsl')"),
+    );
+    expect(
+      () => db.execute('''
+      insert into sessions (id, source_type, source_file_path, display_path,
+        platform_path, created_at_utc, updated_at_utc)
+      values ('native-linux', 'linux', '/tmp/native', '/tmp/native', '/tmp/native', 'now', 'now')
+    '''),
+      throwsA(isA<SqliteException>()),
+    );
+  });
+
+  for (final originalForeignKeys in [0, 1]) {
+    test(
+      'migration 29 rejects caller transaction with FK$originalForeignKeys without changes',
+      () async {
+        await _seedNativeMigration28(dbFile);
+        final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+        addTearDown(db.close);
+        db.execute('pragma foreign_keys = $originalForeignKeys');
+        db.execute('begin immediate');
+        db.execute(
+          "update sessions set title='caller sentinel 73' where id='native-migration-parent'",
+        );
+        final before = _nativeMigrationRows(db);
+        final objects = _nativeMigrationObjects(db);
+        var ranAtomic = false;
+        final result = await DatabaseMigrator(sqlRoot: Directory('../sql'))
+            .migrateOpenDatabase(
+              db,
+              dbFile,
+              runAtomic: (_) async {
+                ranAtomic = true;
+              },
+            );
+        expect(result.canStartNormalUi, isFalse);
+        expect(db.autocommit, isFalse);
+        expect(ranAtomic, isFalse);
+        expect(
+          db.select('pragma foreign_keys').single.values.single,
+          originalForeignKeys,
+        );
+        expect(_nativeMigrationRows(db), before);
+        expect(_nativeMigrationObjects(db), objects);
+        expect(
+          db
+              .select(
+                "select title from sessions where id='native-migration-parent'",
+              )
+              .single['title'],
+          'caller sentinel 73',
+        );
+        db.execute('rollback');
+      },
+    );
+  }
+
+  test(
+    'migration 29 engine interrupt retains cancellation and reusable connection',
+    () async {
+      await _seedNativeMigration28(dbFile);
+      final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(db.close);
+      db.execute('create table interrupt_values(value integer)');
+      db.createFunction(
+        functionName: 'interrupt_migration',
+        argumentCount: const AllowedArgumentCount(1),
+        function: (args) {
+          native.sqlite3_interrupt(db.handle.cast());
+          return args.single;
+        },
+      );
+      final before = _nativeMigrationRows(db);
+      final objects = _nativeMigrationObjects(db);
+      var interrupted = false;
+      await expectLater(
+        DatabaseMigrator(sqlRoot: Directory('../sql')).migrateOpenDatabase(
+          db,
+          dbFile,
+          runAtomic: (action) async {
+            action();
+            try {
+              db.execute(
+                'insert into interrupt_values select interrupt_migration(73)',
+              );
+              fail('SQLite should interrupt the active statement');
+            } on SqliteException catch (error) {
+              expect(error.resultCode, 9);
+              expect(
+                db.autocommit,
+                isTrue,
+                reason: 'SQLite has already rolled back the owned transaction',
+              );
+              expect(
+                db
+                    .select('select count(*) n from interrupt_values')
+                    .single['n'],
+                0,
+              );
+              interrupted = true;
+              throw const DatabaseMaintenanceCancelled();
+            }
+          },
+        ),
+        throwsA(isA<DatabaseMaintenanceCancelled>()),
+      );
+      expect(interrupted, isTrue);
+      expect(db.autocommit, isTrue);
+      expect(db.select('pragma foreign_keys').single.values.single, 1);
+      expect(db.select('pragma foreign_key_check'), isEmpty);
+      expect(_nativeMigrationRows(db), before);
+      expect(_nativeMigrationObjects(db), objects);
+      expect(
+        db
+            .select('select count(*) n from schema_version where version=29')
+            .single['n'],
+        0,
+      );
+      db.execute('insert into interrupt_values values (74)');
+      expect(
+        db.select('select value from interrupt_values').single['value'],
+        74,
+      );
+      final resumed = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).migrateOpenDatabase(db, dbFile);
+      expect(
+        resumed.canStartNormalUi,
+        isTrue,
+        reason: resumed.fatalError?.details,
+      );
+      expect(resumed.lastAppliedSchemaVersion, 29);
+    },
+  );
+
+  for (final cancelled in [false, true]) {
+    test(
+      'migration 29 borrowed connection restores enforcement after ${cancelled ? 'cancellation' : 'failure'}',
+      () async {
+        await _seedNativeMigration28(dbFile);
+        final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+        addTearDown(db.close);
+        final before = _nativeMigrationRows(db);
+        final objects = _nativeMigrationObjects(db);
+        Object? caught;
+        DatabaseStartupResult? result;
+        try {
+          result = await DatabaseMigrator(sqlRoot: Directory('../sql'))
+              .migrateOpenDatabase(
+                db,
+                dbFile,
+                runAtomic: (action) async {
+                  action();
+                  if (cancelled) throw const DatabaseMaintenanceCancelled();
+                  throw StateError(
+                    'Injected interruption after parent replacement.',
+                  );
+                },
+              );
+        } on Object catch (error) {
+          caught = error;
+        }
+        if (cancelled) {
+          expect(caught, isA<DatabaseMaintenanceCancelled>());
+        } else {
+          expect(result?.canStartNormalUi, isFalse);
+        }
+        expect(db.autocommit, isTrue);
+        expect(db.select('pragma foreign_keys').single.values.single, 1);
+        expect(db.select('pragma foreign_key_check'), isEmpty);
+        expect(_nativeMigrationRows(db), before);
+        expect(_nativeMigrationObjects(db), objects);
+        expect(
+          db
+              .select(
+                'select max(version) v from schema_version where success=1',
+              )
+              .single['v'],
+          28,
+        );
+      },
+    );
+  }
+
+  test(
+    'migration 29 fresh bootstrap failure retains earlier schema and can resume',
+    () async {
+      final sqlCopy = await _copySqlRoot(tempDir);
+      final failing = File(
+        p.join(sqlCopy.path, 'migration', '029_native_source_types.sql'),
+      );
+      final original = await failing.readAsString();
+      await failing.writeAsString(
+        '$original\ndrop trigger trg_session_tags_change_insert;',
+      );
+      final failed = await DatabaseMigrator(
+        sqlRoot: sqlCopy,
+      ).openAndMigrate(dbFile);
+      expect(failed.canStartNormalUi, isFalse);
+      final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      expect(db.select('pragma foreign_keys').single.values.single, 1);
+      expect(
+        db
+            .select('select max(version) v from schema_version where success=1')
+            .single['v'],
+        28,
+      );
+      expect(
+        _schemaSql(db, 'table', 'sessions'),
+        contains("source_type in ('windows', 'wsl')"),
+      );
+      db.close();
+      await failing.writeAsString(original);
+      final restored = await DatabaseMigrator(
+        sqlRoot: sqlCopy,
+      ).openAndMigrate(dbFile);
+      expect(
+        restored.canStartNormalUi,
+        isTrue,
+        reason: restored.fatalError?.details,
+      );
+      expect(restored.lastAppliedSchemaVersion, 29);
+    },
+  );
+
+  test(
+    'migration 29 fatal cleanup closes borrowed connection and retains original failure',
+    () async {
+      await _seedNativeMigration28(dbFile);
+      final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(db.close);
+      final refusingRollback = _RollbackRefusingDatabase(db);
+      final result = await DatabaseMigrator(sqlRoot: Directory('../sql'))
+          .migrateOpenDatabase(
+            refusingRollback,
+            dbFile,
+            runAtomic: (action) async {
+              action();
+              expect(db.autocommit, isFalse);
+              refusingRollback.refuseRollback = true;
+              throw StateError('Original injected migration failure');
+            },
+          );
+      expect(result.canStartNormalUi, isFalse);
+      expect(
+        result.fatalError?.details,
+        contains('Original injected migration failure'),
+      );
+      expect(result.fatalError?.details, contains('rollback'));
+      expect(
+        result.fatalError?.details,
+        contains('Injected recovery rollback refusal'),
+      );
+      expect(refusingRollback.refused, isTrue);
+      expect(
+        () => db.select('select count(*) from sessions'),
+        throwsStateError,
+      );
+      expect(
+        () => db.execute("update sessions set title='unsafe reuse'"),
+        throwsStateError,
+      );
+      db.close();
+    },
+  );
 
   test(
     'startup can defer schema 16 without rejecting an existing upgrade',
@@ -555,7 +1115,7 @@ void main() {
       '025_session_change_journal_precision.sql',
     );
     expect(versionRows.last['version'], latestSchemaVersion);
-    expect(versionRows.last['filename'], '028_session_project_refined.sql');
+    expect(versionRows.last['filename'], '029_native_source_types.sql');
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -1346,10 +1906,15 @@ void main() {
   test(
     'blocks normal startup when an applied migration checksum changes',
     () async {
+      await _seedNativeMigration28(dbFile);
       final sqlRoot = await _copySqlRoot(tempDir);
       final migrator = DatabaseMigrator(sqlRoot: sqlRoot);
       final firstRun = await migrator.openAndMigrate(dbFile);
       expect(firstRun.canStartNormalUi, isTrue);
+      final before = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      final receipts = _migrationReceiptRows(before);
+      final rows = _nativeMigrationRows(before);
+      before.close();
 
       final migration = File(
         '${sqlRoot.path}${Platform.pathSeparator}init'
@@ -1372,6 +1937,10 @@ void main() {
         secondRun.fatalError?.failingMigrationFile,
         '001_initial_schema.sql',
       );
+      final checked = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(checked.close);
+      expect(_migrationReceiptRows(checked), receipts);
+      expect(_nativeMigrationRows(checked), rows);
     },
   );
 
@@ -2477,6 +3046,38 @@ void main() {
   });
 }
 
+/// Keeps the production connection and transaction, failing only recovery SQL.
+class _RollbackRefusingDatabase implements Database {
+  _RollbackRefusingDatabase(this.delegate);
+
+  final Database delegate;
+  bool refuseRollback = false;
+  bool refused = false;
+
+  @override
+  bool get autocommit => delegate.autocommit;
+
+  @override
+  void execute(String sql, [List<Object?> parameters = const []]) {
+    if (refuseRollback && sql.trim().toLowerCase() == 'rollback') {
+      expect(delegate.autocommit, isFalse);
+      refused = true;
+      throw StateError('Injected recovery rollback refusal');
+    }
+    delegate.execute(sql, parameters);
+  }
+
+  @override
+  ResultSet select(String sql, [List<Object?> parameters = const []]) =>
+      delegate.select(sql, parameters);
+
+  @override
+  void close() => delegate.close();
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 bool _tableExists(Database db, String tableName) {
   final result = db.select(
     "select 1 from sqlite_master where name = ? and type in ('table', 'view')",
@@ -3243,6 +3844,75 @@ String _schemaSql(Database db, String type, String name) =>
         .toLowerCase()
         .replaceAll(RegExp(r'\s+'), ' ');
 
+Future<void> _seedNativeMigration28(File file) async {
+  final prepared = await DatabaseMigrator(
+    sqlRoot: Directory('../sql'),
+    supportedSchemaVersion: 28,
+  ).openAndMigrate(file);
+  expect(
+    prepared.canStartNormalUi,
+    isTrue,
+    reason: prepared.fatalError?.details,
+  );
+  final db = openFileBackedDatabase(file, maintenanceWriter: true);
+  try {
+    db.execute('''
+      insert into sessions (id, session_id, source_type, source_file_path,
+        display_path, platform_path, created_at_utc, updated_at_utc)
+      values ('native-migration-parent', 'native-migration-id', 'windows',
+        'C:\\fixture\\session.jsonl', 'C:\\fixture\\session.jsonl',
+        'C:\\fixture\\session.jsonl', 'now', 'now')
+    ''');
+    db.execute('''
+      insert into messages (session_id, message_index, author_type, first_line,
+        content_plain, content_preview, created_at_db_utc, updated_at_db_utc)
+      values ('native-migration-parent', 0, 'user', 'nativeuniquetoken',
+        'nativeuniquetoken', 'nativeuniquetoken', 'now', 'now')
+    ''');
+    db.execute(
+      "insert into tags (id, name, created_at_utc, updated_at_utc) values (1, 'retained', 'now', 'now')",
+    );
+    db.execute(
+      "insert into session_tags (session_id, tag_id, created_at_utc) values ('native-migration-parent', 1, 'now')",
+    );
+    db.execute('''
+insert into tool_calls(session_id,message_id,tool_index,tool_name,status) select 'native-migration-parent',id,0,'retained-tool','finished' from messages where session_id='native-migration-parent';
+insert into session_path_keys(session_id,path_key) values ('native-migration-parent','c:/parent');
+insert into session_source_extras(session_row_id,extra_json,updated_at_utc) values ('native-migration-parent','{"retained":true}','now');
+insert into usage_event_inputs(session_row_id,source_record_ordinal,provider,billable_units_json) values ('native-migration-parent',1,'retained-provider','{"units":3}');
+insert into usage_path_contexts(id,display_path_raw,platform_path_raw,unc_path_raw,display_path_key,platform_path_key,unc_path_key,normalization_version,resolution_source,project_rules_version,created_at_utc,updated_at_utc) values (99,'C:/parent','C:/parent','','c:/parent','c:/parent','',1,'unassigned',0,'now','now');
+insert into usage_events_next(session_row_id,source_record_ordinal,epoch,path_context_id,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,branch_scope,derivation,event_fingerprint) values ('native-migration-parent',1,0,99,10,0,0,2,0,12,'local','last_token_usage','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,branch_scope,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,cost_status,pricing_resolution_method,cost_projection_version,updated_at_utc) values ('native-migration-parent','2026-10-05','retained-model',99,'local',10,0,0,2,0,12,'unknown','unknown',1,'now');
+''');
+    db.execute(
+      '''
+      insert into collector_upload_outbox (id, record_json, created_at_utc, record_key)
+      values (1, ?, 'now', 'legacy-status')
+    ''',
+      [
+        '{"contract":"codex-sessions-viewer.ingest","version":1,"kind":"source_status","record":{"harness":"codex","path":"C:/legacy","status":"missing","state":"missing"}}',
+      ],
+    );
+    db.execute('''
+      insert or replace into collector_hub_state (id, hub_url, machine_id,
+        last_sequence, enabled, inflight_batch_id, inflight_last_id)
+      values (1, 'https://example.invalid', 'fixture-machine', 0, 1,
+        'legacy-batch', 1)
+    ''');
+  } finally {
+    db.close();
+  }
+}
+
+List<String> _nativeMigrationObjects(Database db) => db
+    .select('''
+      select type || ':' || name as object from sqlite_schema
+      where type in ('index', 'trigger', 'view') and sql is not null
+      order by object
+    ''')
+    .map((row) => row['object'] as String)
+    .toList(growable: false);
+
 Future<Directory> _copySqlRoot(Directory tempDir) async {
   final target = Directory('${tempDir.path}${Platform.pathSeparator}sql');
   for (final folder in ['init', 'migration']) {
@@ -3286,4 +3956,63 @@ Future<void> _applySqlFile(Database db, File file) async {
       '2026-07-07T10:00:00.000Z',
     ],
   );
+}
+
+Map<String, List<Map<String, Object?>>> _nativeMigrationRows(Database db) => {
+  for (final table in [
+    'sessions',
+    'messages',
+    'tool_calls',
+    'session_source_extras',
+    'session_tags',
+    'session_path_keys',
+    'usage_event_inputs',
+    'usage_events',
+    'usage_events_next',
+    'usage_session_daily',
+    'collector_upload_outbox',
+    'collector_hub_state',
+  ])
+    table: db
+        .select('select ${table == 'sessions' ? 'rowid,' : ''}* from $table')
+        .map((row) => Map<String, Object?>.from(row))
+        .toList(),
+};
+
+List<Map<String, Object?>> _migrationReceiptRows(Database db) => db
+    .select('select * from schema_version order by version')
+    .map((row) => Map<String, Object?>.from(row))
+    .toList();
+
+Future<List<File>> _newlineSqlFiles(
+  Directory root, {
+  required bool crlf,
+}) async {
+  final files = await root
+      .list(recursive: true)
+      .where((e) => e is File && e.path.endsWith('.sql'))
+      .cast<File>()
+      .toList();
+  files.sort((a, b) => p.basename(a.path).compareTo(p.basename(b.path)));
+  for (final file in files) {
+    final lf = (await file.readAsString()).replaceAll('\r\n', '\n');
+    await file.writeAsString(crlf ? lf.replaceAll('\n', '\r\n') : lf);
+  }
+  return files;
+}
+
+Future<void> _seedRawNewlineReceipts(
+  Database db,
+  List<File> files, {
+  required bool crlf,
+}) async {
+  for (final file in files) {
+    final lf = (await file.readAsString()).replaceAll('\r\n', '\n');
+    final raw = crlf ? lf.replaceAll('\n', '\r\n') : lf;
+    final version = int.parse(p.basename(file.path).split('_').first);
+    db.execute(
+      "update schema_version set checksum=?,applied_at_utc='legacy receipt time',error_message='retained historical detail' where version=?",
+      [sha256.convert(utf8.encode(raw)).toString(), version],
+    );
+  }
 }

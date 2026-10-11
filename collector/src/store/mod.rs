@@ -90,10 +90,14 @@ impl Store {
         let mut pending = Pending::default();
         for envelope in records {
             let kind = std::mem::discriminant(&envelope.record);
-            if pending.kind.is_some_and(|current| current != kind) {
+            if pending
+                .kind
+                .is_some_and(|current| current != kind || pending.version != envelope.version)
+            {
                 summary.add(&self.flush(&mut pending)?);
             }
             pending.kind = Some(kind);
+            pending.version = envelope.version;
             match envelope.record {
                 Record::SessionSnapshot(snapshot) => pending.snapshots.push(*snapshot),
                 Record::SourceStatus(status) => pending.statuses.push(status),
@@ -108,25 +112,36 @@ impl Store {
     fn flush(&self, pending: &mut Pending) -> StoreResult<ApplySummary> {
         let mut summary = ApplySummary::default();
         if !pending.snapshots.is_empty() {
-            summary.sessions =
-                writer::apply_session_batch(&self.conn, std::mem::take(&mut pending.snapshots))?;
+            summary.sessions = writer::apply_session_batch_versioned(
+                &self.conn,
+                std::mem::take(&mut pending.snapshots),
+                Some(pending.version),
+            )?;
         }
         if !pending.statuses.is_empty() {
-            writer::apply_source_statuses(&self.conn, &pending.statuses)?;
+            writer::apply_source_statuses_versioned(
+                &self.conn,
+                &pending.statuses,
+                Some(pending.version),
+            )?;
             summary.statuses = pending.statuses.len();
             pending.statuses.clear();
         }
         if !pending.thread_names.is_empty() {
-            summary.thread_names_changed =
-                writer::apply_thread_names(&self.conn, &pending.thread_names)?;
+            summary.thread_names_changed = writer::apply_thread_names_versioned(
+                &self.conn,
+                &pending.thread_names,
+                Some(pending.version),
+            )?;
             pending.thread_names.clear();
         }
         for hints in pending.hints.drain(..) {
-            summary.project_updates += writer::apply_project_hints(
+            summary.project_updates += writer::apply_project_hints_versioned(
                 &self.conn,
                 &hints.harness,
                 &hints.sessions,
                 &hints.hints,
+                Some(pending.version),
             )?;
         }
         pending.kind = None;
@@ -136,6 +151,7 @@ impl Store {
 
 #[derive(Default)]
 struct Pending {
+    version: u32,
     kind: Option<std::mem::Discriminant<Record>>,
     snapshots: Vec<crate::contract::SessionSnapshot>,
     statuses: Vec<crate::contract::SourceStatus>,

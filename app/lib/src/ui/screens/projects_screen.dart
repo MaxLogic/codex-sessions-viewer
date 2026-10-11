@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../platform_shortcuts.dart';
+
 import '../../database/project_tag_state.dart';
 import '../dialogs/project_dialogs.dart';
 import '../models/projects_repository.dart';
@@ -412,14 +414,16 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
     return Material(
       child: CallbackShortcuts(
         bindings: {
-          const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
+          PlatformShortcuts.of(context).activator(LogicalKeyboardKey.keyF): () {
             _searchFocusNode.requestFocus();
             _searchController.selection = TextSelection(
               baseOffset: 0,
               extentOffset: _searchController.text.length,
             );
           },
-          const SingleActivator(LogicalKeyboardKey.keyN, control: true): () =>
+          PlatformShortcuts.of(
+            context,
+          ).activator(LogicalKeyboardKey.keyN): () =>
               unawaited(_addRule()),
         },
         child: Focus(
@@ -464,9 +468,11 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
                       child: TextField(
                         controller: _searchController,
                         focusNode: _searchFocusNode,
-                        decoration: const InputDecoration(
-                          labelText: 'Search projects (Ctrl+F)',
-                          prefixIcon: Icon(Icons.search),
+                        decoration: InputDecoration(
+                          labelText: PlatformShortcuts.of(
+                            context,
+                          ).label('Search projects (Ctrl+F)'),
+                          prefixIcon: const Icon(Icons.search),
                           isDense: true,
                         ),
                         onChanged: (value) =>
@@ -661,7 +667,11 @@ class _ProjectsScreenState extends State<ProjectsScreen> {
                     AppButton.filled(
                       onPressed: _busy ? null : _addRule,
                       icon: const Icon(Icons.create_new_folder_outlined),
-                      label: const Text('Add folder rule… (Ctrl+N)'),
+                      label: Text(
+                        PlatformShortcuts.of(
+                          context,
+                        ).label('Add folder rule… (Ctrl+N)'),
+                      ),
                     ),
                     AppButton.outlined(
                       onPressed: _busy ? null : _mergeProject,

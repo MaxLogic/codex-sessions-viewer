@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../../accessibility/announcement_service.dart';
 import '../../config/app_settings.dart';
 import '../copy_shortcut.dart';
+import '../platform_shortcuts.dart';
 import '../models/conversation_message_view_model.dart';
 import '../motion.dart';
 import 'svg_icon.dart';
@@ -195,7 +196,7 @@ class _ConversationViewState extends State<ConversationView> {
         : null;
     final view = CallbackShortcuts(
       bindings: {
-        const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+        PlatformShortcuts.of(context).activator(LogicalKeyboardKey.keyF):
             _focusFind,
         const SingleActivator(LogicalKeyboardKey.f3): () => _stepMatch(1),
         const SingleActivator(LogicalKeyboardKey.f3, shift: true): () =>
@@ -375,7 +376,9 @@ class _ConversationViewState extends State<ConversationView> {
               textInputAction: TextInputAction.search,
               decoration: InputDecoration(
                 isDense: true,
-                hintText: 'Find in conversation (Ctrl+F)',
+                hintText: PlatformShortcuts.of(
+                  context,
+                ).label('Find in conversation (Ctrl+F)'),
                 prefixIcon: const Icon(Icons.search, size: 18),
                 prefixIconConstraints: const BoxConstraints(
                   minWidth: 32,

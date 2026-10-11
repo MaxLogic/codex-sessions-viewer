@@ -8,7 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
 void main() {
-  testWidgets('app applies Windows startup preference on load and save', (
+  testWidgets('app applies startup preference on load and save', (
     tester,
   ) async {
     final temp = Directory.systemTemp.createTempSync(
@@ -52,7 +52,7 @@ void main() {
       find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
     );
     await _pumpFrames(tester);
-    await tester.tap(find.bySemanticsLabel('Start with Windows setting'));
+    await tester.tap(find.bySemanticsLabel('Start at login setting'));
     await tester.pump();
     await tester.tap(find.text('Save settings'));
     await _pumpFrames(tester);

@@ -104,7 +104,7 @@ class HubDataSource {
       'args': args,
     });
     if (value['contract'] != 'codex-sessions-viewer.query' ||
-        value['version'] != 1 ||
+        value['version'] != 2 ||
         value['machine'] != machine) {
       throw const HubFailure('Unsupported hub query response.');
     }

@@ -1,6 +1,6 @@
 import 'package:sqlite3/sqlite3.dart';
 
-enum SessionSearchSourceType { windows, wsl }
+enum SessionSearchSourceType { windows, wsl, macos, linux }
 
 enum ArchivedFilter { activeOnly, archivedOnly, all }
 
@@ -341,6 +341,8 @@ extension on SessionSearchSourceType {
   String get wireName => switch (this) {
     SessionSearchSourceType.windows => 'windows',
     SessionSearchSourceType.wsl => 'wsl',
+    SessionSearchSourceType.macos => 'macos',
+    SessionSearchSourceType.linux => 'linux',
   };
 }
 

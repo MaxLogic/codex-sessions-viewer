@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Codex Session Viewer
+Comment=Browse local Codex and Claude session history
+Exec=codex_sessions_viewer
+Icon=eu.maxlogic.codexsessionsviewer
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=eu.maxlogic.codexsessionsviewer

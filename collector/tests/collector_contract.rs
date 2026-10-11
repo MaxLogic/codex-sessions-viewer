@@ -44,6 +44,125 @@ fn count(db: &Path, table: &str) -> i64 {
 }
 
 #[test]
+fn v2_status_requires_explicit_native_environment_before_write() {
+    let temp = TempDir::new("native_status_contract");
+    let db = temp.path().join("native.sqlite");
+    let status = json!({
+        "contract": "codex-sessions-viewer.ingest",
+        "version": 2,
+        "kind": "source_status",
+        "record": {
+            "harness": "codex",
+            "path": "/tmp/windows/home/Session.jsonl",
+            "status": "parse_error",
+            "state": "active",
+            "environment": "linux"
+        }
+    });
+    let output = apply(&temp, &db, &status);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let conn = Connection::open(&db).unwrap();
+    let source_type: String = conn
+        .query_row(
+            "select source_type from sessions where id like 'source-status:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source_type, "linux");
+    for invalid in [json!(null), json!("unknown")] {
+        let mut bad = status.clone();
+        bad["record"]["environment"] = invalid;
+        assert!(!apply(&temp, &db, &bad).status.success());
+        assert_eq!(count(&db, "sessions"), 1);
+    }
+    let mut absent = status.clone();
+    absent["record"]
+        .as_object_mut()
+        .unwrap()
+        .remove("environment");
+    assert!(!apply(&temp, &db, &absent).status.success());
+    assert_eq!(count(&db, "sessions"), 1);
+}
+
+#[test]
+fn native_snapshots_statuses_and_legacy_updates_preserve_explicit_provenance() {
+    use codex_sessions_collector::contract::{Envelope, Record};
+    let temp = TempDir::new("native_provenance");
+    let db = temp.path().join("native.sqlite");
+    for environment in ["macos", "linux"] {
+        let mut snapshot = support::sample_snapshot(environment);
+        snapshot.source.environment = environment.to_owned();
+        snapshot.source.path = format!("C:/windows/wsl/{environment}.jsonl");
+        let record =
+            serde_json::to_value(Envelope::new(Record::SessionSnapshot(Box::new(snapshot))))
+                .unwrap();
+        assert!(apply(&temp, &db, &record).status.success());
+        let mut old = record.clone();
+        old["version"] = json!(1);
+        let rejected = apply(&temp, &db, &old);
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("unsupported source.environment")
+        );
+        let legacy = json!({"contract":"codex-sessions-viewer.ingest","version":1,"kind":"source_status","record":{"harness":"codex","path":format!("C:/windows/wsl/{environment}.jsonl"),"environment":"windows","status":"missing","state":"missing"}});
+        assert!(apply(&temp, &db, &legacy).status.success());
+        let conn = Connection::open(&db).unwrap();
+        let stored: (String, String) = conn
+            .query_row(
+                "select source_type,scan_status from sessions where session_id=?",
+                [environment],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (environment.to_owned(), "missing".to_owned()));
+        drop(conn);
+        let error = json!({"contract":"codex-sessions-viewer.ingest","version":2,"kind":"source_status","record":{"harness":"claude","path":format!("C:/windows/wsl/{environment}-error.jsonl"),"environment":environment,"status":"parse_error","state":"active"}});
+        assert!(apply(&temp, &db, &error).status.success());
+        let conn = Connection::open(&db).unwrap();
+        let placeholder: (String, String) = conn
+            .query_row(
+                "select source_type,scan_status from sessions where source_file_path=?",
+                [format!("C:/windows/wsl/{environment}-error.jsonl")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            placeholder,
+            (environment.to_owned(), "parse_error".to_owned())
+        );
+    }
+    assert_eq!(count(&db, "sessions"), 4);
+}
+
+#[test]
+fn legacy_status_ignores_any_unknown_environment_value_before_typed_decode() {
+    use codex_sessions_collector::contract::{Record, parse_line};
+    for extra in [
+        json!("linux"),
+        json!("unknown"),
+        json!(null),
+        json!(73),
+        json!({"future":true}),
+        json!(["linux"]),
+    ] {
+        let value = json!({"contract":"codex-sessions-viewer.ingest","version":1,"kind":"source_status","record":{"harness":"codex","path":"/tmp/windows/legacy.jsonl","environment":extra,"status":"parse_error","state":"active"}});
+        let parsed = parse_line(&value.to_string()).unwrap_or_else(|error| {
+            panic!("legacy unknown field {extra} must be tolerated: {error}")
+        });
+        assert_eq!(parsed.version, 1);
+        let Record::SourceStatus(status) = parsed.record else {
+            panic!("source_status expected")
+        };
+        assert_eq!(status.environment, None);
+    }
+}
+
+#[test]
 fn independent_example_is_searchable_idempotent_and_revisable() {
     let temp = TempDir::new("contract_example");
     let db = temp.path().join("example.sqlite");

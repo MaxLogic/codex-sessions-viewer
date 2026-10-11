@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../platform_shortcuts.dart';
+
 /// One keyboard shortcut and what it does.
 class KeyboardShortcut {
   const KeyboardShortcut(this.keys, this.action);
@@ -121,7 +123,7 @@ class KeyboardShortcutsDialog extends StatelessWidget {
                     Padding(
                       padding: const EdgeInsets.only(top: 2),
                       child: Text(
-                        note,
+                        PlatformShortcuts.of(context).label(note),
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),
@@ -157,7 +159,8 @@ class _ShortcutRow extends StatelessWidget {
     final theme = Theme.of(context);
     return Semantics(
       container: true,
-      label: '${shortcut.keysLabel}: ${shortcut.action}',
+      label:
+          '${PlatformShortcuts.of(context).label(shortcut.keysLabel)}: ${shortcut.action}',
       child: ExcludeSemantics(
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 3),
@@ -170,7 +173,8 @@ class _ShortcutRow extends StatelessWidget {
                   spacing: 4,
                   runSpacing: 4,
                   children: [
-                    for (final key in shortcut.keys) _KeyCap(label: key),
+                    for (final key in shortcut.keys)
+                      _KeyCap(label: PlatformShortcuts.of(context).label(key)),
                   ],
                 ),
               ),

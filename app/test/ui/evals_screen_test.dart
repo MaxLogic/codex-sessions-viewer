@@ -1,10 +1,59 @@
 import 'package:codex_sessions_viewer/src/export/eval_dataset_exporter.dart';
 import 'package:codex_sessions_viewer/src/ui/models/session_row_view_model.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/evals_screen.dart';
+import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets(
+    'native eval filters retain copied WSL rows and filter native sources',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        MaterialApp(
+          home: EvalsScreen(
+            hostPlatform: AppHostPlatform.linux,
+            initialRows: [
+              _row(
+                id: 'linux',
+                title: 'Native Linux',
+                platform: SessionRowPlatform.linux,
+              ),
+              _row(
+                id: 'mac',
+                title: 'Native Mac',
+                platform: SessionRowPlatform.macos,
+              ),
+              _row(
+                id: 'wsl',
+                title: 'Copied WSL',
+                platform: SessionRowPlatform.wsl,
+              ),
+            ],
+          ),
+        ),
+      );
+      expect(find.text('Copied WSL'), findsOneWidget);
+      await tester.tap(find.bySemanticsLabel('Eval source filter'));
+      await tester.pumpAndSettle();
+      expect(
+        find.ancestor(
+          of: find.text('WSL'),
+          matching: find.byWidgetPredicate(
+            (widget) => widget is DropdownMenuItem,
+          ),
+        ),
+        findsNothing,
+      );
+      await tester.tap(find.text('Linux').last);
+      await tester.pumpAndSettle();
+      expect(find.text('Native Linux'), findsOneWidget);
+      expect(find.text('Native Mac'), findsNothing);
+      expect(find.text('Copied WSL'), findsNothing);
+    },
+  );
   testWidgets(
     'reviews eval-ready sessions and exports selected or filtered rows',
     (tester) async {

@@ -2,6 +2,41 @@ import 'package:codex_sessions_viewer/src/path_mapping/path_mapper.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'native paths keep provenance without WSL aliases and search ignores case',
+    () {
+      const nativeMapper = CodexPathMapper(
+        wslDistro: 'Ubuntu',
+        wslLinuxHome: '/home/ada',
+        wslUncRoot: r'\\wsl.localhost\Ubuntu\',
+      );
+      for (final platform in [
+        SessionSourceType.macos,
+        SessionSourceType.linux,
+      ]) {
+        const path = '/mnt/c/Windows/home/Session.jsonl';
+        final mapped = nativeMapper.mapNativePath(path, platform);
+        expect(mapped.sourceType, platform);
+        expect(mapped.displayPath, path);
+        expect(mapped.sourceFilePath, path);
+        expect(mapped.platformPath, path);
+        expect(mapped.sourceFileUncPath, isNull);
+        expect(mapped.normalizedPathKeys, {
+          '/mnt/c/windows/home/session.jsonl',
+        });
+        expect(
+          matchesAnyPathPattern(mapped.normalizedPathKeys, [
+            '/MNT/C/WINDOWS/*',
+          ]),
+          isTrue,
+        );
+        expect(
+          matchesAnyPathPattern(mapped.normalizedPathKeys, ['c:/windows/*']),
+          isFalse,
+        );
+      }
+    },
+  );
   const mapper = CodexPathMapper(
     wslDistro: 'Ubuntu',
     wslLinuxHome: '/home/pawel',

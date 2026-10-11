@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::codex::parser::DEFAULT_MAX_TOOL_OUTPUT_PREVIEW_CHARS;
+use crate::codex::parser::{DEFAULT_MAX_TOOL_OUTPUT_PREVIEW_CHARS, SourceType};
 use crate::platform_locations::PlatformLocations;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,12 +49,20 @@ pub struct DefaultFolders {
 impl DefaultFolders {
     /// The home folder is `USERPROFILE`, falling back to `HOME`.
     pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        Self::from_env_for(SourceType::native(), var)
+    }
+
+    pub fn from_env_for(platform: SourceType, var: impl Fn(&str) -> Option<String>) -> Self {
         let non_empty = |name: &str| {
             var(name)
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
         };
-        let home = non_empty("USERPROFILE").or_else(|| non_empty("HOME"));
+        let home = if platform == SourceType::Windows {
+            non_empty("USERPROFILE").or_else(|| non_empty("HOME"))
+        } else {
+            non_empty("HOME").or_else(|| non_empty("USERPROFILE"))
+        };
         let under_home = |parts: &[&str]| {
             home.as_ref().map_or_else(String::new, |home| {
                 let mut path = PathBuf::from(home);

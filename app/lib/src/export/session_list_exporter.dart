@@ -49,7 +49,11 @@ class SessionListExporter {
         ..writeln()
         ..writeln(_inlineCode(row.workingDirectoryForCommands))
         ..writeln()
-        ..writeln('```powershell')
+        ..writeln(switch (row.platform) {
+          SessionRowPlatform.macos || SessionRowPlatform.linux => '```text',
+          SessionRowPlatform.windows ||
+          SessionRowPlatform.wsl => '```powershell',
+        })
         ..writeln(_resumeCommand(row))
         ..writeln('```');
       if (row.platform == SessionRowPlatform.wsl) {
@@ -255,6 +259,10 @@ class SessionListExporter {
   }
 
   String _resumeCommand(SessionRowViewModel row, {bool plain = false}) {
+    if (row.platform == SessionRowPlatform.macos ||
+        row.platform == SessionRowPlatform.linux) {
+      return 'Resume is unavailable for this source platform.';
+    }
     final commandSet = ResumeCommandGenerator(settings: settings).build(
       ResumeCommandSession(
         sessionId: row.sessionId,

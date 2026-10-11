@@ -1,9 +1,11 @@
 import 'dart:io';
 
+import 'startup_registration.dart';
+
 typedef StartupProcessRunner =
     Future<ProcessResult> Function(String executable, List<String> arguments);
 
-class WindowsStartupRegistration {
+class WindowsStartupRegistration implements StartupRegistration {
   WindowsStartupRegistration({
     this.executablePath,
     bool? isWindows,
@@ -18,6 +20,7 @@ class WindowsStartupRegistration {
   final bool _isWindows;
   final StartupProcessRunner _runProcess;
 
+  @override
   Future<void> apply({required bool enabled}) async {
     if (!_isWindows) {
       return;

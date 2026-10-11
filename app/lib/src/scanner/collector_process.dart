@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import '../platform/app_locations.dart';
 import 'scan_types.dart';
 
 /// Starts the collector; tests substitute a scripted process.
@@ -52,12 +53,26 @@ class CollectorProcess {
 
   /// The collector that sits next to the viewer, or the one named by
   /// `CODEX_SESSIONS_COLLECTOR_EXE`.
-  static String defaultExecutable() =>
-      Platform.environment['CODEX_SESSIONS_COLLECTOR_EXE'] ??
-      p.join(
-        p.dirname(Platform.resolvedExecutable),
-        'codex-sessions-collector.exe',
-      );
+  static String defaultExecutable({
+    AppHostPlatform? hostPlatform,
+    Map<String, String>? environment,
+    String? viewerExecutable,
+  }) {
+    final platform = hostPlatform ?? AppLocations.currentPlatform;
+    final variables = environment ?? Platform.environment;
+    final context = p.Context(
+      style: platform == AppHostPlatform.windows
+          ? p.Style.windows
+          : p.Style.posix,
+    );
+    return variables['CODEX_SESSIONS_COLLECTOR_EXE'] ??
+        context.join(
+          context.dirname(viewerExecutable ?? Platform.resolvedExecutable),
+          platform == AppHostPlatform.windows
+              ? 'codex-sessions-collector.exe'
+              : 'codex-sessions-collector',
+        );
+  }
 
   /// A write batch holds the lease for well under a second. The one-time
   /// cache repair copies the database between two leases, not under one,
@@ -108,7 +123,7 @@ class CollectorProcess {
       input: [
         jsonEncode({
           'contract': 'codex-sessions-viewer.ingest',
-          'version': 1,
+          'version': 2,
           'kind': 'project_hints',
           'record': {
             'harness': 'codex',

@@ -2,7 +2,7 @@ import '../../usage/usage_summary.dart';
 import 'conversation_message_view_model.dart';
 import 'session_label_formatter.dart';
 
-enum SessionRowPlatform { windows, wsl }
+enum SessionRowPlatform { windows, wsl, macos, linux }
 
 enum SessionRowSourceState { active, codexArchived, missing }
 
@@ -186,7 +186,7 @@ class SessionRowViewModel {
   }
 
   bool get canOpenContainingFolder {
-    if (platform == SessionRowPlatform.windows) {
+    if (platform != SessionRowPlatform.wsl) {
       return true;
     }
     return _isWindowsOpenablePath(containingFolderTarget);

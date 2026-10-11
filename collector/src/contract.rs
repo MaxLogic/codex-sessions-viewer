@@ -3,7 +3,7 @@
 //! A collector writes one JSON object per line:
 //!
 //! ```json
-//! {"contract":"codex-sessions-viewer.ingest","version":1,"kind":"session_snapshot","record":{...}}
+//! {"contract":"codex-sessions-viewer.ingest","version":2,"kind":"session_snapshot","record":{...}}
 //! ```
 //!
 //! Records describe what a source says; they carry no SQL row IDs, costs, or
@@ -22,7 +22,7 @@ use crate::dart::DartDateTime;
 use crate::path_mapping::MappedSessionPath;
 
 pub const CONTRACT_NAME: &str = "codex-sessions-viewer.ingest";
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -85,7 +85,7 @@ pub struct SessionSnapshot {
 pub struct Source {
     /// The file as the collector found it; the source identity for rescans.
     pub path: String,
-    /// `windows` or `wsl`: where the harness ran.
+    /// `windows`, `wsl`, `macos`, or `linux`: where the harness ran.
     pub environment: String,
     /// `active`, `codex_archived`, or `missing`.
     pub state: String,
@@ -270,6 +270,9 @@ pub struct ProjectHint {
 pub struct SourceStatus {
     pub harness: String,
     pub path: String,
+    /// Explicit in v2. Absent only for a legacy v1 status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     /// `available`, `missing`, `path_unreachable`, `parse_error`,
     /// `permission_denied`, `unsupported_format`, `changed_pending_parse`.
     pub status: String,
@@ -320,7 +323,7 @@ impl std::error::Error for ContractError {}
 
 /// Parse one contract line, rejecting other contracts and versions.
 pub fn parse_line(line: &str) -> Result<Envelope, ContractError> {
-    let value: Value = serde_json::from_str(line).map_err(ContractError::Json)?;
+    let mut value: Value = serde_json::from_str(line).map_err(ContractError::Json)?;
     let contract = value.get("contract").and_then(Value::as_str);
     if contract != Some(CONTRACT_NAME) {
         return Err(ContractError::Contract(format!(
@@ -328,25 +331,41 @@ pub fn parse_line(line: &str) -> Result<Envelope, ContractError> {
         )));
     }
     let version = value.get("version").and_then(Value::as_u64);
-    if version != Some(u64::from(CONTRACT_VERSION)) {
+    if !matches!(version, Some(1 | 2)) {
         return Err(ContractError::Contract(format!(
             "unsupported contract version {version:?}; this collector reads version {CONTRACT_VERSION}"
         )));
     }
+    if version == Some(1)
+        && value.get("kind").and_then(Value::as_str) == Some("source_status")
+        && let Some(record) = value.get_mut("record").and_then(Value::as_object_mut)
+    {
+        // v1 never defined this field. Ignore any JSON value before typed
+        // decoding so its tolerance and lack of provenance remain unchanged.
+        record.remove("environment");
+    }
     let envelope: Envelope = serde_json::from_value(value).map_err(ContractError::Json)?;
-    envelope.record.validate()?;
+    envelope.record.validate(envelope.version)?;
     Ok(envelope)
 }
 
 impl Record {
-    fn validate(&self) -> Result<(), ContractError> {
+    fn validate(&self, version: u32) -> Result<(), ContractError> {
         let fail = |message: String| Err(ContractError::Contract(message));
         match self {
             Self::SessionSnapshot(snapshot) => {
                 validate_harness(&snapshot.harness)?;
-                if !matches!(snapshot.source.environment.as_str(), "windows" | "wsl") {
+                let valid = match version {
+                    1 => matches!(snapshot.source.environment.as_str(), "windows" | "wsl"),
+                    2 => matches!(
+                        snapshot.source.environment.as_str(),
+                        "windows" | "wsl" | "macos" | "linux"
+                    ),
+                    _ => false,
+                };
+                if !valid {
                     return fail(format!(
-                        "source.environment must be windows or wsl, not {:?}",
+                        "unsupported source.environment {:?} in v{version}",
                         snapshot.source.environment
                     ));
                 }
@@ -398,6 +417,17 @@ impl Record {
             }
             Self::SourceStatus(status) => {
                 validate_harness(&status.harness)?;
+                if version == 2
+                    && !matches!(
+                        status.environment.as_deref(),
+                        Some("windows" | "wsl" | "macos" | "linux")
+                    )
+                {
+                    return fail(format!(
+                        "source_status.environment must be explicit windows, wsl, macos or linux in v2, not {:?}",
+                        status.environment
+                    ));
+                }
                 validate_state(&status.state)?;
                 if !matches!(
                     status.status.as_str(),

@@ -772,11 +772,10 @@ struct Row {
 
 impl Row {
     fn source_type(&self) -> SourceType {
-        if self.source_type.as_deref() == Some("wsl") {
-            SourceType::Wsl
-        } else {
-            SourceType::Windows
-        }
+        self.source_type
+            .as_deref()
+            .and_then(SourceType::from_wire)
+            .unwrap_or(SourceType::Windows)
     }
 
     fn stable_id(&self) -> &str {
@@ -868,7 +867,7 @@ fn classify_rows(
     resolver: &PhysicalPathResolver,
 ) -> StoreResult<Vec<Entry>> {
     let rows = load_rows(conn)?;
-    let mut canonical: HashSet<(bool, String)> = HashSet::new();
+    let mut canonical: HashSet<(SourceType, String)> = HashSet::new();
     for row in &rows {
         if row.stable_id().is_empty() {
             continue;
@@ -878,7 +877,7 @@ fn classify_rows(
             continue;
         }
         for path in &row.paths {
-            canonical.insert((source_type == SourceType::Wsl, path_key(path, source_type)));
+            canonical.insert((source_type, path_key(path, source_type)));
         }
     }
     Ok(rows
@@ -890,7 +889,7 @@ fn classify_rows(
 fn classify_row(
     row: &Row,
     roots: &[ScanRoot],
-    canonical: &HashSet<(bool, String)>,
+    canonical: &HashSet<(SourceType, String)>,
     resolver: &PhysicalPathResolver,
 ) -> Entry {
     let entry = |category, reason_code, delete_eligible| Entry {
@@ -917,9 +916,10 @@ fn classify_row(
     }
     let parser_version = row.parser_version.unwrap_or(0);
     let owns_nothing = row.counts[0] == 0 && row.counts[1] == 0 && row.counts[2] == 0;
-    if paths.iter().any(|path| {
-        canonical.contains(&(source_type == SourceType::Wsl, path_key(path, source_type)))
-    }) {
+    if paths
+        .iter()
+        .any(|path| canonical.contains(&(source_type, path_key(path, source_type))))
+    {
         let empty_legacy = row.is_fallback()
             && parser_version == 1
             && !row.has_protected_metadata()
@@ -991,8 +991,8 @@ fn path_key(path: &str, source_type: SourceType) -> String {
     }
     let normalized = format!("{}{}", if absolute { "/" } else { "" }, segments.join("/"));
     match source_type {
-        SourceType::Windows => normalized.to_lowercase(),
-        SourceType::Wsl => normalized,
+        SourceType::Windows | SourceType::Macos => normalized.to_lowercase(),
+        SourceType::Wsl | SourceType::Linux => normalized,
     }
 }
 
@@ -1042,8 +1042,8 @@ fn contains_session_namespace(paths: &[String], source_type: SourceType) -> bool
             .split('/')
             .filter(|segment| !segment.is_empty())
             .map(|segment| match source_type {
-                SourceType::Windows => segment.to_lowercase(),
-                SourceType::Wsl => segment.to_owned(),
+                SourceType::Windows | SourceType::Macos => segment.to_lowercase(),
+                SourceType::Wsl | SourceType::Linux => segment.to_owned(),
             })
             .any(|segment| segment == "sessions" || segment == "archived_sessions")
     })

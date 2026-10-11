@@ -15,6 +15,7 @@ import '../database/project_tag_state.dart';
 import '../database/session_list_query.dart';
 import '../logging/structured_logger.dart';
 import '../pricing/pricing_repository.dart';
+import '../platform/app_locations.dart';
 import '../scanner/scan_batching.dart';
 import '../scanner/collector_process.dart';
 import '../scanner/scan_types.dart';
@@ -989,7 +990,8 @@ class RuntimeSessionController implements ProjectsRepository {
         );
         // Alternate resolvers are explicit dependencies (for example an
         // embedded host without wsl.exe). The collector still owns persistence.
-        if (wslProjectResolver is! ProcessWslProjectResolver) {
+        if (AppLocations.currentPlatform == AppHostPlatform.windows &&
+            wslProjectResolver is! ProcessWslProjectResolver) {
           final candidates = db.select(
             "select session_id, source_file_path, working_directory_display from sessions where source_type = 'wsl' and harness = 'codex'",
           );
@@ -1901,9 +1903,12 @@ SessionRowViewModel _loadRow(
     lastMessageAtUtc:
         _dateTime(row['last_message_at_utc'] as String?) ??
         DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
-    platform: sourceType == 'wsl'
-        ? SessionRowPlatform.wsl
-        : SessionRowPlatform.windows,
+    platform: switch (sourceType) {
+      'wsl' => SessionRowPlatform.wsl,
+      'macos' => SessionRowPlatform.macos,
+      'linux' => SessionRowPlatform.linux,
+      _ => SessionRowPlatform.windows,
+    },
     sourceState: _sessionRowSourceState(row['source_state'] as String?),
     project: row['project_name_snapshot'] as String? ?? '',
     path:

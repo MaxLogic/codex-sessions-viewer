@@ -824,9 +824,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
             exception: error,
             stack: stack,
             library: 'codex_sessions_viewer',
-            context: ErrorDescription(
-              'while applying the Windows startup preference',
-            ),
+            context: ErrorDescription('while applying the startup preference'),
           ),
         );
       }),

@@ -75,10 +75,12 @@ impl AuthorType {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceType {
     Windows,
     Wsl,
+    Macos,
+    Linux,
 }
 
 impl SourceType {
@@ -86,6 +88,8 @@ impl SourceType {
         match self {
             Self::Windows => "windows",
             Self::Wsl => "wsl",
+            Self::Macos => "macos",
+            Self::Linux => "linux",
         }
     }
 
@@ -93,7 +97,19 @@ impl SourceType {
         match value {
             "windows" => Some(Self::Windows),
             "wsl" => Some(Self::Wsl),
+            "macos" => Some(Self::Macos),
+            "linux" => Some(Self::Linux),
             _ => None,
+        }
+    }
+
+    pub fn native() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::Linux
         }
     }
 }
@@ -664,12 +680,10 @@ fn first_line(value: &str) -> String {
 }
 
 pub fn source_type_for(value: Option<&str>, path: &str) -> SourceType {
-    match value {
-        Some("windows") => SourceType::Windows,
-        Some("wsl") => SourceType::Wsl,
-        _ if path.starts_with("\\\\wsl") || path.contains("/home/") => SourceType::Wsl,
-        _ => SourceType::Windows,
-    }
+    let _ = path;
+    value
+        .and_then(SourceType::from_wire)
+        .unwrap_or_else(SourceType::native)
 }
 
 /// `isInjectedEnvironmentContextMessage` from `injected_context_filter.dart`.

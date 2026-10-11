@@ -6,7 +6,7 @@ views only for an explicitly requested custom query.
 
 | View | One row per | Key columns |
 | --- | --- | --- |
-| `history_sessions` | collected session | `reference`, `machine_id`, `harness`, `session_key`, `session_id`, `project`, `working_directory`, `environment` (windows/wsl), `title`, `thread_name`, `started_at_utc`, `last_message_at_utc`, `activity_at_utc`, `last_parsed_utc`, `message_count`, token totals, `source_state` |
+| `history_sessions` | collected session | `reference`, `machine_id`, `harness`, `session_key`, `session_id`, `project`, `working_directory`, `environment` (windows/wsl/macos/linux), `title`, `thread_name`, `started_at_utc`, `last_message_at_utc`, `activity_at_utc`, `last_parsed_utc`, `message_count`, token totals, `source_state` |
 | `history_messages` | parsed message | `reference` (`<session reference>#<message_index>`), `session_reference`, `message_index`, `author_type`, `created_at_utc` (may be null), `content_plain`, `content_truncated`, `message_rowid` |
 | `history_tool_calls` | tool call | `session_reference`, `tool_index`, `tool_name`, `status`, `input_preview`, `output_preview`, `error_message` |
 

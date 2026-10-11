@@ -39,6 +39,7 @@ void main() {
       addTearDown(() => server.close(force: true));
       final received = <Map<String, dynamic>>[];
       var fail = false;
+      var queryVersion = 2;
       server.listen((request) async {
         expect(request.headers.value('authorization'), 'Bearer owner');
         received.add(
@@ -49,7 +50,7 @@ void main() {
         request.response.write(
           jsonEncode({
             'contract': 'codex-sessions-viewer.query',
-            'version': 1,
+            'version': queryVersion,
             'machine': 'machine-a',
             'results': [],
             'next_cursor': 'next',
@@ -72,6 +73,12 @@ void main() {
         '--cursor',
         'previous',
       ]);
+      queryVersion = 1;
+      await expectLater(
+        source.sessions('machine-a'),
+        throwsA(isA<HubFailure>()),
+      );
+      queryVersion = 2;
       fail = true;
       await expectLater(
         source.sessions('machine-a'),

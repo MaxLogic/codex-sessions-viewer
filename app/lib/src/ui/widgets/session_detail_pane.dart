@@ -97,18 +97,25 @@ class SessionDetailPane extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final effectiveSettings = settings ?? AppSettings.defaults();
-    final commandSet = ResumeCommandGenerator(settings: effectiveSettings)
-        .build(
-          ResumeCommandSession(
-            sessionId: row.sessionId,
-            harness: row.harness,
-            sourceType: switch (row.platform) {
-              SessionRowPlatform.windows => ResumeSessionSourceType.windows,
-              SessionRowPlatform.wsl => ResumeSessionSourceType.wsl,
-            },
-            workingDirectory: row.workingDirectoryForCommands,
-          ),
-        );
+    final commandSet =
+        row.platform == SessionRowPlatform.macos ||
+            row.platform == SessionRowPlatform.linux
+        ? const ResumeCommandSet.unavailable(
+            disabledReason: 'Resume is unavailable for this source platform.',
+          )
+        : ResumeCommandGenerator(settings: effectiveSettings).build(
+            ResumeCommandSession(
+              sessionId: row.sessionId,
+              harness: row.harness,
+              sourceType: switch (row.platform) {
+                SessionRowPlatform.windows => ResumeSessionSourceType.windows,
+                SessionRowPlatform.wsl => ResumeSessionSourceType.wsl,
+                SessionRowPlatform.macos || SessionRowPlatform.linux =>
+                  throw StateError('Native resume command is unavailable'),
+              },
+              workingDirectory: row.workingDirectoryForCommands,
+            ),
+          );
     final visibleMessages = row.conversationMessages
         .where((message) => !_isInjectedContextMessage(message))
         .toList(growable: false);

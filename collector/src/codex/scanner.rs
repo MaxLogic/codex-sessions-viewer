@@ -148,10 +148,17 @@ struct Candidate {
     metadata: Option<std::fs::Metadata>,
 }
 
-fn status(path: &str, status: &str, state: &str, message: Option<String>) -> SourceStatus {
+fn status(
+    path: &str,
+    status: &str,
+    state: &str,
+    source_type: SourceType,
+    message: Option<String>,
+) -> SourceStatus {
     SourceStatus {
         harness: "codex".to_owned(),
         path: path.to_owned(),
+        environment: Some(source_type.wire_name().to_owned()),
         status: status.to_owned(),
         state: state.to_owned(),
         message,
@@ -282,7 +289,13 @@ fn discover(
                 return;
             }
             discovery.counts.files_failed += 1;
-            let entry = status(path, code, root.source_state, Some(message.to_owned()));
+            let entry = status(
+                path,
+                code,
+                root.source_state,
+                root.source_type,
+                Some(message.to_owned()),
+            );
             discovery.errors.push(entry.clone());
             discovery.statuses.push(entry);
         };
@@ -379,7 +392,7 @@ const DISCOVERY_WORKERS: usize = 8;
 struct Walked {
     candidates: Vec<Candidate>,
     unsupported: Vec<SourceStatus>,
-    failures: Vec<(String, String, &'static str, std::io::Error)>,
+    failures: Vec<(String, String, SourceType, &'static str, std::io::Error)>,
 }
 
 /// Lists every folder under `roots`. The result does not depend on thread
@@ -463,8 +476,15 @@ fn walk(
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
     unsupported.sort_by(|left, right| left.path.cmp(&right.path));
     failures.sort_by(|left, right| left.0.cmp(&right.0));
-    for (directory, owner_path, state, error) in failures {
-        directory_failed(discovery, &directory, &owner_path, state, &error);
+    for (directory, owner_path, source_type, state, error) in failures {
+        directory_failed(
+            discovery,
+            &directory,
+            &owner_path,
+            source_type,
+            state,
+            &error,
+        );
     }
     discovery.counts.files_skipped += unsupported.len() as u64;
     discovery.errors.extend(unsupported.iter().cloned());
@@ -485,7 +505,7 @@ fn list_directory(
         Err(error) => {
             walked
                 .failures
-                .push((directory, owner_path, source_state, error));
+                .push((directory, owner_path, source_type, source_state, error));
             return subdirectories;
         }
     };
@@ -496,9 +516,13 @@ fn list_directory(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                walked
-                    .failures
-                    .push((directory.clone(), owner_path.clone(), source_state, error));
+                walked.failures.push((
+                    directory.clone(),
+                    owner_path.clone(),
+                    source_type,
+                    source_state,
+                    error,
+                ));
                 break;
             }
         };
@@ -518,6 +542,7 @@ fn list_directory(
                 &path,
                 "unsupported_format",
                 source_state,
+                source_type,
                 Some("Unsupported session file format.".to_owned()),
             ));
             continue;
@@ -544,6 +569,7 @@ fn directory_failed(
     discovery: &mut Discovery,
     directory: &str,
     owner_path: &str,
+    source_type: SourceType,
     state: &str,
     error: &std::io::Error,
 ) {
@@ -551,7 +577,13 @@ fn directory_failed(
         .failed_owners
         .insert(canonical_scan_path(owner_path));
     discovery.counts.files_failed += 1;
-    let entry = status(directory, io_status(error), state, Some(error.to_string()));
+    let entry = status(
+        directory,
+        io_status(error),
+        state,
+        source_type,
+        Some(error.to_string()),
+    );
     discovery.errors.push(entry.clone());
     discovery.statuses.push(entry);
 }
@@ -604,6 +636,7 @@ pub fn scan_controlled<E>(
                 &candidate.path,
                 "available",
                 candidate.source_state,
+                candidate.source_type,
                 None,
             ));
         }
@@ -651,6 +684,7 @@ pub fn scan_controlled<E>(
                     &candidate.path,
                     parse_error_status(&error),
                     candidate.source_state,
+                    candidate.source_type,
                     Some(error.display_message()),
                 );
                 errors.push(entry.clone());
@@ -670,6 +704,7 @@ pub fn scan_controlled<E>(
                     &candidate.path,
                     &snapshot.source.status,
                     candidate.source_state,
+                    candidate.source_type,
                     None,
                 ));
                 parsed.push(ParsedRef {
@@ -740,6 +775,7 @@ pub fn scan_controlled<E>(
                 &source.source_path,
                 "missing",
                 "missing",
+                source.source_type,
                 Some("Previously cached session file is missing.".to_owned()),
             );
             errors.push(entry.clone());
@@ -810,6 +846,9 @@ pub fn build_snapshot(
     let mapped = match source_type {
         SourceType::Windows => options.mapper.map_windows_path(path),
         SourceType::Wsl => options.mapper.map_wsl_unc_path(path),
+        native @ (SourceType::Macos | SourceType::Linux) => {
+            options.mapper.map_native_path(path, native)
+        }
     };
     let session = &success.session;
     let index_name = session
@@ -852,7 +891,7 @@ fn project_hints(
     source_type: SourceType,
     cache: &mut HashMap<String, Option<String>>,
 ) -> Vec<ProjectHint> {
-    if source_type != SourceType::Windows {
+    if source_type == SourceType::Wsl {
         return Vec::new();
     }
     let mut directories: Vec<&str> = Vec::new();

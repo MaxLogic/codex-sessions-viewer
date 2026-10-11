@@ -57,6 +57,18 @@ impl PathMapper {
         }
     }
 
+    pub fn map_native_path(&self, path: &str, source_type: SourceType) -> MappedSessionPath {
+        debug_assert!(matches!(source_type, SourceType::Macos | SourceType::Linux));
+        MappedSessionPath {
+            source_type,
+            display_path: path.to_owned(),
+            source_file_path: path.to_owned(),
+            source_file_unc_path: None,
+            platform_path: path.to_owned(),
+            normalized_path_keys: vec![normalize_path_key(path)],
+        }
+    }
+
     pub fn map_wsl_unc_path(&self, unc_path: &str) -> MappedSessionPath {
         let linux_path = self.unc_to_linux(unc_path);
         let windows_alias = mnt_to_windows_path(&linux_path);

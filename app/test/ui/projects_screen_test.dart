@@ -172,6 +172,38 @@ List<String> _listedNames(WidgetTester tester) => [
 ];
 
 void main() {
+  testWidgets(
+    'primary project shortcuts match their labels',
+    (tester) async {
+      await _pump(tester, _repository(), openProjectName: 'viewer');
+      final modifier =
+          Theme.of(tester.element(find.byType(ProjectsScreen))).platform ==
+              TargetPlatform.macOS
+          ? LogicalKeyboardKey.metaLeft
+          : LogicalKeyboardKey.controlLeft;
+      final label = modifier == LogicalKeyboardKey.metaLeft ? 'Cmd' : 'Ctrl';
+      expect(find.text('Add folder rule… ($label+N)'), findsOneWidget);
+      await tester.sendKeyDownEvent(modifier);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.sendKeyUpEvent(modifier);
+      await tester.pump();
+      final field = tester.widget<TextField>(
+        find.widgetWithText(TextField, 'Search projects ($label+F)'),
+      );
+      expect(field.focusNode?.hasFocus, isTrue);
+      await tester.sendKeyDownEvent(modifier);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+      await tester.sendKeyUpEvent(modifier);
+      await tester.pumpAndSettle();
+      expect(find.widgetWithText(TextField, 'Folder'), findsOneWidget);
+    },
+    variant: TargetPlatformVariant({
+      TargetPlatform.macOS,
+      TargetPlatform.windows,
+      TargetPlatform.linux,
+    }),
+  );
+
   testWidgets('sorts by last activity, by name, and in both directions', (
     tester,
   ) async {

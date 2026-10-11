@@ -14,12 +14,72 @@ import 'package:codex_sessions_viewer/src/database/session_list_query.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/context_search_screen.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
+import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
 void main() {
+  test(
+    'cached viewer decodes all four source environments without path inference',
+    () async {
+      final dir = Directory.systemTemp.createTempSync('native_decode_');
+      final file = File('${dir.path}/viewer.sqlite');
+      final writer = sqlite3.open(file.path);
+      try {
+        _createSchema(writer);
+        for (final platform in SessionRowPlatform.values) {
+          writer.execute(
+            "insert into sessions(id,session_id,source_type,source_file_path,display_path,platform_path,title,started_at_utc,created_at_utc,updated_at_utc) values (?,?,?,'/mnt/c/windows/Session','/mnt/c/windows/Session','/mnt/c/windows/Session',?,'2026-06-10T00:00:00Z','now','now')",
+            [platform.name, platform.name, platform.name, platform.name],
+          );
+        }
+        // These rows bypass the collector writer, which also maintains FTS.
+        writer.execute('''
+          insert into session_search(rowid,title,summary,tool_names,display_path,
+            normalized_path_keys,project_name,tags)
+          select rowid,title,'','','/mnt/c/windows/Session','','','' from sessions
+        ''');
+        final controller = RuntimeSessionController(
+          settingsFile: File('${dir.path}/unused.toml'),
+          databaseFile: file,
+        );
+        final result = await controller.loadCachedRows();
+        expect(
+          {for (final row in result.rows) row.id: row.platform},
+          {
+            for (final platform in SessionRowPlatform.values)
+              platform.name: platform,
+          },
+        );
+        expect(
+          result.rows.every(
+            (row) => row.sourceFilePath == '/mnt/c/windows/Session',
+          ),
+          isTrue,
+        );
+        final search = SessionSearchIndex(writer);
+        for (final type in [
+          SessionSearchSourceType.macos,
+          SessionSearchSourceType.linux,
+        ]) {
+          expect(
+            search.search(
+              SessionSearchQuery(
+                text: type.name.toUpperCase(),
+                sourceTypes: {type},
+              ),
+            ),
+            [type.name],
+          );
+        }
+      } finally {
+        writer.close();
+        dir.deleteSync(recursive: true);
+      }
+    },
+  );
   test(
     'external commits coalesce and reconnect catches missed commits',
     () async {

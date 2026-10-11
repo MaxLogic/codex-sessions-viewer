@@ -8,11 +8,13 @@ import 'package:flutter/services.dart';
 import '../../commands/resume_command_generator.dart';
 import '../../commands/windows_command_line.dart';
 import '../../config/app_settings.dart';
+import '../../platform/app_locations.dart';
 import '../../export/session_list_exporter.dart';
 import '../dialogs/delayed_export_progress.dart';
 import '../dialogs/exclude_projects_dialog.dart';
 import '../../voice_over/voice_over_service.dart';
 import '../copy_shortcut.dart';
+import '../platform_shortcuts.dart';
 import '../../usage/usage_summary.dart';
 import '../motion.dart';
 import '../models/conversation_message_view_model.dart';
@@ -29,7 +31,7 @@ import '../widgets/menu_header_entry.dart';
 
 export '../models/session_row_view_model.dart';
 
-enum SessionsPlatformFilter { both, windows, wsl }
+enum SessionsPlatformFilter { both, windows, wsl, macos, linux }
 
 enum SessionsArchivedFilter { activeOnly, archivedOnly, all }
 
@@ -178,9 +180,11 @@ class SessionsScreen extends StatefulWidget {
     this.projectFilterRequest,
     this.projectFilterSerial = 0,
     this.now = DateTime.now,
+    this.hostPlatform,
   });
 
   final List<SessionRowViewModel> initialRows;
+  final AppHostPlatform? hostPlatform;
   final Future<List<SessionRowViewModel>> Function()? onRefresh;
   final Future<SessionsRefreshResult> Function()? onRefreshResult;
   final SessionsRefreshWithProgress? onRefreshWithProgress;
@@ -485,7 +489,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     return Material(
       child: CallbackShortcuts(
         bindings: {
-          const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
+          PlatformShortcuts.of(context).activator(LogicalKeyboardKey.keyF): () {
             _searchFocusNode.requestFocus();
             _searchController.selection = TextSelection(
               baseOffset: 0,
@@ -497,12 +501,14 @@ class _SessionsScreenState extends State<SessionsScreen> {
               unawaited(_refresh(userInitiated: true));
             }
           },
-          const SingleActivator(LogicalKeyboardKey.keyL, control: true): () {
+          PlatformShortcuts.of(context).activator(LogicalKeyboardKey.keyL): () {
             _filterAreaFocusNode
               ..requestFocus()
               ..nextFocus();
           },
-          const SingleActivator(LogicalKeyboardKey.keyE, control: true): () =>
+          PlatformShortcuts.of(context).activator(
+            LogicalKeyboardKey.keyE,
+          ): () =>
               unawaited(_exportSelectedSession()),
         },
         // Holds focus at startup so Ctrl+F and F5 work before anything else
@@ -540,7 +546,9 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                   pathController: _pathController,
                                   threadNameController: _threadNameController,
                                   platformFilter: _platformFilter,
-
+                                  hostPlatform:
+                                      widget.hostPlatform ??
+                                      AppLocations.currentPlatform,
                                   timeFilter: _timeFilter,
                                   archivedFilter: _archivedFilter,
                                   originFilter: _originFilter,
@@ -1364,6 +1372,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
       SessionsPlatformFilter.windows =>
         row.platform == SessionRowPlatform.windows,
       SessionsPlatformFilter.wsl => row.platform == SessionRowPlatform.wsl,
+      SessionsPlatformFilter.macos => row.platform == SessionRowPlatform.macos,
+      SessionsPlatformFilter.linux => row.platform == SessionRowPlatform.linux,
     };
   }
 
@@ -2380,18 +2390,23 @@ class _SessionsScreenState extends State<SessionsScreen> {
       return;
     }
     final commandSet =
-        ResumeCommandGenerator(
-          settings: widget.settings ?? AppSettings.defaults(),
-        ).build(
-          ResumeCommandSession(
-            sessionId: row.sessionId,
-            harness: row.harness,
-            sourceType: row.platform == SessionRowPlatform.wsl
-                ? ResumeSessionSourceType.wsl
-                : ResumeSessionSourceType.windows,
-            workingDirectory: row.workingDirectoryForCommands,
-          ),
-        );
+        row.platform == SessionRowPlatform.macos ||
+            row.platform == SessionRowPlatform.linux
+        ? const ResumeCommandSet.unavailable(
+            disabledReason: 'Resume is unavailable for this source platform.',
+          )
+        : ResumeCommandGenerator(
+            settings: widget.settings ?? AppSettings.defaults(),
+          ).build(
+            ResumeCommandSession(
+              sessionId: row.sessionId,
+              harness: row.harness,
+              sourceType: row.platform == SessionRowPlatform.wsl
+                  ? ResumeSessionSourceType.wsl
+                  : ResumeSessionSourceType.windows,
+              workingDirectory: row.workingDirectoryForCommands,
+            ),
+          );
     final request = switch (action) {
       SessionDetailAction.openContainingFolder => SessionActionRequest(
         row: row,
@@ -3414,6 +3429,7 @@ class _FilterBar extends StatefulWidget {
     required this.pathController,
     required this.threadNameController,
     required this.platformFilter,
+    required this.hostPlatform,
     required this.timeFilter,
     required this.archivedFilter,
     required this.originFilter,
@@ -3452,6 +3468,7 @@ class _FilterBar extends StatefulWidget {
   final TextEditingController pathController;
   final TextEditingController threadNameController;
   final SessionsPlatformFilter platformFilter;
+  final AppHostPlatform hostPlatform;
   final SessionsTimeFilter timeFilter;
   final SessionsArchivedFilter archivedFilter;
   final SessionsOriginFilter originFilter;
@@ -3563,7 +3580,9 @@ class _FilterBarState extends State<_FilterBar> {
         focusNode: widget.searchFocusNode,
         decoration: InputDecoration(
           isDense: true,
-          hintText: 'Search titles, messages, paths, tags (Ctrl+F)',
+          hintText: PlatformShortcuts.of(
+            context,
+          ).label('Search titles, messages, paths, tags (Ctrl+F)'),
           border: const OutlineInputBorder(),
           prefixIcon: const Icon(Icons.search, size: 18),
           prefixIconConstraints: const BoxConstraints(
@@ -3661,7 +3680,9 @@ class _FilterBarState extends State<_FilterBar> {
           isActive: widget.platformFilter != SessionsPlatformFilter.both,
           options: [
             for (final value in SessionsPlatformFilter.values)
-              (value, value.label),
+              if (value != SessionsPlatformFilter.wsl ||
+                  widget.hostPlatform == AppHostPlatform.windows)
+                (value, value.label),
           ],
           onSelected: widget.onPlatformChanged,
         ),
@@ -3983,9 +4004,11 @@ class _ActiveFilterChip {
 
 extension on SessionsPlatformFilter {
   String get label => switch (this) {
-    SessionsPlatformFilter.both => 'Windows and WSL',
+    SessionsPlatformFilter.both => 'All platforms',
     SessionsPlatformFilter.windows => 'Windows only',
     SessionsPlatformFilter.wsl => 'WSL only',
+    SessionsPlatformFilter.macos => 'macOS only',
+    SessionsPlatformFilter.linux => 'Linux only',
   };
 }
 
@@ -4352,10 +4375,12 @@ class _HeaderCell extends StatelessWidget {
             child: Semantics(
               label: '${column.label} column$sortLabel',
               button: column.key != 'actions',
-              onTap: column.key == 'actions' ? null : _handleTap,
+              onTap: column.key == 'actions' ? null : () => _handleTap(context),
               excludeSemantics: true,
               child: InkWell(
-                onTap: column.key == 'actions' ? null : _handleTap,
+                onTap: column.key == 'actions'
+                    ? null
+                    : () => _handleTap(context),
                 onSecondaryTapDown: (_) => onShowSortOptions(context),
                 child: ExcludeSemantics(
                   child: Padding(
@@ -4392,10 +4417,11 @@ class _HeaderCell extends StatelessWidget {
     );
   }
 
-  void _handleTap() {
+  void _handleTap(BuildContext context) {
     final pressed = HardwareKeyboard.instance.logicalKeysPressed;
-    if (pressed.contains(LogicalKeyboardKey.controlLeft) ||
-        pressed.contains(LogicalKeyboardKey.controlRight)) {
+    if (PlatformShortcuts.of(
+      context,
+    ).primaryModifierPressed(HardwareKeyboard.instance)) {
       onSortGesture(column.key, _SortGesture.remove);
       return;
     }
@@ -5104,6 +5130,16 @@ class _PlatformGlyph extends StatelessWidget {
           size: 16,
           color: color,
         ),
+        SessionRowPlatform.macos => Icon(
+          Icons.laptop_mac,
+          size: 16,
+          color: color,
+        ),
+        SessionRowPlatform.linux => Icon(
+          Icons.computer,
+          size: 16,
+          color: color,
+        ),
       },
     );
   }
@@ -5375,6 +5411,12 @@ class _ActionsMenuState extends State<_ActionsMenu> {
   }
 
   ResumeCommandSet _commandSet(SessionRowViewModel row) {
+    if (row.platform == SessionRowPlatform.macos ||
+        row.platform == SessionRowPlatform.linux) {
+      return const ResumeCommandSet.unavailable(
+        disabledReason: 'Resume is unavailable for this source platform.',
+      );
+    }
     return ResumeCommandGenerator(settings: settings).build(
       ResumeCommandSession(
         sessionId: row.sessionId,

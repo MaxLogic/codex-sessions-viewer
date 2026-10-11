@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-/// Whether Ctrl+C belongs to the focused text: a text field or selectable
+import 'platform_shortcuts.dart';
+
+/// Whether the primary copy shortcut belongs to the focused text: a text field or selectable
 /// text. Inside a selection area it does only when [textSelected], or when
 /// the caller cannot tell ([textSelected] null).
 bool focusedTextOwnsCopy({bool? textSelected}) {
@@ -19,7 +21,7 @@ bool focusedTextOwnsCopy({bool? textSelected}) {
   return false;
 }
 
-/// Calls [onCopy] for Ctrl+C pressed while focus is inside [child].
+/// Calls [onCopy] for the primary copy shortcut pressed while focus is inside [child].
 /// [onCopy] returns false to leave the key to the default copy handling.
 class CopyShortcut extends StatelessWidget {
   const CopyShortcut({
@@ -37,6 +39,7 @@ class CopyShortcut extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final shortcuts = PlatformShortcuts.of(context);
     return Focus(
       focusNode: focusNode,
       autofocus: autofocus,
@@ -45,10 +48,9 @@ class CopyShortcut extends StatelessWidget {
         final keyboard = HardwareKeyboard.instance;
         if (event is! KeyDownEvent ||
             event.logicalKey != LogicalKeyboardKey.keyC ||
-            !keyboard.isControlPressed ||
+            !shortcuts.primaryModifierPressed(keyboard) ||
             keyboard.isShiftPressed ||
-            keyboard.isAltPressed ||
-            keyboard.isMetaPressed) {
+            keyboard.isAltPressed) {
           return KeyEventResult.ignored;
         }
         return onCopy() ? KeyEventResult.handled : KeyEventResult.ignored;

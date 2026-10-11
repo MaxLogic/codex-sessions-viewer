@@ -1,7 +1,7 @@
 //! Read-only queries over collected history (`query` commands).
 //!
 //! Output is the versioned JSON contract `codex-sessions-viewer.query`
-//! version 1. Every command opens the database read-only with `query_only`,
+//! version 2. Every command opens the database read-only with `query_only`,
 //! reads through the `history_*` views (migration 019) inside one read
 //! transaction, validates its limits, and pages with keyset cursors so a page
 //! never repeats or skips rows of the same ordering. Nothing here writes,
@@ -20,7 +20,7 @@ use crate::settings::default_viewer_database;
 use crate::store::schema::{last_applied_version, metadata};
 
 pub const QUERY_CONTRACT: &str = "codex-sessions-viewer.query";
-pub const QUERY_CONTRACT_VERSION: u32 = 1;
+pub const QUERY_CONTRACT_VERSION: u32 = 2;
 /// The first schema with the `history_*` views.
 pub const VIEWS_SCHEMA_VERSION: i64 = 19;
 

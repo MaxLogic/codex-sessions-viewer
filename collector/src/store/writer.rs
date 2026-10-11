@@ -53,6 +53,10 @@ fn source_type(snapshot: &SessionSnapshot) -> SourceType {
     SourceType::from_wire(&snapshot.source.environment).unwrap_or(SourceType::Windows)
 }
 
+fn physical_paths_are_case_sensitive(source_type: SourceType) -> bool {
+    matches!(source_type, SourceType::Wsl | SourceType::Linux)
+}
+
 fn lifecycle_preference(state: &str) -> i32 {
     match state {
         "active" => 2,
@@ -115,8 +119,8 @@ fn compare_candidates(left: &Evidence, right: &Evidence) -> Ordering {
             lifecycle_preference(&left.source_state).cmp(&lifecycle_preference(&right.source_state))
         })
         .then_with(|| {
-            let case_sensitive =
-                left.source_type == SourceType::Wsl || right.source_type == SourceType::Wsl;
+            let case_sensitive = physical_paths_are_case_sensitive(left.source_type)
+                || physical_paths_are_case_sensitive(right.source_type);
             let (left_path, right_path) = if case_sensitive {
                 (left.source_path.clone(), right.source_path.clone())
             } else {
@@ -155,6 +159,14 @@ pub fn canonical_snapshots(snapshots: Vec<SessionSnapshot>) -> Vec<(String, Sess
 pub fn apply_session_batch(
     conn: &Connection,
     snapshots: Vec<SessionSnapshot>,
+) -> StoreResult<usize> {
+    apply_session_batch_versioned(conn, snapshots, None)
+}
+
+pub(crate) fn apply_session_batch_versioned(
+    conn: &Connection,
+    snapshots: Vec<SessionSnapshot>,
+    version: Option<u32>,
 ) -> StoreResult<usize> {
     let own_machine: Option<String> = conn
         .query_row(
@@ -202,10 +214,11 @@ pub fn apply_session_batch(
                 upsert_session(conn, id, snapshot, &now, &resolver, lookup)
             })?;
             if queue_hub_records {
-                hub_client::enqueue(
+                enqueue_for_version(
                     conn,
                     Record::SessionSnapshot(Box::new(snapshot.clone())),
                     &now,
+                    version,
                 )?;
             }
         }
@@ -255,11 +268,11 @@ fn candidate_should_replace(
         )?
         .query_row([id], |row| {
             Ok(Evidence {
-                source_type: if row.get::<_, Option<String>>(0)?.as_deref() == Some("wsl") {
-                    SourceType::Wsl
-                } else {
-                    SourceType::Windows
-                },
+                source_type: row
+                    .get::<_, Option<String>>(0)?
+                    .as_deref()
+                    .and_then(SourceType::from_wire)
+                    .unwrap_or(SourceType::Windows),
                 source_path: row.get(1)?,
                 source_state: normalize_state(row.get::<_, Option<String>>(2)?.as_deref())
                     .to_owned(),
@@ -288,7 +301,7 @@ fn same_source_file(existing: &Evidence, snapshot: &SessionSnapshot) -> bool {
     if existing.source_type != snapshot_type {
         return false;
     }
-    if snapshot_type == SourceType::Wsl {
+    if physical_paths_are_case_sensitive(snapshot_type) {
         existing.source_path == snapshot.source.path
     } else {
         to_lower(&existing.source_path) == to_lower(&snapshot.source.path)
@@ -1494,7 +1507,9 @@ fn capture_identity_merge(
     if stable.is_empty() {
         return Ok(None);
     }
-    let case_sensitive = source_type(snapshot) == SourceType::Wsl;
+    // Logical lookup/search policy does not establish physical-file equivalence
+    // for a NULL-ID fallback. Folded search keys are not alias evidence.
+    let case_sensitive = physical_paths_are_case_sensitive(source_type(snapshot));
     let source = &snapshot.source;
     let mut raw_keys: Vec<&str> = vec![
         &source.path,
@@ -2279,6 +2294,14 @@ fn source_type_label(source_path: &str) -> &'static str {
 
 /// `_upsertScanStatusesOnly`, in its own transaction.
 pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> StoreResult<()> {
+    apply_source_statuses_versioned(conn, statuses, None)
+}
+
+pub(crate) fn apply_source_statuses_versioned(
+    conn: &Connection,
+    statuses: &[SourceStatus],
+    version: Option<u32>,
+) -> StoreResult<()> {
     if statuses.is_empty() {
         return Ok(());
     }
@@ -2297,20 +2320,22 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
             "drop table if exists temp_scan_statuses;
              create temp table temp_scan_statuses (
                harness text not null, source_path text not null, status text not null,
-               source_state text not null, primary key (harness, source_path)
+               source_state text not null, environment text,
+               primary key (harness, source_path)
              );",
         )?;
         {
             let mut insert = conn.prepare(
-                "insert or replace into temp_scan_statuses (harness, source_path, status, source_state)
-                 values (?, ?, ?, ?)",
+                "insert or replace into temp_scan_statuses (harness, source_path, status, source_state, environment)
+                 values (?, ?, ?, ?, ?)",
             )?;
             for status in &ordered {
                 insert.execute(params![
                     status.harness,
                     status.path,
                     status.status,
-                    status.state
+                    status.state,
+                    status.environment
                 ])?;
             }
         }
@@ -2332,16 +2357,22 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
                  or sessions.source_state is not t.source_state)",
             params![now],
         )?;
-        let missing: Vec<(String, String, String, String)> = {
+        let missing: Vec<(String, String, String, String, Option<String>)> = {
             let mut statement = conn.prepare(
-                "select t.harness, t.source_path, t.status, t.source_state from temp_scan_statuses t
+                "select t.harness, t.source_path, t.status, t.source_state, t.environment from temp_scan_statuses t
                  where t.status not in ('available', 'missing', 'path_unreachable')
                    and not exists (select 1 from sessions s where s.harness = t.harness
                      and (s.source_file_path = t.source_path or s.source_file_unc_path = t.source_path))",
             )?;
             statement
                 .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })?
                 .collect::<Result<_, _>>()?
         };
@@ -2355,10 +2386,12 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
                    scan_status = excluded.scan_status, source_state = excluded.source_state,
                    updated_at_utc = excluded.updated_at_utc, last_scanned_utc = excluded.last_scanned_utc",
             )?;
-            for (harness, path, status, state) in &missing {
+            for (harness, path, status, state, environment) in &missing {
                 insert.execute(params![
                     placeholder_id(harness, path),
-                    source_type_label(path),
+                    environment
+                        .as_deref()
+                        .unwrap_or_else(|| source_type_label(path)),
                     path,
                     path,
                     path,
@@ -2379,7 +2412,7 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
         conn.execute_batch("delete from temp_scan_statuses")?;
         if hub_client::queue_enabled(conn)? {
             for status in statuses {
-                hub_client::enqueue(conn, Record::SourceStatus(status.clone()), &now)?;
+                enqueue_for_version(conn, Record::SourceStatus(status.clone()), &now, version)?;
             }
         }
         Ok(())
@@ -2389,6 +2422,14 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
 
 /// `_applySessionIndexThreadNames`.
 pub fn apply_thread_names(conn: &Connection, names: &[ThreadName]) -> StoreResult<usize> {
+    apply_thread_names_versioned(conn, names, None)
+}
+
+pub(crate) fn apply_thread_names_versioned(
+    conn: &Connection,
+    names: &[ThreadName],
+    version: Option<u32>,
+) -> StoreResult<usize> {
     if names.is_empty() {
         return Ok(0);
     }
@@ -2419,7 +2460,7 @@ pub fn apply_thread_names(conn: &Connection, names: &[ThreadName]) -> StoreResul
                     .execute(params![thread_name, rowid])?;
                 changed.insert(id);
             }
-            hub_client::enqueue(conn, Record::ThreadName(entry.clone()), &now)?;
+            enqueue_for_version(conn, Record::ThreadName(entry.clone()), &now, version)?;
         }
         Ok(changed.len())
     })();
@@ -2458,6 +2499,16 @@ pub fn apply_project_hints(
     sessions: &[SessionRef],
     hints: &[ProjectHint],
 ) -> StoreResult<usize> {
+    apply_project_hints_versioned(conn, harness, sessions, hints, None)
+}
+
+pub(crate) fn apply_project_hints_versioned(
+    conn: &Connection,
+    harness: &str,
+    sessions: &[SessionRef],
+    hints: &[ProjectHint],
+    version: Option<u32>,
+) -> StoreResult<usize> {
     let resolver = ProjectResolver::new(
         hints
             .iter()
@@ -2491,11 +2542,10 @@ pub fn apply_project_hints(
             })?;
             for row in found {
                 let (id, working_directory, source_type) = row?;
-                let source_type = if source_type.as_deref() == Some("wsl") {
-                    SourceType::Wsl
-                } else {
-                    SourceType::Windows
-                };
+                let source_type = source_type
+                    .as_deref()
+                    .and_then(SourceType::from_wire)
+                    .unwrap_or(SourceType::Windows);
                 if let Some((name, refined)) =
                     resolver.resolve_marked(working_directory.as_deref(), source_type)
                 {
@@ -2516,7 +2566,7 @@ pub fn apply_project_hints(
             .execute(params![project_id, refined, now, id])?;
             refresh_session_project(conn, id)?;
         }
-        hub_client::enqueue(
+        enqueue_for_version(
             conn,
             Record::ProjectHints(ProjectHints {
                 harness: harness.to_owned(),
@@ -2524,6 +2574,7 @@ pub fn apply_project_hints(
                 hints: hints.to_vec(),
             }),
             &now,
+            version,
         )?;
         Ok(rows.len())
     })();
@@ -2555,11 +2606,11 @@ pub fn project_backfill_candidates(
             Ok(ProjectBackfillCandidate {
                 id: row.get(0)?,
                 working_directory: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                source_type: if row.get::<_, Option<String>>(2)?.as_deref() == Some("wsl") {
-                    SourceType::Wsl
-                } else {
-                    SourceType::Windows
-                },
+                source_type: row
+                    .get::<_, Option<String>>(2)?
+                    .as_deref()
+                    .and_then(SourceType::from_wire)
+                    .unwrap_or(SourceType::Windows),
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -2658,6 +2709,7 @@ pub fn clean_session_metadata_placeholders(conn: &Connection) -> StoreResult<()>
 pub struct CachedSource {
     pub source_path: String,
     pub unc_path: Option<String>,
+    pub source_type: SourceType,
     pub scan_status: String,
     pub file_size: Option<i64>,
     pub modified_utc: Option<DartDateTime>,
@@ -2687,7 +2739,7 @@ pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
 /// `_cachedSessions`, limited to one harness.
 pub fn cached_sources(conn: &Connection, harness: &str) -> StoreResult<Vec<CachedSource>> {
     let mut statement = conn.prepare(
-        "select source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version
+        "select source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version, source_type
          from sessions where harness = ?",
     )?;
     let rows = statement
@@ -2695,6 +2747,11 @@ pub fn cached_sources(conn: &Connection, harness: &str) -> StoreResult<Vec<Cache
             Ok(CachedSource {
                 source_path: row.get(0)?,
                 unc_path: row.get(1)?,
+                source_type: row
+                    .get::<_, Option<String>>(6)?
+                    .as_deref()
+                    .and_then(SourceType::from_wire)
+                    .unwrap_or(SourceType::Windows),
                 scan_status: row
                     .get::<_, Option<String>>(2)?
                     .unwrap_or_else(|| "available".to_owned()),
@@ -2705,4 +2762,16 @@ pub fn cached_sources(conn: &Connection, harness: &str) -> StoreResult<Vec<Cache
         })?
         .collect::<Result<_, _>>()?;
     Ok(rows)
+}
+
+fn enqueue_for_version(
+    conn: &Connection,
+    record: Record,
+    now: &str,
+    version: Option<u32>,
+) -> StoreResult<()> {
+    match version {
+        Some(version) => hub_client::enqueue_versioned(conn, record, now, version),
+        None => hub_client::enqueue(conn, record, now),
+    }
 }

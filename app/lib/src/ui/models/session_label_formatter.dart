@@ -13,6 +13,8 @@ class SessionLabelFormatter {
     return switch (platformName.trim().toLowerCase()) {
       'windows' => 'Windows',
       'wsl' => 'WSL',
+      'macos' => 'macOS',
+      'linux' => 'Linux',
       _ => unknown,
     };
   }
@@ -21,6 +23,8 @@ class SessionLabelFormatter {
     return switch (sourceType?.trim().toLowerCase()) {
       'windows' => 'Windows',
       'wsl' => 'WSL',
+      'macos' => 'macOS',
+      'linux' => 'Linux',
       _ => unknown,
     };
   }

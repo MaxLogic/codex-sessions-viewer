@@ -1,5 +1,8 @@
 # Collector ingestion contract, version 1
 
+New producers use [version 2](contract-v2.md). Version 1 remains accepted for
+Windows/WSL snapshots and legacy source statuses.
+
 An independent collector writes UTF-8 JSON Lines to standard output. The
 viewer does not need to be running. Pipe or save those lines and pass them to
 `codex-sessions-collector apply`; the shared collector validates the records
