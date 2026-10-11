@@ -1,0 +1,87 @@
+name: Native release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: ${{ matrix.target }} release
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - target: windows
+            os: windows-2025
+            archive: release/codex_session_viewer_windows.zip
+          - target: macos
+            os: macos-15
+            archive: release/codex_sessions_viewer_macos.zip
+          - target: linux
+            os: ubuntu-24.04
+            archive: release/codex_sessions_viewer_linux.tar.gz
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      CI: 'true'
+      CARGO_BUILD_JOBS: '2'
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      FLUTTER_SUPPRESS_ANALYTICS: 'true'
+      CXV_MACOS_SIGN_IDENTITY: ''
+      CXV_MACOS_NOTARY_PROFILE: ''
+      RUSTUP_TOOLCHAIN: '1.98.1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: '3.44.1'
+          channel: stable
+      - name: Install locked Rust toolchain and checks
+        shell: bash
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - name: Install Linux desktop build dependencies
+        if: matrix.target == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev
+      - name: Native package and deadline fixtures
+        run: python -B scripts/test_native_release.py
+      - name: POSIX wrapper syntax
+        if: matrix.target != 'windows'
+        run: |
+          bash -n scripts/build_linux.sh
+          bash -n scripts/build_macos.sh
+      - name: Windows release gates and ZIP
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release/logs | Out-Null
+          & ./scripts/package_release.ps1 *> release/logs/windows-release.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: macOS native release gates and ZIP (ad-hoc signing)
+        if: matrix.target == 'macos'
+        run: bash scripts/build_macos.sh
+      - name: Linux native release gates and tarball
+        if: matrix.target == 'linux'
+        run: bash scripts/build_linux.sh
+      - name: Retain gate logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}-gate-logs
+          path: release/logs/
+          if-no-files-found: warn
+      - name: Retain public release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}-release
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
