@@ -839,6 +839,7 @@ Future<void> _databaseMaintenanceWorkerEntry(
       state: DatabaseMaintenanceState.interrupted,
     );
   } on Object catch (error) {
+    var failureMessage = 'Database maintenance failed: $error';
     if (lease != null) {
       try {
         jobs.markFailed(
@@ -848,9 +849,11 @@ Future<void> _databaseMaintenanceWorkerEntry(
         );
       } on StaleMaintenanceLeaseException {
         // A replacement worker owns the durable record and decides its state.
+      } on Object catch (recordError) {
+        failureMessage +=
+            '; recording the failed job also failed: $recordError';
       }
     }
-    final failureMessage = 'Database maintenance failed: $error';
     request.sendPort.send(
       DatabaseMaintenanceProgress(
         state: DatabaseMaintenanceState.failed,

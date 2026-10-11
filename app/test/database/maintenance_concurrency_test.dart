@@ -40,6 +40,31 @@ void main() {
     }
   });
 
+  test(
+    'native migration poisoned worker retains original error when failure recording cannot use connection',
+    () async {
+      final coordinator = DatabaseMaintenanceCoordinator(databaseFile);
+      final operation = await coordinator.start(
+        jobType: 'native_poison_probe',
+        initialPhase: 'migration',
+        worker: _failOnPoisonedConnection,
+      );
+      final result = await operation.result.timeout(
+        const Duration(seconds: 20),
+      );
+      expect(result.state, DatabaseMaintenanceState.failed);
+      expect(
+        result.errorMessage,
+        contains('Original poisoned migration failure'),
+      );
+      expect(
+        result.errorMessage,
+        contains('recording the failed job also failed'),
+      );
+      await coordinator.idle;
+    },
+  );
+
   test('only one connection claims an active maintenance job', () {
     final firstDb = openFileBackedDatabase(databaseFile);
     final secondDb = openFileBackedDatabase(databaseFile);
@@ -1532,4 +1557,11 @@ bool _isMonotonic(List<double> values) {
     }
   }
   return true;
+}
+
+Future<DatabaseMaintenanceWorkerOutcome> _failOnPoisonedConnection(
+  DatabaseMaintenanceWorkerContext context,
+) async {
+  context.database.close();
+  throw StateError('Original poisoned migration failure');
 }
