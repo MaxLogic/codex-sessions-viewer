@@ -517,6 +517,7 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
         repair.pruned_backups = pruned.deleted;
         repair.prune_failures = pruned.failed;
     }
+    crate::t3::import_optional(&store.conn, &settings);
     phases.mark("collect and prune");
     crate::timing::report_totals();
     let printed = print_report(out, "codex scan", &store, &report, options.json);
@@ -670,6 +671,7 @@ fn codex_ingest(options: &Options, out: &mut impl Write) -> Result<(), CliError>
     let mut scan = scan_options(options, &settings, Vec::new());
     scan.force = true;
     let report = codex::collect_file(&store, &scan, &root, options.wsl_projects)?;
+    crate::t3::import_optional(&store.conn, &settings);
     print_report(out, "codex ingest", &store, &report, options.json)?;
     if report.counts.files_parsed == 0 {
         return Err(CliError::Failed(match report.errors.first() {
@@ -877,6 +879,7 @@ fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
     let report = scan_transport(options, out, |cancel, progress, gate| {
         crate::claude::collect_coordinated(&store, &scan, cancel, progress, gate, flush_sessions)
     })?;
+    crate::t3::import_optional(&store.conn, &settings);
     print_report(out, "claude scan", &store, &report, options.json)
 }
 
@@ -910,6 +913,7 @@ fn claude_ingest(options: &Options, out: &mut impl Write) -> Result<(), CliError
         &PathMapper::new(settings.wsl_linux_root_unc.clone()),
         &claude_parser_options(&settings),
     )?;
+    crate::t3::import_optional(&store.conn, &settings);
     print_report(out, "claude ingest", &store, &report, options.json)?;
     if report.counts.files_parsed == 0 {
         return Err(CliError::Failed(format!("{file} was not ingested")));

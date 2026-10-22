@@ -629,15 +629,33 @@ class PathSettings {
   const PathSettings({
     required this.windowsCodexPath,
     required this.wslCodexUncPath,
+    this.t3StatePath = '',
+    this.t3SourceType = '',
   });
 
   final String windowsCodexPath;
   final String wslCodexUncPath;
+  final String t3StatePath;
+
+  /// Empty means the collector host platform; otherwise an explicit source.
+  final String t3SourceType;
 
   factory PathSettings.fromMap(
     Map<String, dynamic> map,
     PathSettings defaults,
   ) => PathSettings(
+    t3StatePath: _string(
+      map,
+      't3_state_path',
+      defaults.t3StatePath,
+      'paths.t3_state_path',
+    ),
+    t3SourceType: _string(
+      map,
+      't3_source_type',
+      defaults.t3SourceType,
+      'paths.t3_source_type',
+    ),
     windowsCodexPath: _string(
       map,
       'windows_codex_path',
@@ -653,6 +671,8 @@ class PathSettings {
   );
 
   Map<String, Object?> toTomlMap() => {
+    't3_state_path': t3StatePath,
+    't3_source_type': t3SourceType,
     'windows_codex_path': windowsCodexPath,
     'wsl_codex_unc_path': wslCodexUncPath,
   };
@@ -660,11 +680,14 @@ class PathSettings {
   @override
   bool operator ==(Object other) =>
       other is PathSettings &&
+      t3StatePath == other.t3StatePath &&
+      t3SourceType == other.t3SourceType &&
       windowsCodexPath == other.windowsCodexPath &&
       wslCodexUncPath == other.wslCodexUncPath;
 
   @override
-  int get hashCode => Object.hash(windowsCodexPath, wslCodexUncPath);
+  int get hashCode =>
+      Object.hash(windowsCodexPath, wslCodexUncPath, t3StatePath, t3SourceType);
 }
 
 class WslSettings {
@@ -884,6 +907,7 @@ class SessionTableSettings {
     bool newestPerProjectOnly = false,
     int? maxSessionsPerProject,
     this.excludedProjects = const [],
+    this.hideChildSessions = false,
     this.paneFraction,
   }) : assert(maxSessionsPerProject == null || maxSessionsPerProject > 0),
        maxSessionsPerProject =
@@ -896,6 +920,7 @@ class SessionTableSettings {
   final int? maxSessionsPerProject;
   bool get newestPerProjectOnly => maxSessionsPerProject == 1;
   final List<String> excludedProjects;
+  final bool hideChildSessions;
 
   /// Table share of the space beside the detail pane. Null uses the default.
   final double? paneFraction;
@@ -924,6 +949,12 @@ class SessionTableSettings {
         final num value when value > 0 && value < 1 => value.toDouble(),
         _ => null,
       },
+      hideChildSessions: _bool(
+        map,
+        'hide_child_sessions',
+        defaults.hideChildSessions,
+        'ui.session_table.hide_child_sessions',
+      ),
       maxSessionsPerProject: _projectLimit(map, defaults),
       excludedProjects: _excludedProjects(map, defaults),
     );
@@ -933,6 +964,7 @@ class SessionTableSettings {
     'column_widths': columnWidths,
     'max_sessions_per_project': maxSessionsPerProject ?? 0,
     'excluded_projects': excludedProjects,
+    'hide_child_sessions': hideChildSessions,
     if (paneFraction != null) 'pane_fraction': paneFraction,
     'sorts': [for (final sort in sorts) sort.toTomlMap()],
   };
@@ -942,6 +974,7 @@ class SessionTableSettings {
       other is SessionTableSettings &&
       _mapEquals(columnWidths, other.columnWidths) &&
       _listEquals(sorts, other.sorts) &&
+      hideChildSessions == other.hideChildSessions &&
       maxSessionsPerProject == other.maxSessionsPerProject &&
       _listEquals(excludedProjects, other.excludedProjects) &&
       paneFraction == other.paneFraction;
@@ -952,6 +985,7 @@ class SessionTableSettings {
     Object.hashAll(sorts),
     maxSessionsPerProject,
     Object.hashAll(excludedProjects),
+    hideChildSessions,
     paneFraction,
   );
 

@@ -452,7 +452,7 @@ void main() {
         isTrue,
         reason: resumed.fatalError?.details,
       );
-      expect(resumed.lastAppliedSchemaVersion, 29);
+      expect(resumed.lastAppliedSchemaVersion, latestSchemaVersion);
     },
   );
 
@@ -542,7 +542,7 @@ void main() {
         isTrue,
         reason: restored.fatalError?.details,
       );
-      expect(restored.lastAppliedSchemaVersion, 29);
+      expect(restored.lastAppliedSchemaVersion, latestSchemaVersion);
     },
   );
 
@@ -1115,7 +1115,7 @@ void main() {
       '025_session_change_journal_precision.sql',
     );
     expect(versionRows.last['version'], latestSchemaVersion);
-    expect(versionRows.last['filename'], '029_native_source_types.sql');
+    expect(versionRows.last['filename'], '030_t3_lineage.sql');
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -3908,6 +3908,7 @@ List<String> _nativeMigrationObjects(Database db) => db
     .select('''
       select type || ':' || name as object from sqlite_schema
       where type in ('index', 'trigger', 'view') and sql is not null
+      and name <> 'trg_sessions_t3_change'
       order by object
     ''')
     .map((row) => row['object'] as String)
@@ -3975,7 +3976,11 @@ Map<String, List<Map<String, Object?>>> _nativeMigrationRows(Database db) => {
   ])
     table: db
         .select('select ${table == 'sessions' ? 'rowid,' : ''}* from $table')
-        .map((row) => Map<String, Object?>.from(row))
+        .map(
+          (row) => Map<String, Object?>.fromEntries(
+            row.entries.where((entry) => !entry.key.startsWith('t3_')),
+          ),
+        )
         .toList(),
 };
 

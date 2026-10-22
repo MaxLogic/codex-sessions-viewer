@@ -12,6 +12,8 @@ use crate::platform_locations::PlatformLocations;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectorSettings {
     pub windows_codex_path: String,
+    pub t3_state_path: String,
+    pub t3_source_type: String,
     pub wsl_codex_unc_path: String,
     pub wsl_linux_root_unc: String,
     pub max_tool_output_preview_chars: usize,
@@ -24,6 +26,8 @@ impl Default for CollectorSettings {
     fn default() -> Self {
         Self {
             windows_codex_path: DefaultFolders::current().codex_home,
+            t3_state_path: String::new(),
+            t3_source_type: SourceType::native().wire_name().to_owned(),
             // The viewer fills the WSL folders from the detected default
             // distribution when it creates settings.toml; without that they
             // stay empty rather than naming one distribution.
@@ -108,7 +112,15 @@ impl CollectorSettings {
                 .filter(|value| *value > 0)
                 .map_or(default, |value| value as usize)
         };
+        let t3_source_type = string("paths", "t3_source_type", "");
+        let t3_source_type = if t3_source_type.is_empty() {
+            defaults.t3_source_type.clone()
+        } else {
+            t3_source_type
+        };
         Ok(Self {
+            t3_state_path: string("paths", "t3_state_path", ""),
+            t3_source_type,
             windows_codex_path: string("paths", "windows_codex_path", &defaults.windows_codex_path),
             wsl_codex_unc_path: string("paths", "wsl_codex_unc_path", &defaults.wsl_codex_unc_path),
             wsl_linux_root_unc: string("wsl", "linux_root_unc", &defaults.wsl_linux_root_unc),

@@ -250,6 +250,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
   var _platformFilter = SessionsPlatformFilter.both;
   var _archivedFilter = SessionsArchivedFilter.activeOnly;
   var _originFilter = _defaultOriginFilter;
+  var _hideChildSessions = false;
   String? _harnessFilter;
   var _timeFilter = _defaultTimeFilter;
   ({int start, int? end})? _timeWindowCache;
@@ -334,6 +335,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _sorts = _normalizedSorts(tableState.sorts);
     _tablePaneFraction = tableState.paneFraction;
     _maxSessionsPerProject = tableState.maxSessionsPerProject;
+    _hideChildSessions = tableState.hideChildSessions;
     _setExcludedProjects(tableState.excludedProjects);
     _scanAnnouncement = widget.initialStatusMessage;
     _handledAutoRefreshToken = widget.autoRefreshToken;
@@ -361,6 +363,16 @@ class _SessionsScreenState extends State<SessionsScreen> {
   @override
   void didUpdateWidget(covariant SessionsScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final previousTable =
+        oldWidget.initialTableState ?? oldWidget.settings?.ui.sessionTable;
+    final nextTable =
+        widget.initialTableState ?? widget.settings?.ui.sessionTable;
+    if (nextTable != null &&
+        previousTable?.hideChildSessions != nextTable.hideChildSessions) {
+      _hideChildSessions = nextTable.hideChildSessions;
+      _retainSelection();
+    }
+
     if (oldWidget.pricingRevision != widget.pricingRevision ||
         oldWidget.pricingUpdating != widget.pricingUpdating) {
       _pricingInvalidated = true;
@@ -552,6 +564,13 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                   timeFilter: _timeFilter,
                                   archivedFilter: _archivedFilter,
                                   originFilter: _originFilter,
+                                  hideChildSessions: _hideChildSessions,
+                                  onHideChildSessionsChanged: (value) {
+                                    _updateFilter(
+                                      () => _hideChildSessions = value,
+                                    );
+                                    _emitTableState();
+                                  },
                                   harnessFilter: _harnessFilter,
                                   onHarnessChanged: (value) => _updateFilter(
                                     () => _harnessFilter = value,
@@ -821,6 +840,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
 
   List<_SessionDisplayRow> get _visibleDisplayRows {
     final inputs = <Object?>[
+      _hideChildSessions,
       _rows,
       _platformFilter,
       _harnessFilter,
@@ -1115,6 +1135,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
 
   _SessionHierarchy _buildSessionHierarchy() {
     final inputs = <Object?>[
+      _hideChildSessions,
       _rows,
       widget.pricingUpdating,
       _pricingCostsPending,
@@ -1135,6 +1156,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
     final subagents = <SessionRowViewModel>[];
     for (final sourceRow in _rows) {
       final row = _pricingOverlay(sourceRow);
+      if (_hideChildSessions && row.isChildSession) continue;
       if (row.isSubagentSession) {
         subagents.add(row);
         continue;
@@ -1151,7 +1173,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     for (final child in subagents) {
       final parent =
           parentByKey[child.harnessSessionKey(child.parentThreadId)] ??
-          parentByKey[child.parentThreadId.trim()];
+          parentByKey[child.parentThreadId.trim()] ??
+          parentByKey[child.t3ParentSessionId];
       if (parent == null) {
         orphanSubagents.add(child);
         continue;
@@ -1191,7 +1214,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     String path,
     String threadName,
   ) {
-    return _matchesArchived(row) &&
+    return (!_hideChildSessions || !row.isChildSession) &&
+        _matchesArchived(row) &&
         _matchesPlatform(row) &&
         _matchesTime(row) &&
         _matchesPath(row, path) &&
@@ -1475,6 +1499,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _timeFilter != _defaultTimeFilter ||
         _archivedFilter != SessionsArchivedFilter.activeOnly ||
         _originFilter != _defaultOriginFilter ||
+        _hideChildSessions ||
         _maxSessionsPerProject != null ||
         _excludedProjects.isNotEmpty ||
         _namedOnly ||
@@ -1898,6 +1923,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         _timeFilter = _defaultTimeFilter;
         _archivedFilter = SessionsArchivedFilter.activeOnly;
         _originFilter = _defaultOriginFilter;
+        _hideChildSessions = false;
         _maxSessionsPerProject = null;
         _setExcludedProjects(const []);
         _namedOnly = false;
@@ -1920,10 +1946,23 @@ class _SessionsScreenState extends State<SessionsScreen> {
   int get _originScopedRowCount {
     return switch (_originFilter) {
       SessionsOriginFilter.user =>
-        _rows.where((row) => !row.isSubagentSession).length,
+        _rows
+            .where(
+              (row) =>
+                  !row.isSubagentSession &&
+                  (!_hideChildSessions || !row.isChildSession),
+            )
+            .length,
       SessionsOriginFilter.subagent =>
-        _rows.where((row) => row.isSubagentSession).length,
-      SessionsOriginFilter.all => _rows.length,
+        _rows
+            .where(
+              (row) =>
+                  row.isSubagentSession &&
+                  (!_hideChildSessions || !row.isChildSession),
+            )
+            .length,
+      SessionsOriginFilter.all =>
+        _rows.where((row) => !_hideChildSessions || !row.isChildSession).length,
     };
   }
 
@@ -2644,6 +2683,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         columnWidths: Map.unmodifiable(_columnWidths),
         sorts: List.unmodifiable(_sorts),
         maxSessionsPerProject: _maxSessionsPerProject,
+        hideChildSessions: _hideChildSessions,
         excludedProjects: List.unmodifiable(_excludedProjects),
         paneFraction: _tablePaneFraction,
       ),
@@ -3453,6 +3493,8 @@ class _FilterBar extends StatefulWidget {
     required this.onTimeChanged,
     required this.onArchivedChanged,
     required this.onOriginChanged,
+    required this.hideChildSessions,
+    required this.onHideChildSessionsChanged,
     required this.onMaxSessionsPerProjectChanged,
     required this.onNamedOnlyChanged,
     required this.onProjectChanged,
@@ -3472,6 +3514,8 @@ class _FilterBar extends StatefulWidget {
   final SessionsTimeFilter timeFilter;
   final SessionsArchivedFilter archivedFilter;
   final SessionsOriginFilter originFilter;
+  final bool hideChildSessions;
+  final ValueChanged<bool> onHideChildSessionsChanged;
   final String? harnessFilter;
   final ValueChanged<String?> onHarnessChanged;
   final int? maxSessionsPerProject;
@@ -3699,6 +3743,25 @@ class _FilterBarState extends State<_FilterBar> {
               (value, value.label),
           ],
           onSelected: widget.onOriginChanged,
+        ),
+        Semantics(
+          label: 'Hide sessions started by other sessions',
+          checked: widget.hideChildSessions,
+          onTap: () =>
+              widget.onHideChildSessionsChanged(!widget.hideChildSessions),
+          child: ExcludeSemantics(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Checkbox(
+                  value: widget.hideChildSessions,
+                  onChanged: (value) =>
+                      widget.onHideChildSessionsChanged(value ?? false),
+                ),
+                const Text('Hide child sessions'),
+              ],
+            ),
+          ),
         ),
         Semantics(
           button: true,
@@ -3935,6 +3998,11 @@ class _FilterBarState extends State<_FilterBar> {
         _ActiveFilterChip(
           SessionLabelFormatter.harness(harness),
           () => widget.onHarnessChanged(null),
+        ),
+      if (widget.hideChildSessions)
+        _ActiveFilterChip(
+          'Hide child sessions',
+          () => widget.onHideChildSessionsChanged(false),
         ),
       if (widget.originFilter != _defaultOriginFilter)
         _ActiveFilterChip(

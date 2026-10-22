@@ -21,6 +21,19 @@ flutter pub get
 flutter run -d windows
 ```
 
+## Sessions started by other sessions
+
+In Settings, set **T3 Code state database (optional)** to T3's `statev2.sqlite`
+and select the session source platform. Leave the path blank to disable the lookup.
+Refresh sessions to import T3's explicit fork and subagent links. The collector opens
+T3 state read only; an unavailable or incompatible database does not stop collection.
+The older `state.sqlite` schema has no parent lineage and is unsupported for this lookup.
+
+Session details show the T3 relationship and parent, including unresolved parents.
+**Hide child sessions** in the Sessions filters hides these sessions and provider-native
+forks and subagents. The option is saved, composes with the other filters, and applies
+to visible-list Markdown and CSV exports.
+
 ## Build
 
 Use the repository scripts for normal release validation:

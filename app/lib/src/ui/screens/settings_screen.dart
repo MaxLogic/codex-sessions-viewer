@@ -59,6 +59,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _diagnosticResult = '';
 
   final _windowsCodexPath = TextEditingController();
+  final _t3StatePath = TextEditingController();
+  final _t3SourceType = TextEditingController();
   final _wslCodexUncPath = TextEditingController();
   final _wslDistro = TextEditingController();
   final _wslLinuxHome = TextEditingController();
@@ -110,6 +112,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     for (final controller in [
       _windowsCodexPath,
+      _t3StatePath,
+      _t3SourceType,
       _wslCodexUncPath,
       _wslDistro,
       _wslLinuxHome,
@@ -133,6 +137,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   void _loadControllers(AppSettings settings) {
     _windowsCodexPath.text = settings.paths.windowsCodexPath;
+    _t3StatePath.text = settings.paths.t3StatePath;
+    _t3SourceType.text = settings.paths.t3SourceType;
     _wslCodexUncPath.text = settings.paths.wslCodexUncPath;
     _wslDistro.text = settings.wsl.distro;
     _wslLinuxHome.text = settings.wsl.linuxHome;
@@ -215,6 +221,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return _settings.copyWith(
       paths: PathSettings(
         windowsCodexPath: _windowsCodexPath.text,
+        t3StatePath: _t3StatePath.text.trim(),
+        t3SourceType: _t3SourceType.text.trim(),
         wslCodexUncPath: _wslCodexUncPath.text,
       ),
       wsl: WslSettings(
@@ -353,6 +361,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       title: 'Application',
                       children: [
                         _SwitchSetting(
+                          label: 'Hide sessions started by other sessions',
+                          helperText:
+                              'Hide forks and subagents in the Sessions list.',
+                          value: _settings.ui.sessionTable.hideChildSessions,
+                          onChanged: (value) => setState(() {
+                            final uiMap = _settings.ui.toTomlMap();
+                            uiMap['session_table'] = {
+                              ..._settings.ui.sessionTable.toTomlMap(),
+                              'hide_child_sessions': value,
+                            };
+                            _settings = _settings.copyWith(
+                              ui: UiSettings.fromMap(uiMap, _settings.ui),
+                            );
+                          }),
+                        ),
+                        _SwitchSetting(
                           label: 'Start at login',
                           helperText:
                               'Launch Codex Session Viewer after signing in.',
@@ -372,6 +396,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     _Section(
                       title: 'Paths',
                       children: [
+                        _TextSetting(
+                          label: 'T3 Code state database (optional)',
+                          semanticsLabel: 'T3 Code state database input',
+                          helperText:
+                              'Path to statev2.sqlite. Read only; leave blank to disable parent-session lookup.',
+                          controller: _t3StatePath,
+                        ),
+                        _ChoiceSetting(
+                          label: 'T3 session source',
+                          emptyValueLabel: 'This computer',
+                          value: _t3SourceType.text,
+                          values: const [
+                            '',
+                            'windows',
+                            'wsl',
+                            'macos',
+                            'linux',
+                          ],
+                          onChanged: (value) =>
+                              setState(() => _t3SourceType.text = value),
+                        ),
                         _TextSetting(
                           label:
                               (widget.hostPlatform ??
@@ -993,9 +1038,11 @@ class _ChoiceSetting extends StatelessWidget {
     required this.value,
     required this.values,
     required this.onChanged,
+    this.emptyValueLabel = 'Automatic',
   });
 
   final String label;
+  final String emptyValueLabel;
   final String value;
   final List<String> values;
   final ValueChanged<String> onChanged;
@@ -1008,21 +1055,25 @@ class _ChoiceSetting extends StatelessWidget {
         children: [
           SizedBox(width: 220, child: Text(label)),
           Expanded(
-            child: Semantics(
-              label: '$label setting',
-              button: true,
-              child: DropdownButton<String>(
-                value: value,
-                isExpanded: true,
-                items: [
-                  for (final item in values)
-                    DropdownMenuItem(value: item, child: Text(item)),
-                ],
-                onChanged: (value) {
-                  if (value != null) {
-                    onChanged(value);
-                  }
-                },
+            child: MergeSemantics(
+              child: Semantics(
+                label: '$label setting',
+                child: DropdownButton<String>(
+                  value: value,
+                  isExpanded: true,
+                  items: [
+                    for (final item in values)
+                      DropdownMenuItem(
+                        value: item,
+                        child: Text(item.isEmpty ? emptyValueLabel : item),
+                      ),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) {
+                      onChanged(value);
+                    }
+                  },
+                ),
               ),
             ),
           ),

@@ -14,7 +14,7 @@ use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 29;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 30;
 
 pub struct Migration {
     pub version: i64,
@@ -94,6 +94,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(27, "migration", "027_fix_search_update_triggers.sql"),
     migration!(28, "migration", "028_session_project_refined.sql"),
     migration!(29, "migration", "029_native_source_types.sql"),
+    migration!(30, "migration", "030_t3_lineage.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1043,8 +1044,18 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     fn native_fixture_snapshot(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
         let mut result = Vec::new();
+        // Compare the pre-lineage data projection across the schema upgrade;
+        // new nullable provenance columns and their trigger are proven separately.
+        let columns: Vec<String> = conn
+            .prepare("select name from pragma_table_info('sessions') where name not like 't3_%'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let session_query = format!("select rowid,{} from sessions", columns.join(","));
         for query in [
-            "select rowid,* from sessions",
+            session_query.as_str(),
             "select * from messages",
             "select * from session_source_extras",
             "select * from tool_calls",
@@ -1056,7 +1067,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             "select * from collector_upload_outbox",
             "select * from collector_hub_state",
             "select * from session_change_state",
-            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') order by type,name",
+            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') and name <> 'trg_sessions_t3_change' order by type,name",
         ] {
             let mut statement = conn.prepare(query).unwrap();
             let columns = statement.column_count();
@@ -1078,7 +1089,10 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
         let before = native_fixture_snapshot(&conn);
         prepare_standalone(&conn, ":memory:").unwrap();
         assert_eq!(native_fixture_snapshot(&conn), before);
-        assert_eq!(last_applied_version(&conn).unwrap(), 29);
+        assert_eq!(
+            last_applied_version(&conn).unwrap(),
+            SUPPORTED_SCHEMA_VERSION
+        );
         assert_eq!(
             conn.query_row("pragma foreign_keys", [], |row| row.get::<_, i64>(0))
                 .unwrap(),

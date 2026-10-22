@@ -18,6 +18,215 @@ use serde_json::{Value, json};
 
 use support::{TempDir, collector, viewer_database};
 
+#[test]
+fn t3_lineage_resolves_scoped_native_refs_and_is_optional() {
+    use codex_sessions_collector::{
+        store::{OwnerMode, Store},
+        t3,
+    };
+    let temp = TempDir::new("t3-lineage");
+    let db = viewer_database(&temp);
+    let store = Store::open(&db, OwnerMode::Viewer).unwrap();
+    for id in ["root", "fork", "nested", "orphan"] {
+        apply_physical(&store, support::sample_snapshot(id));
+    }
+    let mut collision = support::sample_snapshot("root");
+    collision.harness = "claude".to_owned();
+    collision.source.path = "C:\\synthetic\\claude-root.jsonl".to_owned();
+    apply_physical(&store, collision);
+    let mut other_source = support::sample_snapshot("fork");
+    other_source.source.environment = "wsl".to_owned();
+    other_source.source.path = "\\\\wsl\\synthetic\\fork.jsonl".to_owned();
+    apply_physical(&store, other_source);
+    let path = temp.path().join("statev2.sqlite");
+    let t3db = Connection::open(&path).unwrap();
+    for table in ["threads", "provider_threads"] {
+        t3db.execute_batch(&format!(
+            "create table orchestration_v2_projection_{table}(payload_json text not null)"
+        ))
+        .unwrap();
+    }
+    for (id, parent, relationship) in [
+        ("root", None, None),
+        ("fork", Some("root"), Some("fork")),
+        ("nested", Some("fork"), Some("subagent")),
+        ("orphan", Some("missing"), Some("subagent")),
+    ] {
+        let thread = json!({"id": format!("app-{id}"), "lineage": {"parentThreadId": parent.map(|p| format!("app-{p}")), "relationshipToParent": relationship, "rootThreadId": "app-root"}});
+        t3db.execute(
+            "insert into orchestration_v2_projection_threads values (?)",
+            [thread.to_string()],
+        )
+        .unwrap();
+        let provider = json!({"id": format!("internal-{id}"), "driver": "codex", "providerInstanceId": "codex_personal", "providerSessionId": "not-native-id", "appThreadId": format!("app-{id}"), "nativeThreadRef": {"driver": "codex", "nativeId": id, "strength": "strong"}});
+        t3db.execute(
+            "insert into orchestration_v2_projection_provider_threads values (?)",
+            [provider.to_string()],
+        )
+        .unwrap();
+    }
+    let mut claude_child = support::sample_snapshot("claude-child");
+    claude_child.harness = "claude".to_owned();
+    apply_physical(&store, claude_child);
+    t3db.execute("insert into orchestration_v2_projection_threads values (?)", [json!({"id":"app-claude-child", "lineage":{"parentThreadId":"app-root","relationshipToParent":"fork","rootThreadId":"app-root"}}).to_string()]).unwrap();
+    t3db.execute("insert into orchestration_v2_projection_provider_threads values (?)", [json!({"driver":"claudeAgent","appThreadId":"app-claude-child","nativeThreadRef":{"driver":"claudeAgent","nativeId":"claude-child","strength":"strong"}}).to_string()]).unwrap();
+    for reference in [
+        json!({"driver":"codex","nativeId":"fork","strength":"weak"}),
+        json!({"driver":"claudeAgent","nativeId":"fork","strength":"strong"}),
+    ] {
+        t3db.execute("insert into orchestration_v2_projection_provider_threads values (?)", [json!({"driver":"codex","appThreadId":"must-not-match", "nativeThreadRef":reference}).to_string()]).unwrap();
+    }
+    let before_revision: i64 = store
+        .conn
+        .query_row("select revision from session_change_state", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let row_id = |native: &str| -> String {
+        store.conn.query_row("select id from sessions where session_id = ? and harness = 'codex' and source_type = 'windows'", [native], |r| r.get(0)).unwrap()
+    };
+    let relation = |native: &str| -> (Option<String>, Option<String>, Option<String>) {
+        store.conn.query_row("select t3_parent_thread_id, t3_parent_session_id, t3_relationship from sessions where id = ?", [row_id(native)], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+    };
+    assert_eq!(t3::import(&store.conn, &path, "windows").unwrap(), 5);
+    assert_eq!(relation("root"), (None, None, None));
+    assert_eq!(
+        relation("fork"),
+        (
+            Some("app-root".into()),
+            Some(row_id("root")),
+            Some("fork".into())
+        )
+    );
+    assert_eq!(
+        relation("nested"),
+        (
+            Some("app-fork".into()),
+            Some(row_id("fork")),
+            Some("subagent".into())
+        )
+    );
+    assert_eq!(
+        relation("orphan"),
+        (Some("app-missing".into()), None, Some("subagent".into()))
+    );
+    assert_eq!(store.conn.query_row("select count(*) from sessions where ((harness='claude' and session_id='root') or source_type='wsl') and t3_parent_thread_id is not null", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    let revision: i64 = store
+        .conn
+        .query_row("select revision from session_change_state", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(revision > before_revision);
+    assert!(
+        store
+            .conn
+            .query_row(
+                "select revision > ? and deleted = 0 from session_changes where session_id = ?",
+                rusqlite::params![before_revision, row_id("fork")],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    assert_eq!(store.conn.query_row("select t3_parent_session_id from sessions where harness='claude' and session_id='claude-child'", [], |r| r.get::<_,String>(0)).unwrap(), row_id("root"));
+    t3::import(&store.conn, &path, "windows").unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("select revision from session_change_state", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        revision
+    );
+    // Reingesting provider snapshots must not wipe independent T3 provenance.
+    apply_physical(&store, support::sample_snapshot("fork"));
+    assert_eq!(relation("fork").2.as_deref(), Some("fork"));
+    assert!(t3::import(&store.conn, &temp.path().join("missing.sqlite"), "windows").is_err());
+    let incompatible = temp.path().join("state.sqlite");
+    Connection::open(&incompatible)
+        .unwrap()
+        .execute_batch("create table projection_threads(thread_id text)")
+        .unwrap();
+    assert!(t3::import(&store.conn, &incompatible, "windows").is_err());
+    assert_eq!(relation("fork").2.as_deref(), Some("fork"));
+    t3db.execute_batch("begin exclusive").unwrap();
+    assert!(t3::import(&store.conn, &path, "windows").is_err());
+    t3db.execute_batch("rollback").unwrap();
+    // Ambiguous provider-instance bindings must leave parent explicitly unresolved.
+    t3db.execute("insert into orchestration_v2_projection_provider_threads values (?)", [json!({"driver":"codex", "providerInstanceId":"codex_work", "appThreadId":"other-root", "nativeThreadRef":{"driver":"codex","nativeId":"root","strength":"strong"}}).to_string()]).unwrap();
+    t3::import(&store.conn, &path, "windows").unwrap();
+    assert_eq!(relation("fork").1, None);
+    // A successful authoritative root snapshot clears obsolete T3 links.
+    t3db.execute("update orchestration_v2_projection_threads set payload_json = ? where json_extract(payload_json, '$.id') = 'app-fork'", [json!({"id":"app-fork", "lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":"app-fork"}}).to_string()]).unwrap();
+    t3::import(&store.conn, &path, "windows").unwrap();
+    assert_eq!(relation("fork"), (None, None, None));
+}
+
+#[test]
+fn t3_lineage_scan_reads_configured_state_after_cached_collection() {
+    let temp = TempDir::new("t3-scan");
+    let db = viewer_database(&temp);
+    let home = temp.path().join("codex");
+    let sessions = home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    for id in ["root", "child"] {
+        support::write_generated_session(&sessions.join(format!("{id}.jsonl")), id, 1);
+    }
+    let state = temp.path().join("statev2.sqlite");
+    let t3 = Connection::open(&state).unwrap();
+    t3.execute_batch("create table orchestration_v2_projection_threads(payload_json text); create table orchestration_v2_projection_provider_threads(payload_json text)").unwrap();
+    for id in ["root", "child"] {
+        t3.execute("insert into orchestration_v2_projection_threads values (?)", [json!({"id":id, "lineage":{"parentThreadId":if id == "child" {Some("root")} else {None},"relationshipToParent":if id == "child" {Some("fork")} else {None},"rootThreadId":"root"}}).to_string()]).unwrap();
+        t3.execute("insert into orchestration_v2_projection_provider_threads values (?)", [json!({"driver":"codex","appThreadId":id,"nativeThreadRef":{"driver":"codex","nativeId":id,"strength":"strong"}}).to_string()]).unwrap();
+    }
+    let settings = temp.path().join("settings.toml");
+    std::fs::write(
+        &settings,
+        format!(
+            "[paths]\nwindows_codex_path = {}\nt3_state_path = {}\nt3_source_type = 'windows'\n",
+            json!(home.to_string_lossy()),
+            json!(state.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    let scan = || {
+        collector()
+            .args(["codex", "scan", "--json", "--no-wsl-projects", "--db"])
+            .arg(&db)
+            .arg("--settings")
+            .arg(&settings)
+            .output()
+            .unwrap()
+    };
+    for _ in 0..2 {
+        let output = scan();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "select t3_relationship from sessions where session_id='child'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "fork"
+        );
+    }
+    // Unsupported installed-v1 state is a reported optional failure, not a scan failure.
+    t3.execute_batch("drop table orchestration_v2_projection_threads")
+        .unwrap();
+    let output = scan();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Optional T3 lineage lookup unavailable")
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("root.jsonl"));
+}
+
 fn physical_snapshot(
     environment: &str,
     path: &str,

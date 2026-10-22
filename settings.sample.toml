@@ -8,6 +8,10 @@ start_with_windows = false
 [paths]
 windows_codex_path = ''
 wsl_codex_unc_path = ''
+# Optional read-only T3 v2 parent-session lookup. Older state.sqlite has no lineage.
+t3_state_path = ''
+# Blank uses this computer platform; alternatively windows, wsl, macos, linux.
+t3_source_type = ''
 
 [wsl]
 distro = ''

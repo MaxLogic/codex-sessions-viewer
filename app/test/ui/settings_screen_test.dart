@@ -1,3 +1,5 @@
+import 'dart:ui' show Tristate;
+import 'dart:io';
 import 'package:codex_sessions_viewer/src/accessibility/announcement_service.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
@@ -5,9 +7,78 @@ import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
 import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('persists parent-session filter', (tester) async {
+    final semantics = tester.ensureSemantics();
+
+    await tester.binding.setSurfaceSize(const Size(1800, 1600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final directory = (await tester.runAsync(
+      () => Directory.systemTemp.createTemp('parent-filter-'),
+    ))!;
+    addTearDown(() => directory.delete(recursive: true));
+    final repo = SettingsRepository(File('${directory.path}/settings.toml'));
+    final original = AppSettings.defaults();
+    Future<void>? save;
+    Future<AppSettings>? reload;
+    await tester.runAsync(() => repo.save(original));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          initialSettings: original,
+          onSave: (value) => save = repo.save(value),
+          onReload: () => reload = repo.loadOrCreate(),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final toggle = find.bySemanticsLabel(
+      'Hide sessions started by other sessions setting',
+    );
+    await tester.ensureVisible(toggle);
+    // Native Switch receives keyboard activation and exposes checked state.
+    final switchFinder = find.descendant(
+      of: toggle,
+      matching: find.byType(Switch),
+    );
+    expect(switchFinder, findsOneWidget);
+    final focus = FocusManager.instance.rootScope.descendants.firstWhere(
+      (node) => node.context?.findAncestorWidgetOfExactType<Switch>() != null,
+    );
+    focus.requestFocus();
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    await tester.pumpAndSettle();
+    await tester.runAsync(() async {
+      await tester.tap(find.text('Save settings'));
+      await save;
+    });
+    await tester.pumpAndSettle();
+    expect(
+      (await tester.runAsync(
+        repo.loadOrCreate,
+      ))!.ui.sessionTable.hideChildSessions,
+      isTrue,
+    );
+    await tester.runAsync(() async {
+      await tester.tap(find.text('Reload from file'));
+      await reload;
+    });
+    await tester.pumpAndSettle();
+    expect(
+      tester.getSemantics(toggle).flagsCollection.isToggled == Tristate.isTrue,
+      isTrue,
+    );
+    expect(
+      (await tester.runAsync(repo.loadOrCreate))!.ui.sessionTable.columnWidths,
+      original.ui.sessionTable.columnWidths,
+    );
+    semantics.dispose();
+  });
+
   testWidgets(
     'native settings omit WSL controls and preserve copied WSL configuration',
     (tester) async {
@@ -633,7 +704,19 @@ void main() {
     await tester.ensureVisible(find.text('Motion'));
     await tester.pumpAndSettle();
 
-    expect(find.bySemanticsLabel('Motion setting'), findsOneWidget);
+    final choice = find.bySemanticsLabel(RegExp(r'^Motion setting\n'));
+    expect(choice, findsOneWidget);
+    expect(
+      tester.getSemantics(choice),
+      matchesSemantics(
+        hasTapAction: true,
+        hasFocusAction: true,
+        isButton: true,
+        isFocusable: true,
+        hasExpandedState: true,
+        label: 'Motion setting\nsystem',
+      ),
+    );
 
     semantics.dispose();
   });

@@ -535,6 +535,15 @@ class _DetailsTab extends StatelessWidget {
             _DetailText('Harness', row.harnessLabel),
             _DetailText('Platform', row.platformLabel),
             _DetailText('Origin', row.originLabel),
+            if (row.t3ParentThreadId.isNotEmpty) ...[
+              _DetailText('T3 relationship', row.t3Relationship),
+              _DetailText(
+                'Started by session',
+                row.t3ParentSessionId.isEmpty
+                    ? 'Unresolved T3 parent: ${row.t3ParentThreadId}'
+                    : row.t3ParentSessionId,
+              ),
+            ],
             _DetailText('Project', row.project),
             if (row.hasThreadName) _DetailText('Thread name', row.threadName),
             if (row.parentThreadId.isNotEmpty)

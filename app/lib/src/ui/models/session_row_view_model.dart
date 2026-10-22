@@ -26,6 +26,10 @@ class SessionRowViewModel {
     this.threadName = '',
     this.threadSource = '',
     this.parentThreadId = '',
+    this.forkedFromId = '',
+    this.t3ParentThreadId = '',
+    this.t3ParentSessionId = '',
+    this.t3Relationship = '',
     this.agentNickname = '',
     this.agentRole = '',
     this.subagentDepth,
@@ -85,6 +89,16 @@ class SessionRowViewModel {
   final String threadName;
   final String threadSource;
   final String parentThreadId;
+  final String forkedFromId;
+  final String t3ParentThreadId;
+  final String t3ParentSessionId;
+  final String t3Relationship;
+
+  bool get isChildSession =>
+      isSubagentSession ||
+      parentThreadId.isNotEmpty ||
+      forkedFromId.isNotEmpty ||
+      t3ParentThreadId.isNotEmpty;
   final String agentNickname;
   final String agentRole;
   final int? subagentDepth;
@@ -140,7 +154,9 @@ class SessionRowViewModel {
     return trimmed.isEmpty ? '' : '$harness:$trimmed';
   }
 
-  bool get isSubagentSession => threadSource.toLowerCase() == 'subagent';
+  bool get isSubagentSession =>
+      threadSource.toLowerCase() == 'subagent' ||
+      (t3ParentThreadId.isNotEmpty && t3Relationship == 'subagent');
 
   bool get hasThreadName => threadName.trim().isNotEmpty;
 
@@ -160,10 +176,12 @@ class SessionRowViewModel {
     return id;
   }
 
-  String get originLabel => SessionLabelFormatter.origin(
-    threadSource: threadSource,
-    agentNickname: agentNickname,
-  );
+  String get originLabel => t3ParentThreadId.isNotEmpty
+      ? 'T3 ${t3Relationship == 'subagent' ? 'subagent' : 'fork'}'
+      : SessionLabelFormatter.origin(
+          threadSource: threadSource,
+          agentNickname: agentNickname,
+        );
 
   String get providerLabel => SessionLabelFormatter.provider(model);
 
@@ -249,6 +267,10 @@ class SessionRowViewModel {
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
+      forkedFromId: forkedFromId,
+      t3ParentThreadId: t3ParentThreadId,
+      t3ParentSessionId: t3ParentSessionId,
+      t3Relationship: t3Relationship,
       agentNickname: agentNickname,
       agentRole: agentRole,
       subagentDepth: subagentDepth,
@@ -306,6 +328,10 @@ class SessionRowViewModel {
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
+      forkedFromId: forkedFromId,
+      t3ParentThreadId: t3ParentThreadId,
+      t3ParentSessionId: t3ParentSessionId,
+      t3Relationship: t3Relationship,
       agentNickname: agentNickname,
       agentRole: agentRole,
       subagentDepth: subagentDepth,
@@ -369,6 +395,10 @@ class SessionRowViewModel {
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
+      forkedFromId: forkedFromId,
+      t3ParentThreadId: t3ParentThreadId,
+      t3ParentSessionId: t3ParentSessionId,
+      t3Relationship: t3Relationship,
       agentNickname: agentNickname,
       agentRole: agentRole,
       subagentDepth: subagentDepth,
@@ -429,6 +459,10 @@ class SessionRowViewModel {
       threadName: threadName,
       threadSource: threadSource,
       parentThreadId: parentThreadId,
+      forkedFromId: forkedFromId,
+      t3ParentThreadId: t3ParentThreadId,
+      t3ParentSessionId: t3ParentSessionId,
+      t3Relationship: t3Relationship,
       agentNickname: agentNickname,
       agentRole: agentRole,
       subagentDepth: subagentDepth,

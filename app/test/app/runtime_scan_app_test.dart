@@ -3604,6 +3604,9 @@ void main() {
         find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
       );
       await _pumpFrames(tester);
+      await tester.ensureVisible(
+        find.bySemanticsLabel('Background scan enabled setting'),
+      );
       await tester.tap(
         find.bySemanticsLabel('Background scan enabled setting'),
       );

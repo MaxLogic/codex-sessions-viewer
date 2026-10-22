@@ -57,10 +57,10 @@ void main() {
         upgraded
             .select('select max(version) v from schema_version where success=1')
             .single['v'],
-        29,
+        latestSchemaVersion,
       );
       await _seedLegacyChecksumReceipts(upgraded);
-      final receipts29 = _checksumReceiptRows(upgraded);
+      final receiptsCurrent = _checksumReceiptRows(upgraded);
       upgraded.close();
       final resumed = await DatabaseMaintenanceCoordinator(file).start(
         jobType: 'usage_projection_migration',
@@ -76,7 +76,7 @@ void main() {
       );
       final checked = openFileBackedDatabase(file, maintenanceWriter: true);
       addTearDown(checked.close);
-      expect(_checksumReceiptRows(checked), receipts29);
+      expect(_checksumReceiptRows(checked), receiptsCurrent);
       expect(
         checked
             .select(

@@ -1,3 +1,4 @@
+import 'dart:ui' show CheckedState, Tristate;
 import 'dart:async';
 import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
 
@@ -15,6 +16,236 @@ import 'package:flutter_test/flutter_test.dart';
 import '../helpers/test_sessions_screen.dart';
 
 void main() {
+  testWidgets(
+    'T3 subagents compose with origin filters and cross-harness grouping',
+    (tester) async {
+      final semantics = tester.ensureSemantics();
+      await tester.binding.setSurfaceSize(const Size(1800, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TestSessionsScreen(
+            initialRows: [
+              _row(
+                id: 'parent-row',
+                sessionId: 'native-parent',
+                harness: 'claude',
+                title: 'Cross harness parent',
+                project: 'Viewer',
+              ),
+              _row(
+                id: 't3-child',
+                title: 'T3 spawned instruction',
+                project: 'Viewer',
+                t3ParentThreadId: 'app-parent',
+                t3ParentSessionId: 'parent-row',
+                t3Relationship: 'subagent',
+              ),
+              _row(
+                id: 't3-fork',
+                title: 'T3 fork instruction',
+                project: 'Viewer',
+                t3ParentThreadId: 'app-parent',
+                t3ParentSessionId: 'parent-row',
+                t3Relationship: 'fork',
+              ),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await _setOriginFilter(tester, 'Subagent');
+      expect(
+        find.bySemanticsLabel(
+          RegExp(r'^Session T3 subagent, T3 spawned instruction'),
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('T3 fork instruction'), findsNothing);
+      expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+      await _setOriginFilter(tester, 'User');
+      await _enterSessionSearch(tester, 'T3 spawned instruction');
+      // A child search displays the correctly resolved parent as its context.
+      expect(
+        find.bySemanticsLabel(
+          RegExp(r'^Session Cross harness parent, 1 subagent'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel(
+          RegExp(
+            r'^Session T3 subagent, T3 spawned instruction under Cross harness parent',
+          ),
+        ),
+        findsOneWidget,
+      );
+      await _enterSessionSearch(tester, '');
+      expect(
+        find.bySemanticsLabel(RegExp(r'^Session T3 fork instruction')),
+        findsOneWidget,
+      );
+      expect(
+        find.bySemanticsLabel(
+          RegExp(r'^Session T3 subagent, T3 spawned instruction'),
+        ),
+        findsNothing,
+      );
+      semantics.dispose();
+    },
+  );
+
+  testWidgets('hides sessions started by other sessions', (tester) async {
+    final semantics = tester.ensureSemantics();
+
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    SessionTableSettings? saved;
+    String? copied;
+    String? csv;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TestSessionsScreen(
+            initialRows: [
+              _row(
+                id: 'root',
+                sessionId: 'root-native',
+                title: 'Root instruction',
+                project: 'Viewer',
+              ),
+              _row(
+                id: 'fork',
+                title: 'Fork instruction',
+                project: 'Viewer',
+                t3ParentThreadId: 'app-root',
+                t3ParentSessionId: 'root',
+                t3Relationship: 'fork',
+              ),
+              _row(
+                id: 'nested',
+                title: 'Nested instruction',
+                project: 'Viewer',
+                t3ParentThreadId: 'app-fork',
+                t3ParentSessionId: 'fork',
+                t3Relationship: 'subagent',
+              ),
+              _row(
+                id: 'orphan',
+                title: 'Unresolved instruction',
+                project: 'Viewer',
+                t3ParentThreadId: 'app-missing',
+                t3Relationship: 'fork',
+              ),
+              _row(
+                id: 'native-fork',
+                title: 'Native fork instruction',
+                project: 'Viewer',
+                forkedFromId: 'root-native',
+              ),
+              _row(
+                id: 'child',
+                title: 'Native child instruction',
+                project: 'Viewer',
+                threadSource: 'subagent',
+                parentThreadId: 'root-native',
+              ),
+            ],
+            onTableStateChanged: (value) => saved = value,
+            onCopyText: (value) async => copied = value,
+            onSaveSessionListCsv: (value) async => csv = value,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.bySemanticsLabel(RegExp(r'^Session Fork instruction')),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.bySemanticsLabel(RegExp(r'^Session Fork instruction')),
+    );
+    await tester.pumpAndSettle();
+    // The filter is a keyboard focusable checkbox with a descriptive label.
+    final filter = find.bySemanticsLabel(
+      'Hide sessions started by other sessions',
+    );
+    expect(filter, findsOneWidget);
+    final focus = FocusManager.instance.rootScope.descendants.firstWhere(
+      (node) => node.context?.findAncestorWidgetOfExactType<Checkbox>() != null,
+    );
+    focus.requestFocus();
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.space);
+    await tester.pumpAndSettle();
+    expect(saved?.hideChildSessions, isTrue);
+    expect(
+      tester.getSemantics(filter).flagsCollection.isChecked ==
+          CheckedState.isTrue,
+      isTrue,
+    );
+    expect(
+      find.bySemanticsLabel(RegExp(r'^Session Root instruction')),
+      findsOneWidget,
+    );
+    for (final title in [
+      'Fork instruction',
+      'Nested instruction',
+      'Unresolved instruction',
+      'Native fork instruction',
+      'Native child instruction',
+    ]) {
+      expect(find.text(title), findsNothing);
+    }
+    expect(find.bySemanticsLabel('Sessions, 1 visible'), findsOneWidget);
+    expect(
+      tester
+          .getSemantics(
+            find.bySemanticsLabel(RegExp(r'^Session Root instruction')),
+          )
+          .flagsCollection
+          .isSelected,
+      Tristate.isFalse,
+    );
+    expect(
+      find.bySemanticsLabel(RegExp(r'1 of 1 sessions shown')),
+      findsOneWidget,
+    );
+    // The hidden selection is cleared; exports use precisely visible rows.
+    await tester.tap(find.byTooltip('Session list actions'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Copy visible list as Markdown'));
+    await tester.pumpAndSettle();
+    expect(copied, startsWith('# Sessions (1)'));
+    expect(copied, contains('Root instruction'));
+    expect(copied, isNot(contains('Fork instruction')));
+    await tester.tap(find.byTooltip('Session list actions'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save visible list as CSV…'));
+    await tester.pumpAndSettle();
+    expect(csv, contains('Root instruction'));
+    expect(csv, isNot(contains('Fork instruction')));
+    await _enterSessionSearch(tester, 'Fork instruction');
+    expect(
+      find.bySemanticsLabel(RegExp(r'^Session Fork instruction')),
+      findsNothing,
+    );
+    await _enterSessionSearch(tester, 'Root instruction');
+    expect(
+      find.bySemanticsLabel(RegExp(r'^Session Root instruction')),
+      findsOneWidget,
+    );
+    await _setOriginFilter(tester, 'Subagent');
+    expect(find.text('Native child instruction'), findsNothing);
+    await _setOriginFilter(tester, 'All');
+    expect(
+      find.bySemanticsLabel(RegExp(r'^Session Root instruction')),
+      findsOneWidget,
+    );
+    semantics.dispose();
+  });
+
   testWidgets(
     'native platform filters hide WSL but copied rows stay readable',
     (tester) async {
@@ -2841,10 +3072,15 @@ SessionRowViewModel _row({
   required String title,
   required String project,
   String sessionId = '',
+  String harness = 'codex',
   String threadName = '',
   String threadSource = '',
   String parentThreadId = '',
   String agentNickname = '',
+  String t3ParentThreadId = '',
+  String t3ParentSessionId = '',
+  String t3Relationship = '',
+  String forkedFromId = '',
   bool isArchived = false,
   SessionRowSourceState sourceState = SessionRowSourceState.active,
   SessionRowPlatform platform = SessionRowPlatform.windows,
@@ -2863,9 +3099,14 @@ SessionRowViewModel _row({
   return SessionRowViewModel(
     id: id,
     sessionId: sessionId,
+    harness: harness,
     threadName: threadName,
     threadSource: threadSource,
     parentThreadId: parentThreadId,
+    t3ParentThreadId: t3ParentThreadId,
+    t3ParentSessionId: t3ParentSessionId,
+    t3Relationship: t3Relationship,
+    forkedFromId: forkedFromId,
     agentNickname: agentNickname,
     startedAtUtc: DateTime.utc(2026, 6, 12, 9),
     lastMessageAtUtc: lastMessageAtUtc ?? DateTime.utc(2026, 6, 12, 10),

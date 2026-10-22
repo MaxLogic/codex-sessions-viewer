@@ -18,4 +18,5 @@ pub mod price_history;
 pub mod query;
 pub mod settings;
 pub mod store;
+pub mod t3;
 pub mod timing;
