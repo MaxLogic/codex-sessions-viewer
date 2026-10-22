@@ -1030,10 +1030,10 @@ fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
                 if line.is_empty() {
                     break;
                 }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse().unwrap();
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
                 }
             }
             let mut body = vec![0u8; length];

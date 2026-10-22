@@ -15,6 +15,7 @@ pub struct PlatformLocations {
     pub settings_file: PathBuf,
     pub log_dir: PathBuf,
     pub queue_dir: PathBuf,
+    pub runtime_dir: PathBuf,
     pub backup_dir: PathBuf,
     pub sql_dir: PathBuf,
     pub assets_dir: PathBuf,
@@ -119,6 +120,13 @@ impl PlatformLocations {
             settings_file: settings,
             log_dir: logs,
             queue_dir: cache.join("collector").join("queue"),
+            runtime_dir: if platform == HostPlatform::Linux {
+                non_empty("XDG_RUNTIME_DIR")
+                    .map(|path| path.join("CodexSessionViewer"))
+                    .unwrap_or_else(|| cache.join("run"))
+            } else {
+                cache.join("run")
+            },
             backup_dir: data.join("backups"),
             sql_dir: resources.join("sql"),
             assets_dir: resources.join("assets"),

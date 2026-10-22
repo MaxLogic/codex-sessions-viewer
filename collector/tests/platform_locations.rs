@@ -36,6 +36,10 @@ fn windows_defaults_and_adjacent_settings() {
         locations.queue_dir,
         temp.join("Local/CodexSessionViewer/collector/queue")
     );
+    assert_eq!(
+        locations.runtime_dir,
+        temp.join("Local/CodexSessionViewer/run")
+    );
     std::fs::remove_file(temp.join("settings.toml")).unwrap();
     let fresh = PlatformLocations::resolve(
         HostPlatform::Windows,
@@ -71,6 +75,10 @@ fn macos_and_linux_defaults() {
         "/Users/tester/Library/Caches/CodexSessionViewer/collector/queue"
     );
     assert_eq!(
+        normalized(&mac.runtime_dir),
+        "/Users/tester/Library/Caches/CodexSessionViewer/run"
+    );
+    assert_eq!(
         normalized(&mac.sql_dir),
         "/Applications/Viewer.app/Contents/Resources/sql"
     );
@@ -83,6 +91,7 @@ fn macos_and_linux_defaults() {
             "XDG_CONFIG_HOME" => Some("/custom/config".into()),
             "XDG_STATE_HOME" => Some("/custom/state".into()),
             "XDG_CACHE_HOME" => Some("/custom/cache".into()),
+            "XDG_RUNTIME_DIR" => Some("/run/user/1000".into()),
             _ => None,
         },
         Path::new("/opt/viewer/bin/viewer"),
@@ -103,6 +112,10 @@ fn macos_and_linux_defaults() {
     assert_eq!(
         normalized(&linux.queue_dir),
         "/custom/cache/CodexSessionViewer/collector/queue"
+    );
+    assert_eq!(
+        normalized(&linux.runtime_dir),
+        "/run/user/1000/CodexSessionViewer"
     );
     assert_eq!(normalized(&linux.sql_dir), "/opt/viewer/bin/data/sql");
     assert_eq!(normalized(&linux.assets_dir), "/opt/viewer/bin/data/assets");
@@ -132,6 +145,10 @@ fn linux_explicit_xdg_roots_do_not_need_home() {
     let exe = Path::new("/opt/viewer/bin/viewer");
     let locations = PlatformLocations::resolve(HostPlatform::Linux, all_xdg, exe)
         .expect("all XDG roots determine locations without HOME");
+    assert_eq!(
+        normalized(&locations.runtime_dir),
+        "/custom/cache/CodexSessionViewer/run"
+    );
     assert_eq!(
         normalized(&locations.database_file),
         "/custom/data/CodexSessionViewer/codex_sessions_viewer.sqlite"

@@ -109,6 +109,7 @@ name = "codex-sessions-collector"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -118,6 +119,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

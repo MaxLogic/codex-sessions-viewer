@@ -45,6 +45,8 @@ USAGE:
   codex-sessions-collector hub resync [DATABASE OPTIONS]  Continue from the hub's last accepted sequence
   codex-sessions-collector hub disable [DATABASE OPTIONS] Stop queuing and clear the outbox
   codex-sessions-collector version
+  codex-sessions-collector serve [OPTIONS] [--lifetime resident|viewer]
+  codex-sessions-collector resident <stop|status|info> [--db <FILE>]
 
 DATABASE OPTIONS:
   --db <FILE>           Viewer database (default: platform user data folder)
@@ -86,6 +88,7 @@ separately; local collection never waits for network delivery.
 ";
 
 struct Options {
+    lifetime: crate::resident::Lifetime,
     db: Option<PathBuf>,
     standalone: Option<PathBuf>,
     settings: Option<PathBuf>,
@@ -128,6 +131,7 @@ impl From<StoreError> for CliError {
 
 fn parse_options(args: &[String]) -> Result<Options, CliError> {
     let mut options = Options {
+        lifetime: crate::resident::Lifetime::Resident,
         db: None,
         standalone: None,
         settings: None,
@@ -160,6 +164,17 @@ fn parse_options(args: &[String]) -> Result<Options, CliError> {
                 .ok_or_else(|| CliError::Usage(format!("{name} needs a value")))
         };
         match arg.as_str() {
+            "--lifetime" => {
+                options.lifetime = match value("--lifetime")?.as_str() {
+                    "resident" => crate::resident::Lifetime::Resident,
+                    "viewer" => crate::resident::Lifetime::Viewer,
+                    _ => {
+                        return Err(CliError::Usage(
+                            "--lifetime must be resident or viewer".into(),
+                        ));
+                    }
+                }
+            }
             "--db" => options.db = Some(PathBuf::from(value("--db")?)),
             "--standalone" => options.standalone = Some(PathBuf::from(value("--standalone")?)),
             "--settings" => options.settings = Some(PathBuf::from(value("--settings")?)),
@@ -233,6 +248,38 @@ pub fn run(args: &[String]) -> i32 {
     let mut stderr = std::io::stderr().lock();
     let command: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
     let result = match command.as_slice() {
+        ["serve", ..] => parse_options(&args[1..]).and_then(|options| {
+            if options.standalone.is_some() || !options.positional.is_empty() {
+                return Err(CliError::Usage(
+                    "serve needs --db and no positional arguments or --standalone".into(),
+                ));
+            }
+            let database = options.db.or_else(default_viewer_database).ok_or_else(|| {
+                CliError::Usage("database location unavailable; pass --db".into())
+            })?;
+            crate::resident::run(&database, options.lifetime).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    CliError::Refused(error.to_string())
+                } else {
+                    CliError::Failed(error.to_string())
+                }
+            })
+        }),
+        ["resident", action @ ("stop" | "status" | "info")] => {
+            parse_options(&args[2..]).and_then(|options| {
+                if options.standalone.is_some() || !options.positional.is_empty() {
+                    return Err(CliError::Usage(
+                        "resident needs --db and no positional arguments or --standalone".into(),
+                    ));
+                }
+                let database = options.db.or_else(default_viewer_database).ok_or_else(|| {
+                    CliError::Usage("database location unavailable; pass --db".into())
+                })?;
+                let reply = crate::resident::control(&database, action)
+                    .map_err(|error| CliError::Failed(error.to_string()))?;
+                writeln!(stdout, "{reply}").map_err(|error| CliError::Failed(error.to_string()))
+            })
+        }
         [
             harness @ ("codex" | "claude"),
             action @ ("setup" | "verify" | "status"),

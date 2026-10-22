@@ -2,7 +2,7 @@
 name = "codex-sessions-collector"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 publish = false
 description = "Collects local Codex sessions into the Codex Sessions Viewer database."
 
@@ -21,6 +21,12 @@ toml = "1.1.6"
 toml_edit = "0.25"
 tiny_http = "0.12.0"
 ureq = { version = "3.4.2", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
