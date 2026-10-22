@@ -3,6 +3,7 @@
 pub mod cache_repair;
 pub mod projects;
 pub mod schema;
+pub mod write_budget;
 pub mod writer;
 
 use std::path::Path;

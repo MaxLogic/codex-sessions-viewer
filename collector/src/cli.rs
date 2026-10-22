@@ -480,6 +480,7 @@ fn configured_roots(settings: &CollectorSettings) -> Vec<ScanRoot> {
 }
 
 fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let holds = crate::store::write_budget::WriteHoldScope::start();
     if !options.positional.is_empty() {
         return Err(CliError::Usage(format!(
             "unexpected argument {:?}",
@@ -518,6 +519,7 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
         repair.prune_failures = pruned.failed;
     }
     crate::t3::import_optional(&store.conn, &settings);
+    report.write_hold = holds.report();
     phases.mark("collect and prune");
     crate::timing::report_totals();
     let printed = print_report(out, "codex scan", &store, &report, options.json);
@@ -783,6 +785,7 @@ fn print_report(
             "sessions_missing": counts.sessions_missing,
             "persistence_flushes": counts.persistence_flushes,
             "cache_repair": report.cache_repair,
+            "write_hold": report.write_hold,
             "errors": report.errors.iter().map(|error| json!({
                 "path": error.path,
                 "status": error.status,
@@ -800,6 +803,13 @@ fn print_report(
             counts.files_failed,
             counts.sessions_missing
         );
+        text.push_str(&format!(
+            "\n  write_hold: {} transaction(s), max {:.3} ms, p99 {:.3} ms, max_phase {}.",
+            report.write_hold.transactions,
+            report.write_hold.max_ms,
+            report.write_hold.p99_ms,
+            report.write_hold.max_phase.as_deref().unwrap_or("none")
+        ));
         for error in &report.errors {
             text.push_str(&format!(
                 "\n  {} {}: {}",
@@ -853,6 +863,7 @@ fn claude_parser_options(settings: &CollectorSettings) -> crate::claude::parser:
 }
 
 fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let holds = crate::store::write_budget::WriteHoldScope::start();
     if !options.positional.is_empty() {
         return Err(CliError::Usage(format!(
             "unexpected argument {:?}",
@@ -876,10 +887,11 @@ fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
     } else {
         options.flush_sessions
     };
-    let report = scan_transport(options, out, |cancel, progress, gate| {
+    let mut report = scan_transport(options, out, |cancel, progress, gate| {
         crate::claude::collect_coordinated(&store, &scan, cancel, progress, gate, flush_sessions)
     })?;
     crate::t3::import_optional(&store.conn, &settings);
+    report.write_hold = holds.report();
     print_report(out, "claude scan", &store, &report, options.json)
 }
 

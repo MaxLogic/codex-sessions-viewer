@@ -154,6 +154,8 @@ pub type StoreResult<T> = Result<T, StoreError>;
 pub const BUSY_TIMEOUT_MS: u64 = 30_000;
 
 pub fn configure(conn: &Connection, busy_timeout_ms: u64) -> StoreResult<()> {
+    #[cfg(debug_assertions)]
+    super::write_budget::audit::configured(conn)?;
     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))?;
     conn.pragma_update(None, "foreign_keys", "on")?;
     let foreign_keys: i64 = conn.query_row("pragma foreign_keys", [], |row| row.get(0))?;
@@ -162,7 +164,9 @@ pub fn configure(conn: &Connection, busy_timeout_ms: u64) -> StoreResult<()> {
             "SQLite foreign key enforcement could not be enabled.".to_owned(),
         ));
     }
-    let mode: String = conn.query_row("pragma journal_mode = wal", [], |row| row.get(0))?;
+    let mode: String = super::write_budget::outside_transaction(conn, "journal_mode", || {
+        conn.query_row("pragma journal_mode = wal", [], |row| row.get(0))
+    })?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(StoreError::Refused(format!(
             "SQLite did not enable WAL journal mode; active mode is {mode}."
@@ -256,7 +260,7 @@ fn version_mismatch(conn: &Connection, harness: &str) -> StoreResult<StoreError>
 }
 
 /// Every write: the owner's cost projection version must be this collector's.
-fn check_writer_versions(conn: &Connection) -> StoreResult<()> {
+pub(crate) fn check_writer_versions(conn: &Connection) -> StoreResult<()> {
     if metadata(conn, COST_VERSION_KEY)?.as_deref()
         != Some(USAGE_COST_PROJECTION_VERSION.to_string().as_str())
     {
@@ -332,7 +336,7 @@ fn validate_applied_checksums(conn: &Connection) -> StoreResult<()> {
 
 /// Refuse while the viewer's startup migration owns the database. Mirrors the
 /// read-only guards in `openFileBackedDatabase`.
-fn ensure_no_pending_viewer_migration(conn: &Connection) -> StoreResult<()> {
+pub(crate) fn ensure_no_pending_viewer_migration(conn: &Connection) -> StoreResult<()> {
     if metadata(conn, "usage_migration_bootstrap")?.is_some() {
         return Err(StoreError::Refused(
             "The viewer is migrating this database. Open the viewer and let the migration finish, then collect again.".to_owned(),
@@ -414,6 +418,7 @@ const SCHEMA_VERSION_TABLE: &str = "create table if not exists schema_version (
 /// Create a collector-owned database, or migrate one the collector owns.
 /// Uses the viewer migrator's steps so the result is an ordinary database.
 pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
+    let _phase = super::write_budget::write_phase("schema");
     if last_applied_version(conn)? == 0 {
         return create_standalone(conn, path, MIGRATIONS);
     }
@@ -426,7 +431,7 @@ pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
     }
     // Only the standalone owner may adopt a legacy database without the pair.
     // Never overwrite a recorded mismatch or a partially damaged pair.
-    conn.execute_batch("begin immediate")?;
+    super::write_budget::begin_immediate(conn)?;
     let agreement = (|| -> StoreResult<()> {
         if metadata(conn, PARSER_VERSION_KEY)?.is_none()
             && metadata(conn, COST_VERSION_KEY)?.is_none()
@@ -451,7 +456,7 @@ pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
             .is_some();
         if !applied {
             let apply = || {
-                conn.execute_batch("begin immediate")?;
+                super::write_budget::begin_immediate(conn)?;
                 finish(conn, apply_migration_in_transaction(conn, migration))
             };
             if migration.version == 29 {
@@ -479,7 +484,7 @@ fn create_standalone(conn: &Connection, path: &str, migrations: &[Migration]) ->
         )));
     }
     let create = || -> StoreResult<()> {
-        conn.execute_batch("begin immediate")?;
+        super::write_budget::begin_immediate(conn)?;
         let result = (|| -> StoreResult<()> {
             conn.execute_batch(SCHEMA_VERSION_TABLE)?;
             for migration in migrations {
@@ -680,6 +685,7 @@ fn with_foreign_keys_disabled<T>(
     let mut rollback_failed = false;
     if !conn.is_autocommit() {
         let rollback = conn.execute_batch("rollback");
+        super::write_budget::complete_hold(conn);
         rollback_failed = rollback.is_err();
         let original_error = result.err().map_or_else(
             || "migration left a transaction open".to_owned(),
@@ -719,116 +725,8 @@ fn with_foreign_keys_disabled<T>(
     }))
 }
 
-thread_local! {
-    /// The connection whose outer transaction `in_write_transaction` owns on
-    /// this thread (its address, 0 for none). Writers on that connection use
-    /// a savepoint inside it; any other connection starts its own checked
-    /// transaction.
-    static OUTER_WRITE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn connection_key(conn: &Connection) -> usize {
-    std::ptr::from_ref(conn) as usize
-}
-
-/// Marks `conn` as owning the outer write for its lifetime. Dropping it
-/// restores the previous owner, also when the body panics; a panic rolls the
-/// outer transaction back, since `finish` never runs.
-struct OuterWrite<'a> {
-    conn: &'a Connection,
-    previous: usize,
-}
-
-impl<'a> OuterWrite<'a> {
-    fn enter(conn: &'a Connection) -> Self {
-        let previous = OUTER_WRITE.with(|outer| outer.replace(connection_key(conn)));
-        Self { conn, previous }
-    }
-}
-
-impl Drop for OuterWrite<'_> {
-    fn drop(&mut self) {
-        OUTER_WRITE.with(|outer| outer.set(self.previous));
-        if std::thread::panicking() {
-            let _ = self.conn.execute_batch("rollback");
-        }
-    }
-}
-
-/// Runs several writers in one transaction: either all of their changes
-/// commit together or none do. Used by hub ingestion so that the applied
-/// records and the received-batch row are atomic.
-pub fn in_write_transaction<T>(
-    conn: &Connection,
-    body: impl FnOnce() -> StoreResult<T>,
-) -> StoreResult<T> {
-    begin_write(conn)?;
-    let outer = OuterWrite::enter(conn);
-    let result = body();
-    drop(outer);
-    finish(conn, result)
-}
-
-fn nested_write(conn: &Connection) -> bool {
-    OUTER_WRITE.with(std::cell::Cell::get) == connection_key(conn)
-}
-
-/// Start a write and re-check, under the write lock, that the database is
-/// still at this collector's schema with no viewer migration pending. The
-/// check at open is not enough: a newer viewer can migrate the database
-/// between two batches of a long scan. Inside `in_write_transaction` (same
-/// thread and connection) it opens a savepoint in the outer transaction.
-pub fn begin_write(conn: &Connection) -> StoreResult<()> {
-    if nested_write(conn) {
-        conn.execute_batch("savepoint nested_write")?;
-        return Ok(());
-    }
-    conn.execute_batch("begin immediate")?;
-    let check = (|| -> StoreResult<()> {
-        let version = last_applied_version(conn)?;
-        if version != SUPPORTED_SCHEMA_VERSION {
-            return Err(StoreError::Refused(format!(
-                "The database moved to schema version {version} while collecting; this collector writes schema {SUPPORTED_SCHEMA_VERSION}. Use a collector from the same release as the viewer."
-            )));
-        }
-        ensure_no_pending_viewer_migration(conn)?;
-        check_writer_versions(conn)
-    })();
-    if let Err(error) = check {
-        let _ = conn.execute_batch("rollback");
-        return Err(error);
-    }
-    Ok(())
-}
-
-/// Commit on success, roll back on failure, keeping the first error.
-pub fn finish<T>(conn: &Connection, result: StoreResult<T>) -> StoreResult<T> {
-    if nested_write(conn) {
-        return match result {
-            Ok(value) => {
-                conn.execute_batch("release nested_write")?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = conn.execute_batch("rollback to nested_write; release nested_write");
-                Err(error)
-            }
-        };
-    }
-    match result {
-        Ok(value) => match conn.execute_batch("commit") {
-            Ok(()) => Ok(value),
-            Err(error) => {
-                let _ = conn.execute_batch("rollback");
-                Err(error.into())
-            }
-        },
-        Err(error) => {
-            let _ = conn.execute_batch("rollback");
-            Err(error)
-        }
-    }
-}
+// Compatibility exports for existing library callers. Transaction ownership lives in write_budget.
+pub use super::write_budget::{begin_write, finish, in_write_transaction};
 
 #[cfg(test)]
 mod tests {

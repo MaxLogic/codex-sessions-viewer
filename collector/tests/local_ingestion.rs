@@ -26,6 +26,8 @@ fn t3_lineage_resolves_scoped_native_refs_and_is_optional() {
     };
     let temp = TempDir::new("t3-lineage");
     let db = viewer_database(&temp);
+    #[cfg(debug_assertions)]
+    let audit = codex_sessions_collector::store::write_budget::audit::WriteAudit::start();
     let store = Store::open(&db, OwnerMode::Viewer).unwrap();
     for id in ["root", "fork", "nested", "orphan"] {
         apply_physical(&store, support::sample_snapshot(id));
@@ -160,6 +162,11 @@ fn t3_lineage_resolves_scoped_native_refs_and_is_optional() {
     t3db.execute("update orchestration_v2_projection_threads set payload_json = ? where json_extract(payload_json, '$.id') = 'app-fork'", [json!({"id":"app-fork", "lineage":{"parentThreadId":null,"relationshipToParent":null,"rootThreadId":"app-fork"}}).to_string()]).unwrap();
     t3::import(&store.conn, &path, "windows").unwrap();
     assert_eq!(relation("fork"), (None, None, None));
+    #[cfg(debug_assertions)]
+    {
+        assert!(audit.report().commits > 0);
+        audit.assert_complete();
+    }
 }
 
 #[test]
@@ -2601,15 +2608,20 @@ impl RepairFixture {
         cancelled: bool,
     ) -> codex_sessions_collector::store::cache_repair::RepairReport {
         use codex_sessions_collector::store::{OwnerMode, Store, cache_repair};
+        #[cfg(debug_assertions)]
+        let audit = codex_sessions_collector::store::write_budget::audit::WriteAudit::start();
         let store = Store::open(&self.db, OwnerMode::Viewer).unwrap();
-        cache_repair::run(
+        let report = cache_repair::run(
             &store,
             &self.roots(),
             discovery_complete,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cancelled)),
             &mut |_| Ok(true),
         )
-        .unwrap()
+        .unwrap();
+        #[cfg(debug_assertions)]
+        audit.assert_complete();
+        report
     }
 
     fn ids(&self) -> Vec<String> {

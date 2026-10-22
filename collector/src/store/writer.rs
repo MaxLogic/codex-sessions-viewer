@@ -189,6 +189,7 @@ pub(crate) fn apply_session_batch_versioned(
     }
     let canonical = canonical_snapshots(snapshots);
     let count = canonical.len();
+    let _phase = super::write_budget::write_phase("sessions");
     begin_write(conn)?;
     let result = (|| -> StoreResult<()> {
         let mut checked: Vec<&str> = Vec::new();
@@ -2313,6 +2314,7 @@ pub(crate) fn apply_source_statuses_versioned(
         )
         .then_with(|| status_index(&left.status).cmp(&status_index(&right.status)))
     });
+    let _phase = super::write_budget::write_phase("statuses");
     begin_write(conn)?;
     let result = (|| -> StoreResult<()> {
         let now = DartDateTime::now().to_iso8601();
@@ -2433,6 +2435,7 @@ pub(crate) fn apply_thread_names_versioned(
     if names.is_empty() {
         return Ok(0);
     }
+    let _phase = super::write_budget::write_phase("thread_names");
     begin_write(conn)?;
     let result = (|| -> StoreResult<usize> {
         let mut changed: HashSet<String> = HashSet::new();
@@ -2525,6 +2528,7 @@ pub(crate) fn apply_project_hints_versioned(
         return Ok(0);
     }
     // Read and write under one write lock so the rows cannot change between.
+    let _phase = super::write_budget::write_phase("project_hints");
     begin_write(conn)?;
     let result = (|| -> StoreResult<usize> {
         let mut rows: Vec<(String, String, bool)> = Vec::new();
@@ -2626,6 +2630,7 @@ pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> Store
             .iter()
             .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
     );
+    let _phase = super::write_budget::write_phase("project_backfill");
     begin_write(conn)?;
     let result = (|| -> StoreResult<usize> {
         let now = DartDateTime::now().to_iso8601();
@@ -2672,6 +2677,7 @@ pub fn clean_session_metadata_placeholders(conn: &Connection) -> StoreResult<()>
     }
     // Select the rows again under the write lock: rowids read earlier could
     // belong to other sessions by now.
+    let _phase = super::write_budget::write_phase("metadata_placeholders");
     begin_write(conn)?;
     let result = (|| -> StoreResult<()> {
         let rows: Vec<(i64, bool, bool)> = {
@@ -2723,7 +2729,10 @@ pub struct CachedSource {
 pub const COMPLETE_CODEX_SCAN_KEY: &str = "codex_scan.completed_parser_version";
 
 pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
-    conn.execute(
+    let _phase = super::write_budget::write_phase("scan_complete");
+    begin_write(conn)?;
+    let result = (|| {
+        conn.execute(
         "insert into app_metadata (key, value, updated_at_utc) values (?, ?, ?)
          on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc
          where value is not excluded.value",
@@ -2733,7 +2742,9 @@ pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
             DartDateTime::now().to_iso8601()
         ],
     )?;
-    Ok(())
+        Ok(())
+    })();
+    finish(conn, result)
 }
 
 /// `_cachedSessions`, limited to one harness.

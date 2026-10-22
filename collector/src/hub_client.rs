@@ -189,6 +189,7 @@ pub fn validate_url(url: &str) -> Result<String, String> {
 }
 
 fn enable(store: &Store, url: &str, machine: &str) -> Result<i64, String> {
+    let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<i64> {
         let previous: Option<(String, String, i64)> = store
@@ -226,6 +227,7 @@ fn enable(store: &Store, url: &str, machine: &str) -> Result<i64, String> {
 /// continues the same hub history.
 pub fn disable(db_path: &Path, mode: OwnerMode) -> Result<i64, String> {
     let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
+    let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<i64> {
         let cleared = pending(&store.conn)?;
@@ -499,6 +501,7 @@ fn next_batch(
 /// as a duplicate and the rest is sent again (records apply idempotently).
 /// Returns whether the batch was shrunk.
 fn record_transport_failure(conn: &Connection, batch: &Batch) -> StoreResult<bool> {
+    let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(conn)?;
     let result = (|| -> StoreResult<bool> {
         let failures = conn
@@ -592,6 +595,7 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
         }) {
             isolate_until = None;
         }
+        let _phase = crate::store::write_budget::write_phase("hub");
         begin_write(conn).map_err(|error| error.to_string())?;
         let mut dead = 0;
         let batch = next_batch(
@@ -650,12 +654,15 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
             }
             // The hub applies a batch atomically, so nothing was stored.
             if batch.rows.len() == 1 {
+                let _phase = crate::store::write_budget::write_phase("hub");
                 begin_write(conn).map_err(|error| error.to_string())?;
                 let result = dead_letter(conn, batch.rows[0].0, Some(status), &message);
                 finish(conn, result).map_err(|error| error.to_string())?;
                 report.dead_lettered += 1;
             } else {
-                conn.execute(
+                crate::store::write_budget::execute_write(
+                    conn,
+                    "hub_rejection",
                     "update collector_hub_state set inflight_batch_id = null, inflight_last_id = null where id = 1",
                     [],
                 )
@@ -674,6 +681,7 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
         {
             return Err("hub acknowledgment does not match the queued batch".to_owned());
         }
+        let _phase = crate::store::write_budget::write_phase("hub");
         begin_write(conn).map_err(|error| error.to_string())?;
         let result = (|| -> StoreResult<()> {
             conn.execute(
@@ -722,6 +730,7 @@ pub fn resync(
     let machine = local_machine(&store)?;
     let previous = enable(&store, &url, &machine)?;
     let verified = verify(&agent(), &url, token, &machine)?;
+    let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<()> {
         store.conn.execute(

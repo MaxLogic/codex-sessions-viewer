@@ -230,6 +230,7 @@ pub fn collect_coordinated(
     mut gate: impl FnMut(bool) -> StoreResult<bool>,
     flush_sessions: usize,
 ) -> StoreResult<CollectReport> {
+    let holds = crate::store::write_budget::WriteHoldScope::start();
     let is_cancelled = || cancel.load(Ordering::Relaxed);
     let cached: HashMapCache = writer::cached_sources(&store.conn, HARNESS)?
         .into_iter()
@@ -410,6 +411,7 @@ pub fn collect_coordinated(
     }
     counts.cancelled = is_cancelled();
     Ok(CollectReport {
+        write_hold: holds.report(),
         counts,
         applied,
         errors,
@@ -425,6 +427,7 @@ pub fn collect_file(
     mapper: &PathMapper,
     options: &ClaudeOptions,
 ) -> StoreResult<CollectReport> {
+    let holds = crate::store::write_budget::WriteHoldScope::start();
     let mut files = vec![path.to_path_buf()];
     files.extend(subagent_files(path));
     let mut counts = ScanCounts::default();
@@ -461,6 +464,7 @@ pub fn collect_file(
     writer::apply_source_statuses(&store.conn, &statuses)?;
     applied.statuses = statuses.len();
     Ok(CollectReport {
+        write_hold: holds.report(),
         counts,
         applied,
         errors,

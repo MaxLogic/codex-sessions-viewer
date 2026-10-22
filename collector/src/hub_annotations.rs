@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -102,40 +102,46 @@ pub fn edit(data_root: &Path, config: &HubConfig, value: Value) -> Result<Value,
     {
         return Err((400, "annotation exceeds allowed length or revision".into()));
     }
-    let mut store = open_machine(data_root, &request.machine)
+    let store = open_machine(data_root, &request.machine)
         .map_err(|_| (500, "cannot open hub database".to_owned()))?;
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
+    let _phase = crate::store::write_budget::write_phase("hub_annotations");
+    crate::store::write_budget::begin_immediate(&store.conn)
         .map_err(|_| (500, "cannot begin annotation edit".to_owned()))?;
-    if !exists(&tx, &request.reference)? {
-        return Err((404, "session not found".into()));
-    }
-    let current: Option<i64> = tx
-        .query_row(
-            "select revision from hub_annotations where reference = ?",
-            [&request.reference],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| (500, "cannot read annotation revision".to_owned()))?;
-    if current.unwrap_or(0) != request.expected_revision {
-        return Err((409, "annotation changed; reload before saving".into()));
-    }
-    let next = request
-        .expected_revision
-        .checked_add(1)
-        .ok_or((400, "annotation revision is too large".to_owned()))?;
-    tx.execute(
-        "insert into hub_annotations(reference, revision, title, notes) values (?, ?, ?, ?)
+    let _rollback = crate::store::write_budget::rollback_on_panic(&store.conn);
+    let result = (|| {
+        if !exists(&store.conn, &request.reference)? {
+            return Err((404, "session not found".into()));
+        }
+        let current: Option<i64> = store
+            .conn
+            .query_row(
+                "select revision from hub_annotations where reference = ?",
+                [&request.reference],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| (500, "cannot read annotation revision".to_owned()))?;
+        if current.unwrap_or(0) != request.expected_revision {
+            return Err((409, "annotation changed; reload before saving".into()));
+        }
+        let next = request
+            .expected_revision
+            .checked_add(1)
+            .ok_or((400, "annotation revision is too large".to_owned()))?;
+        store
+            .conn
+            .execute(
+                "insert into hub_annotations(reference, revision, title, notes) values (?, ?, ?, ?)
          on conflict(reference) do update set revision = excluded.revision,
          title = excluded.title, notes = excluded.notes",
-        params![request.reference, next, request.title, request.notes],
-    )
-    .map_err(|_| (500, "cannot save hub annotation".to_owned()))?;
-    tx.commit()
-        .map_err(|_| (500, "cannot commit hub annotation".to_owned()))?;
-    Ok(
-        json!({"protocol":HUB_PROTOCOL_VERSION,"machine":request.machine,"reference":request.reference,"revision":next,"title":request.title,"notes":request.notes}),
-    )
+                params![request.reference, next, request.title, request.notes],
+            )
+            .map_err(|_| (500, "cannot save hub annotation".to_owned()))?;
+        Ok(
+            json!({"protocol":HUB_PROTOCOL_VERSION,"machine":request.machine,"reference":request.reference,"revision":next,"title":request.title,"notes":request.notes}),
+        )
+    })();
+    crate::store::write_budget::finish_immediate(&store.conn, result, |_| {
+        (500, "cannot commit hub annotation".to_owned())
+    })
 }

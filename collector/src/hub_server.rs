@@ -525,21 +525,23 @@ pub(crate) fn open_machine(data_root: &Path, machine: &str) -> Result<Store, Str
         // Standalone bootstrap and the identity update are separate steps.
         // A crash between them leaves a valid empty DB with a generated ID.
         // Recover only while it contains no session data.
-        store
-            .conn
-            .execute(
-                "update app_metadata set value = ? where key = 'machine_id'",
-                [machine],
-            )
-            .map_err(|error| error.to_string())?;
+        crate::store::write_budget::execute_write(
+            &store.conn,
+            "hub_identity",
+            "update app_metadata set value = ? where key = 'machine_id'",
+            [machine],
+        )
+        .map_err(|error| error.to_string())?;
     } else if actual_machine.as_deref() != Some(machine) {
         return Err("hub database machine identity mismatch".to_owned());
     }
-    store
-        .conn
-        .execute_batch("create table if not exists hub_received_batches (sequence integer primary key, batch_id text not null unique);
-            create table if not exists hub_annotations (reference text primary key, revision integer not null, title text, notes text);")
-        .map_err(|error| error.to_string())?;
+    for sql in [
+        "create table if not exists hub_received_batches (sequence integer primary key, batch_id text not null unique)",
+        "create table if not exists hub_annotations (reference text primary key, revision integer not null, title text, notes text)",
+    ] {
+        crate::store::write_budget::execute_write(&store.conn, "hub_schema", sql, [])
+            .map_err(|error| error.to_string())?;
+    }
     Ok(store)
 }
 
@@ -630,6 +632,7 @@ fn ingest(data_root: &Path, machine: &str, body: &[u8]) -> Result<Value, IngestE
     // The sequence check, the records, and the received-batch row commit in
     // one immediate transaction: concurrent uploads serialize, and a failed
     // record leaves neither data nor a consumed sequence behind.
+    let _phase = crate::store::write_budget::write_phase("hub_ingestion");
     let outcome = in_write_transaction(&store.conn, || {
         let received: Option<String> = store
             .conn
@@ -923,6 +926,53 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn ingestion_commits_have_completed_holds() {
+        use crate::store::write_budget::audit::WriteAudit;
+        let root = std::env::temp_dir().join(format!(
+            "cxv_hub_audit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let audit = WriteAudit::start();
+        let body = serde_json::to_vec(&json!({"protocol":1,"sequence":1,"batch_id":"audit-1",
+            "records":[{"contract":contract::CONTRACT_NAME,"version":contract::CONTRACT_VERSION,
+                "kind":"thread_name","record":{"harness":"codex","session_id":"audit-native","thread_name":"Audit"}}]
+        })).unwrap();
+        assert_eq!(
+            ingest(&root, "audit-machine", &body).unwrap()["duplicate"],
+            false
+        );
+        audit.assert_complete();
+        let commits = audit.report().commits;
+        assert!(commits > 0);
+        assert_eq!(
+            ingest(&root, "audit-machine", &body).unwrap()["duplicate"],
+            true
+        );
+        audit.assert_complete();
+        let rejected = serde_json::to_vec(&json!({"protocol":1,"sequence":2,"batch_id":"audit-2",
+            "records":[{"contract":contract::CONTRACT_NAME,"version":999,"kind":"thread_name","record":{}}]
+        })).unwrap();
+        assert_eq!(
+            ingest(&root, "audit-machine", &rejected).unwrap_err().1,
+            "record_rejected"
+        );
+        audit.assert_complete();
+    }
 
     #[test]
     fn a_panicking_connection_releases_its_slot() {

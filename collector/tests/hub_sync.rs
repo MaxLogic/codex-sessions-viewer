@@ -740,6 +740,47 @@ fn sync_delivers_full_batches_and_hub_disable_stops_queuing() {
 }
 
 #[test]
+fn rejected_multi_record_batch_accounts_for_recovery_write() {
+    use codex_sessions_collector::store::write_budget::WriteHoldScope;
+    let temp = TempDir::new("hub_rejection_hold");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            sample_snapshot("rejection-hold-good"),
+        )))])
+        .unwrap();
+    store.conn.execute(
+        "insert into collector_upload_outbox(record_json, created_at_utc) values (?, 'now')",
+        [json!({"contract":"codex-sessions-viewer.ingest","version":999,"kind":"thread_name","record":{}}).to_string()],
+    ).unwrap();
+    drop(store);
+    let recovery = WriteHoldScope::for_phase("hub_rejection");
+    #[cfg(debug_assertions)]
+    let audit = codex_sessions_collector::store::write_budget::audit::WriteAudit::start();
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    #[cfg(debug_assertions)]
+    audit.assert_complete();
+    assert_eq!(
+        (report.sent, report.dead_lettered, report.pending),
+        (1, 1, 0)
+    );
+    let hold = recovery.report();
+    assert_eq!(
+        hold.transactions, 1,
+        "the rejected multi-record batch must release its persisted inflight state through the measured owner"
+    );
+    assert_eq!(hold.max_phase.as_deref(), Some("hub_rejection"));
+    assert!(hold.max_ms > 0.0);
+    #[cfg(debug_assertions)]
+    {
+        assert!(audit.report().commits > 0);
+        audit.assert_complete();
+    }
+}
+
+#[test]
 fn rejected_record_moves_to_dead_letters_without_blocking_the_queue() {
     let temp = TempDir::new("hub_dead_letter");
     let hub = start(&temp);

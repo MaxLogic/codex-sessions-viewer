@@ -519,10 +519,8 @@ pub fn synchronize(data_root: &Path, machine: &str, input: Value) -> Result<Valu
         })
         .transpose()?;
     let store = open(data_root)?;
-    store
-        .conn
-        .execute_batch("begin immediate")
-        .map_err(database_error)?;
+    let _phase = crate::store::write_budget::write_phase("price_history");
+    crate::store::write_budget::begin_immediate(&store.conn).map_err(database_error)?;
     let result = (|| {
         let revision = merge_conn(&store.conn, &observations)?;
         if !download {
@@ -638,16 +636,7 @@ pub fn synchronize(data_root: &Path, machine: &str, input: Value) -> Result<Valu
         }
         Ok(response)
     })();
-    match result {
-        Ok(response) => {
-            store.conn.execute_batch("commit").map_err(database_error)?;
-            Ok(response)
-        }
-        Err(error) => {
-            let _ = store.conn.execute_batch("rollback");
-            Err(error)
-        }
-    }
+    crate::store::write_budget::finish_immediate(&store.conn, result, database_error)
 }
 
 #[derive(Clone, Deserialize)]
@@ -779,10 +768,8 @@ pub fn fetch_once(data_root: &Path, config: &FetchConfig) -> Result<usize, Error
         Ok(observations)
     });
     let store = open(data_root)?;
-    store
-        .conn
-        .execute_batch("begin immediate")
-        .map_err(database_error)?;
+    let _phase = crate::store::write_budget::write_phase("price_history");
+    crate::store::write_budget::begin_immediate(&store.conn).map_err(database_error)?;
     let commit = (|| match result {
         Ok(mut observations) => {
             let current_ids: HashSet<_> = observations
@@ -881,16 +868,7 @@ pub fn fetch_once(data_root: &Path, config: &FetchConfig) -> Result<usize, Error
             Ok(0)
         }
     })();
-    match commit {
-        Ok(count) => {
-            store.conn.execute_batch("commit").map_err(database_error)?;
-            Ok(count)
-        }
-        Err(error) => {
-            let _ = store.conn.execute_batch("rollback");
-            Err(error)
-        }
-    }
+    crate::store::write_budget::finish_immediate(&store.conn, commit, database_error)
 }
 
 fn fetch_catalog(endpoint: &str, retry_after: &mut Option<i64>) -> Result<Vec<Value>, Error> {

@@ -130,31 +130,36 @@ pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, S
             ));
         }
     }
-    let tx = viewer.unchecked_transaction().map_err(|e| e.to_string())?;
-    // Do not clear first: unchanged snapshots must not emit change revisions.
-    let retained: HashSet<_> = updates.iter().map(|u| u.0.as_str()).collect();
-    let mut old = tx
-        .prepare(
-            "select id from sessions where source_type = ? and t3_parent_thread_id is not null",
-        )
-        .map_err(|e| e.to_string())?;
-    let old_ids = old
-        .query_map([source], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    drop(old);
-    for id in old_ids {
-        if !retained.contains(id.as_str()) {
-            tx.execute("update sessions set t3_parent_thread_id = null, t3_parent_session_id = null, t3_relationship = null where id = ?", [id]).map_err(|e| e.to_string())?;
+    let _phase = crate::store::write_budget::write_phase("t3_lineage");
+    crate::store::write_budget::begin_write(viewer).map_err(|e| e.to_string())?;
+    let _rollback = crate::store::write_budget::rollback_on_panic(viewer);
+    let result = (|| -> Result<usize, String> {
+        // Do not clear first: unchanged snapshots must not emit change revisions.
+        let retained: HashSet<_> = updates.iter().map(|u| u.0.as_str()).collect();
+        let mut old = viewer
+            .prepare(
+                "select id from sessions where source_type = ? and t3_parent_thread_id is not null",
+            )
+            .map_err(|e| e.to_string())?;
+        let old_ids = old
+            .query_map([source], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(old);
+        for id in old_ids {
+            if !retained.contains(id.as_str()) {
+                viewer.execute("update sessions set t3_parent_thread_id = null, t3_parent_session_id = null, t3_relationship = null where id = ?", [id]).map_err(|e| e.to_string())?;
+            }
         }
-    }
-    for (id, parent, resolved, relation) in &updates {
-        tx.execute("update sessions set t3_parent_thread_id = ?, t3_parent_session_id = ?, t3_relationship = ? where id = ?",
+        for (id, parent, resolved, relation) in &updates {
+            viewer.execute("update sessions set t3_parent_thread_id = ?, t3_parent_session_id = ?, t3_relationship = ? where id = ?",
             params![parent, resolved, relation, id]).map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(updates.len())
+        }
+        Ok(updates.len())
+    })();
+    crate::store::write_budget::finish(viewer, result.map_err(crate::store::StoreError::Refused))
+        .map_err(|e| e.to_string())
 }
 
 pub fn import_optional(viewer: &Connection, settings: &crate::settings::CollectorSettings) {

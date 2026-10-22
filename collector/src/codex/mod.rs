@@ -43,6 +43,7 @@ impl Default for CollectionBatching {
 
 #[derive(Debug, Default)]
 pub struct CollectReport {
+    pub write_hold: crate::store::write_budget::WriteHoldReport,
     pub counts: ScanCounts,
     pub applied: ApplySummary,
     pub errors: Vec<SourceStatus>,
@@ -102,6 +103,7 @@ pub fn collect_coordinated(
     mut gate: impl FnMut(bool) -> StoreResult<bool>,
     batching: CollectionBatching,
 ) -> StoreResult<CollectReport> {
+    let holds = crate::store::write_budget::WriteHoldScope::start();
     let is_cancelled = || cancel.load(Ordering::Relaxed);
     let mut phases = crate::timing::Phases::start();
     // Count first: a lease that would find nothing to clean only makes the
@@ -229,6 +231,7 @@ pub fn collect_coordinated(
     }
     outcome.counts.cancelled |= is_cancelled();
     Ok(CollectReport {
+        write_hold: holds.report(),
         counts: outcome.counts,
         applied,
         errors: outcome.errors,
@@ -474,6 +477,7 @@ pub fn collect_file_with(
     root: &ScanRoot,
     resolve_wsl: impl FnOnce(&[String]) -> HashMap<String, String>,
 ) -> StoreResult<CollectReport> {
+    let holds = crate::store::write_budget::WriteHoldScope::start();
     writer::clean_session_metadata_placeholders(&store.conn)?;
     let mut counts = ScanCounts {
         files_found: 1,
@@ -564,6 +568,7 @@ pub fn collect_file_with(
     writer::apply_source_statuses(&store.conn, std::slice::from_ref(&status))?;
     applied.statuses = 1;
     Ok(CollectReport {
+        write_hold: holds.report(),
         counts,
         applied,
         errors,

@@ -196,6 +196,7 @@ pub fn run_with(
         Err(_) => {
             if !conn.is_autocommit() {
                 let _ = conn.execute_batch("rollback");
+                super::write_budget::complete_hold(conn);
             }
             RepairReport::postponed("unexpected_repair_error", None)
         }
@@ -332,6 +333,7 @@ fn delete_audited_rows(
     resolver: &PhysicalPathResolver,
     audit: &Audit,
 ) -> StoreResult<usize> {
+    let _phase = super::write_budget::write_phase("cache_repair_delete");
     begin_write(conn)?;
     let result = (|| -> StoreResult<usize> {
         let entries = classify_rows(conn, roots, resolver)?;
@@ -461,6 +463,7 @@ fn record_audit(
     inputs: &str,
     now: DartDateTime,
 ) -> StoreResult<Audit> {
+    let _phase = super::write_budget::write_phase("cache_repair_audit");
     begin_write(conn)?;
     let result = (|| -> StoreResult<Audit> {
         let entries = if data_version(conn)? == classified_at {
