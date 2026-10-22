@@ -66,19 +66,8 @@ Database openSessionListExportDatabase(File file) {
 const _exportText =
     "trim(coalesce(nullif(trim(content_plain), ''), content_preview, ''))";
 
-/// Tool and system events that never make a meaningful endpoint. Mirrors
-/// [SessionListExporter.messageContent]; that check still runs on the one
-/// body that is loaded.
-const _ignoredEventTypes = [
-  'task_started',
-  'token_count',
-  'thread_settings_applied',
-  'thread_goal_updated',
-  'context_compacted',
-  'model_reroute',
-];
-
-/// Finds the first user message or the last message worth exporting. Probes
+/// Finds the first user prompt or latest assistant response, including
+/// completion-event text. Mirrors [SessionListExporter.messageContent]. Probes
 /// select only indexes and authors; a body is loaded for one candidate at a
 /// time, so large skipped bodies are never copied out of SQLite.
 @visibleForTesting
@@ -89,7 +78,6 @@ ConversationMessageViewModel? findSessionListEndpoint(
   void Function(int messageIndex)? onBodyLoaded,
 }) {
   const probeSize = 32;
-  final ignored = _ignoredEventTypes.map((type) => "'$type'").join(', ');
   int? cursor;
   while (true) {
     final candidates = db.select(
@@ -97,22 +85,23 @@ ConversationMessageViewModel? findSessionListEndpoint(
       select message_index, author_type
       from messages
       where session_id = ?
-        ${firstUser ? "and author_type = 'user'" : ''}
-        ${cursor == null ? '' : 'and message_index ${firstUser ? '>' : '<'} ?'}
-        and length($_exportText) > 0
-        and not (
-          author_type in ('tool', 'system')
-          and json_valid($_exportText)
-          and (
-            json_extract($_exportText, '\$.type') in ($ignored)
-            or (
+        ${firstUser ? "and author_type = 'user'" : """
+        and (
+          author_type = 'assistant'
+          or (
+            author_type in ('tool', 'system')
+            and case when json_valid($_exportText) then
               json_extract($_exportText, '\$.type') = 'task_complete'
-              and length(trim(coalesce(
-                json_extract($_exportText, '\$.last_agent_message'), ''
-              ))) = 0
-            )
+              and json_type($_exportText, '\$.last_agent_message') = 'text'
+              and length(trim(json_extract(
+                $_exportText, '\$.last_agent_message'
+              ))) > 0
+            else 0 end
           )
         )
+        """}
+        ${cursor == null ? '' : 'and message_index ${firstUser ? '>' : '<'} ?'}
+        and length($_exportText) > 0
       order by message_index ${firstUser ? 'asc' : 'desc'}
       limit $probeSize
       ''',

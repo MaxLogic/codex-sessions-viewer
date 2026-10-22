@@ -5,6 +5,114 @@ import 'package:flutter_test/flutter_test.dart';
 import '../support/fixture_settings.dart';
 
 void main() {
+  test('exports meaningful Claude first instructions', () {
+    final exporter = SessionListExporter(settings: fixtureDefaultSettings());
+    final messages = [
+      _message(
+        0,
+        ConversationAuthor.user,
+        '<local-command-caveat>local only</local-command-caveat>',
+      ),
+      _message(
+        1,
+        ConversationAuthor.user,
+        '<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>',
+      ),
+      _message(
+        2,
+        ConversationAuthor.user,
+        '<local-command-stdout>Opus</local-command-stdout>',
+      ),
+      _message(
+        3,
+        ConversationAuthor.user,
+        '<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>continue resolving open tasks in appropriate slices.</command-args>',
+      ),
+      _message(4, ConversationAuthor.assistant, 'Real answer.'),
+      _message(
+        5,
+        ConversationAuthor.reasoning,
+        'Reasoning content is encrypted and cannot be displayed.',
+      ),
+      _message(6, ConversationAuthor.tool, 'Tool output'),
+      _message(7, ConversationAuthor.system, 'System event'),
+      _message(8, ConversationAuthor.user, 'Next question'),
+    ];
+    String export(List<ConversationMessageViewModel> messages) =>
+        exporter.exportMarkdown(
+          [
+            _row(
+              id: 'one',
+              sessionId: 'one',
+              workingDirectory: 'project',
+              conversationMessages: messages,
+            ),
+          ],
+          includeFirstMessage: true,
+          includeLastMessage: true,
+        );
+    final result = export(messages.reversed.toList());
+    expect(
+      result,
+      contains(
+        '### First message \u{1F464}\n\ncontinue resolving open tasks in appropriate slices.',
+      ),
+    );
+    expect(result, contains('### Last message \u{1F916}\n\nReal answer.'));
+    expect(result, isNot(contains('<command-name>')));
+    expect(
+      export(messages.take(3).toList()),
+      isNot(contains('### First message')),
+    );
+    expect(
+      export(messages.take(3).toList()),
+      isNot(contains('### Last message')),
+    );
+    expect(
+      export([
+        _message(
+          0,
+          ConversationAuthor.user,
+          'Explain <command-name>/model</command-name> please.',
+        ),
+      ]),
+      contains('Explain <command-name>/model</command-name> please.'),
+    );
+    expect(
+      export([
+        _message(
+          0,
+          ConversationAuthor.user,
+          '/model is a command I need help with',
+        ),
+      ]),
+      contains('/model is a command I need help with'),
+    );
+  });
+  test('stats abbreviate large counts and express long durations in days', () {
+    final exporter = SessionListExporter(settings: fixtureDefaultSettings());
+    for (final entry in [
+      (100000, '100k'),
+      (10000000, '10M'),
+      (484213148, '484M'),
+      (1000000000, '1B'),
+      (1000000000000, '1T'),
+    ]) {
+      final output = exporter.exportMarkdown([
+        _row(
+          id: 'one',
+          sessionId: 'one',
+          workingDirectory: 'project',
+          totalTokens: entry.$1,
+          duration: const Duration(hours: 254, minutes: 44),
+        ),
+      ]);
+      expect(output, contains('Tokens: ${entry.$2},'));
+      expect(output, contains('Duration: 10d 14h 44m'));
+      expect(output, isNot(contains('UTC')));
+    }
+  });
+
   for (final platform in [SessionRowPlatform.macos, SessionRowPlatform.linux]) {
     test(
       'native ${platform.name} export guards Markdown CSV and isolate formatting',
@@ -62,28 +170,9 @@ void main() {
       markdown,
       contains('## Clipboard reliability — codex-sessions-viewer\n\n'),
     );
-    expect(
-      markdown,
-      contains(
-        '`F:\\projects\\MaxLogic\\codex-sessions-viewer`\n\n'
-        '```powershell\n'
-        'codex resume session-2\n'
-        '```',
-      ),
-    );
-    expect(
-      markdown,
-      contains(
-        '**Started:** 2026-08-06 09:14 UTC · '
-        '**Last:** 2026-08-06 11:02 UTC · '
-        '**Duration:** 1h 48m · '
-        '**Messages:** 87 · '
-        '**Tokens:** 123,456 · '
-        '**Cost:** \$1.24 · '
-        '**Model:** GPT 5.6 · '
-        '**Platform:** Windows',
-      ),
-    );
+    expect(markdown, contains('**Stats**\n\n'));
+    expect(markdown, contains('Tokens: 123k, in: 0 (0 cached, 0%), out: 0'));
+    expect(markdown, contains('Cost: \$1.24 (estimate)'));
     expect(markdown, contains('\n\n---\n\n## Parser work — DelphiAiKit'));
     expect(
       markdown,
@@ -289,6 +378,8 @@ SessionRowViewModel _row({
   SessionRowPlatform platform = SessionRowPlatform.windows,
   DateTime? startedAtUtc,
   DateTime? lastMessageAtUtc,
+  int totalTokens = 123456,
+  Duration duration = const Duration(hours: 1, minutes: 48),
   List<ConversationMessageViewModel> conversationMessages = const [],
 }) {
   return SessionRowViewModel(
@@ -297,7 +388,7 @@ SessionRowViewModel _row({
     threadName: threadName,
     startedAtUtc: startedAtUtc ?? DateTime.utc(2026, 8, 6, 9, 14),
     lastMessageAtUtc: lastMessageAtUtc ?? DateTime.utc(2026, 8, 6, 11, 2),
-    duration: const Duration(hours: 1, minutes: 48),
+    duration: duration,
     platform: platform,
     project: 'Codex Viewer',
     path: workingDirectory,
@@ -305,7 +396,7 @@ SessionRowViewModel _row({
     title: title,
     summary: 'Session summary',
     messageCount: 87,
-    totalTokens: 123456,
+    totalTokens: totalTokens,
     estimatedCostText: '1.24',
     costUnknown: false,
     model: 'gpt-5.6',

@@ -271,8 +271,8 @@ void main() {
       final exporter = SessionListExporter(settings: AppSettings.defaults());
       final rows = [_row('codex'), _row('claude')];
       final markdown = exporter.exportMarkdown(rows);
-      expect(markdown, contains('**Harness:** Codex'));
-      expect(markdown, contains('**Harness:** Claude Code'));
+      expect(markdown, contains('Harness: Codex'));
+      expect(markdown, contains('Harness: Claude Code'));
       expect(markdown, contains('claude --resume same-id'));
       final csv = exporter.exportCsv(rows);
       expect(csv.split('\n').first, contains('harness'));

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:codex_sessions_viewer/src/export/session_list_exporter.dart';
 
 import 'package:codex_sessions_viewer/src/export/session_list_message_loader.dart';
 import 'package:codex_sessions_viewer/src/ui/models/conversation_message_view_model.dart';
@@ -6,6 +7,59 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
 void main() {
+  test('skips Claude local commands and preserves goal instructions', () {
+    final db = sqlite3.openInMemory();
+    addTearDown(db.close);
+    db.execute(
+      'create table messages(session_id text, message_index integer, author_type text, created_at_utc text, content_preview text, content_plain text)',
+    );
+    void add(String id, int index, String text) => db.execute(
+      'insert into messages values (?, ?, ?, ?, ?, ?)',
+      [id, index, 'user', '2026-10-07T18:06:30Z', '', text],
+    );
+    add('one', 0, '<local-command-caveat>local</local-command-caveat>');
+    add(
+      'one',
+      1,
+      '<command-name>/model</command-name><command-message>model</command-message><command-args></command-args>',
+    );
+    add('one', 2, '<local-command-stdout>Opus</local-command-stdout>');
+    add(
+      'one',
+      3,
+      '<command-name>/goal</command-name><command-message>goal</command-message><command-args>continue resolving open tasks in appropriate slices.</command-args>',
+    );
+    add('one', 4, 'Later cleanup request');
+    add(
+      'model-only',
+      0,
+      '<command-name>/model</command-name><command-message>model</command-message><command-args></command-args>',
+    );
+    add(
+      'quoted',
+      0,
+      'Explain <local-command-stdout>Opus</local-command-stdout> please.',
+    );
+    final bodies = <int>[];
+    final selected = findSessionListEndpoint(
+      db,
+      'one',
+      firstUser: true,
+      onBodyLoaded: bodies.add,
+    );
+    expect(selected?.number, 3);
+    expect(
+      SessionListExporter.messageContent(selected!)?.body,
+      'continue resolving open tasks in appropriate slices.',
+    );
+    expect(bodies, [0, 1, 2, 3]);
+    expect(findSessionListEndpoint(db, 'model-only', firstUser: true), isNull);
+    expect(
+      findSessionListEndpoint(db, 'quoted', firstUser: true)?.body,
+      contains('Explain'),
+    );
+  });
+
   test('loads only meaningful first user and last message bodies', () async {
     final directory = await Directory.systemTemp.createTemp('list-export-');
     addTearDown(() => directory.delete(recursive: true));
@@ -52,14 +106,26 @@ void main() {
       for (var index = 4; index < 45; index++) {
         add('one', index, 'tool', '{"type":"token_count"}');
       }
+      add(
+        'one',
+        45,
+        'reasoning',
+        'Reasoning content is encrypted and cannot be displayed.',
+      );
+      add('one', 46, 'tool', 'Tool call and output.');
+      add('one', 47, 'system', 'System event.');
+      add('one', 48, 'user', 'Next prompt.');
       add('two', 1, 'assistant', 'No user prompt.');
+      add('two', 2, 'tool', '{broken JSON');
+      add('unanswered', 1, 'user', 'Unanswered prompt.');
+      add('unanswered', 2, 'reasoning', 'Still thinking.');
     } finally {
       db.close();
     }
 
     final result = await loadSessionListExportMessages(
       file,
-      ['one', 'two', 'missing'],
+      ['one', 'two', 'unanswered', 'missing'],
       includeFirstMessage: true,
       includeLastMessage: true,
     );
@@ -68,6 +134,7 @@ void main() {
     expect(result['one']!.first.body, 'First prompt in full.');
     expect(result['one']!.last.author, ConversationAuthor.tool);
     expect(result['two']!.map((message) => message.number), [1]);
+    expect(result['unanswered']!.map((message) => message.number), [1]);
     expect(result['missing'], isEmpty);
 
     final lastOnly = await loadSessionListExportMessages(
@@ -120,6 +187,9 @@ void main() {
         add(index, 'tool', '{"type":"token_count","info":null}');
       }
       add(80, 'system', '   ');
+      add(81, 'reasoning', 'Private reasoning.');
+      add(82, 'tool', 'Tool output.');
+      add(83, 'user', 'Next prompt.');
     } finally {
       setup.close();
     }

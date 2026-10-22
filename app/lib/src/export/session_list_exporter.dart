@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:isolate';
+import 'first_instruction.dart';
 
 import '../commands/resume_command_generator.dart';
 import '../config/app_settings.dart';
@@ -115,7 +116,12 @@ class SessionListExporter {
       }
     }
     if (includeLastMessage) {
-      _writeMessage(buffer, 'Last message', messages.last);
+      for (final message in messages.reversed) {
+        if (messageContent(message)?.author == ConversationAuthor.assistant) {
+          _writeMessage(buffer, 'Last message', message);
+          break;
+        }
+      }
     }
   }
 
@@ -154,6 +160,12 @@ class SessionListExporter {
         (message.body.trim().isNotEmpty ? message.body : message.preview)
             .trim();
     if (body.isEmpty) return null;
+    if (message.author == ConversationAuthor.user) {
+      final instruction = firstInstruction(body);
+      return instruction == null
+          ? null
+          : (author: message.author, body: instruction);
+    }
     if (message.author == ConversationAuthor.tool ||
         message.author == ConversationAuthor.system) {
       Object? decoded;
@@ -163,18 +175,7 @@ class SessionListExporter {
         // Ordinary tool output is not necessarily JSON.
       }
       if (decoded is Map<String, dynamic>) {
-        final type = decoded['type'];
-        if (const {
-          'task_started',
-          'token_count',
-          'thread_settings_applied',
-          'thread_goal_updated',
-          'context_compacted',
-          'model_reroute',
-        }.contains(type)) {
-          return null;
-        }
-        if (type == 'task_complete') {
+        if (decoded['type'] == 'task_complete') {
           final text = decoded['last_agent_message'];
           return text is String && text.trim().isNotEmpty
               ? (author: ConversationAuthor.assistant, body: text.trim())
@@ -182,7 +183,11 @@ class SessionListExporter {
         }
       }
     }
-    return (author: message.author, body: body);
+    return switch (message.author) {
+      ConversationAuthor.user ||
+      ConversationAuthor.assistant => (author: message.author, body: body),
+      _ => null,
+    };
   }
 
   String exportCsv(List<SessionRowViewModel> rows) {
@@ -281,14 +286,28 @@ class SessionListExporter {
   String _metadata(SessionRowViewModel row) {
     final duration =
         row.duration ?? row.lastMessageAtUtc.difference(row.startedAtUtc);
-    return '**Started:** ${_dateMinute(row.startedAtUtc)} · '
-        '**Last:** ${_dateMinute(row.lastMessageAtUtc)} · '
-        '**Duration:** ${_duration(duration)} · '
-        '**Messages:** ${_groupedInt(row.messageCount)} · '
-        '**Tokens:** ${_groupedInt(row.displayTotalTokens)} · '
-        '**Cost:** ${row.displayEstimatedCost} · '
-        '**Model:** ${row.modelLabel} · '
-        '**Platform:** ${row.platformLabel} · **Harness:** ${row.harnessLabel}';
+    final cachedPercent = row.inputTokens > 0
+        ? '${(row.cachedInputTokens * 100 / row.inputTokens).toStringAsFixed(1).replaceFirst(RegExp(r'\.0$'), '')}%'
+        : '0%';
+    final cost = row.displayEstimatedCost;
+    final estimated = cost.startsWith(r'$') ? '$cost (estimate)' : cost;
+    final inputLabel =
+        row.usageRollup != null && row.displayTotalTokens != row.totalTokens
+        ? 'session in'
+        : 'in';
+    return '**Stats**\n\n'
+        'Started: ${_dateMinute(row.startedAtUtc)}  \n'
+        'Last: ${_dateMinute(row.lastMessageAtUtc)}  \n'
+        'Duration: ${_duration(duration)}  \n'
+        'Messages: ${_compactInt(row.messageCount)}  \n'
+        'Tokens: ${_compactInt(row.displayTotalTokens)}, '
+        '$inputLabel: ${_compactInt(row.inputTokens)} '
+        '(${_compactInt(row.cachedInputTokens)} cached, $cachedPercent), '
+        'out: ${_compactInt(row.outputTokens)}  \n'
+        'Cost: $estimated  \n'
+        'Model: ${row.modelLabel}  \n'
+        'Platform: ${row.platformLabel}  \n'
+        'Harness: ${row.harnessLabel}';
   }
 }
 
@@ -325,35 +344,38 @@ String _csvValue(String value) {
 }
 
 String _dateMinute(DateTime value) {
-  final utc = value.toUtc();
-  return '${_fourDigits(utc.year)}-${_twoDigits(utc.month)}-'
-      '${_twoDigits(utc.day)} ${_twoDigits(utc.hour)}:'
-      '${_twoDigits(utc.minute)} UTC';
+  final local = value.toLocal();
+  return '${_fourDigits(local.year)}-${_twoDigits(local.month)}-'
+      '${_twoDigits(local.day)} ${_twoDigits(local.hour)}:'
+      '${_twoDigits(local.minute)}';
 }
 
 String _duration(Duration value) {
   final duration = value.isNegative ? Duration.zero : value;
-  final hours = duration.inHours;
+  final days = duration.inDays;
+  final hours = days > 0 ? duration.inHours.remainder(24) : duration.inHours;
   final minutes = duration.inMinutes.remainder(60);
-  if (hours > 0 && minutes > 0) {
-    return '${hours}h ${minutes}m';
-  }
-  if (hours > 0) {
-    return '${hours}h';
-  }
-  return '${minutes}m';
+  return [
+    if (days > 0) '${days}d',
+    if (hours > 0) '${hours}h',
+    if (minutes > 0 || (days == 0 && hours == 0)) '${minutes}m',
+  ].join(' ');
 }
 
-String _groupedInt(int value) {
-  final digits = value.abs().toString();
-  final buffer = StringBuffer();
-  for (var index = 0; index < digits.length; index++) {
-    if (index > 0 && (digits.length - index) % 3 == 0) {
-      buffer.write(',');
+String _compactInt(int value) {
+  for (final unit in [
+    (1000000000000, 'T'),
+    (1000000000, 'B'),
+    (1000000, 'M'),
+    (1000, 'k'),
+  ]) {
+    if (value.abs() >= unit.$1) {
+      final scaled = value / unit.$1;
+      final digits = scaled.abs() >= 100 ? 0 : 1;
+      return '${scaled.toStringAsFixed(digits).replaceFirst(RegExp(r'\.0$'), '')}${unit.$2}';
     }
-    buffer.write(digits[index]);
   }
-  return value < 0 ? '-$buffer' : buffer.toString();
+  return value.toString();
 }
 
 String _twoDigits(int value) => value.toString().padLeft(2, '0');
