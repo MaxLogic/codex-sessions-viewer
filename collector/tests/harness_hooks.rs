@@ -54,12 +54,25 @@ impl Env {
         command
             .args(args)
             .env("CODEX_SESSIONS_COLLECTOR_QUEUE", &self.queue)
+            .env("LOCALAPPDATA", self.temp.path())
+            .env("APPDATA", self.temp.path())
+            .env("XDG_CONFIG_HOME", self.temp.path())
+            .env("XDG_DATA_HOME", self.temp.path())
+            .env("USERPROFILE", self.temp.path())
+            .env("HOME", self.temp.path())
+            .env("XDG_RUNTIME_DIR", self.temp.path())
+            .env("XDG_CACHE_HOME", self.temp.path())
             .arg("--db")
             .arg(&self.db)
             .arg("--windows-root")
             .arg(&self.codex_home)
             .args(["--wsl-root", "", "--no-wsl-projects", "--claude-root"])
             .arg(&self.claude_root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
         command
     }
 
@@ -124,6 +137,17 @@ impl Env {
             "cwd": "C:\\nonexistent\\claude-project",
             "hook_event_name": event,
         })
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let output = self.run(&["resident", "stop"]);
+        assert!(
+            output.status.success(),
+            "test-owned resident did not stop: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -341,11 +365,26 @@ fn duplicate_and_simultaneous_hooks_converge_on_one_copy() {
     );
     assert_eq!(env.queued().len(), 4);
     // Several drains race for the same queue.
-    let mut drains: Vec<std::process::Child> = (0..3)
-        .map(|_| env.command(&["drain"]).spawn().unwrap())
+    let drains: Vec<std::process::Child> = (0..3)
+        .map(|_| {
+            env.command(&["drain"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
         .collect();
-    for drain in &mut drains {
-        assert!(drain.wait().unwrap().success());
+    // Reap every caller before asserting, including on a contention failure.
+    let outputs: Vec<_> = drains
+        .into_iter()
+        .map(|drain| drain.wait_with_output().unwrap())
+        .collect();
+    for output in outputs {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     assert!(env.queued().is_empty());
     assert_eq!(
@@ -385,9 +424,13 @@ fn a_transcript_caught_mid_write_is_retried_until_complete() {
     assert_eq!(status(), "changed_pending_parse");
     // A drain started by a hook waits for the retry itself: no later hook
     // is needed once the transcript is complete.
-    let mut waiting = env.command(&["drain"]).spawn().unwrap();
+    let mut waiting = env.command(&["serve"]).spawn().unwrap();
     std::thread::sleep(Duration::from_millis(300));
     std::fs::write(&path, &full).unwrap();
+    wait_until("resident retry", || {
+        env.queued().is_empty() && status() == "available"
+    });
+    assert!(env.run(&["resident", "stop"]).status.success());
     assert!(waiting.wait().unwrap().success());
     assert!(env.queued().is_empty());
     assert_eq!(status(), "available");
@@ -571,7 +614,9 @@ fn codex_notify_keeps_the_previous_notify_command_running() {
         env!("CARGO_BIN_EXE_codex-sessions-collector"),
         "codex",
         "notify",
-        "--no-drain"
+        "--no-drain",
+        "--db",
+        env.db.to_string_lossy()
     ])
     .to_string();
     let output = env.run(&[

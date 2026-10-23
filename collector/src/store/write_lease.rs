@@ -29,10 +29,10 @@ fn key(conn: &Connection) -> usize {
     // SAFETY: opaque live SQLite handle identity, never dereferenced.
     unsafe { conn.handle() as usize }
 }
-pub fn lock_path(database: &Path) -> PathBuf {
-    let mut name = database.as_os_str().to_owned();
+pub fn lock_path(database: &Path) -> std::io::Result<PathBuf> {
+    let mut name = crate::resident::instance::identity_path(database)?.into_os_string();
     name.push(".collector.write.lock");
-    PathBuf::from(name)
+    Ok(PathBuf::from(name))
 }
 /// Scoped acquisition timeout, not a lease hold. Scans use ten minutes;
 /// drains use their remaining deadline. Default is the connection busy timeout.
@@ -129,8 +129,9 @@ impl<'a> WriteLease<'a> {
                     .write(true)
                     .create(true)
                     .truncate(false)
-                    .open(lock_path(Path::new(path)))?;
+                    .open(lock_path(Path::new(path))?)?;
                 loop {
+                    write_budget::check_control()?;
                     match file.try_lock() {
                         Ok(()) => break,
                         Err(TryLockError::WouldBlock) => {

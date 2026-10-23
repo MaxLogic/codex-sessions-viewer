@@ -11,6 +11,8 @@ use crate::platform_locations::PlatformLocations;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectorSettings {
+    pub background_rescan_enabled: bool,
+    pub background_rescan_interval_seconds: u64,
     pub windows_codex_path: String,
     pub t3_state_path: String,
     pub t3_source_type: String,
@@ -25,6 +27,8 @@ pub struct CollectorSettings {
 impl Default for CollectorSettings {
     fn default() -> Self {
         Self {
+            background_rescan_enabled: true,
+            background_rescan_interval_seconds: 300,
             windows_codex_path: DefaultFolders::current().codex_home,
             t3_state_path: String::new(),
             t3_source_type: SourceType::native().wire_name().to_owned(),
@@ -119,6 +123,16 @@ impl CollectorSettings {
             t3_source_type
         };
         Ok(Self {
+            background_rescan_enabled: table
+                .get("scanner")
+                .and_then(|value| value.get("background_rescan_enabled"))
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(defaults.background_rescan_enabled),
+            background_rescan_interval_seconds: positive(
+                "scanner",
+                "background_rescan_interval_seconds",
+                300,
+            ) as u64,
             t3_state_path: string("paths", "t3_state_path", ""),
             t3_source_type,
             windows_codex_path: string("paths", "windows_codex_path", &defaults.windows_codex_path),

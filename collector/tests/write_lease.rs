@@ -506,7 +506,11 @@ fn l3_process_death_releases_the_lease_without_unlinking() {
     let _wait = LeaseWait::enter(Duration::from_secs(1));
     let _lease = WriteLease::acquire(&store.conn).unwrap();
     assert!(start.elapsed() < Duration::from_secs(1));
-    assert!(codex_sessions_collector::store::write_lease::lock_path(&path).exists());
+    assert!(
+        codex_sessions_collector::store::write_lease::lock_path(&path)
+            .unwrap()
+            .exists()
+    );
 }
 #[test]
 fn l4_begin_write_requires_lease_and_memory_reentrancy_is_per_connection() {
@@ -540,6 +544,7 @@ fn l5_drain_lease_timeout_releases_claim_without_attempting() {
     let queue = temp.path().join("queue");
     std::fs::create_dir(&queue).unwrap();
     let item = hooks::WorkItem {
+        database_key: None,
         harness: "codex".into(),
         event: "turn".into(),
         session_id: Some("a".into()),

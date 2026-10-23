@@ -660,10 +660,14 @@ fn migration_marker_stops_each_phase_at_the_next_chunk_and_rerun_converges() {
             assert!(
                 matches!(
                     error,
-                    codex_sessions_collector::store::StoreError::Refused(_)
+                    codex_sessions_collector::store::StoreError::Unavailable(_)
+                        | codex_sessions_collector::store::StoreError::Refused(_)
                 ),
                 "{phase}: {error:?}"
             );
+            // The legacy T3 adapter returns a string refusal; the store APIs
+            // preserve the typed transient fence. Both must name migration.
+            assert!(error.to_string().contains("migrating"), "{phase}: {error}");
             assert_eq!(
                 injected.get(),
                 boundary,

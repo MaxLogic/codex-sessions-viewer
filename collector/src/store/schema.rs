@@ -114,6 +114,9 @@ pub enum StoreError {
     Io(std::io::Error),
     /// The database cannot be written safely; the message says what to do.
     Refused(String),
+    /// A recoverable migration fence that a bounded worker may retry without
+    /// charging a transcript attempt. The write remains refused meanwhile.
+    Unavailable(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -128,12 +131,20 @@ impl std::fmt::Display for StoreError {
             ),
             Self::Sql(error) => write!(f, "SQLite error: {error}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
-            Self::Refused(message) => f.write_str(message),
+            Self::Refused(message) | Self::Unavailable(message) => f.write_str(message),
         }
     }
 }
 
 impl std::error::Error for StoreError {}
+
+impl StoreError {
+    pub(crate) fn is_database_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+            || matches!(self, Self::Sql(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+    }
+}
 
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
@@ -338,7 +349,7 @@ fn validate_applied_checksums(conn: &Connection) -> StoreResult<()> {
 /// read-only guards in `openFileBackedDatabase`.
 pub(crate) fn ensure_no_pending_viewer_migration(conn: &Connection) -> StoreResult<()> {
     if metadata(conn, "usage_migration_bootstrap")?.is_some() {
-        return Err(StoreError::Refused(
+        return Err(StoreError::Unavailable(
             "The viewer is migrating this database. Open the viewer and let the migration finish, then collect again.".to_owned(),
         ));
     }
@@ -351,7 +362,7 @@ pub(crate) fn ensure_no_pending_viewer_migration(conn: &Connection) -> StoreResu
             )
             .optional()?;
         if latest.is_some_and(|state| state != "succeeded") {
-            return Err(StoreError::Refused(
+            return Err(StoreError::Unavailable(
                 "A usage migration of this database has not finished. Open the viewer and let it complete, then collect again.".to_owned(),
             ));
         }
@@ -364,7 +375,7 @@ pub(crate) fn ensure_no_pending_viewer_migration(conn: &Connection) -> StoreResu
         )
         .optional()?;
     if target.is_none_or(|version| version < 16) {
-        return Err(StoreError::Refused(
+        return Err(StoreError::Unavailable(
             "The database has no active usage generation for schema 16 or newer. Open the viewer to finish migrating it.".to_owned(),
         ));
     }
@@ -398,7 +409,7 @@ pub fn check_writable(conn: &Connection, mode: OwnerMode, path: &str) -> StoreRe
         _ => {}
     }
     if version < SUPPORTED_SCHEMA_VERSION {
-        return Err(StoreError::Refused(format!(
+        return Err(StoreError::Unavailable(format!(
             "{path} is at schema version {version}; this collector writes schema {SUPPORTED_SCHEMA_VERSION}. Open the viewer once to upgrade the database."
         )));
     }

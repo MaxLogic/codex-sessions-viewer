@@ -2042,7 +2042,10 @@ fn a_viewer_migration_started_mid_collection_stops_further_writes() {
     let result = store.apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
         support::sample_snapshot("after"),
     )))]);
-    assert!(matches!(result, Err(StoreError::Refused(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(StoreError::Unavailable(_))),
+        "{result:?}"
+    );
     let conn = open(&db);
     assert_eq!(
         count(

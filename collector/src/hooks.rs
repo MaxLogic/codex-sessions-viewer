@@ -1,8 +1,8 @@
 //! Harness hooks and the durable work queue behind them.
 //!
 //! A hook only records what happened in a small JSON file in the queue folder
-//! and starts a detached `drain`; it never opens the database, so a busy
-//! database or a slow collection cannot block the agent. `drain` claims queue
+//! and wakes (or starts) the resident; it never opens the database, so a busy
+//! database or a slow collection cannot block the agent. The worker claims queue
 //! files by renaming them (so concurrent drains never process the same entry),
 //! ingests the named sessions, and deletes each entry once it is committed.
 //! Failed entries return to the queue with a retry time; claims left by a
@@ -28,6 +28,8 @@ const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
+    #[serde(default)]
+    pub database_key: Option<String>,
     pub harness: String,
     pub event: String,
     #[serde(default)]
@@ -101,11 +103,34 @@ pub fn log_error(dir: &Path, message: &str) {
 /// harness's job (Windows) or process group (Unix).
 pub fn spawn_detached(program: &Path, args: &[String]) -> std::io::Result<()> {
     let mut command = Command::new(program);
+    command.stderr(Stdio::null());
+    spawn_detached_command(&mut command, args)
+}
+
+pub(crate) fn spawn_detached_with_queue(
+    program: &Path,
+    args: &[String],
+    queue: &Path,
+) -> std::io::Result<()> {
+    let mut command = Command::new(program);
+    std::fs::create_dir_all(queue)?;
+    let errors = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(queue.join("errors.log"))?;
+    command.stderr(errors);
+    command.env(
+        "CODEX_SESSIONS_COLLECTOR_QUEUE",
+        std::path::absolute(queue)?,
+    );
+    spawn_detached_command(&mut command, args)
+}
+
+fn spawn_detached_command(command: &mut Command, args: &[String]) -> std::io::Result<()> {
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -119,6 +144,12 @@ pub fn spawn_detached(program: &Path, args: &[String]) -> std::io::Result<()> {
         match command.spawn() {
             Ok(_) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                log_error(
+                    &queue_dir(),
+                    &format!(
+                        "process job breakaway unavailable: {error}; detached worker remains subject to the caller's job"
+                    ),
+                );
                 command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
             }
             Err(error) => return Err(error),
@@ -171,6 +202,7 @@ pub fn codex_work_item(payload: &str) -> WorkItem {
     let value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     WorkItem {
+        database_key: None,
         harness: "codex".to_owned(),
         event: text("type").unwrap_or_else(|| "notify".to_owned()),
         session_id: text("thread-id").or_else(|| text("thread_id")),
@@ -189,6 +221,7 @@ pub fn claude_work_item(input: &str) -> WorkItem {
     let value: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     WorkItem {
+        database_key: None,
         harness: "claude".to_owned(),
         event: text("hook_event_name").unwrap_or_else(|| "hook".to_owned()),
         session_id: text("session_id"),
@@ -240,7 +273,7 @@ fn claim_suffix() -> String {
     format!(".claimed-{}", std::process::id())
 }
 
-fn is_due(item: &WorkItem, now: DartDateTime) -> bool {
+pub(crate) fn is_due(item: &WorkItem, now: DartDateTime) -> bool {
     item.not_before_utc
         .as_deref()
         .and_then(DartDateTime::try_parse)

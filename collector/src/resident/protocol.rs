@@ -7,13 +7,23 @@ pub const VERSION: u64 = 1;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Request {
     pub v: u64,
     pub id: String,
     pub op: String,
     pub client: Option<String>,
     pub lifetime: Option<String>,
+    pub entry: Option<String>,
+    /// Ownership metadata for hook wake-ups, never a collection command.
+    pub queue: Option<std::path::PathBuf>,
+    pub database_key: Option<String>,
+    #[serde(default)]
+    pub harnesses: Vec<String>,
+    pub harness: Option<String>,
+    pub path: Option<String>,
+    pub force: Option<bool>,
+    pub parser_workers: Option<usize>,
 }
 
 pub enum Frame {
@@ -72,6 +82,16 @@ pub fn decode(line: &[u8]) -> Result<Request, Value> {
             id,
             "unsupported_version",
             "this server supports protocol v1",
+        ));
+    }
+    if value.get("arguments").is_some()
+        || value.get("collection").is_some()
+        || value.get("cwd").is_some()
+    {
+        return Err(error(
+            id,
+            "bad_request",
+            "CLI command forwarding is not supported",
         ));
     }
     let request: Request = serde_json::from_value(value)

@@ -32,6 +32,26 @@ thread_local! {
     static COMPLETION_TIME: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
     static SESSION_SHAPE: std::cell::Cell<Option<SessionWriteShape>> = const { std::cell::Cell::new(None) };
     static CHUNK_OBSERVER: RefCell<Option<Box<ChunkObserver>>> = const { RefCell::new(None) };
+    static CONTROL: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
+}
+
+/// Resident control only. Collection work must never run inside a public call.
+pub(crate) struct WriteControlScope(Option<Box<dyn Fn() -> bool>>);
+impl WriteControlScope {
+    pub(crate) fn enter(stopping: impl Fn() -> bool + 'static) -> Self {
+        Self(CONTROL.with_borrow_mut(|current| current.replace(Box::new(stopping))))
+    }
+}
+impl Drop for WriteControlScope {
+    fn drop(&mut self) {
+        CONTROL.with_borrow_mut(|current| *current = self.0.take());
+    }
+}
+pub(crate) fn check_control() -> StoreResult<()> {
+    if CONTROL.with_borrow(|control| control.as_ref().is_some_and(|stopping| stopping())) {
+        return Err(StoreError::Refused("resident collection cancelled".into()));
+    }
+    Ok(())
 }
 
 type ChunkObserver = dyn FnMut(&'static str);
@@ -511,6 +531,7 @@ fn nested_write(conn: &Connection) -> bool {
 /// between two batches of a long scan. Inside `in_write_transaction` (same
 /// thread and connection) it opens a savepoint in the outer transaction.
 pub fn begin_write(conn: &Connection) -> StoreResult<()> {
+    check_control()?;
     if nested_write(conn) {
         conn.execute_batch("savepoint nested_write")?;
         return Ok(());

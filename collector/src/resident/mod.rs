@@ -2,6 +2,7 @@
 pub mod endpoint;
 pub mod instance;
 pub mod protocol;
+pub mod scheduler;
 
 use crate::store::{OwnerMode, StoreError, schema, write_budget};
 use rusqlite::{Connection, OpenFlags};
@@ -39,20 +40,34 @@ struct State {
     idle_since: Instant,
     started: Instant,
     write_hold: write_budget::WriteHoldReport,
+    last_scan: Value,
 }
 struct Shared {
     state: Mutex<State>,
     stopping: AtomicBool,
     connections: AtomicUsize,
+    pending: Mutex<scheduler::Pending>,
+    key: String,
+    queue: PathBuf,
+    requests: Mutex<std::collections::VecDeque<scheduler::Request>>,
+    wake: std::sync::mpsc::SyncSender<()>,
 }
 
 impl Shared {
+    fn sweep_queues(&self, debounce: Duration) {
+        self.pending
+            .lock()
+            .unwrap()
+            .sweep(&self.queue, &self.key, debounce);
+    }
     // The callback exposes the decision/publication boundary to deterministic
     // concurrency tests; production supplies a no-op.
     fn stop_if_idle(&self, now: Instant, before_publish: impl FnOnce()) -> bool {
         let mut state = self.state.lock().unwrap();
         let idle = state.lifetime == Lifetime::Viewer
             && state.viewers == 0
+            && self.pending.lock().unwrap().is_empty()
+            && self.requests.lock().unwrap().is_empty()
             && now.saturating_duration_since(state.idle_since) >= VIEWER_IDLE;
         if idle {
             before_publish();
@@ -108,7 +123,7 @@ fn hello(id: &str, state: &State) -> Value {
 fn status(id: &str, state: &State) -> Value {
     json!({"v":protocol::VERSION,"id":id,"event":"status","pid":std::process::id(),
         "state":state.state,"lifetime":state.lifetime.name(),"queue":{"pending":0,"claimed":0},
-        "last_scan":null,"write_hold":state.write_hold,"uptime":state.started.elapsed().as_secs_f64()})
+        "last_scan":state.last_scan,"write_hold":state.write_hold,"uptime":state.started.elapsed().as_secs_f64()})
 }
 
 struct ConnectionGuard {
@@ -177,10 +192,84 @@ fn handle(stream: endpoint::Stream, shared: Arc<Shared>) -> io::Result<()> {
         };
         line.clear();
         debug_assert_eq!(request.v, protocol::VERSION);
+        if matches!(request.op.as_str(), "scan" | "ingest") {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            {
+                let state = guard.shared.state.lock().unwrap();
+                let mut requests = guard.shared.requests.lock().unwrap();
+                if state.state == "stopping" || requests.len() >= 64 {
+                    protocol::send(
+                        reader.get_mut(),
+                        &protocol::error(
+                            &request.id,
+                            "refused",
+                            "resident stopping or request queue full",
+                        ),
+                    )?;
+                    continue;
+                }
+                requests.push_back(scheduler::Request {
+                    request,
+                    reply: sender,
+                });
+                let _ = guard.shared.wake.try_send(());
+            }
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(events) => {
+                        for event in events {
+                            protocol::send(reader.get_mut(), &event)?;
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if !guard.shared.stopping.load(Ordering::SeqCst) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+            continue;
+        }
         let mut state = guard.shared.state.lock().unwrap();
         let reply = match request.op.as_str() {
-            "hello" => register_hello(&request, &mut state, &mut guard.viewer),
-            "status" => status(&request.id, &state),
+            "hello" => {
+                let mut reply = register_hello(&request, &mut state, &mut guard.viewer);
+                reply["database_key"] = json!(guard.shared.key);
+                reply["queue"] = json!(guard.shared.queue);
+                reply
+            }
+            "status" => {
+                let mut reply = status(&request.id, &state);
+                reply["queue"]["pending"] = json!(guard.shared.pending.lock().unwrap().len());
+                reply["queue"]["claimed"] = json!(guard.shared.pending.lock().unwrap().claimed);
+                reply["work_requests"] = json!(guard.shared.requests.lock().unwrap().len());
+                reply
+            }
+            "notify" => {
+                if state.state == "stopping" {
+                    json!({"v":1,"id":request.id,"event":"ack","state":"stopping"})
+                } else if request
+                    .queue
+                    .as_ref()
+                    .is_some_and(|queue| queue != &guard.shared.queue)
+                    || request
+                        .database_key
+                        .as_ref()
+                        .is_some_and(|key| key != &guard.shared.key)
+                {
+                    json!({"v":1,"id":request.id,"event":"ack","state":"ownership_mismatch"})
+                } else {
+                    let result = guard.shared.pending.lock().unwrap().notify(
+                        request.queue.as_deref().unwrap_or(&guard.shared.queue),
+                        &guard.shared.key,
+                        request.entry.as_deref().unwrap_or(""),
+                    );
+                    state.lifetime = Lifetime::Resident;
+                    json!({"v":1,"id":request.id,"event":"ack","state":result})
+                }
+            }
             "shutdown" => {
                 guard.shared.publish_stopping(&mut state);
                 protocol::event(&request.id, "stopping")
@@ -188,6 +277,7 @@ fn handle(stream: endpoint::Stream, shared: Arc<Shared>) -> io::Result<()> {
             _ => protocol::error(&request.id, "bad_request", "unknown operation"),
         };
         drop(state);
+        let _ = guard.shared.wake.try_send(());
         protocol::send(reader.get_mut(), &reply)?;
     }
     Ok(())
@@ -347,9 +437,56 @@ pub fn request(key: &str, value: &Value, timeout: Duration) -> io::Result<Value>
     Ok(reply)
 }
 
+/// Bound the complete hook IPC exchange, including a stalled/squatted peer.
+/// The basename and ownership metadata cross IPC; the queue remains authoritative.
+pub(crate) enum HookNotify {
+    Handled,
+    OtherQueue,
+    Unavailable,
+}
+pub(crate) fn notify_hook(key: &str, entry: &str) -> HookNotify {
+    let queue = match instance::identity_path(&crate::hooks::queue_dir()) {
+        Ok(queue) => queue,
+        Err(_) => return HookNotify::Unavailable,
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let key = key.to_owned();
+    let entry = entry.to_owned();
+    thread::spawn(move || {
+        let result = (|| {
+            let hello = request(&key, &json!({"v":1,"id":"hook-hello","op":"hello","client":"hook","lifetime":"resident"}), Duration::from_millis(300))?;
+            if hello["state"] == "stopping" { return Ok(HookNotify::Unavailable); }
+            if hello["database_key"] != key {
+                return Ok(HookNotify::Unavailable);
+            }
+            if hello["queue"] != json!(queue) { return Ok(HookNotify::OtherQueue); }
+            let ack = request(&key, &json!({"v":1,"id":"hook-notify","op":"notify","entry":entry,"database_key":key,"queue":queue}), Duration::from_millis(300))?;
+            if ack["state"] == "ownership_mismatch" { return Ok(HookNotify::OtherQueue); }
+            if ack["state"] == "rejected" {
+                crate::hooks::log_error(&crate::hooks::queue_dir(), "resident rejected hook notification; durable entry retained for sweep");
+            }
+            Ok::<_, io::Error>(if ack["event"] == "ack" && matches!(ack["state"].as_str(), Some("accepted" | "already_handled" | "rejected")) { HookNotify::Handled } else { HookNotify::Unavailable })
+        })().unwrap_or(HookNotify::Unavailable);
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or(HookNotify::Unavailable)
+}
+
 pub fn run(database: &Path, lifetime: Lifetime) -> io::Result<()> {
+    let options =
+        crate::cli::parse_options(&[]).map_err(|_| io::Error::other("default options"))?;
+    run_configured(database, lifetime, options)
+}
+
+pub(crate) fn run_configured(
+    database: &Path,
+    lifetime: Lifetime,
+    options: crate::cli::Options,
+) -> io::Result<()> {
     let log = LifecycleLog::new()?;
-    let result = run_inner(database, lifetime, &log);
+    let result = run_inner(database, lifetime, options, &log);
     if let Err(error) = &result
         && let Err(log_error) = log.record(&format!("failed: {error}"))
     {
@@ -358,9 +495,17 @@ pub fn run(database: &Path, lifetime: Lifetime) -> io::Result<()> {
     result
 }
 
-fn run_inner(database: &Path, lifetime: Lifetime, log: &LifecycleLog) -> io::Result<()> {
+fn run_inner(
+    database: &Path,
+    lifetime: Lifetime,
+    options: crate::cli::Options,
+    log: &LifecycleLog,
+) -> io::Result<()> {
     let signal = signals::Guard::install()?;
     let key = instance::database_key(database)?;
+    let queue = crate::hooks::queue_dir();
+    std::fs::create_dir_all(&queue)?;
+    let queue = instance::identity_path(&queue)?;
     if let Some(parent) = std::path::absolute(database)?.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -381,6 +526,19 @@ fn run_inner(database: &Path, lifetime: Lifetime, log: &LifecycleLog) -> io::Res
             && reply["event"] == "hello"
             && reply["state"] != "stopping"
         {
+            if reply["database_key"] != key {
+                return Err(io::Error::other("resident database identity mismatch"));
+            }
+            if reply["queue"] != json!(queue) {
+                // Another starter won with a different queue. Keep this caller's
+                // configuration and run its bounded retry policy here.
+                let mut options = options.clone();
+                if options.db.is_none() && options.standalone.is_none() {
+                    options.db = Some(database.to_owned());
+                }
+                crate::cli::drain(&options, &mut io::sink())
+                    .map_err(|_| io::Error::other("fallback drain failed"))?;
+            }
             return Ok(());
         }
         if Instant::now() >= lock_deadline {
@@ -394,6 +552,7 @@ fn run_inner(database: &Path, lifetime: Lifetime, log: &LifecycleLog) -> io::Res
         });
     };
     let now = Instant::now();
+    let (wake, wakes) = std::sync::mpsc::sync_channel(1);
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             state: "starting",
@@ -402,9 +561,15 @@ fn run_inner(database: &Path, lifetime: Lifetime, log: &LifecycleLog) -> io::Res
             idle_since: now,
             started: now,
             write_hold: write_budget::hold_report(),
+            last_scan: Value::Null,
         }),
         stopping: AtomicBool::new(false),
         connections: AtomicUsize::new(0),
+        pending: Mutex::new(scheduler::Pending::default()),
+        key: key.clone(),
+        queue,
+        requests: Mutex::new(std::collections::VecDeque::new()),
+        wake,
     });
     let listener = match endpoint::Listener::bind(&key) {
         Ok(listener) => Some(listener),
@@ -416,71 +581,26 @@ fn run_inner(database: &Path, lifetime: Lifetime, log: &LifecycleLog) -> io::Res
         let shared = shared.clone();
         thread::spawn(move || accept_loop(listener, shared))
     });
-    let mut next_probe = Instant::now();
-    let mut busy_delay = Duration::from_secs(5);
+    let mut worker = scheduler::Scheduler::new(database, options, shared.clone());
     let mut previous_state = "starting";
     let mut fatal = None;
     while !shared.stopping.load(Ordering::SeqCst) && !signal.stopping() {
-        let now = Instant::now();
-        if now >= next_probe {
-            let (state, delay) = match database_state(database) {
-                Ok(()) => {
-                    busy_delay = Duration::from_secs(5);
-                    ("ready", Duration::from_secs(30))
-                }
-                Err(StoreError::Refused(message))
-                    if message.contains("newer than")
-                        || message.contains("moved to schema version") =>
-                {
-                    fatal = Some(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "database schema is newer than this collector; update the collector",
-                    ));
-                    break;
-                }
-                Err(StoreError::Sql(rusqlite::Error::SqliteFailure(code, _)))
-                    if matches!(
-                        code.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) =>
-                {
-                    let delay = busy_delay;
-                    busy_delay = (busy_delay * 2).min(Duration::from_secs(60));
-                    ("waiting_for_database", delay)
-                }
-                Err(StoreError::Refused(_)) => (
-                    "waiting_for_database",
-                    if database.is_file() {
-                        Duration::from_secs(10)
-                    } else {
-                        Duration::from_secs(30)
-                    },
-                ),
-                Err(error) => {
-                    fatal = Some(io::Error::other(error));
-                    break;
-                }
-            };
-            {
-                let mut current = shared.state.lock().unwrap();
-                if current.state == "stopping" {
-                    break;
-                }
-                current.state = state;
+        if let Err(error) = worker.tick() {
+            fatal = Some(error);
+            break;
+        }
+        let state = shared.state.lock().unwrap().state;
+        if state != previous_state {
+            if let Err(error) = log.record(state) {
+                fatal = Some(error);
+                break;
             }
-            if state != previous_state {
-                if let Err(error) = log.record(state) {
-                    fatal = Some(error);
-                    break;
-                }
-                previous_state = state;
-            }
-            next_probe = now + delay;
+            previous_state = state;
         }
         if shared.stop_if_idle(Instant::now(), || {}) {
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        let _ = wakes.recv_timeout(worker.wait());
     }
     shared.stop();
     if let Some(accept) = accept {
@@ -566,6 +686,9 @@ pub fn control(database: &Path, action: &str) -> io::Result<Value> {
 mod signals {
     use super::*;
     static STOP: AtomicBool = AtomicBool::new(false);
+    pub(super) fn stopping() -> bool {
+        STOP.load(Ordering::SeqCst)
+    }
     pub struct Guard {
         #[cfg(unix)]
         old_int: libc::sigaction,
@@ -657,9 +780,15 @@ mod tests {
                 idle_since: now - VIEWER_IDLE,
                 started: now,
                 write_hold: write_budget::hold_report(),
+                last_scan: Value::Null,
             }),
             stopping: AtomicBool::new(false),
             connections: AtomicUsize::new(0),
+            pending: Mutex::new(scheduler::Pending::default()),
+            key: "0000000000000000".into(),
+            queue: PathBuf::new(),
+            requests: Mutex::new(std::collections::VecDeque::new()),
+            wake: std::sync::mpsc::sync_channel(1).0,
         })
     }
     fn requests() -> [protocol::Request; 2] {

@@ -42,6 +42,15 @@ impl Store {
     /// Open a database this collector may write in `mode`, creating a
     /// standalone database when needed. Never creates a viewer database.
     pub fn open(path: &Path, mode: OwnerMode) -> StoreResult<Self> {
+        Self::open_with_wait_limit(path, mode, std::time::Duration::MAX)
+    }
+
+    /// Clamp SQLite's busy wait to a bounded worker's remaining deadline.
+    pub(crate) fn open_with_wait_limit(
+        path: &Path,
+        mode: OwnerMode,
+        remaining: std::time::Duration,
+    ) -> StoreResult<Self> {
         let display = path.display().to_string();
         let conn = match mode {
             OwnerMode::Viewer => {
@@ -69,7 +78,10 @@ impl Store {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(schema::BUSY_TIMEOUT_MS);
-        schema::configure(&conn, busy_timeout)?;
+        schema::configure(
+            &conn,
+            busy_timeout.min(remaining.as_millis().min(u64::MAX.into()) as u64),
+        )?;
         if mode == OwnerMode::Standalone {
             schema::prepare_standalone(&conn, &display)?;
         }
