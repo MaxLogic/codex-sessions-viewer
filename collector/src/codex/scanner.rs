@@ -195,21 +195,39 @@ fn is_wsl_unc_path(path: &str) -> bool {
 
 struct CachedIndex {
     by_path: HashMap<String, CachedSource>,
+    statuses_by_path: HashMap<String, Vec<(String, String)>>,
 }
 
 impl CachedIndex {
     fn new(cached: &[CachedSource]) -> Self {
         let mut by_path = HashMap::new();
+        let mut statuses_by_path: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for source in cached {
             for key in snapshot_keys(source) {
+                statuses_by_path
+                    .entry(key.clone())
+                    .or_default()
+                    .push((source.scan_status.clone(), source.source_state.clone()));
                 by_path.insert(key, source.clone());
             }
         }
-        Self { by_path }
+        Self {
+            by_path,
+            statuses_by_path,
+        }
     }
 
     fn lookup(&self, path: &str) -> Option<&CachedSource> {
         self.by_path.get(&canonical_scan_path(path))
+    }
+
+    fn status_matches(&self, status: &SourceStatus) -> bool {
+        self.statuses_by_path
+            .get(&canonical_scan_path(&status.path))
+            .is_some_and(|rows| {
+                rows.iter()
+                    .all(|(scan, state)| scan == &status.status && state == &status.state)
+            })
     }
 }
 
@@ -620,9 +638,23 @@ pub fn scan_controlled<E>(
     phases.mark("discover files");
     let mut counts = discovery.counts;
     progress(&counts);
+    let unsupported_paths: HashSet<String> = discovery
+        .statuses
+        .iter()
+        .filter(|status| status.status == "unsupported_format")
+        .map(|status| canonical_scan_path(&status.path))
+        .collect();
     let mut statuses = discovery.statuses;
     let mut errors = discovery.errors;
     let index = CachedIndex::new(cached);
+    // Unchanged compressed/unsupported files remain in diagnostic counts, but
+    // need no persistence or placeholder membership check on every scan.
+    statuses.retain(|status| {
+        if status.status != "unsupported_format" {
+            return true;
+        }
+        !index.status_matches(status)
+    });
     let mut to_parse: Vec<usize> = Vec::new();
     for (position, candidate) in discovery.candidates.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -757,6 +789,7 @@ pub fn scan_controlled<E>(
             .candidates
             .iter()
             .map(|candidate| canonical_scan_path(&candidate.path))
+            .chain(unsupported_paths)
             .collect();
         for source in cached {
             let keys = snapshot_keys(source);

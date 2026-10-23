@@ -1,0 +1,1231 @@
+{
+  "statuses": [
+    {
+      "collector_hub_record_state": [
+        {
+          "record_key": "status:codex:source-status:c:\\synthetic\\local.jsonl",
+          "record_hash": "170bfa0895291d859723339a3fe2f3b2933c5283c4d18295d00bd7f7911d0e85"
+        },
+        {
+          "record_key": "status:codex:source-status:c:\\unknown.zst",
+          "record_hash": "c9527d16f47c41d750862a039de6a133cac0f43a0b227b93cfa414e28067a675"
+        }
+      ],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 2,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:\\\\synthetic\\\\local.jsonl\",\"status\":\"available\",\"state\":\"active\",\"message\":null}}",
+          "created_at_utc": "<clock>",
+          "record_key": "status:codex:source-status:c:\\synthetic\\local.jsonl"
+        },
+        {
+          "id": 3,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:/unknown.zst\",\"status\":\"unsupported_format\",\"state\":\"active\",\"message\":null}}",
+          "created_at_utc": "<clock>",
+          "record_key": "status:codex:source-status:c:\\unknown.zst"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 11
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 8,
+          "deleted": 0
+        },
+        {
+          "session_id": "source-status:c:\\unknown.zst",
+          "revision": 11,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 3
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "parse_error",
+          "source_state": "active",
+          "parse_status": "parse_error",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "source-status:c:\\unknown.zst",
+          "scan_status": "unsupported_format",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": null,
+          "title": null,
+          "summary": null,
+          "detected_project_id": null,
+          "project_refined": 0,
+          "project_id": null,
+          "project_override": 0,
+          "project_name_snapshot": null,
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [
+        {
+          "record_key": "status:codex:source-status:c:\\synthetic\\local.jsonl",
+          "record_hash": "170bfa0895291d859723339a3fe2f3b2933c5283c4d18295d00bd7f7911d0e85"
+        },
+        {
+          "record_key": "status:codex:source-status:c:\\unknown.zst",
+          "record_hash": "c9527d16f47c41d750862a039de6a133cac0f43a0b227b93cfa414e28067a675"
+        }
+      ],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 3,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:/unknown.zst\",\"status\":\"unsupported_format\",\"state\":\"active\",\"message\":null}}",
+          "created_at_utc": "<clock>",
+          "record_key": "status:codex:source-status:c:\\unknown.zst"
+        },
+        {
+          "id": 5,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:\\\\synthetic\\\\local.jsonl\",\"status\":\"available\",\"state\":\"active\",\"message\":null}}",
+          "created_at_utc": "<clock>",
+          "record_key": "status:codex:source-status:c:\\synthetic\\local.jsonl"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 11
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 8,
+          "deleted": 0
+        },
+        {
+          "session_id": "source-status:c:\\unknown.zst",
+          "revision": 11,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 5
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "parse_error",
+          "source_state": "active",
+          "parse_status": "parse_error",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "source-status:c:\\unknown.zst",
+          "scan_status": "unsupported_format",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": null,
+          "title": null,
+          "summary": null,
+          "detected_project_id": null,
+          "project_refined": 0,
+          "project_id": null,
+          "project_override": 0,
+          "project_name_snapshot": null,
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    }
+  ],
+  "project_hints": [
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 1,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"},{\"session_id\":\"missing-locally\",\"source_path\":\"C:/peer/missing-locally.jsonl\"},{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 9
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 9,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 1
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 3,
+          "project_refined": 0,
+          "project_id": 3,
+          "project_override": 0,
+          "project_name_snapshot": "Resolved",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 1,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"},{\"session_id\":\"missing-locally\",\"source_path\":\"C:/peer/missing-locally.jsonl\"},{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        },
+        {
+          "id": 2,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"},{\"session_id\":\"missing-locally\",\"source_path\":\"C:/peer/missing-locally.jsonl\"},{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 9
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 9,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 2
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 3,
+          "project_refined": 0,
+          "project_id": 3,
+          "project_override": 0,
+          "project_name_snapshot": "Resolved",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 1,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"},{\"session_id\":\"missing-locally\",\"source_path\":\"C:/peer/missing-locally.jsonl\"},{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        },
+        {
+          "id": 2,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"},{\"session_id\":\"missing-locally\",\"source_path\":\"C:/peer/missing-locally.jsonl\"},{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        },
+        {
+          "id": 3,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"absent\",\"source_path\":\"C:/peer/absent.jsonl\"}],\"hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 9
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 9,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 3
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 3,
+          "project_refined": 0,
+          "project_id": 3,
+          "project_override": 0,
+          "project_name_snapshot": "Resolved",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 1,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"},{\"session_id\":\"missing-locally\",\"source_path\":\"C:/peer/missing-locally.jsonl\"},{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        },
+        {
+          "id": 2,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"},{\"session_id\":\"missing-locally\",\"source_path\":\"C:/peer/missing-locally.jsonl\"},{\"session_id\":\"local\",\"source_path\":\"C:/peer/local.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        },
+        {
+          "id": 3,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"absent\",\"source_path\":\"C:/peer/absent.jsonl\"}],\"hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": null
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 9
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 9,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 3
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 3,
+          "project_refined": 0,
+          "project_id": 3,
+          "project_override": 0,
+          "project_name_snapshot": "Resolved",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    }
+  ],
+  "thread_names": [
+    {
+      "collector_hub_record_state": [
+        {
+          "record_key": "thread:codex:absent",
+          "record_hash": "83c9b67ac791f68ad2afbcd2ddcdff2732df5c69899079a230b1e8e50a917415"
+        },
+        {
+          "record_key": "thread:codex:local",
+          "record_hash": "0a3693ee2887f24cecd4b21e8ece7fe7e0dcc1e71eee8c3c012639c0a6a97f25"
+        }
+      ],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 1,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"thread_name\",\"record\":{\"harness\":\"codex\",\"session_id\":\"local\",\"thread_name\":\"Original\"}}",
+          "created_at_utc": "<clock>",
+          "record_key": "thread:codex:local"
+        },
+        {
+          "id": 2,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"thread_name\",\"record\":{\"harness\":\"codex\",\"session_id\":\"absent\",\"thread_name\":\"Original\"}}",
+          "created_at_utc": "<clock>",
+          "record_key": "thread:codex:absent"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 8
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 8,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 2
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "Original",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [
+        {
+          "record_key": "thread:codex:absent",
+          "record_hash": "83c9b67ac791f68ad2afbcd2ddcdff2732df5c69899079a230b1e8e50a917415"
+        },
+        {
+          "record_key": "thread:codex:local",
+          "record_hash": "07302cd6eaeaa4e4b497758e095385d419f84cf7e0bdf3c151d9baa5b69c8c5a"
+        }
+      ],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 6,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"thread_name\",\"record\":{\"harness\":\"codex\",\"session_id\":\"absent\",\"thread_name\":\"Original\"}}",
+          "created_at_utc": "<clock>",
+          "record_key": "thread:codex:absent"
+        },
+        {
+          "id": 7,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"thread_name\",\"record\":{\"harness\":\"codex\",\"session_id\":\"local\",\"thread_name\":\" Original \"}}",
+          "created_at_utc": "<clock>",
+          "record_key": "thread:codex:local"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 10
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 10,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 7
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "Original",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [
+        {
+          "record_key": "thread:codex:absent",
+          "record_hash": "83c9b67ac791f68ad2afbcd2ddcdff2732df5c69899079a230b1e8e50a917415"
+        },
+        {
+          "record_key": "thread:codex:local",
+          "record_hash": "07302cd6eaeaa4e4b497758e095385d419f84cf7e0bdf3c151d9baa5b69c8c5a"
+        }
+      ],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 11,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"thread_name\",\"record\":{\"harness\":\"codex\",\"session_id\":\"absent\",\"thread_name\":\"Original\"}}",
+          "created_at_utc": "<clock>",
+          "record_key": "thread:codex:absent"
+        },
+        {
+          "id": 12,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"thread_name\",\"record\":{\"harness\":\"codex\",\"session_id\":\"local\",\"thread_name\":\" Original \"}}",
+          "created_at_utc": "<clock>",
+          "record_key": "thread:codex:local"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 12
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 12,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 12
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "Original",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    }
+  ],
+  "backfill": [
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 10
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 10,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 3,
+          "project_refined": 0,
+          "project_id": 3,
+          "project_override": 0,
+          "project_name_snapshot": "Resolved",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 10
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 10,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 3,
+          "project_refined": 0,
+          "project_id": 3,
+          "project_override": 0,
+          "project_name_snapshot": "Resolved",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    }
+  ],
+  "placeholders": [
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 9
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 9,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": null,
+          "summary": null,
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 9
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 9,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": null,
+          "summary": null,
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    }
+  ],
+  "cache_repair": [
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 11
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 7,
+          "deleted": 0
+        },
+        {
+          "session_id": "source:legacy",
+          "revision": 11,
+          "deleted": 1
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 11
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:local",
+          "revision": 7,
+          "deleted": 0
+        },
+        {
+          "session_id": "source:legacy",
+          "revision": 11,
+          "deleted": 1
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    }
+  ],
+  "t3": [
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 16
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:child",
+          "revision": 16,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:local",
+          "revision": 15,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:child",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": "app-local",
+          "t3_parent_session_id": "session:local",
+          "t3_relationship": "fork"
+        },
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": "fork"
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 16
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:child",
+          "revision": 16,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:local",
+          "revision": 15,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:child",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": "app-local",
+          "t3_parent_session_id": "session:local",
+          "t3_relationship": "fork"
+        },
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": "fork"
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 17
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:child",
+          "revision": 17,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:local",
+          "revision": 15,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [],
+      "sessions": [
+        {
+          "id": "session:child",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": "fork"
+        }
+      ]
+    }
+  ]
+}

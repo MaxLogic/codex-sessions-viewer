@@ -24,11 +24,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut db = None;
     let mut seconds = 60u64;
+    let mut stop_file = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db" => db = Some(PathBuf::from(args.next().ok_or("--db needs a path")?)),
             "--duration-seconds" => {
                 seconds = args.next().ok_or("duration needs seconds")?.parse()?;
+            }
+            "--stop-file" => {
+                stop_file = Some(PathBuf::from(args.next().ok_or("stop-file needs a path")?))
             }
             _ => return Err(format!("unexpected argument {arg}").into()),
         }
@@ -57,7 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_wait = Duration::ZERO;
     let mut attempts = 0u64;
     let mut failures = 0u64;
-    while start.elapsed() < duration {
+    while start.elapsed() < duration && !stop_file.as_ref().is_some_and(|path| path.exists()) {
         let tick = Instant::now();
         attempts += 1;
         if mode == "hold" {

@@ -1115,7 +1115,7 @@ fn drain(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     // the last hook of a day is not left waiting for the next one; it is
     // bounded by MAX_DRAIN_TIME and by each item's retry limit.
     let deadline = std::time::Instant::now() + MAX_DRAIN_TIME;
-    loop {
+    'draining: loop {
         let claims = crate::hooks::claim_due(&queue);
         if claims.is_empty() {
             if options.no_wait {
@@ -1152,7 +1152,24 @@ fn drain(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
             }
         }
         let store = store.as_ref().expect("opened above");
-        for claim in claims {
+        let mut claims = claims.into_iter();
+        while let Some(claim) = claims.next() {
+            let _lease = match crate::hooks::lease_claim(
+                &store.conn,
+                &claim,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .map_err(|error| CliError::Failed(error.to_string()))?
+            {
+                Some(lease) => lease,
+                None => {
+                    for unattempted in claims {
+                        crate::hooks::release(&unattempted)
+                            .map_err(|e| CliError::Failed(e.to_string()))?;
+                    }
+                    break 'draining;
+                }
+            };
             match drain_one(
                 store,
                 options,

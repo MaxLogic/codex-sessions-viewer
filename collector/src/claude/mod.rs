@@ -230,6 +230,7 @@ pub fn collect_coordinated(
     mut gate: impl FnMut(bool) -> StoreResult<bool>,
     flush_sessions: usize,
 ) -> StoreResult<CollectReport> {
+    let _wait = crate::store::write_lease::LeaseWait::enter(std::time::Duration::from_secs(600));
     let holds = crate::store::write_budget::WriteHoldScope::start();
     let is_cancelled = || cancel.load(Ordering::Relaxed);
     let cached: HashMapCache = writer::cached_sources(&store.conn, HARNESS)?
@@ -427,6 +428,7 @@ pub fn collect_file(
     mapper: &PathMapper,
     options: &ClaudeOptions,
 ) -> StoreResult<CollectReport> {
+    let _lease = crate::store::write_lease::WriteLease::acquire(&store.conn)?;
     let holds = crate::store::write_budget::WriteHoldScope::start();
     let mut files = vec![path.to_path_buf()];
     files.extend(subagent_files(path));

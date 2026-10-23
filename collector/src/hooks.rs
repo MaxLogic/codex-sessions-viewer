@@ -353,6 +353,39 @@ pub fn complete(claim: &Claim) {
     let _ = std::fs::remove_file(&claim.path);
 }
 
+/// Return an unattempted claim unchanged after collector-lease contention.
+/// Never rewrite its payload or increment its retry counter.
+pub fn release(claim: &Claim) -> std::io::Result<()> {
+    let name = claim
+        .path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("claim has no filename"))?
+        .to_string_lossy();
+    let base = name
+        .split(".claimed-")
+        .next()
+        .ok_or_else(|| std::io::Error::other("claim has no queue name"))?;
+    std::fs::rename(&claim.path, claim.path.with_file_name(base))
+}
+
+/// Acquire for one drain item. Busy means no attempt was made: release its
+/// claim unchanged. The caller ends the pass and releases any remaining claims.
+pub fn lease_claim<'a>(
+    conn: &'a rusqlite::Connection,
+    claim: &Claim,
+    remaining: Duration,
+) -> crate::store::StoreResult<Option<crate::store::write_lease::WriteLease<'a>>> {
+    let _wait = crate::store::write_lease::LeaseWait::enter(remaining);
+    match crate::store::write_lease::WriteLease::acquire(conn) {
+        Ok(lease) => Ok(Some(lease)),
+        Err(error) if crate::store::write_lease::is_busy(&error) => {
+            release(claim)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Put the entry back with a retry time, or drop it after [`MAX_ATTEMPTS`].
 pub fn retry(dir: &Path, claim: Claim, error: &str) {
     let mut item = claim.item;

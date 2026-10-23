@@ -1,0 +1,769 @@
+{
+  "statuses": {
+    "collector_hub_record_state": [
+      {
+        "record_key": "status:codex:source-status:a",
+        "record_hash": "f86e6b5e1ec28761513c4b31cd999d4bf4c7b5830d16a7bfb93f36d8dcff8b03"
+      },
+      {
+        "record_key": "status:codex:source-status:b",
+        "record_hash": "3238eee30edc8f8785b3199f1d2cb164d63c8a550086b3f1de0cb2ebf039c73d"
+      },
+      {
+        "record_key": "status:codex:source-status:c",
+        "record_hash": "305c500a9912c0025b852c41846d5f9e0da1b9cb9b99c0310a0b3f09059afeb5"
+      },
+      {
+        "record_key": "status:codex:source-status:c:\\a-unknown.zst",
+        "record_hash": "b46b4ca266f318535e0d782f3ad8a961c15084dc5a30c5336100ef8b88900c0c"
+      },
+      {
+        "record_key": "status:codex:source-status:c:\\z-unknown.zst",
+        "record_hash": "5dca4ece4d19caa5c74cbad1bc8088686bf339338d333a8964883a1b3405df45"
+      },
+      {
+        "record_key": "status:codex:source-status:x",
+        "record_hash": "02e6ad1bcfd02f9d1f6b71c76450dfa96f4dd5a7f939894da53fb4e60e9a5c0b"
+      },
+      {
+        "record_key": "status:codex:source-status:y",
+        "record_hash": "84e8b4636ef602b4ac0e395897d60632644b2eb9b43d0445f0eea85b40cf3cf0"
+      },
+      {
+        "record_key": "status:codex:source-status:z",
+        "record_hash": "88bf679c54710941aedd0d5b70704fb64b6bd82608a17075cef9cde823c6d785"
+      }
+    ],
+    "collector_hub_state": [
+      {
+        "id": 1,
+        "hub_url": "http://127.0.0.1:1",
+        "machine_id": "fixture",
+        "last_sequence": 0,
+        "enabled": 1,
+        "inflight_batch_id": null,
+        "inflight_last_id": null
+      }
+    ],
+    "collector_upload_dead_letters": [],
+    "collector_upload_outbox": [
+      {
+        "id": 1,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"b\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:b"
+      },
+      {
+        "id": 2,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"z\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:z"
+      },
+      {
+        "id": 3,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"c\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:c"
+      },
+      {
+        "id": 4,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"y\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:y"
+      },
+      {
+        "id": 5,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"a\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:a"
+      },
+      {
+        "id": 6,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"x\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:x"
+      },
+      {
+        "id": 7,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:/z-unknown.zst\",\"status\":\"unsupported_format\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:c:\\z-unknown.zst"
+      },
+      {
+        "id": 8,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:/a-unknown.zst\",\"status\":\"unsupported_format\",\"state\":\"active\",\"message\":null}}",
+        "created_at_utc": "<clock>",
+        "record_key": "status:codex:source-status:c:\\a-unknown.zst"
+      }
+    ],
+    "session_change_state": [
+      {
+        "id": 1,
+        "revision": 30
+      }
+    ],
+    "session_changes": [
+      {
+        "session_id": "a",
+        "revision": 20,
+        "deleted": 0
+      },
+      {
+        "session_id": "b",
+        "revision": 22,
+        "deleted": 0
+      },
+      {
+        "session_id": "c",
+        "revision": 24,
+        "deleted": 0
+      },
+      {
+        "session_id": "source-status:c:\\a-unknown.zst",
+        "revision": 27,
+        "deleted": 0
+      },
+      {
+        "session_id": "source-status:c:\\z-unknown.zst",
+        "revision": 30,
+        "deleted": 0
+      },
+      {
+        "session_id": "x",
+        "revision": 23,
+        "deleted": 0
+      },
+      {
+        "session_id": "y",
+        "revision": 21,
+        "deleted": 0
+      },
+      {
+        "session_id": "z",
+        "revision": 19,
+        "deleted": 0
+      }
+    ],
+    "queue_sequences": [
+      {
+        "name": "collector_upload_outbox",
+        "seq": 8
+      }
+    ],
+    "sessions": [
+      {
+        "id": "a",
+        "scan_status": "missing",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": "old",
+        "t3_parent_session_id": null,
+        "t3_relationship": "fork"
+      },
+      {
+        "id": "b",
+        "scan_status": "missing",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": "old",
+        "t3_parent_session_id": null,
+        "t3_relationship": "fork"
+      },
+      {
+        "id": "c",
+        "scan_status": "missing",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": "old",
+        "t3_parent_session_id": null,
+        "t3_relationship": "fork"
+      },
+      {
+        "id": "source-status:c:\\a-unknown.zst",
+        "scan_status": "unsupported_format",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "source-status:c:\\z-unknown.zst",
+        "scan_status": "unsupported_format",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "x",
+        "scan_status": "missing",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": "old",
+        "t3_parent_session_id": null,
+        "t3_relationship": "fork"
+      },
+      {
+        "id": "y",
+        "scan_status": "missing",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": "old",
+        "t3_parent_session_id": null,
+        "t3_relationship": "fork"
+      },
+      {
+        "id": "z",
+        "scan_status": "missing",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": "old",
+        "t3_parent_session_id": null,
+        "t3_relationship": "fork"
+      }
+    ],
+    "journal_order": [
+      {
+        "session_id": "z",
+        "revision": 19,
+        "deleted": 0
+      },
+      {
+        "session_id": "a",
+        "revision": 20,
+        "deleted": 0
+      },
+      {
+        "session_id": "y",
+        "revision": 21,
+        "deleted": 0
+      },
+      {
+        "session_id": "b",
+        "revision": 22,
+        "deleted": 0
+      },
+      {
+        "session_id": "x",
+        "revision": 23,
+        "deleted": 0
+      },
+      {
+        "session_id": "c",
+        "revision": 24,
+        "deleted": 0
+      },
+      {
+        "session_id": "source-status:c:\\a-unknown.zst",
+        "revision": 27,
+        "deleted": 0
+      },
+      {
+        "session_id": "source-status:c:\\z-unknown.zst",
+        "revision": 30,
+        "deleted": 0
+      }
+    ],
+    "packet_order": [
+      {
+        "id": 1,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"b\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}"
+      },
+      {
+        "id": 2,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"z\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}"
+      },
+      {
+        "id": 3,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"c\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}"
+      },
+      {
+        "id": 4,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"y\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}"
+      },
+      {
+        "id": 5,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"a\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}"
+      },
+      {
+        "id": 6,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"x\",\"status\":\"missing\",\"state\":\"active\",\"message\":null}}"
+      },
+      {
+        "id": 7,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:/z-unknown.zst\",\"status\":\"unsupported_format\",\"state\":\"active\",\"message\":null}}"
+      },
+      {
+        "id": 8,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":1,\"kind\":\"source_status\",\"record\":{\"harness\":\"codex\",\"path\":\"C:/a-unknown.zst\",\"status\":\"unsupported_format\",\"state\":\"active\",\"message\":null}}"
+      }
+    ]
+  },
+  "t3": {
+    "collector_hub_record_state": [],
+    "collector_hub_state": [
+      {
+        "id": 1,
+        "hub_url": "http://127.0.0.1:1",
+        "machine_id": "fixture",
+        "last_sequence": 0,
+        "enabled": 1,
+        "inflight_batch_id": null,
+        "inflight_last_id": null
+      }
+    ],
+    "collector_upload_dead_letters": [],
+    "collector_upload_outbox": [],
+    "session_change_state": [
+      {
+        "id": 1,
+        "revision": 24
+      }
+    ],
+    "session_changes": [
+      {
+        "session_id": "a",
+        "revision": 20,
+        "deleted": 0
+      },
+      {
+        "session_id": "b",
+        "revision": 22,
+        "deleted": 0
+      },
+      {
+        "session_id": "c",
+        "revision": 24,
+        "deleted": 0
+      },
+      {
+        "session_id": "x",
+        "revision": 23,
+        "deleted": 0
+      },
+      {
+        "session_id": "y",
+        "revision": 21,
+        "deleted": 0
+      },
+      {
+        "session_id": "z",
+        "revision": 19,
+        "deleted": 0
+      }
+    ],
+    "queue_sequences": [],
+    "sessions": [
+      {
+        "id": "a",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "b",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "c",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "x",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "y",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "z",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": null,
+        "title": null,
+        "summary": null,
+        "detected_project_id": null,
+        "project_refined": 0,
+        "project_id": null,
+        "project_override": 0,
+        "project_name_snapshot": null,
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      }
+    ],
+    "journal_order": [
+      {
+        "session_id": "z",
+        "revision": 19,
+        "deleted": 0
+      },
+      {
+        "session_id": "a",
+        "revision": 20,
+        "deleted": 0
+      },
+      {
+        "session_id": "y",
+        "revision": 21,
+        "deleted": 0
+      },
+      {
+        "session_id": "b",
+        "revision": 22,
+        "deleted": 0
+      },
+      {
+        "session_id": "x",
+        "revision": 23,
+        "deleted": 0
+      },
+      {
+        "session_id": "c",
+        "revision": 24,
+        "deleted": 0
+      }
+    ],
+    "packet_order": []
+  },
+  "project_hints": {
+    "collector_hub_record_state": [],
+    "collector_hub_state": [
+      {
+        "id": 1,
+        "hub_url": "http://127.0.0.1:1",
+        "machine_id": "fixture",
+        "last_sequence": 0,
+        "enabled": 1,
+        "inflight_batch_id": null,
+        "inflight_last_id": null
+      }
+    ],
+    "collector_upload_dead_letters": [],
+    "collector_upload_outbox": [
+      {
+        "id": 1,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"z\",\"source_path\":\"C:/peer/z.jsonl\"},{\"session_id\":\"a\",\"source_path\":\"C:/peer/a.jsonl\"},{\"session_id\":\"y\",\"source_path\":\"C:/peer/y.jsonl\"},{\"session_id\":\"b\",\"source_path\":\"C:/peer/b.jsonl\"},{\"session_id\":\"x\",\"source_path\":\"C:/peer/x.jsonl\"},{\"session_id\":\"c\",\"source_path\":\"C:/peer/c.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}",
+        "created_at_utc": "<clock>",
+        "record_key": null
+      }
+    ],
+    "session_change_state": [
+      {
+        "id": 1,
+        "revision": 54
+      }
+    ],
+    "session_changes": [
+      {
+        "session_id": "session:a",
+        "revision": 44,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:b",
+        "revision": 46,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:c",
+        "revision": 48,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:x",
+        "revision": 50,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:y",
+        "revision": 52,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:z",
+        "revision": 54,
+        "deleted": 0
+      }
+    ],
+    "queue_sequences": [
+      {
+        "name": "collector_upload_outbox",
+        "seq": 1
+      }
+    ],
+    "sessions": [
+      {
+        "id": "session:a",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": "",
+        "title": "Synthetic",
+        "summary": "",
+        "detected_project_id": 13,
+        "project_refined": 0,
+        "project_id": 13,
+        "project_override": 0,
+        "project_name_snapshot": "Resolved",
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "session:b",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": "",
+        "title": "Synthetic",
+        "summary": "",
+        "detected_project_id": 13,
+        "project_refined": 0,
+        "project_id": 13,
+        "project_override": 0,
+        "project_name_snapshot": "Resolved",
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "session:c",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": "",
+        "title": "Synthetic",
+        "summary": "",
+        "detected_project_id": 13,
+        "project_refined": 0,
+        "project_id": 13,
+        "project_override": 0,
+        "project_name_snapshot": "Resolved",
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "session:x",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": "",
+        "title": "Synthetic",
+        "summary": "",
+        "detected_project_id": 13,
+        "project_refined": 0,
+        "project_id": 13,
+        "project_override": 0,
+        "project_name_snapshot": "Resolved",
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "session:y",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": "",
+        "title": "Synthetic",
+        "summary": "",
+        "detected_project_id": 13,
+        "project_refined": 0,
+        "project_id": 13,
+        "project_override": 0,
+        "project_name_snapshot": "Resolved",
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      },
+      {
+        "id": "session:z",
+        "scan_status": "available",
+        "source_state": "active",
+        "parse_status": "available",
+        "thread_name": "",
+        "title": "Synthetic",
+        "summary": "",
+        "detected_project_id": 13,
+        "project_refined": 0,
+        "project_id": 13,
+        "project_override": 0,
+        "project_name_snapshot": "Resolved",
+        "t3_parent_thread_id": null,
+        "t3_parent_session_id": null,
+        "t3_relationship": null
+      }
+    ],
+    "journal_order": [
+      {
+        "session_id": "session:a",
+        "revision": 44,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:b",
+        "revision": 46,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:c",
+        "revision": 48,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:x",
+        "revision": 50,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:y",
+        "revision": 52,
+        "deleted": 0
+      },
+      {
+        "session_id": "session:z",
+        "revision": 54,
+        "deleted": 0
+      }
+    ],
+    "packet_order": [
+      {
+        "id": 1,
+        "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"project_hints\",\"record\":{\"harness\":\"codex\",\"sessions\":[{\"session_id\":\"z\",\"source_path\":\"C:/peer/z.jsonl\"},{\"session_id\":\"a\",\"source_path\":\"C:/peer/a.jsonl\"},{\"session_id\":\"y\",\"source_path\":\"C:/peer/y.jsonl\"},{\"session_id\":\"b\",\"source_path\":\"C:/peer/b.jsonl\"},{\"session_id\":\"x\",\"source_path\":\"C:/peer/x.jsonl\"},{\"session_id\":\"c\",\"source_path\":\"C:/peer/c.jsonl\"}],\"hints\":[{\"working_directory\":\"C:/work/repo\",\"project_name\":\"Resolved\"},{\"working_directory\":\"C:/unused\",\"project_name\":\"Unused\"}]}}"
+      }
+    ]
+  }
+}

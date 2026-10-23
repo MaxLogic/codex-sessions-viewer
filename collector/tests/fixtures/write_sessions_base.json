@@ -1,0 +1,337 @@
+{
+  "sessions": [
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 1,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"session_snapshot\",\"record\":{\"harness\":\"codex\",\"machine_id\":null,\"source\":{\"path\":\"C:\\\\synthetic\\\\a.jsonl\",\"environment\":\"windows\",\"state\":\"active\",\"status\":\"available\",\"size\":100,\"modified_utc\":\"2026-09-10T10:00:00.000Z\",\"display_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"mapped_source_file_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"unc_path\":null,\"platform_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"normalized_path_keys\":[\"c:/synthetic/a.jsonl\"]},\"session\":{\"session_id\":\"a\",\"thread_name\":null,\"thread_source\":null,\"parent_thread_id\":null,\"forked_from_id\":null,\"history_base_thread_id\":null,\"history_base_end_ordinal_exclusive\":null,\"history_base_end_byte_offset\":null,\"subagent_history_start_ordinal\":null,\"usage_projection_status\":\"complete\",\"agent_nickname\":null,\"agent_role\":null,\"subagent_depth\":null,\"working_directory_display\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_platform\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"title\":\"Synthetic\",\"summary\":null,\"started_at_utc\":\"2026-09-10T10:00:00Z\",\"last_message_at_utc\":\"2026-09-10T10:05:00Z\",\"models\":[\"model-a\"],\"usage\":{\"input_tokens\":300,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":30,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"parser_version\":4},\"messages\":[{\"index\":0,\"author_type\":\"user\",\"raw_type\":\"user_message\",\"created_at_utc\":\"2026-09-10T10:00:01Z\",\"first_line\":\"hello\",\"content_plain\":\"hello\",\"content_preview\":\"hello\",\"content_truncated\":false,\"usage\":{\"input_tokens\":null,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":null,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"model\":null,\"has_tool_calls\":false,\"has_error\":false}],\"tool_calls\":[{\"tool_index\":0,\"message_index\":1,\"tool_name\":\"shell\",\"status\":\"finished\",\"started_at_utc\":null,\"finished_at_utc\":null,\"input_preview\":\"\",\"output_preview\":\"ok\",\"output_truncated\":false,\"error_message\":null}],\"usage_events\":[{\"source_record_ordinal\":1,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:01:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"2f8fe63a6224321de5d0a24cf30067d37a358706b1ed38b015282ab68dc69ae9\"},{\"source_record_ordinal\":2,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:02:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"d72e654c3645b02dde39fe0be595ef173409544f6e10ea1164759d6c284dbade\"}],\"project_hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": "session:session:a"
+        },
+        {
+          "id": 2,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"session_snapshot\",\"record\":{\"harness\":\"codex\",\"machine_id\":null,\"source\":{\"path\":\"C:\\\\synthetic\\\\b.jsonl\",\"environment\":\"windows\",\"state\":\"active\",\"status\":\"available\",\"size\":100,\"modified_utc\":\"2026-09-10T10:00:00.000Z\",\"display_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"mapped_source_file_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"unc_path\":null,\"platform_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"normalized_path_keys\":[\"c:/synthetic/b.jsonl\"]},\"session\":{\"session_id\":\"b\",\"thread_name\":null,\"thread_source\":null,\"parent_thread_id\":null,\"forked_from_id\":null,\"history_base_thread_id\":null,\"history_base_end_ordinal_exclusive\":null,\"history_base_end_byte_offset\":null,\"subagent_history_start_ordinal\":null,\"usage_projection_status\":\"complete\",\"agent_nickname\":null,\"agent_role\":null,\"subagent_depth\":null,\"working_directory_display\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_platform\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"title\":\"Synthetic\",\"summary\":null,\"started_at_utc\":\"2026-09-10T10:00:00Z\",\"last_message_at_utc\":\"2026-09-10T10:05:00Z\",\"models\":[\"model-a\"],\"usage\":{\"input_tokens\":300,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":30,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"parser_version\":4},\"messages\":[{\"index\":0,\"author_type\":\"user\",\"raw_type\":\"user_message\",\"created_at_utc\":\"2026-09-10T10:00:01Z\",\"first_line\":\"hello\",\"content_plain\":\"hello\",\"content_preview\":\"hello\",\"content_truncated\":false,\"usage\":{\"input_tokens\":null,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":null,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"model\":null,\"has_tool_calls\":false,\"has_error\":false}],\"tool_calls\":[{\"tool_index\":0,\"message_index\":1,\"tool_name\":\"shell\",\"status\":\"finished\",\"started_at_utc\":null,\"finished_at_utc\":null,\"input_preview\":\"\",\"output_preview\":\"ok\",\"output_truncated\":false,\"error_message\":null}],\"usage_events\":[{\"source_record_ordinal\":1,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:01:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"3e499e752620c6a90ed59a200a18132411045ba50ea06c76673ecd53298e5151\"},{\"source_record_ordinal\":2,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:02:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"77c1005401bd4fd1dd7abead933235efcdb445de720551146bc8f8bd13abf74c\"}],\"project_hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": "session:session:b"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 21
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:a",
+          "revision": 14,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:b",
+          "revision": 21,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:local",
+          "revision": 7,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 2
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:a",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 1,
+          "project_refined": 0,
+          "project_id": 1,
+          "project_override": 0,
+          "project_name_snapshot": "synthetic",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "session:b",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 1,
+          "project_refined": 0,
+          "project_id": 1,
+          "project_override": 0,
+          "project_name_snapshot": "synthetic",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 3,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"session_snapshot\",\"record\":{\"harness\":\"codex\",\"machine_id\":null,\"source\":{\"path\":\"C:\\\\synthetic\\\\a.jsonl\",\"environment\":\"windows\",\"state\":\"active\",\"status\":\"available\",\"size\":100,\"modified_utc\":\"2026-09-10T10:00:00.000Z\",\"display_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"mapped_source_file_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"unc_path\":null,\"platform_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"normalized_path_keys\":[\"c:/synthetic/a.jsonl\"]},\"session\":{\"session_id\":\"a\",\"thread_name\":null,\"thread_source\":null,\"parent_thread_id\":null,\"forked_from_id\":null,\"history_base_thread_id\":null,\"history_base_end_ordinal_exclusive\":null,\"history_base_end_byte_offset\":null,\"subagent_history_start_ordinal\":null,\"usage_projection_status\":\"complete\",\"agent_nickname\":null,\"agent_role\":null,\"subagent_depth\":null,\"working_directory_display\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_platform\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"title\":\"Synthetic\",\"summary\":null,\"started_at_utc\":\"2026-09-10T10:00:00Z\",\"last_message_at_utc\":\"2026-09-10T10:05:00Z\",\"models\":[\"model-a\"],\"usage\":{\"input_tokens\":300,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":30,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"parser_version\":4},\"messages\":[{\"index\":0,\"author_type\":\"user\",\"raw_type\":\"user_message\",\"created_at_utc\":\"2026-09-10T10:00:01Z\",\"first_line\":\"hello\",\"content_plain\":\"hello\",\"content_preview\":\"hello\",\"content_truncated\":false,\"usage\":{\"input_tokens\":null,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":null,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"model\":null,\"has_tool_calls\":false,\"has_error\":false}],\"tool_calls\":[{\"tool_index\":0,\"message_index\":1,\"tool_name\":\"shell\",\"status\":\"finished\",\"started_at_utc\":null,\"finished_at_utc\":null,\"input_preview\":\"\",\"output_preview\":\"ok\",\"output_truncated\":false,\"error_message\":null}],\"usage_events\":[{\"source_record_ordinal\":1,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:01:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"2f8fe63a6224321de5d0a24cf30067d37a358706b1ed38b015282ab68dc69ae9\"},{\"source_record_ordinal\":2,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:02:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"d72e654c3645b02dde39fe0be595ef173409544f6e10ea1164759d6c284dbade\"}],\"project_hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": "session:session:a"
+        },
+        {
+          "id": 4,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"session_snapshot\",\"record\":{\"harness\":\"codex\",\"machine_id\":null,\"source\":{\"path\":\"C:\\\\synthetic\\\\b.jsonl\",\"environment\":\"windows\",\"state\":\"active\",\"status\":\"available\",\"size\":100,\"modified_utc\":\"2026-09-10T10:00:00.000Z\",\"display_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"mapped_source_file_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"unc_path\":null,\"platform_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"normalized_path_keys\":[\"c:/synthetic/b.jsonl\"]},\"session\":{\"session_id\":\"b\",\"thread_name\":null,\"thread_source\":null,\"parent_thread_id\":null,\"forked_from_id\":null,\"history_base_thread_id\":null,\"history_base_end_ordinal_exclusive\":null,\"history_base_end_byte_offset\":null,\"subagent_history_start_ordinal\":null,\"usage_projection_status\":\"complete\",\"agent_nickname\":null,\"agent_role\":null,\"subagent_depth\":null,\"working_directory_display\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_platform\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"title\":\"Synthetic\",\"summary\":null,\"started_at_utc\":\"2026-09-10T10:00:00Z\",\"last_message_at_utc\":\"2026-09-10T10:05:00Z\",\"models\":[\"model-a\"],\"usage\":{\"input_tokens\":300,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":30,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"parser_version\":4},\"messages\":[{\"index\":0,\"author_type\":\"user\",\"raw_type\":\"user_message\",\"created_at_utc\":\"2026-09-10T10:00:01Z\",\"first_line\":\"hello\",\"content_plain\":\"hello\",\"content_preview\":\"hello\",\"content_truncated\":false,\"usage\":{\"input_tokens\":null,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":null,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"model\":null,\"has_tool_calls\":false,\"has_error\":false}],\"tool_calls\":[{\"tool_index\":0,\"message_index\":1,\"tool_name\":\"shell\",\"status\":\"finished\",\"started_at_utc\":null,\"finished_at_utc\":null,\"input_preview\":\"\",\"output_preview\":\"ok\",\"output_truncated\":false,\"error_message\":null}],\"usage_events\":[{\"source_record_ordinal\":1,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:01:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"3e499e752620c6a90ed59a200a18132411045ba50ea06c76673ecd53298e5151\"},{\"source_record_ordinal\":2,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:02:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"77c1005401bd4fd1dd7abead933235efcdb445de720551146bc8f8bd13abf74c\"}],\"project_hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": "session:session:b"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 25
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:a",
+          "revision": 23,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:b",
+          "revision": 25,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:local",
+          "revision": 7,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 4
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:a",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 1,
+          "project_refined": 0,
+          "project_id": 1,
+          "project_override": 0,
+          "project_name_snapshot": "synthetic",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "session:b",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 1,
+          "project_refined": 0,
+          "project_id": 1,
+          "project_override": 0,
+          "project_name_snapshot": "synthetic",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    },
+    {
+      "collector_hub_record_state": [],
+      "collector_hub_state": [
+        {
+          "id": 1,
+          "hub_url": "http://127.0.0.1:1",
+          "machine_id": "fixture",
+          "last_sequence": 0,
+          "enabled": 1,
+          "inflight_batch_id": null,
+          "inflight_last_id": null
+        }
+      ],
+      "collector_upload_dead_letters": [],
+      "collector_upload_outbox": [
+        {
+          "id": 5,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"session_snapshot\",\"record\":{\"harness\":\"codex\",\"machine_id\":null,\"source\":{\"path\":\"C:\\\\synthetic\\\\a.jsonl\",\"environment\":\"windows\",\"state\":\"active\",\"status\":\"available\",\"size\":100,\"modified_utc\":\"2026-09-10T10:00:00.000Z\",\"display_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"mapped_source_file_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"unc_path\":null,\"platform_path\":\"C:\\\\synthetic\\\\a.jsonl\",\"normalized_path_keys\":[\"c:/synthetic/a.jsonl\"]},\"session\":{\"session_id\":\"a\",\"thread_name\":null,\"thread_source\":null,\"parent_thread_id\":null,\"forked_from_id\":null,\"history_base_thread_id\":null,\"history_base_end_ordinal_exclusive\":null,\"history_base_end_byte_offset\":null,\"subagent_history_start_ordinal\":null,\"usage_projection_status\":\"complete\",\"agent_nickname\":null,\"agent_role\":null,\"subagent_depth\":null,\"working_directory_display\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_platform\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"title\":\"Changed title\",\"summary\":null,\"started_at_utc\":\"2026-09-10T10:00:00Z\",\"last_message_at_utc\":\"2026-09-10T10:05:00Z\",\"models\":[\"model-a\"],\"usage\":{\"input_tokens\":300,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":30,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"parser_version\":4},\"messages\":[{\"index\":0,\"author_type\":\"user\",\"raw_type\":\"user_message\",\"created_at_utc\":\"2026-09-10T10:00:01Z\",\"first_line\":\"hello\",\"content_plain\":\"hello\",\"content_preview\":\"hello\",\"content_truncated\":false,\"usage\":{\"input_tokens\":null,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":null,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"model\":null,\"has_tool_calls\":false,\"has_error\":false}],\"tool_calls\":[{\"tool_index\":0,\"message_index\":1,\"tool_name\":\"shell\",\"status\":\"finished\",\"started_at_utc\":null,\"finished_at_utc\":null,\"input_preview\":\"\",\"output_preview\":\"ok\",\"output_truncated\":false,\"error_message\":null}],\"usage_events\":[{\"source_record_ordinal\":1,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:01:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"2f8fe63a6224321de5d0a24cf30067d37a358706b1ed38b015282ab68dc69ae9\"},{\"source_record_ordinal\":2,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:02:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"d72e654c3645b02dde39fe0be595ef173409544f6e10ea1164759d6c284dbade\"}],\"project_hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": "session:session:a"
+        },
+        {
+          "id": 6,
+          "record_json": "{\"contract\":\"codex-sessions-viewer.ingest\",\"version\":2,\"kind\":\"session_snapshot\",\"record\":{\"harness\":\"codex\",\"machine_id\":null,\"source\":{\"path\":\"C:\\\\synthetic\\\\b.jsonl\",\"environment\":\"windows\",\"state\":\"active\",\"status\":\"available\",\"size\":100,\"modified_utc\":\"2026-09-10T10:00:00.000Z\",\"display_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"mapped_source_file_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"unc_path\":null,\"platform_path\":\"C:\\\\synthetic\\\\b.jsonl\",\"normalized_path_keys\":[\"c:/synthetic/b.jsonl\"]},\"session\":{\"session_id\":\"b\",\"thread_name\":null,\"thread_source\":null,\"parent_thread_id\":null,\"forked_from_id\":null,\"history_base_thread_id\":null,\"history_base_end_ordinal_exclusive\":null,\"history_base_end_byte_offset\":null,\"subagent_history_start_ordinal\":null,\"usage_projection_status\":\"complete\",\"agent_nickname\":null,\"agent_role\":null,\"subagent_depth\":null,\"working_directory_display\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_platform\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"title\":\"Synthetic\",\"summary\":null,\"started_at_utc\":\"2026-09-10T10:00:00Z\",\"last_message_at_utc\":\"2026-09-10T10:05:00Z\",\"models\":[\"model-a\"],\"usage\":{\"input_tokens\":300,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":30,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"parser_version\":4},\"messages\":[{\"index\":0,\"author_type\":\"user\",\"raw_type\":\"user_message\",\"created_at_utc\":\"2026-09-10T10:00:01Z\",\"first_line\":\"hello\",\"content_plain\":\"hello\",\"content_preview\":\"hello\",\"content_truncated\":false,\"usage\":{\"input_tokens\":null,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":null,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"model\":null,\"has_tool_calls\":false,\"has_error\":false}],\"tool_calls\":[{\"tool_index\":0,\"message_index\":1,\"tool_name\":\"shell\",\"status\":\"finished\",\"started_at_utc\":null,\"finished_at_utc\":null,\"input_preview\":\"\",\"output_preview\":\"ok\",\"output_truncated\":false,\"error_message\":null}],\"usage_events\":[{\"source_record_ordinal\":1,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:01:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"3e499e752620c6a90ed59a200a18132411045ba50ea06c76673ecd53298e5151\"},{\"source_record_ordinal\":2,\"rollout_ordinal\":null,\"turn_ordinal\":0,\"counter_epoch\":0,\"occurred_at_utc\":\"2026-09-10T10:02:00Z\",\"model\":\"model-a\",\"provider\":null,\"working_directory\":\"C:\\\\nonexistent\\\\synthetic\",\"working_directory_unc\":null,\"usage\":{\"input_tokens\":150,\"cached_input_tokens\":null,\"cache_write_input_tokens\":null,\"output_tokens\":15,\"reasoning_output_tokens\":null,\"total_tokens\":null},\"request_input_tokens\":null,\"model_context_window\":null,\"billable_units\":null,\"derivation\":\"last_token_usage\",\"branch_scope\":\"local\",\"event_fingerprint\":\"77c1005401bd4fd1dd7abead933235efcdb445de720551146bc8f8bd13abf74c\"}],\"project_hints\":[]}}",
+          "created_at_utc": "<clock>",
+          "record_key": "session:session:b"
+        }
+      ],
+      "session_change_state": [
+        {
+          "id": 1,
+          "revision": 29
+        }
+      ],
+      "session_changes": [
+        {
+          "session_id": "session:a",
+          "revision": 27,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:b",
+          "revision": 29,
+          "deleted": 0
+        },
+        {
+          "session_id": "session:local",
+          "revision": 7,
+          "deleted": 0
+        }
+      ],
+      "queue_sequences": [
+        {
+          "name": "collector_upload_outbox",
+          "seq": 6
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session:a",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Changed title",
+          "summary": "",
+          "detected_project_id": 1,
+          "project_refined": 0,
+          "project_id": 1,
+          "project_override": 0,
+          "project_name_snapshot": "synthetic",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "session:b",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 1,
+          "project_refined": 0,
+          "project_id": 1,
+          "project_override": 0,
+          "project_name_snapshot": "synthetic",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        },
+        {
+          "id": "session:local",
+          "scan_status": "available",
+          "source_state": "active",
+          "parse_status": "available",
+          "thread_name": "",
+          "title": "Synthetic",
+          "summary": "",
+          "detected_project_id": 2,
+          "project_refined": 0,
+          "project_id": 2,
+          "project_override": 0,
+          "project_name_snapshot": "repo",
+          "t3_parent_thread_id": null,
+          "t3_parent_session_id": null,
+          "t3_relationship": null
+        }
+      ]
+    }
+  ]
+}

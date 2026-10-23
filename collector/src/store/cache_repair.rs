@@ -25,7 +25,7 @@ use crate::codex::scanner::ScanRoot;
 use crate::dart::{DartDateTime, sha256_hex};
 
 use super::Store;
-use super::schema::{StoreError, StoreResult, begin_write, finish, last_applied_version};
+use super::schema::{StoreError, StoreResult, last_applied_version};
 
 pub const REPAIR_VERSION: i64 = 3;
 /// The viewer and older collectors check this key; it must not change.
@@ -150,11 +150,16 @@ pub const RETRY_BACKOFF_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 /// reached and listed every configured root and was not cancelled; files
 /// that failed to parse do not count against it.
 ///
-/// Only the audit and the final delete hold a writer lease. The pre-repair
+/// Only the audit and final delete hold a GUI write grant. The collector lease
+/// is released before requesting each grant, then reacquired after it; enclosing
+/// collector leases are refused rather than reversing that order. The pre-repair
 /// backup (`VACUUM INTO` and its checks) runs between them, and the delete
-/// re-classifies every row under the write lock, so a GUI write made during
-/// the backup cannot be lost. A repair error postpones the repair and never
-/// fails the scan; only a failing `gate` is returned as an error.
+/// re-classifies outside the lock, then checks data_version and indexed row
+/// fingerprints under the lock, so a GUI write during the backup is preserved. A repair error postpones the repair and never
+/// fails the scan; only a failing `gate` or collector lease is returned as an
+/// error before completion. Once completion commits, its report and recovery
+/// copy are preserved even if releasing the grant fails. Subsequent writer calls
+/// still check the viewer's migration fence.
 pub fn run(
     store: &Store,
     roots: &[ScanRoot],
@@ -182,7 +187,12 @@ pub fn run_with(
     resolver: &PhysicalPathResolver,
     gate: &mut WriterGate<'_>,
 ) -> StoreResult<RepairReport> {
-    let mut leases = Leases { gate, error: None };
+    let mut leases = Leases {
+        conn,
+        collector: Some(super::write_lease::WriteLease::acquire(conn)?),
+        gate,
+        error: None,
+    };
     let report = match repair(
         conn,
         database,
@@ -201,6 +211,16 @@ pub fn run_with(
             RepairReport::postponed("unexpected_repair_error", None)
         }
     };
+    if report.status == "completed" {
+        // The completion marker (and deletion, if any) already committed. There
+        // is no more work requiring a lease or migration check in this call.
+        // In particular, a late error must not obscure that durable outcome.
+        if let Some(error) = leases.error {
+            eprintln!("cache repair completed; viewer grant release failed: {error}");
+        }
+        return Ok(report);
+    }
+    super::schema::ensure_no_pending_viewer_migration(conn)?;
     match leases.error {
         Some(error) => Err(error),
         None => Ok(report),
@@ -209,14 +229,23 @@ pub fn run_with(
 
 /// Runs writes under the GUI lease, keeping a gate failure apart from repair
 /// failures.
-struct Leases<'g, 'a> {
+struct Leases<'g, 'a, 'c> {
+    conn: &'c Connection,
+    collector: Option<super::write_lease::WriteLease<'c>>,
     gate: &'g mut WriterGate<'a>,
     error: Option<StoreError>,
 }
 
-impl Leases<'_, '_> {
+impl Leases<'_, '_, '_> {
     /// `None` when the lease was refused because the scan was cancelled.
     fn with<T>(&mut self, write: impl FnOnce() -> StoreResult<T>) -> StoreResult<Option<T>> {
+        // Reload can own the GUI slot while waiting for this database's lease.
+        // Never wait for the slot while retaining the lease, even reentrantly.
+        drop(self.collector.take());
+        if let Err(error) = super::write_lease::before_viewer_grant() {
+            self.error = Some(error);
+            return Err(StoreError::Refused("the writer lease failed".to_owned()));
+        }
         match (self.gate)(true) {
             Ok(true) => {}
             Ok(false) => return Ok(None),
@@ -225,13 +254,39 @@ impl Leases<'_, '_> {
                 return Err(StoreError::Refused("the writer lease failed".to_owned()));
             }
         }
-        let result = write();
-        // A failed release is reported by `run`; the write itself committed
-        // or rolled back already, so its own result still decides the repair.
+        let result = match super::write_lease::WriteLease::acquire(self.conn) {
+            Ok(lease) => {
+                self.collector = Some(lease);
+                write()
+            }
+            Err(error) => {
+                self.error = Some(error);
+                Err(StoreError::Refused("the writer lease failed".to_owned()))
+            }
+        };
+        drop(self.collector.take());
+        // Keep release errors separate: the write's own result alone decides
+        // whether recovery data is required. `run` preserves completed reports.
         if let Err(error) = (self.gate)(false) {
             self.error.get_or_insert(error);
         }
         result.map(Some)
+    }
+
+    /// Only an incomplete audit needs a following lease for the backup interval.
+    /// Do not reacquire after the final delete (or a no-changes audit) commits.
+    fn acquire_for_backup(&mut self) -> StoreResult<()> {
+        if self.error.is_some() {
+            return Err(StoreError::Refused("the writer lease failed".to_owned()));
+        }
+        match super::write_lease::WriteLease::acquire(self.conn) {
+            Ok(lease) => self.collector = Some(lease),
+            Err(error) => {
+                self.error.get_or_insert(error);
+                return Err(StoreError::Refused("the writer lease failed".to_owned()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -242,7 +297,7 @@ fn repair(
     discovery_complete: bool,
     cancel: &Arc<AtomicBool>,
     resolver: &PhysicalPathResolver,
-    leases: &mut Leases<'_, '_>,
+    leases: &mut Leases<'_, '_, '_>,
 ) -> StoreResult<RepairReport> {
     let cancelled = || cancel.load(Ordering::Relaxed);
     if is_completed(conn)? {
@@ -272,8 +327,8 @@ fn repair(
         return Ok(RepairReport::postponed("backoff", None));
     }
 
-    // Classify outside the lease; the audit re-classifies under the write
-    // lock only when another connection committed in between.
+    // Classify outside the GUI grant; re-classify outside the write lock if
+    // another connection committed in between.
     let classified_at = data_version(conn)?;
     let entries = classify_rows(conn, roots, resolver)?;
     if cancelled() {
@@ -291,6 +346,9 @@ fn repair(
     if cancelled() {
         return Ok(RepairReport::postponed("cancelled", Some(&audit)));
     }
+    // Exclude other repairs during the no-grant backup interval, after releasing
+    // the GUI slot. Failure here precedes backup creation and any deletion.
+    leases.acquire_for_backup()?;
     let backup = backup_directory.join(backup_name(database, &audit.id));
     if let Err(_error) = create_verified_backup(conn, database, &backup, &audit) {
         discard_backup(&backup);
@@ -301,9 +359,15 @@ fn repair(
         return Ok(RepairReport::postponed("cancelled", Some(&audit)));
     }
 
-    // Every failure from here on, including a refused `begin immediate`,
-    // discards the backup: it would otherwise be left behind unreferenced.
-    let deleted = leases.with(|| delete_audited_rows(conn, roots, resolver, &audit));
+    // Only refusal or failure of the deletion itself discards this unused copy.
+    // Once deletion commits, grant release must not replace its successful result.
+    let deleted = leases.with(|| {
+        // Another repair may have discarded an apparently orphaned backup
+        // while this call waited for its second GUI grant. Recheck the verified
+        // recovery copy after reacquiring the lease, outside BEGIN IMMEDIATE.
+        verify_backup(&backup, &audit, last_applied_version(conn)?)?;
+        delete_audited_rows(conn, roots, resolver, &audit)
+    });
     match deleted {
         Ok(Some(deleted)) => {
             let mut report = RepairReport::new("completed", "completed", Some(&audit));
@@ -333,43 +397,73 @@ fn delete_audited_rows(
     resolver: &PhysicalPathResolver,
     audit: &Audit,
 ) -> StoreResult<usize> {
-    let _phase = super::write_budget::write_phase("cache_repair_delete");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<usize> {
-        let entries = classify_rows(conn, roots, resolver)?;
-        if entries != audit.entries {
-            return Err(StoreError::Refused(
-                "repair predicates changed after the backup".to_owned(),
-            ));
-        }
-        let mut deleted_ids = Vec::new();
-        for entry in entries.iter().filter(|entry| entry.delete_eligible) {
-            let id: String = conn
-                .query_row(
-                    "select id from sessions where rowid = ?",
-                    [entry.row_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or_else(|| StoreError::Refused("a repair candidate disappeared".to_owned()))?;
-            conn.execute("delete from usage_events where session_row_id = ?", [&id])?;
-            conn.execute("delete from tool_calls where session_id = ?", [&id])?;
-            conn.execute("delete from messages where session_id = ?", [&id])?;
-            conn.execute("delete from session_tags where session_id = ?", [&id])?;
-            conn.execute("delete from session_path_keys where session_id = ?", [&id])?;
-            conn.execute("delete from session_search where rowid = ?", [entry.row_id])?;
-            conn.execute("delete from sessions where rowid = ?", [entry.row_id])?;
-            deleted_ids.push(id);
-        }
-        write_completion(conn, &audit.id)?;
-        if references_remain(conn, &deleted_ids)? {
-            return Err(StoreError::Refused(
-                "repair database invariants failed".to_owned(),
-            ));
-        }
-        Ok(deleted_ids.len())
-    })();
-    finish(conn, result)
+    let (entries, stamp) = stable_classification(conn, roots, resolver)?;
+    if entries != audit.entries {
+        return Err(StoreError::Refused(
+            "repair predicates changed after the backup".to_owned(),
+        ));
+    }
+    let eligible: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.delete_eligible)
+        .collect();
+    let mut deleted = 0;
+    // Safety-sensitive deletion remains one exclusive atomic unit. All
+    // classification and filesystem work has already finished without a lock.
+    super::write_budget::write_chunked(
+        conn,
+        "cache_repair_delete",
+        super::write_budget::current_budget(),
+        1,
+        [()],
+        || Ok(()),
+        |_, ()| {
+            if data_version(conn)? != stamp {
+                return Err(StoreError::Refused(
+                    "repair predicates changed after the backup".to_owned(),
+                ));
+            }
+            let mut deleted_ids = Vec::new();
+            for entry in &eligible {
+                let current = load_rows_where(conn, Some(entry.row_id))?;
+                if current
+                    .first()
+                    .is_none_or(|row| row.fingerprint() != entry.fingerprint)
+                {
+                    return Err(StoreError::Refused(
+                        "a repair candidate changed after classification".to_owned(),
+                    ));
+                }
+                let id: String = conn
+                    .query_row(
+                        "select id from sessions where rowid = ?",
+                        [entry.row_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        StoreError::Refused("a repair candidate disappeared".to_owned())
+                    })?;
+                conn.execute("delete from usage_events where session_row_id = ?", [&id])?;
+                conn.execute("delete from tool_calls where session_id = ?", [&id])?;
+                conn.execute("delete from messages where session_id = ?", [&id])?;
+                conn.execute("delete from session_tags where session_id = ?", [&id])?;
+                conn.execute("delete from session_path_keys where session_id = ?", [&id])?;
+                conn.execute("delete from session_search where rowid = ?", [entry.row_id])?;
+                conn.execute("delete from sessions where rowid = ?", [entry.row_id])?;
+                deleted_ids.push(id);
+            }
+            write_completion(conn, &audit.id)?;
+            if references_remain(conn, &deleted_ids)? {
+                return Err(StoreError::Refused(
+                    "repair database invariants failed".to_owned(),
+                ));
+            }
+            deleted = deleted_ids.len();
+            Ok(())
+        },
+    )?;
+    Ok(deleted)
 }
 
 fn is_completed(conn: &Connection) -> StoreResult<bool> {
@@ -460,48 +554,103 @@ fn record_audit(
     resolver: &PhysicalPathResolver,
     entries: Vec<Entry>,
     classified_at: i64,
-    inputs: &str,
+    _inputs: &str,
     now: DartDateTime,
 ) -> StoreResult<Audit> {
-    let _phase = super::write_budget::write_phase("cache_repair_audit");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<Audit> {
-        let entries = if data_version(conn)? == classified_at {
-            entries
-        } else {
-            classify_rows(conn, roots, resolver)?
-        };
-        let id = match recorded_audit_id(conn, &entries)? {
-            Some(id) => id,
-            None => {
-                let id = format!(
+    enum Unit {
+        Delete(i64),
+        Insert(String, Entry),
+        Finish(Audit, String),
+    }
+    let mut initial = Some(entries);
+    let completed = std::cell::RefCell::new(None);
+    let recorded = now.to_iso8601();
+    super::write_budget::write_planned(
+        conn,
+        "cache_repair_audit",
+        500,
+        || {
+            // Keep repair's own viewer-edit classification check, independent
+            // of collector exclusion. This call plans the manifest only once.
+            let entries = match initial.take() {
+                Some(entries) if data_version(conn)? == classified_at => entries,
+                _ => classify_rows(conn, roots, resolver)?,
+            };
+            let existing = recorded_audit_id(conn, &entries)?;
+            let id = existing.clone().unwrap_or_else(|| {
+                format!(
                     "repair-{REPAIR_VERSION}-{}-{}",
                     now.micros(),
                     AUDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
+                )
+            });
+            let mut units = Vec::new();
+            if existing.is_none() {
+                let old: Vec<i64> = conn
+                    .prepare("select session_rowid from session_cache_repair_manifest")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?;
+                units.extend(old.into_iter().map(Unit::Delete));
+                units.extend(
+                    entries
+                        .iter()
+                        .cloned()
+                        .map(|entry| Unit::Insert(id.clone(), entry)),
                 );
-                write_manifest(conn, &id, &entries, now)?;
-                id
             }
-        };
-        let mut audit = Audit {
-            id,
-            entries,
-            completed: false,
-        };
-        if audit.delete_eligible() == 0 {
-            write_completion(conn, &audit.id)?;
-            audit.completed = true;
-        } else {
-            write_metadata(
-                conn,
-                ATTEMPT_KEY,
-                &json!({"inputs": inputs, "attempted_at_utc": now.to_iso8601(), "audit_id": audit.id})
-                    .to_string(),
-            )?;
+            let mut audit = Audit {
+                id,
+                completed: false,
+                entries,
+            };
+            audit.completed = audit.delete_eligible() == 0;
+            units.push(Unit::Finish(audit, repair_inputs(conn, roots)?));
+            Ok(units)
+        },
+        |unit| {
+            match unit {
+                Unit::Delete(rowid) => {
+                    conn.prepare_cached(
+                        "delete from session_cache_repair_manifest where session_rowid=?",
+                    )?
+                    .execute([rowid])?;
+                }
+                Unit::Insert(id, entry) => {
+                    conn.prepare_cached("insert into session_cache_repair_manifest(audit_id,repair_version,session_rowid,row_fingerprint,category,reason_code,delete_eligible,recorded_at_utc) values (?,?,?,?,?,?,?,?)")?
+                        .execute(params![id,REPAIR_VERSION,entry.row_id,entry.fingerprint,entry.category.wire_name(),entry.reason_code,entry.delete_eligible,recorded])?;
+                }
+                Unit::Finish(audit, inputs) => {
+                    if audit.completed {
+                        write_completion(conn, &audit.id)?;
+                    } else {
+                        write_metadata(conn,ATTEMPT_KEY,&json!({"inputs":inputs,"attempted_at_utc":recorded,"audit_id":audit.id}).to_string())?;
+                    }
+                    *completed.borrow_mut() = Some(audit);
+                }
+            }
+            Ok(())
+        },
+    )?;
+    completed
+        .into_inner()
+        .ok_or_else(|| StoreError::Refused("repair audit did not complete".to_owned()))
+}
+
+fn stable_classification(
+    conn: &Connection,
+    roots: &[ScanRoot],
+    resolver: &PhysicalPathResolver,
+) -> StoreResult<(Vec<Entry>, i64)> {
+    for _ in 0..3 {
+        let stamp = data_version(conn)?;
+        let entries = classify_rows(conn, roots, resolver)?;
+        if data_version(conn)? == stamp {
+            return Ok((entries, stamp));
         }
-        Ok(audit)
-    })();
-    finish(conn, result)
+    }
+    Err(StoreError::Refused(
+        "repair classification changed repeatedly; postpone".to_owned(),
+    ))
 }
 
 /// The stored manifest's audit ID when it records exactly `entries`.
@@ -540,35 +689,6 @@ fn recorded_audit_id(conn: &Connection, entries: &[Entry]) -> StoreResult<Option
                 && row.6 == entry.delete_eligible
         });
     Ok(same.then_some(id))
-}
-
-fn write_manifest(
-    conn: &Connection,
-    id: &str,
-    entries: &[Entry],
-    now: DartDateTime,
-) -> StoreResult<()> {
-    conn.execute("delete from session_cache_repair_manifest", [])?;
-    let mut insert = conn.prepare(
-        "insert into session_cache_repair_manifest (
-           audit_id, repair_version, session_rowid, row_fingerprint,
-           category, reason_code, delete_eligible, recorded_at_utc
-         ) values (?, ?, ?, ?, ?, ?, ?, ?)",
-    )?;
-    let recorded = now.to_iso8601();
-    for entry in entries {
-        insert.execute(params![
-            id,
-            REPAIR_VERSION,
-            entry.row_id,
-            entry.fingerprint,
-            entry.category.wire_name(),
-            entry.reason_code,
-            entry.delete_eligible,
-            recorded,
-        ])?;
-    }
-    Ok(())
 }
 
 /// The `backups` folder beside the database.
@@ -815,8 +935,11 @@ impl Row {
 }
 
 fn load_rows(conn: &Connection) -> StoreResult<Vec<Row>> {
-    let mut statement = conn.prepare(
-        "select s.rowid, s.id, s.session_id, s.source_type,
+    load_rows_where(conn, None)
+}
+
+fn load_rows_where(conn: &Connection, row_id: Option<i64>) -> StoreResult<Vec<Row>> {
+    let sql = "select s.rowid, s.id, s.session_id, s.source_type,
            s.source_file_path, s.source_file_unc_path, s.display_path, s.platform_path,
            s.parser_version,
            coalesce(s.is_pinned, 0) = 1, coalesce(s.is_archived, 0) = 1,
@@ -827,10 +950,15 @@ fn load_rows(conn: &Connection) -> StoreResult<Vec<Row>> {
            (select count(*) from tool_calls tc where tc.session_id = s.id),
            (select count(*) from usage_events ue where ue.session_row_id = s.id),
            (select count(*) from session_tags st where st.session_id = s.id)
-         from sessions s where s.harness = 'codex' order by s.rowid",
-    )?;
+         from sessions s where s.harness = 'codex'";
+    let sql = if row_id.is_some() {
+        format!("{sql} and s.rowid=? order by s.rowid")
+    } else {
+        format!("{sql} order by s.rowid")
+    };
+    let mut statement = conn.prepare(&sql)?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(row_id), |row| {
             let mut paths: Vec<String> = Vec::new();
             for index in 4..8 {
                 if let Some(path) = row.get::<_, Option<String>>(index)? {

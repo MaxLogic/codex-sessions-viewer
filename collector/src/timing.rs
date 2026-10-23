@@ -5,7 +5,7 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("CODEX_SESSIONS_COLLECTOR_TIMINGS").is_some())
 }

@@ -103,6 +103,7 @@ pub fn collect_coordinated(
     mut gate: impl FnMut(bool) -> StoreResult<bool>,
     batching: CollectionBatching,
 ) -> StoreResult<CollectReport> {
+    let _wait = crate::store::write_lease::LeaseWait::enter(std::time::Duration::from_secs(600));
     let holds = crate::store::write_budget::WriteHoldScope::start();
     let is_cancelled = || cancel.load(Ordering::Relaxed);
     let mut phases = crate::timing::Phases::start();
@@ -301,6 +302,7 @@ pub fn gated<T>(
     gate: &mut impl FnMut(bool) -> StoreResult<bool>,
     write: impl FnOnce() -> StoreResult<T>,
 ) -> StoreResult<Option<T>> {
+    crate::store::write_lease::before_viewer_grant()?;
     if !gate(true)? {
         return Ok(None);
     }
@@ -477,8 +479,8 @@ pub fn collect_file_with(
     root: &ScanRoot,
     resolve_wsl: impl FnOnce(&[String]) -> HashMap<String, String>,
 ) -> StoreResult<CollectReport> {
+    let _lease = crate::store::write_lease::WriteLease::acquire(&store.conn)?;
     let holds = crate::store::write_budget::WriteHoldScope::start();
-    writer::clean_session_metadata_placeholders(&store.conn)?;
     let mut counts = ScanCounts {
         files_found: 1,
         ..ScanCounts::default()

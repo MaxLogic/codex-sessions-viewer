@@ -25,6 +25,8 @@ fn payloads(conn: &Connection, table: &str) -> Result<Vec<Value>, String> {
 /// A failed optional lookup leaves the last known relationships intact. A
 /// successful snapshot replaces only T3 metadata in the configured source.
 pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, String> {
+    let _lease =
+        crate::store::write_lease::WriteLease::acquire(viewer).map_err(|e| e.to_string())?;
     let t3 = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -36,6 +38,50 @@ pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, S
         .map_err(|e| e.to_string())?;
     let threads = payloads(&t3, "orchestration_v2_projection_threads")?;
     let providers = payloads(&t3, "orchestration_v2_projection_provider_threads")?;
+    let matched = std::cell::Cell::new(0);
+    crate::store::write_budget::write_planned(viewer,"t3_lineage",500,|| {
+        // Collector identities are stable under this call's writer lease.
+        let updates = match_updates(viewer, source, &threads, &providers)
+            .map_err(crate::store::StoreError::Refused)?;
+        matched.set(updates.len());
+        let retained: HashSet<_> = updates.iter().map(|update| update.0.as_str()).collect();
+        let mut changes = Vec::new();
+        let mut old = viewer.prepare("select id,t3_parent_thread_id,t3_parent_session_id,t3_relationship from sessions where source_type=?")?;
+        let rows = old.query_map([source],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))?;
+        let current: HashMap<_,_> = rows.map(|row|row.map(|(id,parent,resolved,relation)|(id,(parent,resolved,relation)))).collect::<Result<_,_>>()?;
+        // Use the exact base SELECT for cleanup order. The lookup map above is
+        // only for equality checks, never an effect iterator (CXV-180 F7).
+        let mut old = viewer.prepare("select id from sessions where source_type = ? and t3_parent_thread_id is not null")?;
+        let old_ids = old.query_map([source], |row| row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
+        for id in old_ids {
+            // Match the base cleanup predicate; orphan relation-only values
+            // without a parent thread were not cleared or journaled.
+            if !retained.contains(id.as_str()) {
+                changes.push((id,None,None,None));
+            }
+        }
+        for (id,parent,resolved,relation) in &updates {
+            if current.get(id) != Some(&(parent.clone(),resolved.clone(),relation.clone())) {
+                changes.push((id.clone(),parent.clone(),resolved.clone(),relation.clone()));
+            }
+        }
+        Ok(changes)
+    },|(id,parent,resolved,relation)| {
+        viewer.prepare_cached("update sessions set t3_parent_thread_id=?1,t3_parent_session_id=?2,t3_relationship=?3
+            where id=?4 and source_type=?5 and (t3_parent_thread_id is not ?1 or t3_parent_session_id is not ?2 or t3_relationship is not ?3)")?
+            .execute(params![parent,resolved,relation,id,source])?;
+        Ok(())
+    }).map_err(|error|error.to_string())?;
+    Ok(matched.get())
+}
+
+type LineageUpdate = (String, Option<String>, Option<String>, Option<String>);
+fn match_updates(
+    viewer: &Connection,
+    source: &str,
+    threads: &[Value],
+    providers: &[Value],
+) -> Result<Vec<LineageUpdate>, String> {
     let mut sessions: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut stmt = viewer
         .prepare("select id, harness, session_id from sessions where source_type = ? and parse_status = 'available' and scan_status = 'available'")
@@ -60,7 +106,7 @@ pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, S
     let mut app_sessions: HashMap<String, HashSet<String>> = HashMap::new();
     let mut session_apps: HashMap<String, HashSet<String>> = HashMap::new();
     for provider in providers {
-        let Some(app) = field(&provider, "appThreadId") else {
+        let Some(app) = field(provider, "appThreadId") else {
             continue;
         };
         let Some(reference) = provider.get("nativeThreadRef") else {
@@ -72,7 +118,7 @@ pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, S
         if field(reference, "strength") != Some("strong") {
             continue;
         }
-        let driver = field(&provider, "driver");
+        let driver = field(provider, "driver");
         if driver != field(reference, "driver") {
             continue;
         }
@@ -97,7 +143,7 @@ pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, S
     }
     let mut updates = Vec::new();
     for thread in threads {
-        let app = field(&thread, "id").ok_or("T3 thread has no id")?;
+        let app = field(thread, "id").ok_or("T3 thread has no id")?;
         let lineage = thread
             .get("lineage")
             .ok_or("Unsupported T3 thread lineage")?;
@@ -130,36 +176,7 @@ pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, S
             ));
         }
     }
-    let _phase = crate::store::write_budget::write_phase("t3_lineage");
-    crate::store::write_budget::begin_write(viewer).map_err(|e| e.to_string())?;
-    let _rollback = crate::store::write_budget::rollback_on_panic(viewer);
-    let result = (|| -> Result<usize, String> {
-        // Do not clear first: unchanged snapshots must not emit change revisions.
-        let retained: HashSet<_> = updates.iter().map(|u| u.0.as_str()).collect();
-        let mut old = viewer
-            .prepare(
-                "select id from sessions where source_type = ? and t3_parent_thread_id is not null",
-            )
-            .map_err(|e| e.to_string())?;
-        let old_ids = old
-            .query_map([source], |r| r.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        drop(old);
-        for id in old_ids {
-            if !retained.contains(id.as_str()) {
-                viewer.execute("update sessions set t3_parent_thread_id = null, t3_parent_session_id = null, t3_relationship = null where id = ?", [id]).map_err(|e| e.to_string())?;
-            }
-        }
-        for (id, parent, resolved, relation) in &updates {
-            viewer.execute("update sessions set t3_parent_thread_id = ?, t3_parent_session_id = ?, t3_relationship = ? where id = ?",
-            params![parent, resolved, relation, id]).map_err(|e| e.to_string())?;
-        }
-        Ok(updates.len())
-    })();
-    crate::store::write_budget::finish(viewer, result.map_err(crate::store::StoreError::Refused))
-        .map_err(|e| e.to_string())
+    Ok(updates)
 }
 
 pub fn import_optional(viewer: &Connection, settings: &crate::settings::CollectorSettings) {

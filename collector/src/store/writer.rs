@@ -2,8 +2,9 @@
 //! began as a port of the viewer's retired Dart scan writer, and the daily
 //! usage projection matches `UsageSummaryRepository`, which the viewer still
 //! uses for its own repricing. Every write runs in a short `BEGIN IMMEDIATE`
-//! transaction; SQLite's lock and busy timeout serialize the collector with
-//! the viewer and with other collectors.
+//! transaction. A per-call collector lease fences other collectors across
+//! chunks; SQLite locks and its busy timeout serialize individual chunks with
+//! the viewer.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -155,7 +156,7 @@ pub fn canonical_snapshots(snapshots: Vec<SessionSnapshot>) -> Vec<(String, Sess
     result
 }
 
-/// `_persistParsedSessions`: one transaction for a batch of snapshots.
+/// `_persistParsedSessions`: bounded transactions at session boundaries.
 pub fn apply_session_batch(
     conn: &Connection,
     snapshots: Vec<SessionSnapshot>,
@@ -168,6 +169,8 @@ pub(crate) fn apply_session_batch_versioned(
     snapshots: Vec<SessionSnapshot>,
     version: Option<u32>,
 ) -> StoreResult<usize> {
+    let _phase = super::write_budget::write_phase("sessions");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
     let own_machine: Option<String> = conn
         .query_row(
             "select value from app_metadata where key = 'machine_id'",
@@ -189,32 +192,59 @@ pub(crate) fn apply_session_batch_versioned(
     }
     let canonical = canonical_snapshots(snapshots);
     let count = canonical.len();
-    let _phase = super::write_budget::write_phase("sessions");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<()> {
-        let mut checked: Vec<&str> = Vec::new();
-        for (_, snapshot) in &canonical {
-            if !checked.contains(&snapshot.harness.as_str()) {
-                check_parser_version(conn, &snapshot.harness)?;
-                checked.push(&snapshot.harness);
+    let now = DartDateTime::now().to_iso8601();
+    super::write_budget::write_planned(
+        conn,
+        "sessions",
+        // A session's cost is unknown before applying its indexed merges and
+        // projections. Isolate it so one large indivisible unit cannot carry
+        // earlier units past the soft target (CXV-180 live-copy witness).
+        1,
+        || {
+            let lookup = IdentityLookup::for_batch(conn)?;
+            let mut units = Vec::new();
+            for (id, snapshot) in &canonical {
+                let mut candidates = capture_identity_merge(conn, id, snapshot, lookup)?
+                    .map(|merge| merge.alternate_ids)
+                    .unwrap_or_default();
+                candidates.push(id.clone());
+                let shape =
+                    crate::timing::enabled().then(|| super::write_budget::SessionWriteShape {
+                        messages: snapshot.messages.len(),
+                        tool_calls: snapshot.tool_calls.len(),
+                        source_bytes: snapshot.source.size,
+                        content_bytes: snapshot
+                            .messages
+                            .iter()
+                            .map(|message| message.content_plain.len())
+                            .sum(),
+                    });
+                units.push((id, snapshot, candidates, shape));
             }
-        }
-        let now = DartDateTime::now().to_iso8601();
-        let lookup = IdentityLookup::for_batch(conn)?;
-        // Checked once: the write lock keeps the setting fixed for the batch,
-        // and a disabled queue must not pay for a copy of every snapshot.
-        let queue_hub_records = hub_client::queue_enabled(conn)?;
-        for (id, snapshot) in &canonical {
-            let resolver = ProjectResolver::new(
-                snapshot
-                    .project_hints
-                    .iter()
-                    .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
-            );
-            crate::timing::timed("write: session total", || {
-                upsert_session(conn, id, snapshot, &now, &resolver, lookup)
-            })?;
-            if queue_hub_records {
+            Ok(units)
+        },
+        |(id, snapshot, candidates, shape)| {
+            let start = std::time::Instant::now();
+            {
+                check_parser_version(conn, &snapshot.harness)?;
+                let resolver = ProjectResolver::new(
+                    snapshot
+                        .project_hints
+                        .iter()
+                        .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
+                );
+                crate::timing::timed("write: session total", || {
+                    upsert_session(
+                        conn,
+                        id,
+                        snapshot,
+                        &now,
+                        &resolver,
+                        IdentityLookup::Planned(&candidates),
+                    )
+                })?;
+            }
+            if hub_client::queue_enabled(conn)? {
                 enqueue_for_version(
                     conn,
                     Record::SessionSnapshot(Box::new(snapshot.clone())),
@@ -222,10 +252,11 @@ pub(crate) fn apply_session_batch_versioned(
                     version,
                 )?;
             }
-        }
-        Ok(())
-    })();
-    crate::timing::timed("write: commit", || finish(conn, result))?;
+            super::write_budget::record_session_unit(start.elapsed());
+            super::write_budget::record_session_shape(shape);
+            Ok(())
+        },
+    )?;
     Ok(count)
 }
 
@@ -346,7 +377,7 @@ fn upsert_session(
     snapshot: &SessionSnapshot,
     now: &str,
     resolver: &ProjectResolver,
-    lookup: IdentityLookup,
+    lookup: IdentityLookup<'_>,
 ) -> StoreResult<()> {
     let session = &snapshot.session;
     let identity_merge = crate::timing::timed("write: identity capture", || {
@@ -1472,15 +1503,16 @@ fn latest_metadata(
 /// `_captureIdentityMergeState`.
 /// How [`capture_identity_merge`] finds a session's other rows.
 #[derive(Clone, Copy)]
-enum IdentityLookup {
+enum IdentityLookup<'a> {
     /// Every stored session ID is trimmed, so an exact match through the
     /// `(harness, session_id)` index finds the same rows as `trim(...)`.
     Indexed,
     /// Some stored ID has surrounding spaces: compare every row.
     Scan,
+    Planned(&'a [String]),
 }
 
-impl IdentityLookup {
+impl IdentityLookup<'_> {
     fn for_batch(conn: &Connection) -> StoreResult<Self> {
         let untrimmed: bool = conn
             .prepare_cached(
@@ -1497,7 +1529,7 @@ fn capture_identity_merge(
     conn: &Connection,
     canonical_id: &str,
     snapshot: &SessionSnapshot,
-    lookup: IdentityLookup,
+    lookup: IdentityLookup<'_>,
 ) -> StoreResult<Option<IdentityMerge>> {
     let stable = snapshot
         .session
@@ -1569,6 +1601,7 @@ fn capture_identity_merge(
     // trimmed IDs each branch uses the key, the `(harness, session_id)`
     // index, or the few rows without a session ID.
     let sql = match lookup {
+        IdentityLookup::Planned(_) => "select rowid as session_rowid, * from sessions where id in (select value from json_each(?1))".to_owned(),
         IdentityLookup::Scan => format!(
             "select rowid as session_rowid, * from sessions
          where id = ?1
@@ -1600,6 +1633,13 @@ fn capture_identity_merge(
     ];
     for _ in 0..6 {
         values.extend(path_keys.iter().cloned().map(rusqlite::types::Value::from));
+    }
+    if let IdentityLookup::Planned(ids) = lookup {
+        values = vec![
+            serde_json::to_string(ids)
+                .expect("identity IDs serialize")
+                .into(),
+        ];
     }
     let mut statement = conn.prepare(&sql)?;
     let snapshots: Vec<MetadataSnapshot> = statement
@@ -2303,6 +2343,8 @@ pub(crate) fn apply_source_statuses_versioned(
     statuses: &[SourceStatus],
     version: Option<u32>,
 ) -> StoreResult<()> {
+    let _phase = super::write_budget::write_phase("statuses");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
     if statuses.is_empty() {
         return Ok(());
     }
@@ -2314,112 +2356,134 @@ pub(crate) fn apply_source_statuses_versioned(
         )
         .then_with(|| status_index(&left.status).cmp(&status_index(&right.status)))
     });
-    let _phase = super::write_budget::write_phase("statuses");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<()> {
-        let now = DartDateTime::now().to_iso8601();
-        conn.execute_batch(
-            "drop table if exists temp_scan_statuses;
-             create temp table temp_scan_statuses (
-               harness text not null, source_path text not null, status text not null,
-               source_state text not null, environment text,
-               primary key (harness, source_path)
-             );",
-        )?;
-        {
-            let mut insert = conn.prepare(
-                "insert or replace into temp_scan_statuses (harness, source_path, status, source_state, environment)
-                 values (?, ?, ?, ?, ?)",
-            )?;
-            for status in &ordered {
-                insert.execute(params![
-                    status.harness,
-                    status.path,
+    // Last status for each exact (harness,path), matching temp-table replacement.
+    let mut unique = BTreeMap::new();
+    for (index, status) in ordered.into_iter().enumerate() {
+        unique.insert(
+            (status.harness.clone(), status.path.clone()),
+            (index, status),
+        );
+    }
+    let now = DartDateTime::now().to_iso8601();
+    super::write_budget::write_planned(
+        conn,
+        "statuses",
+        500,
+        || {
+            // One membership map over both physical path columns. Never run the
+            // correlated anti-join under BEGIN IMMEDIATE (CXV-180).
+            type Stored = (i64, String, Option<String>, Option<String>, Option<String>);
+            let mut members: HashMap<(String, String), Vec<Stored>> = HashMap::new();
+            let mut statement = conn.prepare("select id,harness,source_file_path,source_file_unc_path,scan_status,source_state,parse_status,rowid from sessions order by rowid")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let harness: String = row.get(1)?;
+                let stored = (
+                    row.get(7)?,
+                    row.get(0)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                );
+                for path in [row.get::<_, Option<String>>(2)?, row.get(3)?]
+                    .into_iter()
+                    .flatten()
+                    .collect::<HashSet<_>>()
+                {
+                    members
+                        .entry((harness.clone(), path))
+                        .or_default()
+                        .push(stored.clone());
+                }
+            }
+            let mut changes = BTreeMap::new();
+            let mut placeholders = Vec::new();
+            for (key, (index, status)) in &unique {
+                match members.get(key) {
+                    Some(rows) => {
+                        for (rowid, id, scan, state, parse) in rows {
+                            if scan.as_deref() != Some(&status.status)
+                                || state.as_deref() != Some(&status.state)
+                                || (status.status == "parse_error"
+                                    && parse.as_deref() != Some("parse_error"))
+                            {
+                                changes.insert(
+                                    *rowid,
+                                    (id.clone(), (*status).clone(), Some(false), None),
+                                );
+                            }
+                        }
+                    }
+                    None if !matches!(
+                        status.status.as_str(),
+                        "available" | "missing" | "path_unreachable"
+                    ) =>
+                    {
+                        let id = placeholder_id(&status.harness, &status.path);
+                        placeholders.push((*index, (id, (*status).clone(), Some(true), None)));
+                    }
+                    None => {}
+                }
+            }
+            let mut units: Vec<_> = changes.into_values().collect();
+            // Base UPDATE FROM applies existing rows in table/rowid order.
+            // Its later temp-table scan inserts missing placeholders in last
+            // INSERT OR REPLACE order, which need not be ID or harness order.
+            // Rowids order the plan only; writes still use stable primary IDs.
+            placeholders.sort_by_key(|(index, _)| *index);
+            units.extend(placeholders.into_iter().map(|(_, unit)| unit));
+            // Local status priority and hub delivery order are different base
+            // contracts. Deliver original inputs, independently of local work.
+            if hub_client::queue_enabled(conn)? {
+                let pending: Vec<_> = statuses.iter().collect();
+                let records: Vec<_> = pending
+                    .iter()
+                    .map(|status| Record::SourceStatus((*status).clone()))
+                    .collect();
+                let delivery = hub_client::plan_delivery(conn, &records, version)?;
+                for (status, deliver) in pending.into_iter().zip(delivery) {
+                    if deliver {
+                        units.push((String::new(), status.clone(), None, Some(true)));
+                    }
+                }
+            }
+            Ok(units)
+        },
+        |(id, status, placeholder, delivery)| {
+            if placeholder == Some(true) {
+                conn.prepare_cached("insert into sessions (id,source_type,source_file_path,display_path,platform_path,
+                scan_status,source_state,parse_status,created_at_utc,updated_at_utc,last_scanned_utc,harness)
+                values (?1,?2,?3,?3,?3,?4,?5,?6,?7,?7,?7,?8)
+                on conflict(id) do update set scan_status=excluded.scan_status,source_state=excluded.source_state,
+                    updated_at_utc=excluded.updated_at_utc,last_scanned_utc=excluded.last_scanned_utc
+                where sessions.scan_status is not excluded.scan_status or sessions.source_state is not excluded.source_state")?
+                .execute(params![id,status.environment.as_deref().unwrap_or_else(|| source_type_label(&status.path)),status.path,
+                    status.status,status.state,if status.status == "parse_error" {"parse_error"} else {"available"},now,status.harness])?;
+            } else if placeholder == Some(false) {
+                conn.prepare_cached(
+                    "update sessions set scan_status=?1,source_state=?2,
+                parse_status=case when ?1='parse_error' then 'parse_error' else parse_status end,
+                updated_at_utc=case when ?1='available' then updated_at_utc else ?3 end,
+                last_scanned_utc=case when ?1='available' then last_scanned_utc else ?3 end
+                where id=?4 and harness=?5 and (source_file_path=?6 or source_file_unc_path=?6)
+                    and (scan_status is not ?1 or source_state is not ?2
+                    or (?1='parse_error' and parse_status is not 'parse_error'))",
+                )?
+                .execute(params![
                     status.status,
                     status.state,
-                    status.environment
+                    now,
+                    id,
+                    status.harness,
+                    status.path
                 ])?;
             }
-        }
-        // `in (...)` lets each session probe the temporary key; an `or` over
-        // the two path columns scanned the whole table for every session.
-        // An unchanged available file changes nothing, so its row is skipped.
-        conn.execute(
-            "update sessions set
-               scan_status = t.status,
-               source_state = t.source_state,
-               parse_status = case when t.status = 'parse_error' then 'parse_error' else sessions.parse_status end,
-               updated_at_utc = case when t.status = 'available' then sessions.updated_at_utc else ?1 end,
-               last_scanned_utc = case when t.status = 'available' then sessions.last_scanned_utc else ?1 end
-             from temp_scan_statuses t
-             where t.harness = sessions.harness
-               and t.source_path in (sessions.source_file_path, sessions.source_file_unc_path)
-               and (t.status <> 'available'
-                 or sessions.scan_status is not t.status
-                 or sessions.source_state is not t.source_state)",
-            params![now],
-        )?;
-        let missing: Vec<(String, String, String, String, Option<String>)> = {
-            let mut statement = conn.prepare(
-                "select t.harness, t.source_path, t.status, t.source_state, t.environment from temp_scan_statuses t
-                 where t.status not in ('available', 'missing', 'path_unreachable')
-                   and not exists (select 1 from sessions s where s.harness = t.harness
-                     and (s.source_file_path = t.source_path or s.source_file_unc_path = t.source_path))",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })?
-                .collect::<Result<_, _>>()?
-        };
-        {
-            let mut insert = conn.prepare(
-                "insert into sessions (id, source_type, source_file_path, display_path, platform_path,
-                   scan_status, source_state, parse_status, created_at_utc, updated_at_utc,
-                   last_scanned_utc, harness)
-                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 on conflict(id) do update set
-                   scan_status = excluded.scan_status, source_state = excluded.source_state,
-                   updated_at_utc = excluded.updated_at_utc, last_scanned_utc = excluded.last_scanned_utc",
-            )?;
-            for (harness, path, status, state, environment) in &missing {
-                insert.execute(params![
-                    placeholder_id(harness, path),
-                    environment
-                        .as_deref()
-                        .unwrap_or_else(|| source_type_label(path)),
-                    path,
-                    path,
-                    path,
-                    status,
-                    state,
-                    if status == "parse_error" {
-                        "parse_error"
-                    } else {
-                        "available"
-                    },
-                    now,
-                    now,
-                    now,
-                    harness,
-                ])?;
+            if delivery.is_some() {
+                enqueue_for_version(conn, Record::SourceStatus(status), &now, version)?;
             }
-        }
-        conn.execute_batch("delete from temp_scan_statuses")?;
-        if hub_client::queue_enabled(conn)? {
-            for status in statuses {
-                enqueue_for_version(conn, Record::SourceStatus(status.clone()), &now, version)?;
-            }
-        }
-        Ok(())
-    })();
-    finish(conn, result)
+            Ok(())
+        },
+    )
 }
 
 /// `_applySessionIndexThreadNames`.
@@ -2432,42 +2496,60 @@ pub(crate) fn apply_thread_names_versioned(
     names: &[ThreadName],
     version: Option<u32>,
 ) -> StoreResult<usize> {
+    let _phase = super::write_budget::write_phase("thread_names");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
     if names.is_empty() {
         return Ok(0);
     }
-    let _phase = super::write_budget::write_phase("thread_names");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<usize> {
-        let mut changed: HashSet<String> = HashSet::new();
-        let now = DartDateTime::now().to_iso8601();
-        for entry in names {
-            let thread_name = trim(&entry.thread_name);
-            if thread_name.is_empty() {
-                continue;
-            }
-            let rows: Vec<(i64, String, Option<String>)> = {
-                let mut statement = conn.prepare_cached(
-                    "select rowid, id, thread_name from sessions where session_id = ? and harness = ?",
-                )?;
-                statement
-                    .query_map(params![entry.session_id, entry.harness], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })?
-                    .collect::<Result<_, _>>()?
-            };
-            for (rowid, id, current) in rows {
-                if current.as_deref().unwrap_or("") == thread_name {
-                    continue;
+    let now = DartDateTime::now().to_iso8601();
+    let changed = std::cell::RefCell::new(HashSet::new());
+    super::write_budget::write_planned(
+        conn,
+        "thread_names",
+        500,
+        || {
+            let pending: Vec<_> = names
+                .iter()
+                .filter(|entry| !trim(&entry.thread_name).is_empty())
+                .collect();
+            let records: Vec<_> = pending
+                .iter()
+                .map(|entry| Record::ThreadName((*entry).clone()))
+                .collect();
+            let delivery = hub_client::plan_delivery(conn, &records, version)?;
+            let mut predicted = HashMap::new();
+            let mut units = Vec::new();
+            for (entry, deliver) in pending.into_iter().zip(delivery) {
+                let name = trim(&entry.thread_name);
+                let rows: Vec<(String, Option<String>)> = conn.prepare_cached("select id,thread_name from sessions where session_id=? and harness=? order by rowid")?
+                    .query_map(params![entry.session_id,entry.harness], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_,_>>()?;
+                for (id, current) in rows {
+                    let previous = predicted.entry(id.clone()).or_insert(current);
+                    if previous.as_deref().unwrap_or("") != name {
+                        *previous = Some(name.to_owned());
+                        units.push((Some(id), entry.clone()));
+                    }
                 }
-                conn.prepare_cached("update sessions set thread_name = ? where rowid = ?")?
-                    .execute(params![thread_name, rowid])?;
-                changed.insert(id);
+                if deliver {
+                    units.push((None, entry.clone()));
+                }
             }
-            enqueue_for_version(conn, Record::ThreadName(entry.clone()), &now, version)?;
-        }
-        Ok(changed.len())
-    })();
-    finish(conn, result)
+            Ok(units)
+        },
+        |(id, entry)| {
+            if let Some(id) = id {
+                let count = conn.prepare_cached("update sessions set thread_name=?1 where id=?2 and harness=?3 and session_id=?4 and coalesce(thread_name,'')<>?1")?
+                    .execute(params![trim(&entry.thread_name),id,entry.harness,entry.session_id])?;
+                if count > 0 {
+                    changed.borrow_mut().insert(id);
+                }
+            } else {
+                enqueue_for_version(conn, Record::ThreadName(entry), &now, version)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(changed.into_inner().len())
 }
 
 /// The project name a resolver already found for a stored WSL session whose
@@ -2512,6 +2594,8 @@ pub(crate) fn apply_project_hints_versioned(
     hints: &[ProjectHint],
     version: Option<u32>,
 ) -> StoreResult<usize> {
+    let _phase = super::write_budget::write_phase("project_hints");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
     let resolver = ProjectResolver::new(
         hints
             .iter()
@@ -2527,62 +2611,110 @@ pub(crate) fn apply_project_hints_versioned(
     if ids.is_empty() {
         return Ok(0);
     }
-    // Read and write under one write lock so the rows cannot change between.
-    let _phase = super::write_budget::write_phase("project_hints");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<usize> {
-        let mut rows: Vec<(String, String, bool)> = Vec::new();
-        for chunk in ids.chunks(500) {
-            let placeholders = vec!["?"; chunk.len()].join(", ");
-            let mut statement = conn.prepare(&format!(
-                "select id, working_directory_display, source_type from sessions where id in ({placeholders})"
-            ))?;
-            let found = statement.query_map(params_from_iter(chunk.iter()), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })?;
-            for row in found {
-                let (id, working_directory, source_type) = row?;
-                let source_type = source_type
-                    .as_deref()
-                    .and_then(SourceType::from_wire)
-                    .unwrap_or(SourceType::Windows);
-                if let Some((name, refined)) =
-                    resolver.resolve_marked(working_directory.as_deref(), source_type)
+    let now = DartDateTime::now().to_iso8601();
+    let mut changed = 0;
+    super::write_budget::write_planned(
+        conn,
+        "project_hints",
+        250,
+        || {
+            let mut rows = Vec::new();
+            // Base discovers rows via IN lookups in each 500-reference group,
+            // rather than applying them in reference input order (F7 audit).
+            // Keep that query order while retaining the original hub packet.
+            let mut ordered_ids = Vec::new();
+            for chunk in ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                ordered_ids.extend(conn.prepare(&format!(
+                    "select id, working_directory_display, source_type from sessions where id in ({placeholders})"
+                ))?.query_map(params_from_iter(chunk.iter()), |row| row.get::<_,String>(0))?
+                    .collect::<Result<Vec<_>,_>>()?);
+            }
+            for id in &ordered_ids {
+                type CurrentProject = (
+                    Option<String>,
+                    String,
+                    Option<String>,
+                    bool,
+                    bool,
+                    Option<String>,
+                );
+                let current: Option<CurrentProject> = conn.prepare_cached(
+                "select s.working_directory_display,s.source_type,p.name,s.project_refined,coalesce(s.project_override,0),s.project_name_snapshot from sessions s
+                 left join projects p on p.id=s.detected_project_id where s.id=?")?
+                .query_row([id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
+                let Some((directory, environment, current, refined, manual, displayed)) = current
+                else {
+                    continue;
+                };
+                let source_type =
+                    SourceType::from_wire(&environment).unwrap_or(SourceType::Windows);
+                if let Some((name, new_refined)) =
+                    resolver.resolve_marked(directory.as_deref(), source_type)
                 {
                     let name = trim(&name).to_owned();
-                    if !name.is_empty() {
-                        rows.push((id, name, refined));
+                    if !name.is_empty()
+                        && (current.as_deref() != Some(&name)
+                            || refined != new_refined
+                            || (!manual && displayed.as_deref() != Some(&name)))
+                    {
+                        rows.push(Some((
+                            id.clone(),
+                            directory,
+                            environment,
+                            name,
+                            new_refined,
+                        )));
                     }
                 }
             }
-        }
-        let now = DartDateTime::now().to_iso8601();
-        for (id, name, refined) in &rows {
-            let project_id = upsert_auto_project(conn, name, &now)?;
-            conn.prepare_cached(
-                "update sessions set detected_project_id = ?, project_refined = ?,
-                   updated_at_utc = ? where id = ?",
-            )?
-            .execute(params![project_id, refined, now, id])?;
-            refresh_session_project(conn, id)?;
-        }
-        enqueue_for_version(
-            conn,
-            Record::ProjectHints(ProjectHints {
-                harness: harness.to_owned(),
-                sessions: sessions.to_vec(),
-                hints: hints.to_vec(),
-            }),
-            &now,
-            version,
-        )?;
-        Ok(rows.len())
-    })();
-    finish(conn, result)
+            if hub_client::queue_enabled(conn)? {
+                // Preserve the original whole packet, including absent refs,
+                // duplicates, unresolved hints and their order (CXV-180 F1).
+                // Delivery is its own bounded unit, even with no local changes.
+                rows.push(None);
+            }
+            Ok(rows)
+        },
+        |unit| {
+            let Some((id, directory, environment, name, refined)) = unit else {
+                enqueue_for_version(
+                    conn,
+                    Record::ProjectHints(ProjectHints {
+                        harness: harness.to_owned(),
+                        sessions: sessions.to_vec(),
+                        hints: hints.to_vec(),
+                    }),
+                    &now,
+                    version,
+                )?;
+                return Ok(());
+            };
+            // A hint planned solely for an automatic display refresh may have
+            // become a no-op after a viewer override. Check before even the
+            // project upsert (which also changes its clock/sequence).
+            let eligible: bool = conn.prepare_cached("select exists(select 1 from sessions s
+                left join projects p on p.id=s.detected_project_id
+                where s.id=?1 and s.working_directory_display is ?2 and s.source_type=?3
+                    and (p.name collate binary is not ?4 or coalesce(s.project_refined,0)<>?5
+                        or (coalesce(s.project_override,0)=0 and s.project_name_snapshot collate binary is not ?4)))")?
+                .query_row(params![id,directory,environment,name,refined], |row| row.get(0))?;
+            if !eligible {
+                return Ok(());
+            }
+            let project_id = upsert_auto_project(conn, &name, &now)?;
+            let count = conn.prepare_cached("update sessions set detected_project_id=?1,project_refined=?2,updated_at_utc=?3
+            where id=?4 and working_directory_display is ?5 and source_type=?6
+                and (detected_project_id is not ?1 or project_refined is not ?2 or (coalesce(project_override,0)=0 and project_name_snapshot is not ?7))")?
+            .execute(params![project_id,refined,now,id,directory,environment,name])?;
+            if count > 0 {
+                refresh_session_project(conn, &id)?;
+                changed += 1;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(changed)
 }
 
 /// A stored session without an automatic project.
@@ -2622,41 +2754,61 @@ pub fn project_backfill_candidates(
 }
 
 /// `_backfillAutomaticProjects`: assign an automatic project to every
-/// candidate, preferring names resolved on this machine. The candidates are
-/// selected again under the write lock.
+/// candidate, preferring names resolved on this machine. Candidate predicates
+/// are checked again by indexed ID under the write lock.
 pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> StoreResult<usize> {
+    let _phase = super::write_budget::write_phase("project_backfill");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
     let resolver = ProjectResolver::new(
         hints
             .iter()
             .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
     );
-    let _phase = super::write_budget::write_phase("project_backfill");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<usize> {
-        let now = DartDateTime::now().to_iso8601();
-        let mut updated = 0;
-        for candidate in project_backfill_candidates(conn)? {
-            let Some((name, refined)) =
-                resolver.resolve_marked(Some(&candidate.working_directory), candidate.source_type)
-            else {
-                continue;
-            };
-            let name = trim(&name).to_owned();
-            if name.is_empty() {
-                continue;
+    let now = DartDateTime::now().to_iso8601();
+    let mut updated = 0;
+    super::write_budget::write_planned(
+        conn,
+        "project_backfill",
+        250,
+        || {
+            let mut units = Vec::new();
+            for candidate in project_backfill_candidates(conn)? {
+                if let Some((name, refined)) = resolver
+                    .resolve_marked(Some(&candidate.working_directory), candidate.source_type)
+                {
+                    let name = trim(&name).to_owned();
+                    if !name.is_empty() {
+                        units.push((candidate, name, refined));
+                    }
+                }
             }
-            let project_id = upsert_auto_project(conn, &name, &now)?;
-            conn.prepare_cached(
-                "update sessions set detected_project_id = ?, project_refined = ?,
-                   updated_at_utc = ? where id = ?",
-            )?
-            .execute(params![project_id, refined, now, candidate.id])?;
-            refresh_session_project(conn, &candidate.id)?;
-            updated += 1;
-        }
-        Ok(updated)
-    })();
-    finish(conn, result)
+            Ok(units)
+        },
+        |(candidate, name, refined)| {
+            // The viewer may have removed a pending row from candidacy. Guard
+            // every effect, including creating/updating the project (F8).
+            let eligible: bool = conn.prepare_cached("select exists(select 1 from sessions
+                where id=?1 and working_directory_display=?2 and source_type=?3
+                    and (detected_project_id is null or (coalesce(project_override,0)=0 and coalesce(trim(project_name_snapshot),'')=''))
+                    and parse_status='available' and scan_status='available')")?
+                .query_row(params![candidate.id,candidate.working_directory,candidate.source_type.wire_name()], |row| row.get(0))?;
+            if !eligible {
+                return Ok(());
+            }
+            let project = upsert_auto_project(conn, &name, &now)?;
+            let count = conn.prepare_cached("update sessions set detected_project_id=?1,project_refined=?2,updated_at_utc=?3
+            where id=?4 and working_directory_display=?5 and source_type=?6
+                and (detected_project_id is null or (coalesce(project_override,0)=0 and coalesce(trim(project_name_snapshot),'')=''))
+                and parse_status='available' and scan_status='available'")?
+            .execute(params![project,refined,now,candidate.id,candidate.working_directory,candidate.source_type.wire_name()])?;
+            if count > 0 {
+                refresh_session_project(conn, &candidate.id)?;
+                updated += 1;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(updated)
 }
 
 /// Sessions whose title or summary is a placeholder older viewers stored.
@@ -2672,42 +2824,30 @@ pub fn session_metadata_placeholder_count(conn: &Connection) -> StoreResult<i64>
 
 /// `_cleanSessionMetadataPlaceholders`.
 pub fn clean_session_metadata_placeholders(conn: &Connection) -> StoreResult<()> {
-    if session_metadata_placeholder_count(conn)? == 0 {
-        return Ok(());
-    }
-    // Select the rows again under the write lock: rowids read earlier could
-    // belong to other sessions by now.
     let _phase = super::write_budget::write_phase("metadata_placeholders");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<()> {
-        let rows: Vec<(i64, bool, bool)> = {
-            let mut statement = conn.prepare(
-                "select rowid,
-                   lower(trim(coalesce(title, ''))) like '# agents.md%',
-                   lower(trim(coalesce(summary, ''))) = 'auto'
-                 from sessions
-                 where lower(trim(coalesce(title, ''))) like '# agents.md%'
-                    or lower(trim(coalesce(summary, ''))) = 'auto'",
-            )?;
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<_, _>>()?
-        };
-        for (rowid, bad_title, bad_summary) in &rows {
-            conn.execute(
-                "update sessions set title = case when ? then null else title end,
-                   summary = case when ? then null else summary end where rowid = ?",
-                params![bad_title, bad_summary, rowid],
-            )?;
-            conn.execute(
-                "update session_search set title = case when ? then '' else title end,
-                   summary = case when ? then '' else summary end where rowid = ?",
-                params![bad_title, bad_summary, rowid],
-            )?;
-        }
-        Ok(())
-    })();
-    finish(conn, result)
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
+    super::write_budget::write_planned(
+        conn,
+        "metadata_placeholders",
+        500,
+        || {
+            Ok(conn.prepare("select id from sessions where lower(trim(coalesce(title,''))) like '# agents.md%' or lower(trim(coalesce(summary,'')))='auto'")?
+            .query_map([],|row|row.get::<_,String>(0))?.collect::<Result<_,_>>()?)
+        },
+        |id| {
+            let row: Option<(i64,bool,bool)> = conn.prepare_cached("select rowid,lower(trim(coalesce(title,''))) like '# agents.md%',lower(trim(coalesce(summary,'')))='auto' from sessions where id=?")?
+            .query_row([&id], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+            if let Some((rowid, bad_title, bad_summary)) = row
+                && (bad_title || bad_summary)
+            {
+                conn.prepare_cached("update sessions set title=case when ?1 then null else title end,summary=case when ?2 then null else summary end where id=?3")?
+                    .execute(params![bad_title,bad_summary,id])?;
+                conn.prepare_cached("update session_search set title=case when ?1 then '' else title end,summary=case when ?2 then '' else summary end where rowid=?3")?
+                    .execute(params![bad_title,bad_summary,rowid])?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Cached invalidation metadata for the scanner's skip decisions.
@@ -2717,6 +2857,7 @@ pub struct CachedSource {
     pub unc_path: Option<String>,
     pub source_type: SourceType,
     pub scan_status: String,
+    pub source_state: String,
     pub file_size: Option<i64>,
     pub modified_utc: Option<DartDateTime>,
     pub parser_version: Option<i64>,
@@ -2730,6 +2871,12 @@ pub const COMPLETE_CODEX_SCAN_KEY: &str = "codex_scan.completed_parser_version";
 
 pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
     let _phase = super::write_budget::write_phase("scan_complete");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
+    if super::schema::metadata(conn, COMPLETE_CODEX_SCAN_KEY)?.as_deref()
+        == Some(crate::codex::parser::PARSER_VERSION.to_string().as_str())
+    {
+        return Ok(());
+    }
     begin_write(conn)?;
     let result = (|| {
         conn.execute(
@@ -2750,7 +2897,7 @@ pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
 /// `_cachedSessions`, limited to one harness.
 pub fn cached_sources(conn: &Connection, harness: &str) -> StoreResult<Vec<CachedSource>> {
     let mut statement = conn.prepare(
-        "select source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version, source_type
+        "select source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version, source_type, source_state
          from sessions where harness = ?",
     )?;
     let rows = statement
@@ -2769,6 +2916,7 @@ pub fn cached_sources(conn: &Connection, harness: &str) -> StoreResult<Vec<Cache
                 file_size: row.get(3)?,
                 modified_utc: parse_time(row.get::<_, Option<String>>(4)?.as_deref()),
                 parser_version: row.get(5)?,
+                source_state: row.get(7)?,
             })
         })?
         .collect::<Result<_, _>>()?;

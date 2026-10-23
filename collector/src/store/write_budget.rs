@@ -9,6 +9,195 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug)]
+pub struct WriteBudget {
+    pub soft: Duration,
+    pub hard: Duration,
+    pub gap: Duration,
+}
+impl Default for WriteBudget {
+    fn default() -> Self {
+        Self {
+            soft: Duration::from_millis(250),
+            hard: Duration::from_millis(1000),
+            gap: Duration::from_millis(150),
+        }
+    }
+}
+thread_local! {
+    static BUDGET: std::cell::Cell<WriteBudget> = std::cell::Cell::new(WriteBudget::default());
+    // One worker, including consecutive phases and parse-side batches. Do not
+    // key by a raw connection address that SQLite can reuse after close.
+    static RELEASED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static COMPLETION_TIME: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    static SESSION_SHAPE: std::cell::Cell<Option<SessionWriteShape>> = const { std::cell::Cell::new(None) };
+    static CHUNK_OBSERVER: RefCell<Option<Box<ChunkObserver>>> = const { RefCell::new(None) };
+}
+
+type ChunkObserver = dyn FnMut(&'static str);
+/// Library-only deterministic interleaving witness. Called after COMMIT and
+/// SQLite lock release; a fixture may perform raw viewer SQL here. Collector
+/// API calls are forbidden until the public writer call returns.
+pub struct WriteChunkScope(Option<Box<ChunkObserver>>, std::marker::PhantomData<Rc<()>>);
+impl WriteChunkScope {
+    pub fn observe(observer: impl FnMut(&'static str) + 'static) -> Self {
+        Self(
+            CHUNK_OBSERVER.with_borrow_mut(|current| current.replace(Box::new(observer))),
+            std::marker::PhantomData,
+        )
+    }
+}
+impl Drop for WriteChunkScope {
+    fn drop(&mut self) {
+        CHUNK_OBSERVER.with_borrow_mut(|current| *current = self.0.take());
+    }
+}
+
+/// Optional diagnostics, computed from the immutable snapshot outside the lock.
+#[derive(Clone, Copy)]
+pub(crate) struct SessionWriteShape {
+    pub messages: usize,
+    pub tool_calls: usize,
+    pub source_bytes: u64,
+    pub content_bytes: usize,
+}
+
+pub(crate) fn record_session_shape(shape: Option<SessionWriteShape>) {
+    SESSION_SHAPE.with(|current| current.set(shape));
+}
+/// Library-only override for deterministic chunking proof; never an environment knob.
+pub struct WriteBudgetScope(WriteBudget, std::marker::PhantomData<Rc<()>>);
+impl WriteBudgetScope {
+    pub fn enter(budget: WriteBudget) -> Self {
+        Self(
+            BUDGET.with(|current| current.replace(budget)),
+            std::marker::PhantomData,
+        )
+    }
+}
+impl Drop for WriteBudgetScope {
+    fn drop(&mut self) {
+        BUDGET.with(|current| current.set(self.0));
+    }
+}
+
+/// Apply independently valid units, yielding at time and row boundaries. Setup
+/// must be constant-time or indexed. Empty work never starts a transaction.
+pub fn write_chunked<U, S>(
+    conn: &Connection,
+    phase: &'static str,
+    budget: WriteBudget,
+    max_units: usize,
+    units: impl IntoIterator<Item = U>,
+    mut setup: impl FnMut() -> StoreResult<S>,
+    mut apply: impl FnMut(&mut S, U) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let _budget = WriteBudgetScope::enter(budget);
+    let _phase = write_phase(phase);
+    let mut units = units.into_iter().peekable();
+    while units.peek().is_some() {
+        SESSION_SHAPE.with(|current| current.set(None));
+        begin_write(conn)?;
+        let _rollback = rollback_on_panic(conn);
+        let owner_started =
+            ACTIVE.with_borrow(|active| active.get(&connection_key(conn)).map(|value| value.0));
+        let validation_time = owner_started.map_or(Duration::ZERO, |started| started.elapsed());
+        let gap = owner_started.and_then(|started| {
+            RELEASED.with(|last| {
+                last.get()
+                    .map(|released| started.saturating_duration_since(released))
+            })
+        });
+        let start = Instant::now();
+        let mut count = 0;
+        let mut largest = Duration::ZERO;
+        let mut setup_time = Duration::ZERO;
+        let mut apply_time = Duration::ZERO;
+        let result = (|| {
+            let setup_start = Instant::now();
+            let mut state = setup()?;
+            setup_time = setup_start.elapsed();
+            for _ in 0..max_units.max(1) {
+                let Some(unit) = units.next() else { break };
+                let unit_start = Instant::now();
+                apply(&mut state, unit)?;
+                let elapsed = unit_start.elapsed();
+                largest = largest.max(elapsed);
+                apply_time += elapsed;
+                count += 1;
+                if start.elapsed() >= budget.soft {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        finish(conn, result)?;
+        if crate::timing::enabled() {
+            eprintln!(
+                "write_chunk phase={phase} units={count} largest_unit_ms={:.3} elapsed_ms={:.3}",
+                largest.as_secs_f64() * 1000.0,
+                start.elapsed().as_secs_f64() * 1000.0,
+            );
+            let shape = SESSION_SHAPE.with(std::cell::Cell::get);
+            eprintln!(
+                "write_detail phase={phase} setup_ms={:.6} apply_ms={:.6} commit_ms={:.6} gap_ms={:.6} required_gap_ms={:.6} messages={} tool_calls={} source_bytes={} content_bytes={}",
+                (validation_time + setup_time).as_secs_f64() * 1000.0,
+                apply_time.as_secs_f64() * 1000.0,
+                COMPLETION_TIME.with(std::cell::Cell::get).as_secs_f64() * 1000.0,
+                gap.map_or(-1.0, |elapsed| elapsed.as_secs_f64() * 1000.0),
+                budget.gap.as_secs_f64() * 1000.0,
+                shape.map_or(0, |shape| shape.messages),
+                shape.map_or(0, |shape| shape.tool_calls),
+                shape.map_or(0, |shape| shape.source_bytes),
+                shape.map_or(0, |shape| shape.content_bytes),
+            );
+        }
+        let _yielding = super::write_lease::between_chunks();
+        if units.peek().is_some() {
+            wait_for_gap();
+        }
+        // Observer code may perform raw viewer SQL; collector API calls are
+        // refused by the between-chunk fence even on this same connection.
+        if let Some(mut observer) = CHUNK_OBSERVER.with_borrow_mut(Option::take) {
+            observer(phase);
+            CHUNK_OBSERVER.with_borrow_mut(|current| *current = Some(observer));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn current_phase() -> &'static str {
+    PHASE.with_borrow(|p| *p)
+}
+
+pub fn current_budget() -> WriteBudget {
+    BUDGET.with(std::cell::Cell::get)
+}
+
+/// Plan once inside the caller's collector lease, outside SQLite's write lock.
+/// Only viewer V-set edits may interleave; every dependent value must be read
+/// or guarded in each unit's own statements. Never copy viewer values from a
+/// plan. Model earlier units of this same call when planning ordered inputs.
+pub(crate) fn write_planned<U>(
+    conn: &Connection,
+    phase: &'static str,
+    max_units: usize,
+    plan: impl FnOnce() -> StoreResult<Vec<U>>,
+    mut apply: impl FnMut(U) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
+    let units = plan()?;
+    write_chunked(
+        conn,
+        phase,
+        current_budget(),
+        max_units,
+        units,
+        || Ok(()),
+        |_, unit| apply(unit),
+    )
+}
+
 #[cfg(debug_assertions)]
 pub mod audit;
 
@@ -18,6 +207,10 @@ pub struct WriteHoldReport {
     pub max_ms: f64,
     pub p99_ms: f64,
     pub max_phase: Option<String>,
+    pub over_budget: u64,
+    /// Largest indivisible session application, excluding shared setup/commit.
+    /// The sessions-phase max hold is its conservative bound including commit.
+    pub max_session_ms: f64,
 }
 
 /// Bounded histogram: 1 ms buckets through 4096 ms, then 64 subdivisions per
@@ -29,6 +222,8 @@ pub struct HoldStats {
     max: Duration,
     max_phase: Option<String>,
     histogram: Vec<u64>,
+    over_budget: u64,
+    max_session: Duration,
 }
 impl Default for HoldStats {
     fn default() -> Self {
@@ -37,12 +232,17 @@ impl Default for HoldStats {
             max: Duration::ZERO,
             max_phase: None,
             histogram: vec![0; 4097 + 52 * 64],
+            over_budget: 0,
+            max_session: Duration::ZERO,
         }
     }
 }
 impl HoldStats {
     pub fn record(&mut self, hold: Duration, phase: &str) {
         self.transactions += 1;
+        if hold > current_budget().hard {
+            self.over_budget += 1;
+        }
         if self.max_phase.is_none() || hold > self.max {
             self.max = hold;
             self.max_phase = Some(phase.to_owned());
@@ -88,6 +288,8 @@ impl HoldStats {
             max_ms,
             p99_ms,
             max_phase: self.max_phase.clone(),
+            over_budget: self.over_budget,
+            max_session_ms: self.max_session.as_secs_f64() * 1000.0,
         }
     }
 }
@@ -119,6 +321,18 @@ impl Drop for PanicRollback<'_> {
 /// Cumulative physical write holds on the current collector worker thread.
 pub fn hold_report() -> WriteHoldReport {
     TOTALS.with_borrow(HoldStats::report)
+}
+
+pub(crate) fn record_session_unit(elapsed: Duration) {
+    TOTALS.with_borrow_mut(|stats| stats.max_session = stats.max_session.max(elapsed));
+    OBSERVERS.with_borrow(|observers| {
+        for observer in observers {
+            if observer.phase.is_none_or(|phase| phase == "sessions") {
+                let mut stats = observer.stats.borrow_mut();
+                stats.max_session = stats.max_session.max(elapsed);
+            }
+        }
+    });
 }
 
 /// Thread-local capture; nested captures independently observe the same physical transactions.
@@ -181,6 +395,19 @@ pub(crate) fn complete_hold(conn: &Connection) {
         ACTIVE.with_borrow_mut(|active| active.remove(&connection_key(conn)))
     {
         let elapsed = start.elapsed();
+        RELEASED.with(|last| last.set(Some(Instant::now())));
+        if crate::timing::enabled() {
+            eprintln!(
+                "write_hold phase={phase} hold_ms={:.6}",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+        if elapsed > current_budget().hard {
+            eprintln!(
+                "collector write hold exceeded hard budget: phase={phase} hold_ms={:.3}",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
         TOTALS.with_borrow_mut(|stats| stats.record(elapsed, phase));
         OBSERVERS.with_borrow(|observers| {
             for observer in observers {
@@ -266,6 +493,7 @@ pub fn in_write_transaction<T>(
     conn: &Connection,
     body: impl FnOnce() -> StoreResult<T>,
 ) -> StoreResult<T> {
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
     begin_write(conn)?;
     let outer = OuterWrite::enter(conn);
     let result = body();
@@ -287,6 +515,12 @@ pub fn begin_write(conn: &Connection) -> StoreResult<()> {
         conn.execute_batch("savepoint nested_write")?;
         return Ok(());
     }
+    if !super::write_lease::held(conn) {
+        return Err(StoreError::Refused(
+            "collector write requires a writer lease".into(),
+        ));
+    }
+    wait_for_gap();
     begin_immediate(conn)?;
     let check = (|| -> StoreResult<()> {
         let version = last_applied_version(conn)?;
@@ -304,6 +538,12 @@ pub fn begin_write(conn: &Connection) -> StoreResult<()> {
         return Err(error);
     }
     Ok(())
+}
+
+fn wait_for_gap() {
+    if let Some(released) = RELEASED.with(std::cell::Cell::get) {
+        std::thread::sleep(current_budget().gap.saturating_sub(released.elapsed()));
+    }
 }
 
 /// Commit on success, roll back on failure, keeping the first error.
@@ -330,6 +570,7 @@ pub(crate) fn finish_immediate<T, E>(
     result: Result<T, E>,
     sql_error: impl FnOnce(rusqlite::Error) -> E,
 ) -> Result<T, E> {
+    let completion_start = Instant::now();
     let finished = match result {
         Ok(value) => match conn.execute_batch("commit") {
             Ok(()) => Ok(value),
@@ -343,6 +584,7 @@ pub(crate) fn finish_immediate<T, E>(
             Err(error)
         }
     };
+    COMPLETION_TIME.with(|elapsed| elapsed.set(completion_start.elapsed()));
     complete_hold(conn);
     finished
 }
@@ -355,6 +597,7 @@ pub fn execute_write(
     sql: &str,
     params: impl rusqlite::Params,
 ) -> StoreResult<usize> {
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
     if !conn.is_autocommit() {
         return Ok(conn.execute(sql, params)?);
     }

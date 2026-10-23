@@ -90,6 +90,7 @@ pub fn queue_enabled(conn: &Connection) -> StoreResult<bool> {
 }
 
 pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> {
+    let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
     // A legacy status has no provenance to add. Keep it in v1 rather than
     // inventing an environment while moving it to a new outbox row.
     let version = if matches!(&record, Record::SourceStatus(status) if status.environment.is_none())
@@ -99,6 +100,57 @@ pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> 
         crate::contract::CONTRACT_VERSION
     };
     enqueue_versioned(conn, record, now, version)
+}
+
+pub(crate) fn plan_delivery(
+    conn: &Connection,
+    records: &[Record],
+    version: Option<u32>,
+) -> StoreResult<Vec<bool>> {
+    if !queue_enabled(conn)? {
+        return Ok(vec![false; records.len()]);
+    }
+    #[derive(serde::Serialize)]
+    struct BorrowedEnvelope<'a> {
+        contract: &'static str,
+        version: u32,
+        #[serde(flatten)]
+        record: &'a Record,
+    }
+    let mut predicted = std::collections::HashMap::new();
+    let mut delivery = Vec::with_capacity(records.len());
+    for record in records {
+        let Some((key, true)) = record_key(record) else {
+            delivery.push(true);
+            continue;
+        };
+        let version = version.unwrap_or_else(|| {
+            if matches!(record,Record::SourceStatus(status) if status.environment.is_none()) {
+                1
+            } else {
+                CONTRACT_VERSION
+            }
+        });
+        let envelope = serde_json::to_string(&BorrowedEnvelope {
+            contract: CONTRACT_NAME,
+            version,
+            record,
+        })
+        .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
+        let hash = crate::dart::sha256_hex(envelope.as_bytes());
+        if !predicted.contains_key(&key) {
+            let previous: Option<String> = conn
+                .prepare_cached(
+                    "select record_hash from collector_hub_record_state where record_key=?",
+                )?
+                .query_row([&key], |row| row.get(0))
+                .optional()?;
+            predicted.insert(key.clone(), previous);
+        }
+        delivery.push(predicted[&key].as_deref() != Some(&hash));
+        predicted.insert(key, Some(hash));
+    }
+    Ok(delivery)
 }
 
 pub(crate) fn enqueue_versioned(
@@ -189,6 +241,8 @@ pub fn validate_url(url: &str) -> Result<String, String> {
 }
 
 fn enable(store: &Store, url: &str, machine: &str) -> Result<i64, String> {
+    let _lease = crate::store::write_lease::WriteLease::acquire(&store.conn)
+        .map_err(|error| error.to_string())?;
     let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<i64> {
@@ -227,6 +281,8 @@ fn enable(store: &Store, url: &str, machine: &str) -> Result<i64, String> {
 /// continues the same hub history.
 pub fn disable(db_path: &Path, mode: OwnerMode) -> Result<i64, String> {
     let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
+    let _lease = crate::store::write_lease::WriteLease::acquire(&store.conn)
+        .map_err(|error| error.to_string())?;
     let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<i64> {
@@ -501,6 +557,7 @@ fn next_batch(
 /// as a duplicate and the rest is sent again (records apply idempotently).
 /// Returns whether the batch was shrunk.
 fn record_transport_failure(conn: &Connection, batch: &Batch) -> StoreResult<bool> {
+    let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
     let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(conn)?;
     let result = (|| -> StoreResult<bool> {
@@ -585,6 +642,8 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
     let mut isolate_until: Option<i64> = None;
     let conn = &store.conn;
     while report.batches < MAX_BATCHES_PER_RUN {
+        let lease = crate::store::write_lease::WriteLease::acquire(conn)
+            .map_err(|error| error.to_string())?;
         if isolate_until.is_some_and(|last| {
             conn.query_row(
                 "select coalesce(min(id), 0) from collector_upload_outbox",
@@ -607,6 +666,7 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
         );
         let batch = finish(conn, batch).map_err(|error| error.to_string())?;
         report.dead_lettered += dead;
+        drop(lease);
         let Some(batch) = batch else {
             break;
         };
@@ -654,6 +714,8 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
             }
             // The hub applies a batch atomically, so nothing was stored.
             if batch.rows.len() == 1 {
+                let _lease = crate::store::write_lease::WriteLease::acquire(conn)
+                    .map_err(|error| error.to_string())?;
                 let _phase = crate::store::write_budget::write_phase("hub");
                 begin_write(conn).map_err(|error| error.to_string())?;
                 let result = dead_letter(conn, batch.rows[0].0, Some(status), &message);
@@ -681,6 +743,8 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
         {
             return Err("hub acknowledgment does not match the queued batch".to_owned());
         }
+        let _lease = crate::store::write_lease::WriteLease::acquire(conn)
+            .map_err(|error| error.to_string())?;
         let _phase = crate::store::write_budget::write_phase("hub");
         begin_write(conn).map_err(|error| error.to_string())?;
         let result = (|| -> StoreResult<()> {
@@ -699,6 +763,8 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
         report.sent += batch.rows.len();
         report.batches += 1;
     }
+    let _lease =
+        crate::store::write_lease::WriteLease::acquire(conn).map_err(|error| error.to_string())?;
     report.pending = pending(conn).map_err(|error| error.to_string())?;
     report.last_sequence = sequence;
     Ok(report)
@@ -730,6 +796,8 @@ pub fn resync(
     let machine = local_machine(&store)?;
     let previous = enable(&store, &url, &machine)?;
     let verified = verify(&agent(), &url, token, &machine)?;
+    let _lease = crate::store::write_lease::WriteLease::acquire(&store.conn)
+        .map_err(|error| error.to_string())?;
     let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<()> {

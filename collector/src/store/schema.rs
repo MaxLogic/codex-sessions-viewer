@@ -1228,6 +1228,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
         prepare_standalone(&outer, ":memory:").unwrap();
         let other = migrated_past_this_release();
         let nested = in_write_transaction(&outer, || {
+            let _lease = super::super::write_lease::WriteLease::acquire(&other)?;
             let result = begin_write(&other);
             if result.is_ok() {
                 let _ = other.execute_batch("rollback");
@@ -1251,6 +1252,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
         // thread is a real, checked transaction again.
         assert!(outer.is_autocommit());
         let other = migrated_past_this_release();
+        let _lease = super::super::write_lease::WriteLease::acquire(&other).unwrap();
         let result = begin_write(&other);
         if result.is_ok() {
             let _ = other.execute_batch("rollback");

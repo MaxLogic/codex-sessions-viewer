@@ -4,6 +4,7 @@ pub mod cache_repair;
 pub mod projects;
 pub mod schema;
 pub mod write_budget;
+pub mod write_lease;
 pub mod writer;
 
 use std::path::Path;
@@ -87,6 +88,7 @@ impl Store {
     /// Apply contract records in order. Consecutive records of one kind are
     /// committed together, like the viewer's scan batches.
     pub fn apply(&self, records: Vec<Envelope>) -> StoreResult<ApplySummary> {
+        let _lease = write_lease::WriteLease::acquire(&self.conn)?;
         let mut summary = ApplySummary::default();
         let mut pending = Pending::default();
         for envelope in records {
