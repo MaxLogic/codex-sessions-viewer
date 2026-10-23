@@ -3,6 +3,113 @@ use std::io;
 use std::time::Duration;
 
 pub use platform::{Listener, Stream};
+
+/// Probe closure without consuming buffered requests. Used only while a
+/// connection's bounded queue is full, so EOF cannot hide behind backpressure.
+pub(super) fn peer_closed(stream: &Stream) -> bool {
+    #[cfg(windows)]
+    {
+        stream.peer_closed()
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        hung_up(stream.as_raw_fd())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = stream;
+        false
+    }
+}
+
+pub(super) fn stdin_closed() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+        // SAFETY: the process owns this standard handle for its lifetime.
+        windows::pipe_closed(unsafe { GetStdHandle(STD_INPUT_HANDLE) })
+    }
+    #[cfg(unix)]
+    {
+        hung_up(libc::STDIN_FILENO)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn hung_up(fd: std::os::fd::RawFd) -> bool {
+    let mut poll = libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: poll points to one initialized descriptor and never waits.
+    unsafe {
+        libc::poll(&mut poll, 1, 0) > 0 && poll.revents & (libc::POLLHUP | libc::POLLERR) != 0
+    }
+}
+
+pub(super) struct Stdin;
+impl std::io::Read for Stdin {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            let mut poll = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialized descriptor, finite wait; stdin is not shared with another reader.
+            let result = unsafe { libc::poll(&mut poll, 1, 200) };
+            if result == 0 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        std::io::stdin().read(bytes)
+    }
+}
+
+pub(super) fn stdout() -> io::Result<std::io::Stdout> {
+    #[cfg(unix)]
+    {
+        // SAFETY: stdout is process-owned. Nonblocking writes let the transport
+        // retry with its stop flag instead of trapping teardown in libc write.
+        unsafe {
+            let flags = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL);
+            if flags < 0
+                || libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(std::io::stdout())
+}
+
+/// Cancel synchronous stdio on Windows; endpoint operations already have finite
+/// overlapped timeouts. Repeated cancellation covers the stop/write entry race.
+pub(super) fn join_io(thread: std::thread::JoinHandle<()>) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        while !thread.is_finished() {
+            // SAFETY: the JoinHandle keeps the thread handle alive. Only this
+            // owned I/O thread is cancelled, never another connection's I/O.
+            unsafe {
+                windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = thread.join();
+}
 #[cfg(unix)]
 use unix as platform;
 #[cfg(not(any(windows, unix)))]
@@ -22,6 +129,43 @@ pub fn endpoint_name(key: &str) -> io::Result<String> {
 pub fn connect(key: &str, timeout: Duration) -> io::Result<Stream> {
     let name = endpoint_name(key)?;
     platform::connect(&name, timeout)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn transport_buffered_pipe_reports_peer_closure() {
+        use std::io::Write;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: valid out pointers; both returned handles are owned below.
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::Pipes::CreatePipe(
+                    &mut read,
+                    &mut write,
+                    std::ptr::null(),
+                    4096,
+                )
+            },
+            0
+        );
+        // SAFETY: CreatePipe transferred two distinct valid owning handles.
+        let (read, write) = unsafe {
+            (
+                OwnedHandle::from_raw_handle(read),
+                OwnedHandle::from_raw_handle(write),
+            )
+        };
+        let mut write = std::fs::File::from(write);
+        write.write_all(b"unread request\n").unwrap();
+        assert!(!super::windows::pipe_closed(read.as_raw_handle()));
+        drop(write);
+        assert!(
+            super::windows::pipe_closed(read.as_raw_handle()),
+            "buffered bytes hid the peer's closed write end"
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -249,6 +393,15 @@ mod windows {
         timeout: Duration,
     }
     impl Stream {
+        pub(super) fn peer_closed(&self) -> bool {
+            pipe_broken(self.pipe.as_raw_handle())
+        }
+        pub fn try_clone(&self) -> io::Result<Self> {
+            Ok(Self {
+                pipe: self.pipe.try_clone()?,
+                timeout: self.timeout,
+            })
+        }
         fn transfer(&self, buffer: *mut u8, length: usize, writing: bool) -> io::Result<usize> {
             // SAFETY: Read/Write supply a valid live buffer for the duration of this function.
             // Every pending I/O completes (or is cancelled and drained) before returning, so
@@ -313,6 +466,51 @@ mod windows {
                 Ok(bytes as usize)
             }
         }
+    }
+    fn pipe_broken(pipe: HANDLE) -> bool {
+        // SAFETY: PeekNamedPipe does not consume input or wait for input/output.
+        // A pipe's peer closure is observable even while our request queue is full.
+        unsafe {
+            PeekNamedPipe(pipe, null_mut(), 0, null_mut(), null_mut(), null_mut()) == 0
+                && matches!(GetLastError(), ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
+        }
+    }
+    /// Stdin is a synchronous pipe read end. PeekNamedPipe alone reports it
+    /// connected until buffered bytes drain, even after the viewer exits.
+    /// Query the local NPFS state without consuming more bounded input.
+    pub(super) fn pipe_closed(pipe: HANDLE) -> bool {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_PIPE_CLOSING_STATE, FILE_PIPE_LOCAL_INFORMATION, FilePipeLocalInformation,
+            NtCancelIoFileEx, NtQueryInformationFile,
+        };
+        let mut info = FILE_PIPE_LOCAL_INFORMATION::default();
+        let mut operation = IO_STATUS_BLOCK::default();
+        // SAFETY: the process owns stdin (or the test owns the read end), and
+        // both output buffers remain live until the query completes. This
+        // metadata query does not wait for the peer to read/write any data.
+        unsafe {
+            let mut status = NtQueryInformationFile(
+                pipe,
+                &mut operation,
+                (&mut info as *mut FILE_PIPE_LOCAL_INFORMATION).cast(),
+                size_of::<FILE_PIPE_LOCAL_INFORMATION>() as u32,
+                FilePipeLocalInformation,
+            );
+            if status == STATUS_PENDING {
+                // Drain a queued OS completion before dropping stack buffers.
+                // There is no other read on this handle while input is full.
+                if WaitForSingleObject(pipe, 200) != WAIT_OBJECT_0 {
+                    let mut cancelled = IO_STATUS_BLOCK::default();
+                    NtCancelIoFileEx(pipe, &operation, &mut cancelled);
+                    WaitForSingleObject(pipe, INFINITE);
+                }
+                status = operation.Anonymous.Status;
+            }
+            if status >= 0 && info.NamedPipeState == FILE_PIPE_CLOSING_STATE {
+                return true;
+            }
+        }
+        pipe_broken(pipe)
     }
     impl Read for Stream {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -662,6 +860,11 @@ mod unsupported {
         }
     }
     pub struct Stream;
+    impl Stream {
+        pub fn try_clone(&self) -> io::Result<Self> {
+            Err(error())
+        }
+    }
     impl Read for Stream {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
             Err(error())

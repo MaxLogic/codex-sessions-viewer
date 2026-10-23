@@ -46,6 +46,7 @@ USAGE:
   codex-sessions-collector hub disable [DATABASE OPTIONS] Stop queuing and clear the outbox
   codex-sessions-collector version
   codex-sessions-collector serve [OPTIONS] [--lifetime resident|viewer]
+  codex-sessions-collector client [OPTIONS]
   codex-sessions-collector resident <stop|status|info> [--db <FILE>]
 
 DATABASE OPTIONS:
@@ -248,9 +249,19 @@ pub(crate) fn parse_options(args: &[String]) -> Result<Options, CliError> {
 
 pub fn run(args: &[String]) -> i32 {
     let mut stdout = std::io::stdout().lock();
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = std::io::stderr();
     let command: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
     let result = match command.as_slice() {
+        ["client", ..] => parse_options(&args[1..]).and_then(|options| {
+            if options.standalone.is_some() || !options.positional.is_empty() {
+                return Err(CliError::Usage(
+                    "client needs --db and no positional arguments or --standalone".into(),
+                ));
+            }
+            drop(stdout);
+            crate::resident::bridge::run(&options)
+                .map_err(|error| CliError::Failed(error.to_string()))
+        }),
         ["serve", ..] => parse_options(&args[1..]).and_then(|options| {
             if !options.positional.is_empty() {
                 return Err(CliError::Usage(

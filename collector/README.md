@@ -18,6 +18,8 @@ codex-sessions-collector claude hook                              # hook input a
 codex-sessions-collector drain  [--db FILE | --standalone FILE]
 codex-sessions-collector apply  [--db FILE | --standalone FILE] [--input FILE]   # stdin by default
 codex-sessions-collector version
+codex-sessions-collector serve  --db FILE [--settings FILE] [--lifetime resident|viewer]
+codex-sessions-collector client --db FILE [--settings FILE] [root flags]
 ```
 
 `codex scan` reads the Windows and WSL Codex homes from `settings.toml`
@@ -31,6 +33,69 @@ Without `--db`, the collector writes the viewer's database at
 `%APPDATA%\CodexSessionViewer\codex_sessions_viewer.sqlite`.
 
 Exit codes: `0` success, `1` failure, `2` usage error, `3` database refused.
+
+## Resident viewer transport
+
+`client` bridges JSON lines on stdin/stdout to the resident endpoint. It starts
+a viewer-lifetime resident when absent and reports `bridge` events with states
+`starting`, `connected`, `replaced`, `reconnecting` or `failed`. Only a complete
+incompatible build identity or an explicit `unsupported_version` reply permits
+deliberate replacement. A transient I/O error never permits replacement. The
+bridge opens only the IPC endpoint and instance-lock sidecar, never the database.
+CLI one-shots continue to execute directly under the per-call collector lease.
+The `hello` field `viewer_protocol: 1` advertises these viewer operations; its
+absence identifies older residents even when their package/parser versions match.
+
+Every request has `v: 1`, a connection-unique `id` and `op`. Viewer operations are:
+
+- `scan`: `harnesses` (`codex`, `claude`), optional `force` and `parser_workers`.
+  Replies stream `progress` (`harness`, `counts`, `sessions_written`), then a
+  `finished` report per completed harness and `done` with `cancelled`.
+  Equivalent queued requests share a scan. Arrivals during a running scan share
+  a follow-up scan that starts after their arrival.
+- `ingest`: `harness` and one `path`, replying with `finished` after commit or
+  `error`. Ingest and hooks preempt scans only between public writer calls.
+- `cancel`: `target` identifies this connection's scan request. Its `done`
+  reports cancellation. Other coalesced requesters keep their scan.
+- `pause`: replies `paused` after the worker abandons its active call and closes
+  its database connection. Each connection holds one pause until `resume` or
+  disconnect. `resume` replies `resumed`. Abandoned plans are never resumed.
+
+The bridge attaches an explicit typed `context` to collection requests, resolving
+defaults and relative paths in its own process. A caller can supply a context:
+`database`, `settings` (path or null), `windows_root`, `wsl_root`, `wsl_unc_root`
+(paths or null), `claude_roots`, `claude_wsl_roots` (path arrays), `wsl_projects`
+(boolean), and optional `t3_state_path` (path or null). Direct endpoint requests
+must use absolute paths, including the ingest file. The resident refuses a
+different database identity or settings path. Null roots disable that source.
+
+On endpoint loss the bridge reports `error` with code `disconnected` for
+in-flight requests and reconnects without replaying them. Stdin EOF closes the
+connection and releases its pause. A viewer-started resident exits 30 seconds
+after its last viewer disconnects when no work is pending; a hook or resident
+lifetime hello upgrades it to remain resident.
+
+Request frames are limited to 64 KiB, and request IDs and cancellation targets
+to 256 UTF-8 bytes. Oversized IDs receive `bad_request` with the original ID.
+An oversized frame receives `bad_request` with an empty ID; the rest of that
+line is discarded through its newline before reading the next request.
+These errors keep the connection and its pause intact.
+
+Endpoint reads run independently of writes on both sides. The bridge reserves
+separate collection credits (64 requests, 4 MiB) and control credits (64 requests,
+64 KiB), including unknown-target cancel errors. Successful cancels release
+their credits when the target terminates. Exhausted control credits stop consuming
+stdin requests until replies release space. Resident and bridge stdin input queues hold at most 64 frames
+and 256 KiB; bridge event queues hold at most 32 frames and 32 MiB. Forwarding
+holds at most one queued and one active frame, each limited to 64 KiB.
+Each connection and bridge stdout has its own writer with one queued and one
+active event, each limited to 16 MiB. Full output queues backpressure only that
+connection. No endpoint/stdout or hook-file I/O runs under shared state/request
+locks. Scan progress keeps the newest pending snapshot; terminal replies retain
+their order and capacity. Full-pipe writes retry without dropping a pause.
+Independent input readers and closure probes detect disconnects even when their
+queues are full. Stdin EOF tears down the endpoint and releases the pause without
+waiting for stdout to drain; Windows synchronous stdio is cancelled and joined.
 
 ## GUI scan transport
 

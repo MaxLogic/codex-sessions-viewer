@@ -1,9 +1,55 @@
 //! The resident's collection worker. Queue files are authoritative; memory is bounded.
 use super::{Shared, protocol, signals};
 use serde_json::{Value, json};
+#[derive(Clone)]
 pub(super) struct Request {
     pub request: protocol::Request,
-    pub reply: std::sync::mpsc::SyncSender<Vec<Value>>,
+    pub reply: std::sync::mpsc::SyncSender<Value>,
+    // Progress is a replaceable snapshot, not a terminal reply. A stalled
+    // connection keeps the newest snapshot without filling terminal capacity.
+    pub progress: Arc<Mutex<Option<Value>>>,
+    pub cancelled: Arc<AtomicBool>,
+    pub completed: Arc<AtomicBool>,
+    pub delivery_failed: Arc<AtomicBool>,
+}
+impl Request {
+    pub fn new(request: protocol::Request, reply: std::sync::mpsc::SyncSender<Value>) -> Self {
+        Self {
+            request,
+            reply,
+            progress: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            completed: Arc::new(AtomicBool::new(false)),
+            delivery_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn emit(&self, mut event: Value) {
+        if self.completed.load(Ordering::SeqCst) {
+            return;
+        }
+        event["id"] = json!(self.request.id);
+        let mut progress = self.progress.lock().unwrap();
+        if event["event"] == "progress" {
+            *progress = Some(event);
+            return;
+        }
+        // Serialize snapshot publication with terminal replies. The handler
+        // drains both under this same local lock, then releases it before I/O.
+        if let Some(snapshot) = progress.take()
+            && self.reply.try_send(snapshot).is_err()
+        {
+            self.delivery_failed.store(true, Ordering::SeqCst);
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+        if self.reply.try_send(event).is_err() {
+            self.delivery_failed.store(true, Ordering::SeqCst);
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+    fn finish(&self, cancelled: bool) {
+        self.emit(json!({"v":1,"event":"done","cancelled":cancelled}));
+        self.completed.store(true, Ordering::SeqCst);
+    }
 }
 use crate::dart::DartDateTime;
 use crate::{
@@ -23,6 +69,11 @@ use std::{
 };
 
 const CAPACITY: usize = 10_000;
+pub(super) fn cli_message(error: cli::CliError) -> String {
+    match error {
+        cli::CliError::Usage(s) | cli::CliError::Failed(s) | cli::CliError::Refused(s) => s,
+    }
+}
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const SWEEP: Duration = Duration::from_secs(30);
 
@@ -69,6 +120,61 @@ fn belongs(item: &hooks::WorkItem, key: &str) -> bool {
         .as_deref()
         .is_none_or(|value| value == key)
 }
+pub(super) struct Notification {
+    path: Option<PathBuf>,
+    entry: Result<Entry, &'static str>,
+}
+/// Filesystem work is deliberately separate from the shared pending/state locks.
+pub(super) fn prepare_notification(
+    queue: &Path,
+    key: &str,
+    name: &str,
+    debounce: Duration,
+) -> Notification {
+    let path = valid_name(name).then(|| queue.join(name));
+    let entry = (|| {
+        let path = path.as_ref().ok_or("rejected")?;
+        let item = read_item(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                "already_handled"
+            } else {
+                "rejected"
+            }
+        })?;
+        if !belongs(&item, key) || !matches!(item.harness.as_str(), "codex" | "claude") {
+            return Err("rejected");
+        }
+        let retry = item
+            .not_before_utc
+            .as_deref()
+            .and_then(DartDateTime::try_parse)
+            .map_or(Duration::ZERO, |at| {
+                Duration::from_micros((at.micros() - DartDateTime::now().micros()).max(0) as u64)
+            });
+        Ok(Entry {
+            due: Instant::now() + debounce.max(retry),
+        })
+    })();
+    Notification { path, entry }
+}
+pub(super) fn sweep_shared(pending: &Mutex<Pending>, queue: &Path, key: &str, debounce: Duration) {
+    hooks::reclaim_stale(queue);
+    if let Ok(entries) = std::fs::read_dir(queue) {
+        for entry in entries.flatten() {
+            if pending.lock().unwrap().len() >= CAPACITY {
+                break;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                let notification = prepare_notification(queue, key, name, debounce);
+                pending.lock().unwrap().accept(notification);
+            }
+        }
+    }
+}
+fn requeue(pending: &Mutex<Pending>, queue: &Path, key: &str, name: &str) {
+    let notification = prepare_notification(queue, key, name, Duration::ZERO);
+    pending.lock().unwrap().accept(notification);
+}
 impl Pending {
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -82,42 +188,28 @@ impl Pending {
             .map(|entry| entry.due.saturating_duration_since(Instant::now()))
             .min()
     }
+    #[cfg(test)]
     pub(crate) fn notify(&mut self, queue: &Path, key: &str, name: &str) -> &'static str {
         self.insert(queue, key, name, DEBOUNCE)
     }
     fn insert(&mut self, queue: &Path, key: &str, name: &str, debounce: Duration) -> &'static str {
-        if !valid_name(name) {
+        self.accept(prepare_notification(queue, key, name, debounce))
+    }
+    pub(super) fn accept(&mut self, notification: Notification) -> &'static str {
+        let Some(path) = notification.path else {
             return "rejected";
-        }
-        let path = queue.join(name);
+        };
         if self.entries.contains_key(&path) {
             return "accepted";
         }
-        let item = match read_item(&path) {
-            Ok(item) => item,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return "already_handled",
-            Err(_) => return "rejected",
+        let entry = match notification.entry {
+            Ok(entry) => entry,
+            Err(result) => return result,
         };
-        if !belongs(&item, key) || !matches!(item.harness.as_str(), "codex" | "claude") {
-            return "rejected";
-        }
         if self.entries.len() >= CAPACITY {
-            // Never acknowledge ownership of an item absent from our pending set.
             return "rejected";
         }
-        let retry = item
-            .not_before_utc
-            .as_deref()
-            .and_then(DartDateTime::try_parse)
-            .map_or(Duration::ZERO, |at| {
-                Duration::from_micros((at.micros() - DartDateTime::now().micros()).max(0) as u64)
-            });
-        self.entries.insert(
-            path,
-            Entry {
-                due: Instant::now() + debounce.max(retry),
-            },
-        );
+        self.entries.insert(path, entry);
         "accepted"
     }
     pub(crate) fn sweep(&mut self, queue: &Path, key: &str, debounce: Duration) {
@@ -271,19 +363,13 @@ fn process(
                 if let Err(error) = hooks::release(&claim) {
                     hooks::log_error(queue, &format!("queue release: {error}"));
                 }
-                pending
-                    .lock()
-                    .unwrap()
-                    .insert(queue, key, name, Duration::ZERO);
+                requeue(pending, queue, key, name);
                 pass.database_error = Some(error);
                 break;
             }
             Err(ItemError::File(message)) => {
                 hooks::retry(queue, claim, &message);
-                pending
-                    .lock()
-                    .unwrap()
-                    .insert(queue, key, name, Duration::ZERO);
+                requeue(pending, queue, key, name);
                 pass.retried += 1;
             }
         }
@@ -528,8 +614,38 @@ impl Scheduler {
     pub(super) fn tick(&mut self) -> io::Result<()> {
         let shared = self.shared.clone();
         let _control = crate::store::write_budget::WriteControlScope::enter(move || {
-            shared.stopping.load(Ordering::SeqCst) || signals::stopping()
+            shared.stopping.load(Ordering::SeqCst)
+                || signals::stopping()
+                || shared.pausers.load(Ordering::SeqCst) > 0
         });
+        // Cancelled queued requests must finish even while another client pauses us.
+        {
+            let mut requests = self.shared.requests.lock().unwrap();
+            requests.retain(|request| {
+                if request.cancelled.load(Ordering::SeqCst) {
+                    request.finish(true);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let paused = {
+            let mut state = self.shared.state.lock().unwrap();
+            let paused = self.shared.pausers.load(Ordering::SeqCst) > 0;
+            if !paused && state.state == "paused" {
+                // Publish departure from paused under the same lock used by
+                // pause registration, before opening any database connection.
+                state.state = "starting";
+                self.retry_at = Instant::now();
+            }
+            paused
+        };
+        if paused {
+            self.store = None;
+            self.state("paused");
+            return Ok(());
+        }
         self.reload();
         let probe_due = Instant::now() >= self.next_sweep;
         if probe_due {
@@ -581,6 +697,11 @@ impl Scheduler {
             &mut self.rollouts,
         );
         if let Some(error) = pass.database_error {
+            if self.shared.pausers.load(Ordering::SeqCst) > 0 {
+                self.store = None;
+                self.state("paused");
+                return Ok(());
+            }
             return self.unavailable(error);
         }
         if pass.completed + pass.retried > 0 {
@@ -594,15 +715,34 @@ impl Scheduler {
             crate::t3::import_optional(&store.conn, &self.settings);
             self.last_import = Some(Instant::now());
         }
-        let request = self.shared.requests.lock().unwrap().pop_front();
+        let request = {
+            let mut requests = self.shared.requests.lock().unwrap();
+            let index = requests
+                .iter()
+                .position(|r| r.request.op == "ingest")
+                .unwrap_or(0);
+            requests.remove(index)
+        };
         if let Some(request) = request {
             self.execute(request)?;
         } else if self.settings.background_rescan_enabled && Instant::now() >= self.next_scan {
             let options = self.options.clone();
-            match self.full_scan(&["codex".into(), "claude".into()], &options) {
+            match self.full_scan(&["codex".into(), "claude".into()], &options, &[], None) {
                 Ok(_) => (),
+                Err(error)
+                    if self.shared.pausers.load(Ordering::SeqCst) > 0
+                        || self.shared.stopping.load(Ordering::SeqCst) =>
+                {
+                    let _ = error;
+                    self.store = None;
+                }
                 Err(error) => return self.unavailable(error),
             }
+        }
+        if self.shared.pausers.load(Ordering::SeqCst) > 0 {
+            self.store = None;
+            self.state("paused");
+            return Ok(());
         }
         if self.store.is_none() {
             return Ok(());
@@ -618,10 +758,45 @@ impl Scheduler {
         &mut self,
         harnesses: &[String],
         options: &cli::Options,
+        waiters: &[Request],
+        context: Option<&super::viewer::Context>,
     ) -> StoreResult<Vec<(String, crate::codex::CollectReport)>> {
         self.state("scanning");
         let store = self.store.as_ref().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
+        let tokens: Vec<_> = waiters.iter().map(|w| w.cancelled.clone()).collect();
+        let shared = self.shared.clone();
+        let _control = crate::store::write_budget::WriteControlScope::enter(move || {
+            shared.stopping.load(Ordering::SeqCst)
+                || signals::stopping()
+                || shared.pausers.load(Ordering::SeqCst) > 0
+                || (!tokens.is_empty() && tokens.iter().all(|t| t.load(Ordering::SeqCst)))
+        });
+        let stopped = || {
+            self.shared.stopping.load(Ordering::SeqCst)
+                || signals::stopping()
+                || self.shared.pausers.load(Ordering::SeqCst) > 0
+                || (!waiters.is_empty()
+                    && waiters.iter().all(|w| w.cancelled.load(Ordering::SeqCst)))
+        };
+        let last_progress = std::cell::Cell::new(None::<Instant>);
+        let progress = |harness: &str,
+                        counts: &crate::codex::scanner::ScanCounts,
+                        written: usize| {
+            let emit = last_progress
+                .get()
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(50));
+            if emit {
+                last_progress.set(Some(Instant::now()));
+            }
+            for waiter in waiters {
+                if waiter.cancelled.load(Ordering::SeqCst) {
+                    waiter.finish(true);
+                } else if emit {
+                    waiter.emit(json!({"v":1,"event":"progress","harness":harness,"counts":counts,"sessions_written":written}));
+                }
+            }
+        };
         let work = std::cell::RefCell::new((&mut self.rollouts, None));
         let next_sweep = std::cell::Cell::new(self.next_sweep);
         let service = || -> StoreResult<bool> {
@@ -629,7 +804,7 @@ impl Scheduler {
                 self.shared.sweep_queues(DEBOUNCE);
                 next_sweep.set(Instant::now() + SWEEP);
             }
-            if self.shared.stopping.load(Ordering::SeqCst) || signals::stopping() {
+            if stopped() {
                 cancel.store(true, Ordering::Relaxed);
                 return Ok(false);
             }
@@ -650,15 +825,34 @@ impl Scheduler {
                 work.0,
             );
             work.1 = pass.database_error;
-            Ok(work.1.is_none())
+            if work.1.is_none() && !stopped() {
+                let ingest = {
+                    let mut requests = self.shared.requests.lock().unwrap();
+                    requests
+                        .iter()
+                        .position(|r| r.request.op == "ingest")
+                        .and_then(|i| requests.remove(i))
+                };
+                if let Some(request) = ingest {
+                    ingest_request(store, &self.options, &request);
+                }
+            }
+            if stopped() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(work.1.is_none() && !stopped())
         };
-        let settings =
-            cli::load_settings(options).map_err(|error| StoreError::Refused(cli_message(error)))?;
+        let settings = match context {
+            Some(context) => context.load_settings().map_err(StoreError::Refused)?,
+            None => cli::load_settings(options)
+                .map_err(|error| StoreError::Refused(cli_message(error)))?,
+        };
         let mut reports = Vec::new();
         for harness in harnesses {
-            if cancel.load(Ordering::Relaxed) {
+            if stopped() || cancel.load(Ordering::Relaxed) {
                 break;
             }
+            progress(harness, &crate::codex::scanner::ScanCounts::default(), 0);
             let report = match harness.as_str() {
                 "codex" => {
                     let scan =
@@ -668,7 +862,8 @@ impl Scheduler {
                         &scan,
                         options.wsl_projects,
                         &cancel,
-                        |_, _| {
+                        |counts, written| {
+                            progress(harness, counts, written);
                             let _ = service();
                         },
                         |acquire| if acquire { service() } else { Ok(true) },
@@ -679,7 +874,10 @@ impl Scheduler {
                     )?
                 }
                 "claude" => {
-                    let roots = cli::claude_roots(options);
+                    let roots = context.map_or_else(
+                        || cli::claude_roots(options),
+                        |context| context.claude_roots(),
+                    );
                     let scan = crate::claude::ClaudeScanOptions {
                         roots,
                         mapper: crate::path_mapping::PathMapper::new(
@@ -696,7 +894,8 @@ impl Scheduler {
                         store,
                         &scan,
                         &cancel,
-                        |_, _| {
+                        |counts, written| {
+                            progress(harness, counts, written);
                             let _ = service();
                         },
                         |acquire| if acquire { service() } else { Ok(true) },
@@ -709,6 +908,9 @@ impl Scheduler {
         }
         if let Some(error) = work.into_inner().1 {
             return Err(error);
+        }
+        if stopped() || cancel.load(Ordering::Relaxed) {
+            return Ok(reports);
         }
         // Discovery has reconciled the persisted identities, including unchanged rollouts.
         // Keep the lookup across hook bursts instead of repeatedly walking every dated folder.
@@ -745,11 +947,15 @@ impl Scheduler {
         Ok(reports)
     }
     fn execute(&mut self, request: Request) -> io::Result<()> {
-        // Snapshot waiters before starting. Requests received during this scan
-        // remain queued for exactly one follow-up, never the scan already in flight.
-        let mut combined = request.request.clone();
+        if request.request.op == "ingest" {
+            ingest_request(self.store.as_ref().unwrap(), &self.options, &request);
+            self.last_work = Instant::now();
+            return Ok(());
+        }
+        // Snapshot before starting. Arrivals during this scan belong to the follow-up.
+        let combined = request.request.clone();
         let mut waiters = vec![request];
-        if combined.op == "scan" {
+        {
             let mut requests = self.shared.requests.lock().unwrap();
             let mut index = 0;
             while index < requests.len() {
@@ -758,6 +964,7 @@ impl Scheduler {
                     && next.force == combined.force
                     && next.parser_workers == combined.parser_workers
                     && next.harnesses == combined.harnesses
+                    && next.context == combined.context
                 {
                     waiters.push(requests.remove(index).unwrap());
                 } else {
@@ -765,131 +972,168 @@ impl Scheduler {
                 }
             }
         }
-        combined.id = waiters[0].request.id.clone();
-        let result = self.execute_inner(&combined);
-        for waiter in waiters {
-            let id = &waiter.request.id;
-            let events = match &result {
-                Ok(events) => {
-                    let mut events = events.to_vec();
-                    for event in &mut events {
-                        event["id"] = json!(id);
-                    }
-                    let cancelled = events.iter().any(|event| event["cancelled"] == true);
-                    if !events.iter().any(|event| event["event"] == "error") {
-                        events.push(json!({"v":1,"id":id,"event":"done","cancelled":cancelled}));
-                    }
-                    events
+        let context = combined.context.as_ref().expect("validated viewer context");
+        let mut options = context.options(&self.options);
+        options.force = combined.force.unwrap_or(false);
+        options.parser_workers = combined.parser_workers;
+        let harnesses = if combined.harnesses.is_empty() {
+            vec!["codex".into(), "claude".into()]
+        } else {
+            combined.harnesses
+        };
+        if harnesses.len() > 2
+            || harnesses
+                .iter()
+                .any(|h| !matches!(h.as_str(), "codex" | "claude"))
+            || matches!(options.parser_workers, Some(0 | 257..))
+        {
+            for waiter in waiters {
+                waiter.emit(protocol::error(
+                    "",
+                    "bad_request",
+                    "invalid harnesses or parser_workers",
+                ));
+                waiter.completed.store(true, Ordering::SeqCst);
+            }
+            return Ok(());
+        }
+        let result = self.full_scan(&harnesses, &options, &waiters, Some(context));
+        let interrupted = self.shared.pausers.load(Ordering::SeqCst) > 0
+            || self.shared.stopping.load(Ordering::SeqCst)
+            || signals::stopping()
+            || waiters.iter().all(|w| w.cancelled.load(Ordering::SeqCst));
+        let mut events = Vec::new();
+        match result {
+            Ok(reports) => {
+                for (command, report) in reports {
+                    let mut bytes = Vec::new();
+                    cli::print_report(
+                        &mut bytes,
+                        &command,
+                        self.store.as_ref().unwrap(),
+                        &report,
+                        true,
+                    )
+                    .map_err(|e| io::Error::other(cli_message(e)))?;
+                    let mut event: Value = serde_json::from_slice(&bytes)?;
+                    event["v"] = json!(1);
+                    events.push(event);
                 }
-                Err(error) => vec![protocol::error(id, "refused", error)],
-            };
-            // A disconnected viewer does not discard committed work.
-            let _ = waiter.reply.send(events);
+            }
+            Err(error) if interrupted => {
+                let _ = error;
+            }
+            Err(error) => {
+                for waiter in &waiters {
+                    waiter.emit(protocol::error("", "refused", &error.to_string()));
+                }
+                self.unavailable(error)?;
+            }
+        }
+        for waiter in waiters {
+            let cancelled = interrupted || waiter.cancelled.load(Ordering::SeqCst);
+            if !cancelled {
+                for event in &events {
+                    waiter.emit(event.clone());
+                }
+            }
+            waiter.finish(cancelled);
+        }
+        if interrupted {
+            // The old public call's plan is gone before pause can be acknowledged.
+            self.store = None;
         }
         Ok(())
     }
-    fn execute_inner(&mut self, request: &protocol::Request) -> Result<Vec<Value>, String> {
-        let mut options = self.options.clone();
-        if self.options.standalone.is_some() {
-            options.db = None;
-            options.standalone = Some(self.database.clone());
-        } else {
-            options.db = Some(self.database.clone());
-            options.standalone = None;
-        }
-        options.json = true;
-        if let Some(force) = request.force {
-            options.force = force;
-        }
-        if let Some(workers) = request.parser_workers {
-            if workers == 0 || workers > 256 {
-                return Err("parser_workers out of range".into());
-            }
-            options.parser_workers = Some(workers);
-        }
-        if request.op == "scan" {
-            let harnesses = if request.harnesses.is_empty() {
-                vec!["codex".into(), "claude".into()]
-            } else {
-                request.harnesses.clone()
-            };
-            if harnesses.len() > 2
-                || harnesses
-                    .iter()
-                    .any(|h| !matches!(h.as_str(), "codex" | "claude"))
-            {
-                return Err("invalid harnesses".into());
-            }
-            let reports = match self.full_scan(&harnesses, &options) {
-                Ok(reports) => reports,
-                Err(error) => {
-                    let message = error.to_string();
-                    self.unavailable(error).map_err(|e| e.to_string())?;
-                    return Err(message);
-                }
-            };
-            let store = self.store.as_ref().ok_or("database unavailable")?;
-            let mut events = Vec::new();
-            for (command, report) in reports {
-                let mut bytes = Vec::new();
-                cli::print_report(&mut bytes, &command, store, &report, true)
-                    .map_err(cli_message)?;
-                let mut event: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-                event["v"] = json!(1);
-                event["id"] = json!(request.id);
-                events.push(event);
-            }
-            return Ok(events);
-        }
-        let mut bytes = Vec::new();
-        if let Some(path) = &request.path {
-            options.positional = vec![path.clone()];
-        }
-        let harness = request.harness.as_deref();
-        let result = match harness {
-            Some("codex") => cli::codex_ingest_on(
-                self.store.as_ref().ok_or("database unavailable")?,
-                &options,
-                &mut bytes,
-            ),
-            Some("claude") => cli::claude_ingest_on(
-                self.store.as_ref().ok_or("database unavailable")?,
-                &options,
-                &mut bytes,
-            ),
-            _ => return Err("invalid ingest harness".into()),
-        };
-        if let Err(error) = result {
-            let exit_code = match &error {
-                cli::CliError::Usage(_) => 2,
-                cli::CliError::Refused(_) => 3,
-                cli::CliError::Failed(_) => 1,
-            };
-            // An unsuccessful ingest can still persist a failure status.
-            let report = serde_json::from_slice::<Value>(&bytes).ok();
-            return Ok(vec![json!({"v":1,"id":request.id,"event":"error",
-                    "code":"collection_failed","message":cli_message(error),
-                "exit_code":exit_code,"report":report})]);
-        }
-        self.last_work = Instant::now();
-        let report: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        Ok(vec![
-            json!({"v":1,"id":request.id,"event":"finished","report":report}),
-        ])
-    }
 }
 
-fn cli_message(error: cli::CliError) -> String {
-    match error {
-        cli::CliError::Usage(message)
-        | cli::CliError::Failed(message)
-        | cli::CliError::Refused(message) => message,
+fn ingest_request(store: &Store, base: &cli::Options, request: &Request) {
+    if request.cancelled.load(Ordering::SeqCst) {
+        request.finish(true);
+        return;
     }
+    let result = (|| -> Result<Value, String> {
+        let context = request
+            .request
+            .context
+            .as_ref()
+            .ok_or("viewer context missing")?;
+        let path = request
+            .request
+            .path
+            .as_deref()
+            .ok_or("ingest requires one absolute file path")?;
+        if !Path::new(path).is_absolute() {
+            return Err("ingest path must be absolute".into());
+        }
+        let options = context.options(base);
+        let settings = context.load_settings()?;
+        let harness = request
+            .request
+            .harness
+            .as_deref()
+            .ok_or("ingest harness missing")?;
+        let report = match harness {
+            "codex" => {
+                let root = cli::root_for_file(&settings, path);
+                let mut scan = cli::scan_options(&options, &settings, Vec::new());
+                scan.force = true;
+                crate::codex::collect_file(store, &scan, &root, options.wsl_projects)
+            }
+            "claude" => crate::claude::collect_file(
+                store,
+                Path::new(path),
+                cli::claude_source_type(&options, path),
+                &crate::path_mapping::PathMapper::new(settings.wsl_linux_root_unc.clone()),
+                &cli::claude_parser_options(&settings),
+            ),
+            _ => return Err("invalid ingest harness".into()),
+        }
+        .map_err(|e| e.to_string())?;
+        if report.counts.files_parsed == 0 {
+            return Err(format!("{path} was not ingested"));
+        }
+        let mut bytes = Vec::new();
+        cli::print_report(
+            &mut bytes,
+            &format!("{harness} ingest"),
+            store,
+            &report,
+            true,
+        )
+        .map_err(cli_message)?;
+        let mut event: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        event["v"] = json!(1);
+        Ok(event)
+    })();
+    match result {
+        Ok(event) => request.emit(event),
+        Err(message) => request.emit(protocol::error("", "refused", &message)),
+    }
+    request.completed.store(true, Ordering::SeqCst);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transport_stalled_progress_keeps_terminal_replies() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+        let request = Request::new(
+            protocol::decode(br#"{"v":1,"id":"scan","op":"scan"}"#).unwrap(),
+            sender,
+        );
+        for count in 0..100 {
+            request.emit(json!({"v":1,"event":"progress","counts":{"files":count}}));
+        }
+        request.emit(json!({"v":1,"event":"finished"}));
+        request.finish(false);
+        assert!(
+            !request.delivery_failed.load(Ordering::SeqCst),
+            "progress overflow disconnected a stalled peer"
+        );
+        assert_eq!(receiver.try_iter().last().unwrap()["event"], "done");
+    }
     #[test]
     fn hook_back_pressure_keeps_the_overflow_entry_durable() {
         let root = std::env::temp_dir().join(format!(

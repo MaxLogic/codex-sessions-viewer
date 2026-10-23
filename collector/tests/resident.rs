@@ -10,6 +10,1134 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 trait Wire: Read + Write + Send {}
 impl<T: Read + Write + Send> Wire for T {}
 
+fn next_event(wire: &mut impl BufRead) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut line = Vec::new();
+    loop {
+        match protocol::read_frame(wire, &mut line, protocol::MAX_EVENT_BYTES) {
+            Ok(protocol::Frame::Complete) => return serde_json::from_slice(&line).unwrap(),
+            Ok(protocol::Frame::Partial) => (),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            other => panic!("event stream ended: {:?}", other.err()),
+        }
+        assert!(Instant::now() < deadline, "event timeout");
+    }
+}
+
+impl Fixture {
+    fn viewer_request(&self, id: &str, op: &str) -> Value {
+        serde_json::json!({"v":1,"id":id,"op":op,"harnesses":["codex"],
+            "context":{"database":self.db,"settings":null,"windows_root":self.root.join("codex"),
+            "wsl_root":null,"wsl_unc_root":null,"claude_roots":[self.root.join("claude")],
+            "claude_wsl_roots":[],"wsl_projects":false}})
+    }
+}
+
+#[test]
+fn scan_request_streams_progress_before_finished_and_done() {
+    let mut fixture = Fixture::new();
+    fixture.rollout("01a0aaaa-0000-7000-8000-000000000201");
+    fixture.start("resident");
+    fixture.ready();
+    let mut wire = fixture.wire();
+    protocol::send(wire.get_mut(), &fixture.viewer_request("scan", "scan")).unwrap();
+    let first = next_event(&mut wire);
+    assert_eq!(first["event"], "progress", "{first}");
+    assert!(first["counts"].is_object());
+    let mut finished = false;
+    loop {
+        let event = next_event(&mut wire);
+        assert_eq!(event["id"], "scan");
+        assert_ne!(event["event"], "error", "{event}");
+        if event["event"] == "finished" {
+            finished = true;
+            assert_eq!(event["files_parsed"], 1);
+        }
+        if event["event"] == "done" {
+            assert!(finished);
+            assert_eq!(event["cancelled"], false);
+            break;
+        }
+    }
+}
+
+#[test]
+fn scan_request_refuses_missing_relative_or_foreign_context() {
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    for case in ["missing", "relative", "database", "settings"] {
+        let mut wire = fixture.wire();
+        let mut request = fixture.viewer_request(case, "scan");
+        match case {
+            "missing" => {
+                request.as_object_mut().unwrap().remove("context");
+            }
+            "relative" => request["context"]["windows_root"] = "relative".into(),
+            "database" => {
+                request["context"]["database"] =
+                    serde_json::json!(fixture.root.join("other.sqlite"))
+            }
+            "settings" => {
+                request["context"]["settings"] = serde_json::json!(fixture.root.join("other.toml"))
+            }
+            _ => unreachable!(),
+        }
+        let event = exchange(&mut wire, request);
+        assert_eq!(event["event"], "error", "{case}: {event}");
+        assert!(
+            matches!(event["code"].as_str(), Some("refused" | "bad_request")),
+            "{event}"
+        );
+    }
+}
+
+fn await_scanning(fixture: &Fixture) {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+        if status["state"] == "scanning" {
+            return;
+        }
+        assert!(Instant::now() < deadline, "scan did not start: {status}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn scan_request_cancel_detaches_one_coalesced_waiter() {
+    let mut fixture = Fixture::new();
+    fixture.rollout("01a0aaaa-0000-7000-8000-000000000204");
+    fixture.start("resident");
+    fixture.ready();
+    let mut first = fixture.wire();
+    let mut second = fixture.wire();
+    let mut control = fixture.wire();
+    assert_eq!(
+        exchange(
+            &mut control,
+            serde_json::json!({"v":1,"id":"pause","op":"pause"})
+        )["event"],
+        "paused"
+    );
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(codex_sessions_collector::store::write_lease::lock_path(&fixture.db).unwrap())
+        .unwrap();
+    lock.try_lock().unwrap();
+    protocol::send(first.get_mut(), &fixture.viewer_request("first", "scan")).unwrap();
+    protocol::send(second.get_mut(), &fixture.viewer_request("second", "scan")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+        if status["work_requests"] == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        exchange(
+            &mut control,
+            serde_json::json!({"v":1,"id":"resume","op":"resume"})
+        )["event"],
+        "resumed"
+    );
+    await_scanning(&fixture);
+    protocol::send(
+        first.get_mut(),
+        &serde_json::json!({"v":1,"id":"cancel","op":"cancel","target":"first"}),
+    )
+    .unwrap();
+    // A status reply on this connection is a barrier after cancellation was registered.
+    protocol::send(
+        first.get_mut(),
+        &serde_json::json!({"v":1,"id":"barrier","op":"status"}),
+    )
+    .unwrap();
+    let mut first_done = false;
+    loop {
+        let event = next_event(&mut first);
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], true);
+            first_done = true;
+        }
+        if event["id"] == "barrier" {
+            break;
+        }
+    }
+    drop(lock);
+    loop {
+        let event = next_event(&mut second);
+        assert_ne!(event["event"], "error", "{event}");
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], false);
+            break;
+        }
+    }
+    while !first_done {
+        let event = next_event(&mut first);
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], true);
+            first_done = true;
+        }
+    }
+    let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+    assert_eq!(status["last_scan"]["sequence"], 1);
+    fixture.await_ingested("01a0aaaa-0000-7000-8000-000000000204");
+}
+
+#[test]
+fn scan_request_cancel_on_same_connection_abandons_a_lease_wait() {
+    let mut fixture = Fixture::new();
+    fixture.rollout("01a0aaaa-0000-7000-8000-000000000202");
+    fixture.start("resident");
+    fixture.ready();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(codex_sessions_collector::store::write_lease::lock_path(&fixture.db).unwrap())
+        .unwrap();
+    lock.try_lock().unwrap();
+    let mut wire = fixture.wire();
+    protocol::send(wire.get_mut(), &fixture.viewer_request("cancel-me", "scan")).unwrap();
+    await_scanning(&fixture);
+    protocol::send(
+        wire.get_mut(),
+        &serde_json::json!({"v":1,"id":"cancel","op":"cancel","target":"cancel-me"}),
+    )
+    .unwrap();
+    loop {
+        let event = next_event(&mut wire);
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], true);
+            break;
+        }
+    }
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.db)
+            .unwrap()
+            .query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(lock);
+    protocol::send(wire.get_mut(), &fixture.viewer_request("fresh", "scan")).unwrap();
+    loop {
+        let event = next_event(&mut wire);
+        assert_ne!(event["event"], "error", "{event}");
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], false);
+            break;
+        }
+    }
+    fixture.await_ingested("01a0aaaa-0000-7000-8000-000000000202");
+}
+
+#[test]
+fn bridge_pause_abandons_scan_and_resume_starts_no_old_plan() {
+    let mut fixture = Fixture::new();
+    let sessions = fixture.root.join("codex/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    for i in 0..64 {
+        support::write_generated_session(
+            &sessions.join(format!("{i:03}.jsonl")),
+            &format!("01a0aaaa-0000-7000-8000-{i:012}"),
+            1,
+        );
+    }
+    let child = fixture
+        .command()
+        .args(["serve", "--db"])
+        .arg(&fixture.db)
+        .args(["--flush-sessions", "1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    fixture.children.push(child);
+    fixture.ready();
+    let mut wire = fixture.wire();
+    protocol::send(
+        wire.get_mut(),
+        &fixture.viewer_request("interrupted", "scan"),
+    )
+    .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.db).unwrap();
+    let count = || {
+        connection
+            .query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while count() == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    protocol::send(
+        wire.get_mut(),
+        &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
+    )
+    .unwrap();
+    let mut cancelled = false;
+    loop {
+        let event = next_event(&mut wire);
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], true);
+            cancelled = true;
+        }
+        if event["event"] == "paused" {
+            assert!(cancelled, "pause acknowledged before scan ended");
+            break;
+        }
+    }
+    let at_pause = count();
+    assert!(at_pause < 64);
+    assert_eq!(
+        connection
+            .query_row("pragma wal_checkpoint(truncate)", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        exchange(
+            &mut wire,
+            serde_json::json!({"v":1,"id":"resume","op":"resume"})
+        )["event"],
+        "resumed"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(), at_pause, "old plan resumed");
+    protocol::send(wire.get_mut(), &fixture.viewer_request("new-plan", "scan")).unwrap();
+    loop {
+        let event = next_event(&mut wire);
+        assert_ne!(event["event"], "error", "{event}");
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], false);
+            break;
+        }
+    }
+    assert_eq!(count(), 64);
+}
+
+#[test]
+fn bridge_pause_waits_for_closed_database_and_disconnect_releases() {
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    let mut first = fixture.wire();
+    let mut second = fixture.wire();
+    assert_eq!(
+        exchange(
+            &mut first,
+            serde_json::json!({"v":1,"id":"p1","op":"pause"})
+        )["event"],
+        "paused"
+    );
+    assert_eq!(
+        exchange(
+            &mut second,
+            serde_json::json!({"v":1,"id":"p2","op":"pause"})
+        )["event"],
+        "paused"
+    );
+    let connection = rusqlite::Connection::open(&fixture.db).unwrap();
+    let result: (i64, i64, i64) = connection
+        .query_row("pragma wal_checkpoint(truncate)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(result.0, 0);
+    drop(connection);
+    #[cfg(windows)]
+    {
+        // Windows SQLite handles do not share deletion. A successful rename
+        // proves the resident closed its connection, beyond transaction quiescence.
+        let renamed = fixture.root.join("closed-while-paused.sqlite");
+        std::fs::rename(&fixture.db, &renamed).unwrap();
+        std::fs::rename(&renamed, &fixture.db).unwrap();
+    }
+    drop(first);
+    let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+    assert_eq!(status["state"], "paused");
+    drop(second);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+        if status["state"] == "ready" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnect did not resume: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn bridge_pause_survives_cancel_flood() {
+    bridge_pause_survives_flood("cancel", 3000, 0, false);
+}
+
+#[test]
+fn bridge_pause_survives_large_id_flood() {
+    bridge_pause_survives_flood("status", 20, 60_000, false);
+}
+
+#[test]
+fn bridge_pause_survives_oversized_frame() {
+    bridge_pause_survives_flood("oversized", 1, 70_000, false);
+}
+
+#[test]
+fn bridge_resident_pause_survives_direct_control_flood() {
+    for (op, count, padding) in [
+        ("cancel", 3000, 0),
+        ("status", 20, 60_000),
+        ("oversized", 1, 70_000),
+    ] {
+        bridge_pause_survives_flood(op, count, padding, true);
+    }
+}
+
+fn bridge_pause_survives_flood(op: &'static str, count: usize, padding: usize, direct: bool) {
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    let (mut input, output): (Box<dyn Write + Send>, Box<dyn Read + Send>) = if direct {
+        let stream = fixture.native_stream();
+        (Box::new(stream.try_clone().unwrap()), Box::new(stream))
+    } else {
+        let child = fixture
+            .command()
+            .args(["client", "--db"])
+            .arg(&fixture.db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        fixture.children.push(child);
+        let child = fixture.children.last_mut().unwrap();
+        (
+            Box::new(child.stdin.take().unwrap()),
+            Box::new(child.stdout.take().unwrap()),
+        )
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            if sender
+                .send(serde_json::from_str::<Value>(&line).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let receive = || {
+        receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("flood reply timeout")
+    };
+    if !direct {
+        assert_eq!(receive()["state"], "connected");
+    }
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
+    )
+    .unwrap();
+    assert_eq!(receive()["event"], "paused");
+    let writer = std::thread::spawn(move || {
+        for index in 0..count {
+            let id = format!(
+                "flood-{index}-{}",
+                "x".repeat(if op == "oversized" { 0 } else { padding })
+            );
+            protocol::send(
+                &mut input,
+                &serde_json::json!({"v":1,"id":id,"op":if op == "oversized" { "status" } else { op },"target":"unknown", "extra":"x".repeat(if op == "oversized" { padding } else { 0 })}),
+            )
+            .unwrap();
+        }
+        protocol::send(
+            &mut input,
+            &serde_json::json!({"v":1,"id":"marker","op":"status"}),
+        )
+        .unwrap();
+        input
+    });
+    let mut answered = std::collections::HashSet::new();
+    loop {
+        let event = receive();
+        assert_ne!(
+            event["event"], "bridge",
+            "flood disconnected an acknowledged pause: {event}"
+        );
+        assert_ne!(event["code"], "disconnected", "flood reply disconnected");
+        if event["id"] == "marker" {
+            assert_eq!(event["state"], "paused", "pause lost during flood: {event}");
+            assert_eq!(answered.len(), count, "missing flood replies");
+            break;
+        }
+        let id = event["id"].as_str().unwrap();
+        assert!(id.starts_with("flood-") || (op == "oversized" && id.is_empty()));
+        assert!(answered.insert(id.to_owned()), "duplicate flood reply");
+        assert_eq!(event["code"], "bad_request");
+    }
+    let mut input = writer.join().unwrap();
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"resume","op":"resume"}),
+    )
+    .unwrap();
+    assert_eq!(receive()["event"], "resumed");
+    if direct {
+        protocol::send(
+            &mut input,
+            &serde_json::json!({"v":1,"id":"shutdown","op":"shutdown"}),
+        )
+        .unwrap();
+        assert_eq!(receive()["event"], "stopping");
+    }
+    drop(input);
+    let child = fixture.children.last_mut().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "bridge survived EOF");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().unwrap();
+}
+
+#[test]
+fn bridge_controls_remain_admissible_at_work_capacity() {
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    // Keep work queued after the bridge resumes, so cancellation is deterministic.
+    let mut other_pauser = fixture.wire();
+    assert_eq!(
+        exchange(
+            &mut other_pauser,
+            serde_json::json!({"v":1,"id":"other-pause","op":"pause"})
+        )["event"],
+        "paused"
+    );
+    let child = fixture
+        .command()
+        .args(["client", "--db"])
+        .arg(&fixture.db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fixture.children.push(child);
+    let child = fixture.children.last_mut().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            let event = serde_json::from_str::<Value>(&line).unwrap();
+            if sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    let receive = || receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(receive()["state"], "connected");
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
+    )
+    .unwrap();
+    assert_eq!(receive()["event"], "paused");
+    for index in 0..64 {
+        protocol::send(
+            &mut input,
+            &fixture.viewer_request(&format!("scan-{index}"), "scan"),
+        )
+        .unwrap();
+    }
+    protocol::send(&mut input, &fixture.viewer_request("overflow", "scan")).unwrap();
+    let overflow = receive();
+    assert_eq!(overflow["id"], "overflow", "{overflow}");
+    assert_eq!(overflow["code"], "refused", "{overflow}");
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"resume","op":"resume"}),
+    )
+    .unwrap();
+    let resumed = receive();
+    assert_eq!(
+        resumed["event"], "resumed",
+        "control refused at capacity: {resumed}"
+    );
+    for op in ["status", "hello"] {
+        protocol::send(
+            &mut input,
+            &serde_json::json!({"v":1,"id":op,"op":op,"client":"viewer"}),
+        )
+        .unwrap();
+        let event = receive();
+        assert_eq!(event["event"], op, "{event}");
+        assert_eq!(event["state"], "paused", "{event}");
+        if op == "status" {
+            assert_eq!(event["work_requests"], 64, "{event}");
+        }
+    }
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"cancel","op":"cancel","target":"scan-0"}),
+    )
+    .unwrap();
+    let cancelled = receive();
+    assert_eq!(cancelled["id"], "scan-0", "{cancelled}");
+    assert_eq!(cancelled["event"], "done", "{cancelled}");
+    assert_eq!(cancelled["cancelled"], true, "{cancelled}");
+    assert_eq!(
+        exchange(
+            &mut other_pauser,
+            serde_json::json!({"v":1,"id":"other-resume","op":"resume"})
+        )["event"],
+        "resumed"
+    );
+    let mut completed = std::collections::HashSet::new();
+    while completed.len() < 63 {
+        let event = receive();
+        assert_ne!(event["event"], "error", "{event}");
+        if event["event"] == "done" {
+            assert_eq!(event["cancelled"], false, "{event}");
+            assert!(completed.insert(event["id"].as_str().unwrap().to_owned()));
+        }
+    }
+    drop(input);
+    let child = fixture.children.last_mut().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "bridge survived EOF");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    reader.join().unwrap();
+}
+
+#[test]
+fn bridge_stalled_stdout_does_not_delay_stdin_eof() {
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    let mut child = fixture
+        .command()
+        .args(["client", "--db"])
+        .arg(&fixture.db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    fixture.children.push(child);
+    assert_eq!(next_event(&mut output)["state"], "connected");
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
+    )
+    .unwrap();
+    assert_eq!(next_event(&mut output)["event"], "paused");
+    // Rust's child pipe is larger than Python's 4 KiB reviewer pipe.
+    for index in 0..300 {
+        protocol::send(
+            &mut input,
+            &serde_json::json!({"v":1,"id":format!("status-{index}"),"op":"status"}),
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fixture
+        .children
+        .last_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "stalled stdout prevented EOF teardown"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    loop {
+        let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+        if status["state"] == "ready" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "EOF did not release pause: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn bridge_resident_disconnect_releases_pause_with_full_output_queue() {
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    let mut stream = BufReader::new(fixture.native_stream());
+    protocol::send(
+        stream.get_mut(),
+        &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
+    )
+    .unwrap();
+    assert_eq!(next_event(&mut stream)["event"], "paused");
+    for index in 0..300 {
+        protocol::send(
+            stream.get_mut(),
+            &serde_json::json!({"v":1,"id":format!("status-{index}"),"op":"status"}),
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = fixture.cli("status");
+        assert!(status.status.success(), "other client's status was blocked");
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        if status["state"] == "ready" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "full queue hid disconnect: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn bridge_resident_stalled_refusals_isolate_other_clients() {
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    let mut stalled = BufReader::new(fixture.native_stream());
+    protocol::send(
+        stalled.get_mut(),
+        &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
+    )
+    .unwrap();
+    assert_eq!(next_event(&mut stalled)["event"], "paused");
+    for index in 0..64 {
+        protocol::send(
+            stalled.get_mut(),
+            &fixture.viewer_request(&format!("queued-{index}"), "scan"),
+        )
+        .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+        if status["work_requests"] == 64 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "work queue did not fill: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let template = fixture.viewer_request("flood", "scan");
+    let (release, hold) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let mut stream = stalled.into_inner();
+        for index in 0..300 {
+            let mut request = template.clone();
+            request["id"] = format!("refused-{index}-{}", "x".repeat(230)).into();
+            if protocol::send(&mut stream, &request).is_err() {
+                break;
+            }
+        }
+        let _ = hold.recv();
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let started = Instant::now();
+    let status = fixture.cli("status");
+    let shutdown = fixture.cli("stop");
+    // Stop the fixture before joining the producer, including on a regression.
+    for child in &mut fixture.children {
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+    }
+    let _ = release.send(());
+    writer.join().unwrap();
+    assert!(
+        status.status.success(),
+        "independent status blocked: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        shutdown.status.success(),
+        "independent shutdown blocked: {}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "independent controls were delayed"
+    );
+}
+
+#[test]
+fn bridge_starts_absent_resident_relays_and_exits_on_stdin_eof() {
+    let mut fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.root.join("caller-root")).unwrap();
+    support::write_generated_session(
+        &fixture.root.join("caller-root/one.jsonl"),
+        "01a0aaaa-0000-7000-8000-000000000203",
+        1,
+    );
+    let child = fixture
+        .command()
+        .current_dir(&fixture.root)
+        .args([
+            "client",
+            "--db",
+            "viewer.sqlite",
+            "--windows-root",
+            "caller-root",
+            "--no-wsl-projects",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fixture.children.push(child);
+    let child = fixture.children.last_mut().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            if sender
+                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"status","op":"status"}),
+    )
+    .unwrap();
+    let mut connected = false;
+    loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bridge did not relay status");
+        if event["event"] == "bridge" && event["state"] == "connected" {
+            connected = true;
+        }
+        if event["id"] == "status" {
+            assert_eq!(event["event"], "status");
+            assert!(connected);
+            break;
+        }
+    }
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"scan","op":"scan","harnesses":["codex"]}),
+    )
+    .unwrap();
+    let mut finished = false;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(event["event"], "error", "{event}");
+        if event["event"] == "finished" {
+            assert_eq!(event["files_parsed"], 1);
+            finished = true;
+        }
+        if event["event"] == "done" {
+            assert!(finished);
+            break;
+        }
+    }
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
+    )
+    .unwrap();
+    let event = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(event["event"], "paused", "{event}");
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "bridge survived EOF");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    reader.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
+        if status["state"] == "ready" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bridge EOF left resident paused");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn bridge_reports_inflight_disconnect_and_reconnects_without_replaying() {
+    let mut fixture = Fixture::new();
+    fixture.rollout("01a0aaaa-0000-7000-8000-000000000205");
+    fixture.start("resident");
+    fixture.ready();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(codex_sessions_collector::store::write_lease::lock_path(&fixture.db).unwrap())
+        .unwrap();
+    lock.try_lock().unwrap();
+    let mut bridge = fixture
+        .command()
+        .args(["client", "--db"])
+        .arg(&fixture.db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = bridge.stdin.take().unwrap();
+    let output = bridge.stdout.take().unwrap();
+    fixture.children.push(bridge);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            if sender
+                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"interrupted","op":"scan","harnesses":["codex"]}),
+    )
+    .unwrap();
+    await_scanning(&fixture);
+    fixture.children[0].kill().unwrap();
+    fixture.children[0].wait().unwrap();
+    let mut disconnected = false;
+    let mut reconnecting = false;
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        if event["id"] == "interrupted" && event["code"] == "disconnected" {
+            disconnected = true;
+        }
+        if event["event"] == "bridge" && event["state"] == "reconnecting" {
+            reconnecting = true;
+        }
+        if reconnecting && event["event"] == "bridge" && event["state"] == "connected" {
+            assert!(disconnected);
+            break;
+        }
+    }
+    drop(lock);
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"fresh","op":"scan","harnesses":["codex"]}),
+    )
+    .unwrap();
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(event["id"], "interrupted", "disconnected scan replayed");
+        assert_ne!(event["event"], "error", "{event}");
+        if event["id"] == "fresh" && event["event"] == "done" {
+            assert_eq!(event["cancelled"], false);
+            break;
+        }
+    }
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = fixture.children[1].try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_replaces_only_a_positively_incompatible_resident() {
+    for scenario in [
+        "disconnect",
+        "malformed",
+        "build",
+        "version",
+        "viewer-protocol",
+    ] {
+        eprintln!("bridge compatibility scenario={scenario}");
+        let incompatible = matches!(scenario, "build" | "version" | "viewer-protocol");
+        let fixture = Fixture::new();
+        let key = instance::database_key(&fixture.db).unwrap();
+        let lock = instance::InstanceLock::try_acquire(&fixture.db)
+            .unwrap()
+            .unwrap();
+        let mut listener = endpoint::Listener::bind(&key).unwrap();
+        let fake = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut accept = || {
+                loop {
+                    match listener.accept() {
+                        Ok(stream) => return stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            assert!(Instant::now() < deadline)
+                        }
+                        Err(e) => panic!("fake accept: {e}"),
+                    }
+                }
+            };
+            let mut wire = BufReader::new(accept());
+            let request = next_event(&mut wire);
+            assert_eq!(request["op"], "hello");
+            if scenario == "malformed" {
+                protocol::send(wire.get_mut(), &serde_json::json!({"v":1,"id":"bridge-hello","event":"hello","database_key":key})).unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    wire.read(&mut byte).unwrap(),
+                    0,
+                    "malformed hello triggered another request"
+                );
+            }
+            if incompatible {
+                if scenario == "version" {
+                    protocol::send(wire.get_mut(), &serde_json::json!({"v":2,"id":"bridge-hello","event":"error","code":"unsupported_version"})).unwrap();
+                    drop(wire);
+                    wire = BufReader::new(accept());
+                } else {
+                    let mut hello = serde_json::json!({"v":1,"id":"bridge-hello","event":"hello",
+                        "database_key":key,"protocol":1,"collector_version":"older-build","schema":30,"contract":2,
+                        "parsers":{"codex":1,"claude":1},"state":"ready"});
+                    if scenario == "viewer-protocol" {
+                        hello["collector_version"] = env!("CARGO_PKG_VERSION").into();
+                        hello["schema"] =
+                            codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION
+                                .into();
+                        hello["contract"] =
+                            codex_sessions_collector::contract::CONTRACT_VERSION.into();
+                        hello["parsers"]["codex"] =
+                            codex_sessions_collector::codex::parser::PARSER_VERSION.into();
+                        hello["parsers"]["claude"] =
+                            codex_sessions_collector::claude::parser::CLAUDE_PARSER_VERSION.into();
+                    }
+                    protocol::send(wire.get_mut(), &hello).unwrap();
+                }
+                let shutdown = next_event(&mut wire);
+                assert_eq!(shutdown["op"], "shutdown");
+                protocol::send(
+                    wire.get_mut(),
+                    &protocol::event("bridge-replace", "stopping"),
+                )
+                .unwrap();
+            }
+            // false simulates a transient disconnect during hello, with no identity reply.
+            drop(wire);
+            drop(listener);
+            drop(lock);
+        });
+        let output = fixture
+            .command()
+            .args(["client", "--db"])
+            .arg(&fixture.db)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        fake.join().unwrap();
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        if incompatible {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["event"] == "bridge" && e["state"] == "replaced"),
+                "{events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["event"] == "bridge" && e["state"] == "connected")
+            );
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["event"] == "bridge" && e["state"] == "failed")
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e["state"].as_str(), Some("replaced" | "starting")))
+            );
+            assert!(
+                instance::InstanceLock::try_acquire(&fixture.db)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn database_identity_survives_creation_through_a_junction() {
@@ -218,16 +1346,18 @@ fn alternate_queue_detached_drain_recovers_from_database_unavailability() {
             .spawn()
             .unwrap();
         let pid = hook.id();
-        assert!(hook.wait_with_output().unwrap().status.success());
+        let output = hook.wait_with_output().unwrap();
+        let hook_elapsed = started.elapsed();
+        let _workers = DetachedWorkers::for_hook(pid);
+        assert!(output.status.success());
         eprintln!(
             "database recovery {unavailable} hook_returned_ms={:.3}",
-            started.elapsed().as_secs_f64() * 1000.0
+            hook_elapsed.as_secs_f64() * 1000.0
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            hook_elapsed < Duration::from_secs(1),
             "hook waited for database recovery"
         );
-        let _workers = DetachedWorkers::for_hook(pid);
         // Keep the refusal in place across several retry polls. Attempts are a
         // file retry budget, never a database availability budget.
         let held_until = Instant::now() + Duration::from_secs(3);
@@ -457,8 +1587,9 @@ fn alternate_queue_detached_drain_logs_permanent_refusal() {
         .spawn()
         .unwrap();
     let pid = hook.id();
-    assert!(hook.wait_with_output().unwrap().status.success());
+    let output = hook.wait_with_output().unwrap();
     let _workers = DetachedWorkers::for_hook(pid);
+    assert!(output.status.success());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if std::fs::read_to_string(queue.join("errors.log"))
@@ -537,7 +1668,9 @@ struct DetachedWorkers {
 impl DetachedWorkers {
     fn for_resident(fixture: &Fixture) -> Self {
         let status: Value = serde_json::from_slice(&fixture.cli("status").stdout).unwrap();
-        let pid = status["pid"].as_u64().unwrap() as u32;
+        Self::for_pid(status["pid"].as_u64().unwrap() as u32)
+    }
+    fn for_pid(pid: u32) -> Self {
         #[cfg(windows)]
         {
             use std::os::windows::io::FromRawHandle;
@@ -551,11 +1684,12 @@ impl DetachedWorkers {
                     pid,
                 )
             };
-            assert!(!handle.is_null());
             Self {
-                handles: vec![unsafe {
-                    std::os::windows::io::OwnedHandle::from_raw_handle(handle)
-                }],
+                handles: if handle.is_null() {
+                    Vec::new()
+                } else {
+                    vec![unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) }]
+                },
             }
         }
         #[cfg(not(windows))]
@@ -1171,6 +2305,9 @@ impl Fixture {
         }
     }
     fn wire(&self) -> BufReader<Box<dyn Wire>> {
+        BufReader::new(Box::new(self.native_stream()))
+    }
+    fn native_stream(&self) -> endpoint::Stream {
         #[cfg(windows)]
         let stream = endpoint::connect(
             &instance::database_key(&self.db).unwrap(),
@@ -1191,7 +2328,7 @@ impl Fixture {
                 .unwrap();
             stream
         };
-        BufReader::new(Box::new(stream))
+        stream
     }
     fn wait_all(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
@@ -1461,6 +2598,15 @@ fn cli_scan_and_ingest_run_alongside_the_resident() {
 
 #[test]
 fn hook_notify_preempts_a_long_periodic_scan_between_writer_calls() {
+    preempts_periodic_scan(false);
+}
+
+#[test]
+fn scan_request_ingest_preempts_periodic_scan() {
+    preempts_periodic_scan(true);
+}
+
+fn preempts_periodic_scan(viewer_ingest: bool) {
     let mut fixture = Fixture::new();
     // Forty-eight real public writer calls create a bounded long scan using
     // the production 150 ms write gap, without a test-only scheduler delay.
@@ -1527,14 +2673,25 @@ fn hook_notify_preempts_a_long_periodic_scan_between_writer_calls() {
     )
     .unwrap();
     let started = Instant::now();
-    let output = fixture
-        .command()
-        .args(["claude", "hook", "--db"])
-        .arg(&fixture.db)
-        .stdin(Stdio::from(std::fs::File::open(input).unwrap()))
-        .output()
-        .unwrap();
-    assert!(output.status.success());
+    let mut viewer = None;
+    if viewer_ingest {
+        let mut wire = fixture.wire();
+        let mut request = fixture.viewer_request("priority", "ingest");
+        request["context"]["settings"] = serde_json::json!(settings);
+        request["harness"] = "claude".into();
+        request["path"] = serde_json::json!(transcript);
+        protocol::send(wire.get_mut(), &request).unwrap();
+        viewer = Some(wire);
+    } else {
+        let output = fixture
+            .command()
+            .args(["claude", "hook", "--db"])
+            .arg(&fixture.db)
+            .stdin(Stdio::from(std::fs::File::open(input).unwrap()))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
     let handoff = started.elapsed();
     assert!(
         handoff < Duration::from_secs(1),
@@ -1546,6 +2703,11 @@ fn hook_notify_preempts_a_long_periodic_scan_between_writer_calls() {
             "hook starved behind periodic scan"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(mut wire) = viewer {
+        let reply = next_event(&mut wire);
+        assert_eq!(reply["event"], "finished", "{reply}");
+        assert_eq!(reply["files_parsed"], 1);
     }
     let latency = started.elapsed();
     assert!(
@@ -1651,7 +2813,7 @@ fn resident_shutdown_interrupts_a_scan_waiting_for_the_collector_lease() {
     let mut wire = fixture.wire();
     protocol::send(
         wire.get_mut(),
-        &serde_json::json!({"v":1,"id":"shutdown-scan","op":"scan","harnesses":["codex"]}),
+        &fixture.viewer_request("shutdown-scan", "scan"),
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -1674,7 +2836,7 @@ fn resident_shutdown_interrupts_a_scan_waiting_for_the_collector_lease() {
 }
 
 #[test]
-fn resident_coalesces_waiters_into_one_followup_scan() {
+fn scan_request_coalesces_waiters_into_one_followup_scan() {
     let mut fixture = Fixture::new();
     fixture.rollout("01a0aaaa-0000-7000-8000-000000000190");
     fixture.start("resident");
@@ -1688,11 +2850,7 @@ fn resident_coalesces_waiters_into_one_followup_scan() {
         .unwrap();
     lock.try_lock().unwrap();
     let mut wires = [fixture.wire(), fixture.wire(), fixture.wire()];
-    protocol::send(
-        wires[0].get_mut(),
-        &serde_json::json!({"v":1,"id":"first","op":"scan","harnesses":["codex"]}),
-    )
-    .unwrap();
+    protocol::send(wires[0].get_mut(), &fixture.viewer_request("first", "scan")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if serde_json::from_slice::<Value>(&fixture.cli("status").stdout).unwrap()["state"]
@@ -1704,7 +2862,9 @@ fn resident_coalesces_waiters_into_one_followup_scan() {
         std::thread::sleep(Duration::from_millis(20));
     }
     for (index, wire) in wires.iter_mut().enumerate().skip(1) {
-        protocol::send(wire.get_mut(), &serde_json::json!({"v":1,"id":format!("follow-{index}"),"op":"scan","harnesses":["codex"],"force":true})).unwrap();
+        let mut request = fixture.viewer_request(&format!("follow-{index}"), "scan");
+        request["force"] = true.into();
+        protocol::send(wire.get_mut(), &request).unwrap();
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -1749,6 +2909,13 @@ fn resident_coalesces_waiters_into_one_followup_scan() {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // A detached resident can own this fixture as its current directory.
+        // Retain a process handle before shutdown and wait for process exit,
+        // not merely instance-lock release, before removing the fixture.
+        let resident = serde_json::from_slice::<Value>(&self.cli("status").stdout)
+            .ok()
+            .and_then(|v| v["pid"].as_u64())
+            .map(|pid| DetachedWorkers::for_pid(pid as u32));
         // Includes residents started by this fixture's hook fallback.
         let _ = self.cli("stop");
         for child in &mut self.children {
@@ -1757,6 +2924,7 @@ impl Drop for Fixture {
             }
             child.wait().unwrap();
         }
+        drop(resident);
         // Only this test's freshly allocated root; never follow reparse points.
         fn no_links(path: &Path) -> bool {
             std::fs::read_dir(path).unwrap().all(|entry| {
@@ -1891,7 +3059,7 @@ fn single_instance_database_key_uses_absolute_case_normalization() {
 }
 
 #[test]
-fn protocol_wire_version_and_validation() {
+fn bridge_protocol_wire_version_and_validation() {
     let mut fixture = Fixture::new();
     fixture.start("viewer");
     fixture.ready();

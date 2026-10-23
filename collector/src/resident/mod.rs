@@ -1,8 +1,11 @@
 //! Resident control plane. The scheduler and collection operations join in S2b/S3a.
+pub mod bridge;
 pub mod endpoint;
 pub mod instance;
 pub mod protocol;
 pub mod scheduler;
+mod transport;
+pub mod viewer;
 
 use crate::store::{OwnerMode, StoreError, schema, write_budget};
 use rusqlite::{Connection, OpenFlags};
@@ -51,14 +54,13 @@ struct Shared {
     queue: PathBuf,
     requests: Mutex<std::collections::VecDeque<scheduler::Request>>,
     wake: std::sync::mpsc::SyncSender<()>,
+    pausers: AtomicUsize,
+    settings: Option<PathBuf>,
 }
 
 impl Shared {
     fn sweep_queues(&self, debounce: Duration) {
-        self.pending
-            .lock()
-            .unwrap()
-            .sweep(&self.queue, &self.key, debounce);
+        scheduler::sweep_shared(&self.pending, &self.queue, &self.key, debounce);
     }
     // The callback exposes the decision/publication boundary to deterministic
     // concurrency tests; production supplies a no-op.
@@ -115,6 +117,7 @@ fn register_hello(request: &protocol::Request, state: &mut State, viewer: &mut b
 
 fn hello(id: &str, state: &State) -> Value {
     json!({"v":protocol::VERSION,"id":id,"event":"hello", "protocol":protocol::VERSION,
+        "viewer_protocol":protocol::VERSION,
         "collector_version":env!("CARGO_PKG_VERSION"), "schema":schema::SUPPORTED_SCHEMA_VERSION,
         "contract":crate::contract::CONTRACT_VERSION,
         "parsers":{"codex":crate::codex::parser::PARSER_VERSION,"claude":crate::claude::parser::CLAUDE_PARSER_VERSION},
@@ -129,9 +132,18 @@ fn status(id: &str, state: &State) -> Value {
 struct ConnectionGuard {
     shared: Arc<Shared>,
     viewer: bool,
+    paused: bool,
+    work: Vec<scheduler::Request>,
 }
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        for work in &self.work {
+            work.cancelled.store(true, Ordering::SeqCst);
+        }
+        if self.paused {
+            self.shared.pausers.fetch_sub(1, Ordering::SeqCst);
+        }
+        let _ = self.shared.wake.try_send(());
         if self.viewer {
             let mut state = self.shared.state.lock().unwrap();
             state.viewers -= 1;
@@ -146,92 +158,248 @@ fn handle(stream: endpoint::Stream, shared: Arc<Shared>) -> io::Result<()> {
     let mut guard = ConnectionGuard {
         shared,
         viewer: false,
+        paused: false,
+        work: Vec::new(),
     };
-    let mut reader = BufReader::new(stream);
-    let mut line = Vec::new();
-    let mut partial_since = None;
-    while !guard.shared.stopping.load(Ordering::SeqCst) {
-        match protocol::read_frame(&mut reader, &mut line, protocol::MAX_REQUEST_BYTES) {
-            Ok(protocol::Frame::Eof) => break,
-            Ok(protocol::Frame::Complete) => (),
-            Ok(protocol::Frame::Partial) => {
-                if partial_since.get_or_insert_with(Instant::now).elapsed() > START_TIMEOUT {
-                    break;
-                }
-                continue;
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
+    let wake = Arc::new(transport::Wake::default());
+    let incoming =
+        transport::Incoming::new(BufReader::new(stream.try_clone()?), true, wake.clone())?;
+    let closed = incoming.closed_flag();
+    let output_closed = closed.clone();
+    let shared = guard.shared.clone();
+    let mut writer = transport::Output::new(stream, move || {
+        output_closed.load(Ordering::SeqCst) || shared.stopping.load(Ordering::SeqCst)
+    });
+    let mut paused_reply: Option<String> = None;
+    let mut replies = Vec::new();
+    while !guard.shared.stopping.load(Ordering::SeqCst) && !closed.load(Ordering::SeqCst) {
+        let mut delivery_error = None;
+        type ReplyInbox = (std::sync::mpsc::Receiver<Value>, Arc<Mutex<Option<Value>>>);
+        replies.retain(|(receiver, progress): &ReplyInbox| {
+            let mut events = Vec::new();
+            let mut connected = true;
             {
-                if !line.is_empty()
-                    && partial_since.get_or_insert_with(Instant::now).elapsed() > START_TIMEOUT
-                {
-                    break;
+                let mut progress = progress.lock().unwrap();
+                loop {
+                    match receiver.try_recv() {
+                        Ok(event) => events.push(event),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            connected = false;
+                            break;
+                        }
+                    }
                 }
+                if let Some(snapshot) = progress.take() {
+                    events.push(snapshot);
+                }
+            }
+            for event in events {
+                if let Err(error) = protocol::send(&mut writer, &event) {
+                    delivery_error = Some(error);
+                    return false;
+                }
+            }
+            connected
+        });
+        if let Some(error) = delivery_error {
+            return Err(error);
+        }
+        if guard
+            .work
+            .iter()
+            .any(|work| work.delivery_failed.load(Ordering::SeqCst))
+        {
+            return Err(io::Error::other(
+                "viewer is not consuming collection events",
+            ));
+        }
+        guard
+            .work
+            .retain(|work| !work.completed.load(Ordering::SeqCst));
+        if paused_reply.is_some() && guard.shared.state.lock().unwrap().state == "paused" {
+            protocol::send(
+                &mut writer,
+                &protocol::event(&paused_reply.take().unwrap(), "paused"),
+            )?;
+        }
+        let line = match incoming.try_recv() {
+            Some(transport::Event::Frame(bytes)) => bytes,
+            Some(transport::Event::Rejected(error)) => {
+                protocol::send(&mut writer, &error)?;
                 continue;
             }
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                protocol::send(
-                    reader.get_mut(),
-                    &protocol::error("", "bad_request", "invalid or oversized request"),
-                )?;
+            Some(transport::Event::Closed(error))
+                if error.kind() == io::ErrorKind::UnexpectedEof =>
+            {
                 break;
             }
-            Err(error) => return Err(error),
-        }
-        partial_since = None;
-        let request = match protocol::decode(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                protocol::send(reader.get_mut(), &error)?;
-                break;
+            Some(transport::Event::Closed(error)) => return Err(error),
+            None => {
+                wake.wait();
+                continue;
             }
         };
-        line.clear();
+        let mut request = match protocol::decode(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                protocol::send(&mut writer, &error)?;
+                if error["code"] == "unsupported_version" {
+                    break;
+                }
+                continue;
+            }
+        };
         debug_assert_eq!(request.v, protocol::VERSION);
         if matches!(request.op.as_str(), "scan" | "ingest") {
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            {
-                let state = guard.shared.state.lock().unwrap();
-                let mut requests = guard.shared.requests.lock().unwrap();
-                if state.state == "stopping" || requests.len() >= 64 {
-                    protocol::send(
-                        reader.get_mut(),
-                        &protocol::error(
-                            &request.id,
-                            "refused",
-                            "resident stopping or request queue full",
-                        ),
-                    )?;
-                    continue;
-                }
-                requests.push_back(scheduler::Request {
-                    request,
-                    reply: sender,
-                });
-                let _ = guard.shared.wake.try_send(());
+            let validation = request
+                .context
+                .as_ref()
+                .ok_or("viewer request requires explicit context".to_owned())
+                .and_then(|context| context.validate(&guard.shared.key, &guard.shared.settings));
+            if let Err(message) = validation {
+                protocol::send(
+                    &mut writer,
+                    &protocol::error(&request.id, "refused", &message),
+                )?;
+                continue;
             }
-            loop {
-                match receiver.recv_timeout(Duration::from_millis(100)) {
-                    Ok(events) => {
-                        for event in events {
-                            protocol::send(reader.get_mut(), &event)?;
-                        }
-                        break;
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                        if !guard.shared.stopping.load(Ordering::SeqCst) =>
-                    {
-                        continue;
-                    }
-                    Err(_) => break,
+            let invalid = if request.op == "scan" {
+                request.harnesses.len() > 2
+                    || request
+                        .harnesses
+                        .iter()
+                        .any(|h| !matches!(h.as_str(), "codex" | "claude"))
+                    || matches!(request.parser_workers, Some(0 | 257..))
+            } else {
+                !matches!(request.harness.as_deref(), Some("codex" | "claude"))
+                    || request
+                        .path
+                        .as_ref()
+                        .is_none_or(|p| !Path::new(p).is_absolute())
+            };
+            if invalid {
+                protocol::send(
+                    &mut writer,
+                    &protocol::error(
+                        &request.id,
+                        "bad_request",
+                        "invalid harness, workers or absolute ingest path",
+                    ),
+                )?;
+                continue;
+            }
+            if request.op == "scan" {
+                if request.harnesses.is_empty() {
+                    request.harnesses = vec!["codex".into(), "claude".into()];
                 }
+                request.harnesses.sort();
+                request.harnesses.dedup();
+                request.force = Some(request.force.unwrap_or(false));
+                request.parser_workers = Some(
+                    request
+                        .parser_workers
+                        .unwrap_or_else(crate::cli::default_parser_workers),
+                );
+            }
+            let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+            let state = guard.shared.state.lock().unwrap();
+            let mut requests = guard.shared.requests.lock().unwrap();
+            if state.state == "stopping"
+                || requests.len() >= 64
+                || guard.work.len() >= 64
+                || guard.work.iter().any(|w| w.request.id == request.id)
+            {
+                let reply = protocol::error(
+                    &request.id,
+                    "refused",
+                    "resident stopping, duplicate id or request queue full",
+                );
+                drop(requests);
+                drop(state);
+                protocol::send(&mut writer, &reply)?;
+                continue;
+            }
+            let work = scheduler::Request::new(request, sender);
+            guard.work.push(work.clone());
+            replies.push((receiver, work.progress.clone()));
+            requests.push_back(work);
+            let _ = guard.shared.wake.try_send(());
+            continue;
+        }
+        if request.op == "cancel" {
+            if let Some(work) = guard.work.iter().find(|work| {
+                Some(&work.request.id) == request.target.as_ref()
+                    && !work.completed.load(Ordering::SeqCst)
+            }) {
+                work.cancelled.store(true, Ordering::SeqCst);
+                let _ = guard.shared.wake.try_send(());
+            } else {
+                protocol::send(
+                    &mut writer,
+                    &protocol::error(
+                        &request.id,
+                        "bad_request",
+                        "unknown cancellation target on this connection",
+                    ),
+                )?;
             }
             continue;
         }
+        if request.op == "pause" {
+            let state = guard.shared.state.lock().unwrap();
+            if !guard.paused {
+                guard.shared.pausers.fetch_add(1, Ordering::SeqCst);
+                guard.paused = true;
+            }
+            drop(state);
+            if paused_reply.is_some() {
+                protocol::send(
+                    &mut writer,
+                    &protocol::error(
+                        &request.id,
+                        "bad_request",
+                        "pause acknowledgement already pending",
+                    ),
+                )?;
+            } else {
+                paused_reply = Some(request.id);
+            }
+            let _ = guard.shared.wake.try_send(());
+            continue;
+        }
+        if request.op == "resume" {
+            if guard.paused {
+                guard.shared.pausers.fetch_sub(1, Ordering::SeqCst);
+                guard.paused = false;
+            }
+            if let Some(id) = paused_reply.take() {
+                protocol::send(
+                    &mut writer,
+                    &protocol::error(&id, "refused", "pause withdrawn before acknowledgement"),
+                )?;
+            }
+            protocol::send(&mut writer, &protocol::event(&request.id, "resumed"))?;
+            let _ = guard.shared.wake.try_send(());
+            continue;
+        }
+        let notification = (request.op == "notify"
+            && request
+                .queue
+                .as_ref()
+                .is_none_or(|queue| queue == &guard.shared.queue)
+            && request
+                .database_key
+                .as_ref()
+                .is_none_or(|key| key == &guard.shared.key))
+        .then(|| {
+            scheduler::prepare_notification(
+                &guard.shared.queue,
+                &guard.shared.key,
+                request.entry.as_deref().unwrap_or(""),
+                Duration::from_millis(250),
+            )
+        });
         let mut state = guard.shared.state.lock().unwrap();
         let reply = match request.op.as_str() {
             "hello" => {
@@ -261,11 +429,12 @@ fn handle(stream: endpoint::Stream, shared: Arc<Shared>) -> io::Result<()> {
                 {
                     json!({"v":1,"id":request.id,"event":"ack","state":"ownership_mismatch"})
                 } else {
-                    let result = guard.shared.pending.lock().unwrap().notify(
-                        request.queue.as_deref().unwrap_or(&guard.shared.queue),
-                        &guard.shared.key,
-                        request.entry.as_deref().unwrap_or(""),
-                    );
+                    let result = guard
+                        .shared
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .accept(notification.expect("validated notification context"));
                     state.lifetime = Lifetime::Resident;
                     json!({"v":1,"id":request.id,"event":"ack","state":result})
                 }
@@ -278,7 +447,7 @@ fn handle(stream: endpoint::Stream, shared: Arc<Shared>) -> io::Result<()> {
         };
         drop(state);
         let _ = guard.shared.wake.try_send(());
-        protocol::send(reader.get_mut(), &reply)?;
+        protocol::send(&mut writer, &reply)?;
     }
     Ok(())
 }
@@ -570,6 +739,13 @@ fn run_inner(
         queue,
         requests: Mutex::new(std::collections::VecDeque::new()),
         wake,
+        pausers: AtomicUsize::new(0),
+        settings: options
+            .settings
+            .clone()
+            .or_else(crate::settings::default_settings_file)
+            .map(|p| instance::identity_path(&p))
+            .transpose()?,
     });
     let listener = match endpoint::Listener::bind(&key) {
         Ok(listener) => Some(listener),
@@ -626,6 +802,7 @@ fn run_inner(
             Err(_) => fatal = Some(io::Error::other("resident accept loop panicked")),
         }
     }
+    drop(worker);
     log.record("stopped")?;
     drop(lock);
     if let Some(error) = fatal {
@@ -789,6 +966,8 @@ mod tests {
             queue: PathBuf::new(),
             requests: Mutex::new(std::collections::VecDeque::new()),
             wake: std::sync::mpsc::sync_channel(1).0,
+            pausers: AtomicUsize::new(0),
+            settings: None,
         })
     }
     fn requests() -> [protocol::Request; 2] {
