@@ -1,3 +1,6 @@
+import 'package:codex_sessions_viewer/src/scanner/resident_collector_client.dart';
+import 'package:codex_sessions_viewer/src/ui/widgets/collector_status.dart';
+import '../support/scripted_collector_bridge.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
@@ -150,6 +153,78 @@ ButtonStyleButton _button(WidgetTester tester, String key) =>
     );
 
 void main() {
+  testWidgets('resident reconnect and maintenance status have live semantics', (
+    tester,
+  ) async {
+    late ScriptedBridge bridge;
+    late ResidentCollectorClient client;
+    await tester.runAsync(() async {
+      bridge = ScriptedBridge();
+      client = ResidentCollectorClient(
+        databaseFile: File('fixture.sqlite'),
+        settingsFile: File('fixture.toml'),
+        start: (_, _) async {
+          bridge.emit({'event': 'bridge', 'state': 'connected'});
+          return bridge;
+        },
+      );
+      await client.connect();
+    });
+    final semantics = tester.ensureSemantics();
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: CollectorStatus(client: client)),
+        ),
+      );
+      void check(String label) {
+        final data = tester
+            .getSemantics(find.bySemanticsLabel(label))
+            .getSemanticsData();
+        expect(data.flagsCollection.isLiveRegion, isTrue);
+        expect(find.text(label), findsOneWidget);
+        // ignore: avoid_print
+        print(
+          'collector_status label="$label" live_region=${data.flagsCollection.isLiveRegion}',
+        );
+      }
+
+      for (final state in ['replaced', 'reconnecting']) {
+        await tester.runAsync(() async {
+          bridge.emit({'event': 'bridge', 'state': state});
+          await Future<void>.delayed(Duration.zero);
+        });
+        await tester.pumpAndSettle();
+        check('Reconnecting to session collection…');
+      }
+      bridge.onRequest = (request) => bridge.emit({
+        'id': request['id'],
+        'event': request['op'] == 'pause' ? 'paused' : 'resumed',
+      });
+      await tester.runAsync(() async {
+        bridge.emit({'event': 'bridge', 'state': 'connected'});
+        await Future<void>.delayed(Duration.zero);
+      });
+      final pause = await tester.runAsync(client.pause);
+      await tester.pumpAndSettle();
+      check('Session collection is paused during database maintenance.');
+      await tester.runAsync(pause!.dispose);
+      await tester.runAsync(() async {
+        bridge.emit({'event': 'bridge', 'state': 'failed'});
+        await Future<void>.delayed(Duration.zero);
+      });
+      await tester.pumpAndSettle();
+      check(
+        'Session collection is unavailable. Saved sessions are still shown. Select Refresh to try again.',
+      );
+      await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.runAsync(client.dispose);
+      semantics.dispose();
+    }
+  });
+
   testWidgets('off: explains what changes, offers 5-minute default', (
     tester,
   ) async {

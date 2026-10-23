@@ -25,7 +25,7 @@ fn resolved(value: &str) -> io::Result<Option<PathBuf>> {
     if value.is_empty() {
         Ok(None)
     } else {
-        instance::identity_path(Path::new(value)).map(Some)
+        std::path::absolute(Path::new(value)).map(Some)
     }
 }
 fn text(path: &Option<PathBuf>) -> String {
@@ -44,7 +44,7 @@ impl Context {
         let paths = |values: &[String]| -> io::Result<Vec<PathBuf>> {
             values
                 .iter()
-                .map(|p| instance::identity_path(Path::new(p)))
+                .map(|p| std::path::absolute(Path::new(p)))
                 .collect()
         };
         let result = (|| -> io::Result<Self> {
@@ -75,8 +75,10 @@ impl Context {
     }
     pub(crate) fn resolve_paths(mut self) -> io::Result<Self> {
         self.database = instance::identity_path(&self.database)?;
+        if let Some(path) = &mut self.settings {
+            *path = instance::identity_path(path)?;
+        }
         for path in [
-            &mut self.settings,
             &mut self.windows_root,
             &mut self.wsl_root,
             &mut self.wsl_unc_root,
@@ -85,14 +87,14 @@ impl Context {
         .into_iter()
         .flatten()
         {
-            *path = instance::identity_path(path)?;
+            *path = std::path::absolute(&*path)?;
         }
         for path in self
             .claude_roots
             .iter_mut()
             .chain(self.claude_wsl_roots.iter_mut())
         {
-            *path = instance::identity_path(path)?;
+            *path = std::path::absolute(&*path)?;
         }
         Ok(self)
     }
@@ -168,5 +170,38 @@ impl Context {
                 source_type,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_empty_claude_root_disables_profile_discovery() {
+        let options = cli::parse_options(&["--claude-root".into(), String::new()])
+            .unwrap_or_else(|_| panic!("empty root must be accepted"));
+        assert!(cli::claude_roots(&options).is_empty());
+    }
+
+    #[test]
+    fn viewer_source_roots_keep_the_callers_spelling() {
+        let root = std::path::absolute("MixedCase-Source").unwrap();
+        let context = Context {
+            database: std::path::absolute("fixture.sqlite").unwrap(),
+            settings: None,
+            windows_root: Some(root.clone()),
+            wsl_root: None,
+            wsl_unc_root: None,
+            claude_roots: vec![root.clone()],
+            claude_wsl_roots: vec![],
+            wsl_projects: false,
+            t3_state_path: Some(root.clone()),
+        }
+        .resolve_paths()
+        .unwrap();
+        assert_eq!(context.windows_root.as_ref(), Some(&root));
+        assert_eq!(context.claude_roots, vec![root.clone()]);
+        assert_eq!(context.t3_state_path.as_ref(), Some(&root));
     }
 }

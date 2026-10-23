@@ -99,185 +99,6 @@ fn cli_streams_progress_and_terminal_summary() {
     assert_eq!(events.last().unwrap()["cancelled"], false);
 }
 #[test]
-fn gui_grants_each_write_and_can_cancel_before_discovery() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::Stdio;
-    let temp = TempDir::new("writer_leases");
-    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
-    let db = viewer_database(&temp);
-    let mut child = collector()
-        .args([
-            "codex",
-            "scan",
-            "--coordinate-writes",
-            "--no-wsl-projects",
-            "--db",
-        ])
-        .arg(&db)
-        .arg("--windows-root")
-        .arg(home)
-        .args(["--wsl-root", ""])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let output = BufReader::new(child.stdout.take().unwrap());
-    let mut leased = false;
-    let mut grants = 0;
-    let mut terminal = None;
-    for line in output.lines() {
-        let event: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
-        match event["event"].as_str().unwrap() {
-            "write_requested" => {
-                assert!(!leased);
-                leased = true;
-                if grants == 0 {
-                    writeln!(input, "cancel").unwrap();
-                }
-                writeln!(input, "grant").unwrap();
-                input.flush().unwrap();
-                grants += 1;
-            }
-            "write_released" => {
-                assert!(leased);
-                leased = false;
-            }
-            "finished" => terminal = Some(event),
-            "progress" => {}
-            other => panic!("Unexpected event {other}"),
-        }
-    }
-    assert!(child.wait().unwrap().success());
-    assert!(!leased);
-    assert!(grants >= 1);
-    let terminal = terminal.unwrap();
-    assert_eq!(terminal["cancelled"], true);
-    assert_eq!(terminal["sessions_written"], 0);
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let count: i64 = conn
-        .query_row("select count(*) from sessions", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(count, 0);
-}
-
-fn coordinated(args: &[&str], db: &std::path::Path) -> std::process::Child {
-    use std::process::Stdio;
-    collector()
-        .args(args)
-        .args(["--coordinate-writes", "--no-wsl-projects", "--db"])
-        .arg(db)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
-}
-
-#[test]
-fn cancel_while_waiting_for_a_lease_withdraws_it_and_asks_for_no_more() {
-    use std::io::Write;
-    let temp = TempDir::new("cancel_waiting_lease");
-    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
-    let db = viewer_database(&temp);
-    let mut child = coordinated(
-        &[
-            "codex",
-            "scan",
-            "--windows-root",
-            home.to_str().unwrap(),
-            "--wsl-root",
-            "",
-        ],
-        &db,
-    );
-    let mut input = child.stdin.take().unwrap();
-    let events = support::EventStream::new(child.stdout.take().unwrap());
-    let mut requested = 0;
-    let mut after_request = Vec::new();
-    let mut terminal = None;
-    while let Some(event) = events.next(&mut child) {
-        let name = event["event"].as_str().unwrap().to_owned();
-        if requested > 0 && name != "progress" {
-            after_request.push(name.clone());
-        }
-        match name.as_str() {
-            "write_requested" => {
-                requested += 1;
-                // The GUI never grants: its writer queue is busy, then the
-                // user cancels. The collector must not wait forever.
-                writeln!(input, "cancel").unwrap();
-                input.flush().unwrap();
-            }
-            "finished" => terminal = Some(event),
-            _ => {}
-        }
-    }
-    assert!(child.wait().unwrap().success());
-    assert_eq!(requested, 1, "no lease may be requested after a cancel");
-    assert_eq!(after_request, ["write_released", "finished"]);
-    let terminal = terminal.unwrap();
-    assert_eq!(terminal["cancelled"], true);
-    assert_eq!(terminal["sessions_written"], 0);
-}
-
-#[test]
-fn a_cancel_after_parsing_skips_the_remaining_batches() {
-    use std::io::Write;
-    let temp = TempDir::new("cancel_remaining_batches");
-    let home = support::codex_home(
-        &temp,
-        &[
-            "rich_session.jsonl",
-            "subagent_session.jsonl",
-            "no_session_id.jsonl",
-        ],
-    );
-    let db = viewer_database(&temp);
-    let mut child = coordinated(
-        &[
-            "codex",
-            "scan",
-            "--flush-sessions",
-            "1",
-            "--windows-root",
-            home.to_str().unwrap(),
-            "--wsl-root",
-            "",
-        ],
-        &db,
-    );
-    let mut input = child.stdin.take().unwrap();
-    let events = support::EventStream::new(child.stdout.take().unwrap());
-    let mut requested = 0;
-    let mut terminal = None;
-    while let Some(event) = events.next(&mut child) {
-        match event["event"].as_str().unwrap() {
-            "write_requested" => {
-                requested += 1;
-                // Grant the first session batch (a new database has no
-                // placeholders to clean), then cancel instead of granting the
-                // next request.
-                if requested <= 1 {
-                    writeln!(input, "grant").unwrap();
-                } else {
-                    writeln!(input, "cancel").unwrap();
-                }
-                input.flush().unwrap();
-            }
-            "finished" => terminal = Some(event),
-            _ => {}
-        }
-    }
-    assert!(child.wait().unwrap().success());
-    assert_eq!(requested, 2, "statuses, hints and names are skipped");
-    let terminal = terminal.unwrap();
-    assert_eq!(terminal["cancelled"], true);
-    assert_eq!(terminal["sessions_written"], 1);
-}
-
-#[test]
 fn progress_events_are_throttled_but_every_commit_is_reported() {
     let temp = TempDir::new("progress_throttle");
     let home = support::codex_home(&temp, &[]);
@@ -353,79 +174,39 @@ fn progress_events_are_throttled_but_every_commit_is_reported() {
 }
 
 #[test]
-fn claude_scan_uses_the_same_leases_progress_and_cancellation() {
-    use std::io::Write;
-    let temp = TempDir::new("claude_coordinated");
+fn claude_scan_reports_progress_without_viewer_leases() {
+    let temp = TempDir::new("claude_progress");
     let root = support::claude_root(&temp);
     let db = viewer_database(&temp);
-    let mut child = coordinated(
-        &["claude", "scan", "--claude-root", root.to_str().unwrap()],
-        &db,
-    );
-    let mut input = child.stdin.take().unwrap();
-    let events = support::EventStream::new(child.stdout.take().unwrap());
-    let (mut leased, mut grants, mut progress) = (false, 0, 0);
-    let mut terminal = None;
-    while let Some(event) = events.next(&mut child) {
-        match event["event"].as_str().unwrap() {
-            "write_requested" => {
-                assert!(!leased);
-                leased = true;
-                grants += 1;
-                writeln!(input, "grant").unwrap();
-                input.flush().unwrap();
-            }
-            "write_released" => {
-                assert!(leased);
-                leased = false;
-            }
-            "progress" => progress += 1,
-            "finished" => terminal = Some(event),
-            other => panic!("unexpected event {other}"),
-        }
-    }
-    assert!(child.wait().unwrap().success());
-    assert!(!leased && grants >= 2 && progress >= 1);
-    let terminal = terminal.unwrap();
-    assert_eq!(terminal["cancelled"], false);
-    assert_eq!(terminal["sessions_written"], 3);
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let claude: i64 = conn
-        .query_row(
-            "select count(*) from sessions where harness = 'claude'",
-            [],
-            |row| row.get(0),
-        )
+    let result = collector()
+        .args([
+            "claude",
+            "scan",
+            "--progress-json",
+            "--no-wsl-projects",
+            "--db",
+        ])
+        .arg(&db)
+        .arg("--claude-root")
+        .arg(root)
+        .output()
         .unwrap();
-    assert_eq!(claude, 3);
-
-    // A cancel before the first grant writes nothing.
-    let db = viewer_database(&temp);
-    let mut child = coordinated(
-        &["claude", "scan", "--claude-root", root.to_str().unwrap()],
-        &db,
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
     );
-    let mut input = child.stdin.take().unwrap();
-    let events = support::EventStream::new(child.stdout.take().unwrap());
-    let mut requested = 0;
-    let mut terminal = None;
-    while let Some(event) = events.next(&mut child) {
-        match event["event"].as_str().unwrap() {
-            "write_requested" => {
-                requested += 1;
-                writeln!(input, "cancel").unwrap();
-                input.flush().unwrap();
-            }
-            "finished" => terminal = Some(event),
-            _ => {}
-        }
-    }
-    assert!(child.wait().unwrap().success());
-    assert_eq!(requested, 1);
-    assert_eq!(terminal.unwrap()["cancelled"], true);
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let count: i64 = conn
-        .query_row("select count(*) from sessions", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(count, 0);
+    let events: Vec<serde_json::Value> = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|event| event["event"] == "progress"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event"] == "progress" || event["event"] == "finished")
+    );
+    assert_eq!(events.last().unwrap()["sessions_written"], 3);
+    assert_eq!(events.last().unwrap()["cancelled"], false);
 }

@@ -9,10 +9,76 @@ import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/pricing/pricing_repository.dart';
+import 'package:codex_sessions_viewer/src/scanner/resident_collector_client.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  for (final unavailable in [false, true]) {
+    test(
+      'maintenance failure messages stay retryable and plain (pause unavailable=$unavailable)',
+      () async {
+        final temp = await Directory.systemTemp.createTemp(
+          'cxv184-maintenance-message-',
+        );
+        final file = File('${temp.path}/viewer.sqlite');
+        await DatabaseMigrator(
+          sqlRoot: Directory('../sql'),
+        ).openAndMigrate(file);
+        final db = openFileBackedDatabase(file);
+        final scheduler = ApplicationMaintenance(
+          databaseFile: file,
+          coordinator: DatabaseMaintenanceCoordinator(
+            file,
+            pauseCollector: () async {
+              if (unavailable) throw StateError('raw service failure');
+              return CollectorPauseHandle(() async {});
+            },
+          ),
+        );
+        final displayed = <String>[];
+        scheduler.addListener(() {
+          if (scheduler.progress case final progress?) {
+            displayed.add('${progress.currentWork} ${progress.errorMessage}');
+          }
+        });
+        try {
+          await scheduler.configure(
+            AppSettings.fromTomlMap({
+              'pricing': {'use_external_pricing': false},
+            }),
+          );
+          db.execute(
+            "update maintenance_schedules set next_due_at_utc=null where job_type='database_optimize'",
+          );
+          db.execute(
+            "create trigger fail_optimize before update of last_optimized_schema_version on database_state begin select raise(abort, 'raw worker failure'); end",
+          );
+          await scheduler.runDueJobs();
+          final expected = unavailable
+              ? 'Database optimization was postponed because session collection could not pause. It will be retried automatically.'
+              : 'Database maintenance could not finish. Try again in a moment.';
+          expect(scheduler.errorMessage, expected);
+          expect(
+            scheduler.progress!.currentWork,
+            'Database maintenance is not running.',
+          );
+          expect(scheduler.progress!.currentWork, isNot(contains('raw')));
+          expect(displayed.any((message) => message.contains('raw')), isFalse);
+          // ignore: avoid_print
+          print(
+            'maintenance_retryable_label="$expected" raw_error_hidden=true',
+          );
+        } finally {
+          await scheduler.stop();
+          scheduler.dispose();
+          db.close();
+          await temp.delete(recursive: true);
+        }
+      },
+    );
+  }
+
   for (final disabled in [false, true]) {
     for (final downloadFails in [false, true]) {
       test(

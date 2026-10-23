@@ -1,6 +1,8 @@
 @TestOn('windows')
 library;
 
+import '../support/collector_fixture.dart';
+
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
@@ -89,7 +91,7 @@ void main() {
     }
   });
 
-  tearDownAll(() => temp.delete(recursive: true));
+  tearDownAll(() => deleteCollectorFixture(temp));
 
   RuntimeSessionController controller() => RuntimeSessionController(
     settingsFile: settingsFile,

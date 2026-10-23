@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(1);
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const VIEWER_IDLE: Duration = Duration::from_secs(30);
 
@@ -654,8 +655,27 @@ pub(crate) fn run_configured(
     lifetime: Lifetime,
     options: crate::cli::Options,
 ) -> io::Result<()> {
+    run_configured_after_stop(database, lifetime, options, false)
+}
+
+pub(crate) fn run_configured_after_stop(
+    database: &Path,
+    lifetime: Lifetime,
+    options: crate::cli::Options,
+    replacement: bool,
+) -> io::Result<()> {
     let log = LifecycleLog::new()?;
-    let result = run_inner(database, lifetime, options, &log);
+    let total_deadline = Instant::now() + STOP_TIMEOUT + START_TIMEOUT;
+    let result = (|| {
+        let startup_deadline = if replacement {
+            log.record("replacement waiting for instance lock")?;
+            wait_for_stop(database, Instant::now() + STOP_TIMEOUT)?;
+            Some((Instant::now() + START_TIMEOUT).min(total_deadline))
+        } else {
+            None
+        };
+        run_inner(database, lifetime, options, &log, startup_deadline)
+    })();
     if let Err(error) = &result
         && let Err(log_error) = log.record(&format!("failed: {error}"))
     {
@@ -669,6 +689,7 @@ fn run_inner(
     lifetime: Lifetime,
     options: crate::cli::Options,
     log: &LifecycleLog,
+    startup_deadline: Option<Instant>,
 ) -> io::Result<()> {
     let signal = signals::Guard::install()?;
     let key = instance::database_key(database)?;
@@ -679,7 +700,8 @@ fn run_inner(
         std::fs::create_dir_all(parent)?;
     }
     let deadline = Instant::now() + START_TIMEOUT;
-    let lock_deadline = Instant::now() + Duration::from_secs(10 * 60);
+    let lock_deadline =
+        startup_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10 * 60));
     let lock = loop {
         if signal.stopping() {
             return Ok(());
@@ -698,6 +720,11 @@ fn run_inner(
             if reply["database_key"] != key {
                 return Err(io::Error::other("resident database identity mismatch"));
             }
+            if startup_deadline.is_some() {
+                // Another successor won. Do not start fallback collection or
+                // extend this replacement's bounded startup lifetime.
+                return Ok(());
+            }
             if reply["queue"] != json!(queue) {
                 // Another starter won with a different queue. Keep this caller's
                 // configuration and run its bounded retry policy here.
@@ -711,6 +738,12 @@ fn run_inner(
             return Ok(());
         }
         if Instant::now() >= lock_deadline {
+            if startup_deadline.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "replacement resident start timed out",
+                ));
+            }
             log.record("startup lock wait timed out; durable work remains for the next start")?;
             return Ok(());
         }
@@ -821,42 +854,54 @@ pub fn control(database: &Path, action: &str) -> io::Result<Value> {
     }
     let key = instance::database_key(database)?;
     if action == "stop" {
-        match instance::InstanceLock::try_acquire(database) {
-            Ok(Some(_)) => return Ok(json!({"v":1,"event":"stopped"})),
-            Ok(None) => (),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(json!({"v":1,"event":"stopped"}));
-            }
-            Err(error) => return Err(error),
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        if instance_stopped(database)? {
+            return Ok(json!({"v":1,"event":"stopped"}));
         }
         let reply = request(
             &key,
             &json!({"v":1,"id":"stop","op":"shutdown","reason":"resident stop"}),
             CLIENT_TIMEOUT,
-        )?;
-        if reply["event"] != "stopping" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "resident did not acknowledge shutdown",
-            ));
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while instance::InstanceLock::try_acquire(database)?.is_none() {
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "resident did not release its instance lock",
-                ));
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        return Ok(reply);
+        );
+        // Shutdown may close the pipe before its final reply is consumed, or
+        // race another stop/idle exit before sending. Never infer success from
+        // a pipe error (or an acknowledgement): wait for the process-owned lock.
+        wait_for_stop(database, deadline)?;
+        return Ok(reply
+            .ok()
+            .filter(|reply| reply["event"] == "stopping")
+            .unwrap_or_else(|| json!({"v":1,"event":"stopped"})));
     }
     request(
         &key,
         &json!({"v":1,"id":"status","op":"status"}),
         CLIENT_TIMEOUT,
     )
+}
+
+fn instance_stopped(database: &Path) -> io::Result<bool> {
+    match instance::InstanceLock::try_acquire(database) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// A final IPC reply is best effort; only lock release proves the owner stopped.
+fn wait_for_stop(database: &Path, deadline: Instant) -> io::Result<()> {
+    loop {
+        if instance_stopped(database)? {
+            return Ok(());
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resident did not release its instance lock",
+            ));
+        };
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
 }
 
 // Signal handlers do only an atomic store. All teardown stays on the owner thread.

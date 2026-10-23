@@ -1,3 +1,4 @@
+import '../support/collector_fixture.dart';
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/app/runtime_session_controller.dart';
@@ -29,7 +30,7 @@ Future<({Database db, RuntimeSessionController controller})> _fixture() async {
   addTearDown(() async {
     await coordinator.idle;
     db.close();
-    await temp.delete(recursive: true);
+    await deleteCollectorFixture(temp);
   });
   final store = ProjectTagStateStore(db);
   for (final (id, folder, project) in [

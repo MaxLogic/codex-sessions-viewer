@@ -43,23 +43,60 @@ fn valid_hello(hello: &Value, key: &str) -> bool {
 
 fn replace(
     reader: &mut BufReader<endpoint::Stream>,
+    context: &Context,
     version: u64,
-    out: &mut impl Write,
+    deadline: Instant,
 ) -> io::Result<()> {
-    protocol::send(
+    // The viewer can kill this bridge after four seconds. Transfer startup to
+    // a detached process *before* asking the old owner to exit. That process
+    // waits for exclusion and becomes the successor, independently of stdio.
+    start(context, true)?;
+    // Identity was positively checked by attach. The old owner can exit before
+    // the last frame is read, so replacement waits for exclusion, not delivery.
+    let _ = protocol::send(
         reader.get_mut(),
         &json!({"v":version,"id":"bridge-replace","op":"shutdown","reason":"incompatible viewer build"}),
-    )?;
-    let stopping = receive(reader)?;
-    if stopping["event"] != "stopping" || stopping["id"] != "bridge-replace" {
-        return Err(io::Error::other("incompatible resident refused shutdown"));
+    ).and_then(|()| receive_until(reader, deadline));
+    let key = instance::database_key(&context.database)?;
+    loop {
+        if super::instance_stopped(&context.database)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resident did not release its instance lock",
+            ));
+        }
+        // The successor can acquire the lock before this bridge observes its
+        // release. A positive successor hello also proves the old owner exited.
+        if let Ok(stream) = endpoint::connect(
+            &key,
+            Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+        ) {
+            let mut probe = BufReader::new(stream);
+            if protocol::send(
+                probe.get_mut(),
+                &json!({"v":1,"id":"bridge-hello","op":"hello","client":"cli"}),
+            )
+            .is_ok()
+                && let Ok(hello) = receive_until(&mut probe, deadline)
+                && valid_hello(&hello, &key)
+                && compatible(&hello)
+                && hello["state"] != "stopping"
+            {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
-    state(out, "replaced", "incompatible collector identity")
 }
 
-fn receive(reader: &mut BufReader<endpoint::Stream>) -> io::Result<Value> {
+fn receive_until(reader: &mut BufReader<endpoint::Stream>, until: Instant) -> io::Result<Value> {
     let mut line = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = (Instant::now() + Duration::from_secs(2)).min(until);
     loop {
         match protocol::read_frame(reader, &mut line, protocol::MAX_EVENT_BYTES) {
             Ok(protocol::Frame::Complete) => {
@@ -88,9 +125,14 @@ fn receive(reader: &mut BufReader<endpoint::Stream>) -> io::Result<Value> {
     }
 }
 
-fn start(context: &Context) -> io::Result<()> {
+fn start(context: &Context, replacement: bool) -> io::Result<()> {
     let mut args = vec![
-        "serve".into(),
+        if replacement {
+            "serve-replacement"
+        } else {
+            "serve"
+        }
+        .into(),
         "--db".into(),
         context.database.to_string_lossy().into_owned(),
         "--lifetime".into(),
@@ -118,6 +160,9 @@ fn start(context: &Context) -> io::Result<()> {
             args.extend([flag.into(), path.to_string_lossy().into_owned()]);
         }
     }
+    if context.claude_roots.is_empty() && context.claude_wsl_roots.is_empty() {
+        args.extend(["--claude-root".into(), String::new()]);
+    }
     if !context.wsl_projects {
         args.push("--no-wsl-projects".into());
     }
@@ -126,18 +171,31 @@ fn start(context: &Context) -> io::Result<()> {
 
 fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpoint::Stream>> {
     let key = instance::database_key(&context.database)?;
-    let deadline = Instant::now() + Duration::from_secs(6);
+    const ATTACH_TIMEOUT: Duration = Duration::from_secs(6);
+    // Shutdown and successor attachment have separate budgets, within this
+    // fixed overall bound. Repeated attempts never extend the total deadline.
+    let total_deadline = Instant::now() + ATTACH_TIMEOUT + super::STOP_TIMEOUT + ATTACH_TIMEOUT;
+    let mut deadline = Instant::now() + ATTACH_TIMEOUT;
     let mut started = false;
     let mut replaced = false;
     loop {
-        match endpoint::connect(&key, Duration::from_millis(200)) {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resident start timed out",
+            ));
+        }
+        match endpoint::connect(
+            &key,
+            Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+        ) {
             Ok(stream) => {
                 let mut reader = BufReader::new(stream);
                 protocol::send(
                     reader.get_mut(),
                     &json!({"v":1,"id":"bridge-hello","op":"hello","client":"viewer"}),
                 )?;
-                let hello = receive(&mut reader)?;
+                let hello = receive_until(&mut reader, deadline)?;
                 let unsupported = hello["event"] == "error"
                     && hello["code"] == "unsupported_version"
                     && hello["id"] == "bridge-hello"
@@ -151,8 +209,15 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                     drop(reader);
                     let mut reader =
                         BufReader::new(endpoint::connect(&key, Duration::from_millis(200))?);
-                    replace(&mut reader, hello["v"].as_u64().unwrap(), out)?;
+                    replace(
+                        &mut reader,
+                        context,
+                        hello["v"].as_u64().unwrap(),
+                        (Instant::now() + super::STOP_TIMEOUT).min(total_deadline),
+                    )?;
                     replaced = true;
+                    started = true;
+                    deadline = (Instant::now() + ATTACH_TIMEOUT).min(total_deadline);
                 } else if !valid_hello(&hello, &key) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -160,6 +225,9 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                     ));
                 } else if hello["state"] == "stopping" { /* Wait for lock release, without replacing a live build. */
                 } else if compatible(&hello) {
+                    if replaced {
+                        state(out, "replaced", "incompatible collector identity")?;
+                    }
                     state(out, "connected", "")?;
                     return Ok(reader);
                 } else {
@@ -167,8 +235,15 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                         return Err(io::Error::other("replacement resident is incompatible"));
                     }
                     // Only positive build/protocol evidence permits replacement. I/O errors never do.
-                    replace(&mut reader, protocol::VERSION, out)?;
+                    replace(
+                        &mut reader,
+                        context,
+                        protocol::VERSION,
+                        (Instant::now() + super::STOP_TIMEOUT).min(total_deadline),
+                    )?;
                     replaced = true;
+                    started = true;
+                    deadline = (Instant::now() + ATTACH_TIMEOUT).min(total_deadline);
                 }
             }
             Err(error) => {
@@ -185,7 +260,7 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                 };
                 if absent && !started {
                     state(out, "starting", "")?;
-                    start(context)?;
+                    start(context, false)?;
                     started = true;
                 } else if Instant::now() >= deadline {
                     return Err(error);
@@ -360,8 +435,7 @@ fn relay(
                                 };
                                 value["context"] = serde_json::to_value(explicit)?;
                                 if let Some(path) = &request.path {
-                                    value["path"] =
-                                        json!(instance::identity_path(Path::new(path))?);
+                                    value["path"] = json!(std::path::absolute(Path::new(path))?);
                                 }
                             }
                             let mut bytes = serde_json::to_vec(&value)?;

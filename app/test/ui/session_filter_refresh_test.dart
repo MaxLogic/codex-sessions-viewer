@@ -2010,69 +2010,6 @@ void main() {
     );
   });
 
-  testWidgets('periodic rescans follow settings without overlapping', (
-    tester,
-  ) async {
-    var refreshCalls = 0;
-    final operations = <Completer<SessionsRefreshResult>>[];
-    final enabledSettings = AppSettings.defaults().copyWith(
-      scanner: const ScannerSettings(
-        backgroundRescanEnabled: true,
-        backgroundRescanIntervalSeconds: 1,
-      ),
-    );
-    final disabledSettings = AppSettings.defaults().copyWith(
-      scanner: const ScannerSettings(
-        backgroundRescanEnabled: false,
-        backgroundRescanIntervalSeconds: 1,
-      ),
-    );
-
-    Widget screen(AppSettings settings) => MaterialApp(
-      home: TestSessionsScreen(
-        settings: settings,
-        onRefreshOperation: (_) {
-          refreshCalls++;
-          final operation = Completer<SessionsRefreshResult>();
-          operations.add(operation);
-          return SessionsRefreshOperation(
-            result: operation.future,
-            cancel: () => operation.future.then<void>((_) {}),
-          );
-        },
-      ),
-    );
-
-    await tester.pumpWidget(screen(enabledSettings));
-    await tester.pump(const Duration(milliseconds: 999));
-    expect(refreshCalls, 0);
-
-    await tester.pump(const Duration(milliseconds: 2));
-    expect(refreshCalls, 1);
-
-    await tester.pump(const Duration(seconds: 1));
-    expect(refreshCalls, 1);
-
-    operations.single.complete(
-      const SessionsRefreshResult(rows: [], statusMessage: 'Scan finished.'),
-    );
-    await tester.pump();
-
-    await tester.pump(const Duration(seconds: 1));
-    expect(refreshCalls, 2);
-    operations.last.complete(
-      const SessionsRefreshResult(rows: [], statusMessage: 'Scan finished.'),
-    );
-    await tester.pump();
-
-    await tester.pumpWidget(screen(disabledSettings));
-    await tester.pump();
-    final callsAfterDisable = refreshCalls;
-    await tester.pump(const Duration(seconds: 1));
-
-    expect(refreshCalls, callsAfterDisable);
-  });
-
   testWidgets('starts refresh when auto refresh token changes', (tester) async {
     var refreshCalls = 0;
     final refresh = Completer<SessionsRefreshResult>();

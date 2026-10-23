@@ -1,5 +1,10 @@
 import 'dart:ui' show Tristate;
 import 'dart:io';
+import 'package:codex_sessions_viewer/src/database/application_maintenance.dart';
+import 'package:codex_sessions_viewer/src/database/database_connection.dart'
+    hide Row;
+import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/disk_space_probe.dart';
 import 'package:codex_sessions_viewer/src/accessibility/announcement_service.dart';
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
@@ -10,7 +15,147 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+final class _AmpleMaintenanceDisk implements DiskSpaceProbe {
+  const _AmpleMaintenanceDisk();
+  @override
+  DiskVolumeSpace probe(Directory directory) =>
+      const DiskVolumeSpace(volumeKey: 'test', availableBytes: 1 << 50);
+}
+
 void main() {
+  for (final reclaim in [false, true]) {
+    testWidgets(
+      'unavailable maintenance pause shows one accurate message (reclaim=$reclaim)',
+      (tester) async {
+        late Directory root;
+        late ApplicationMaintenance maintenance;
+        final expected = reclaim
+            ? 'Unused database space was not reclaimed because session collection could not pause. It will be retried the next time the viewer starts.'
+            : 'Database optimization was postponed because session collection could not pause. It will be retried automatically.';
+        await tester.runAsync(() async {
+          root = await Directory.systemTemp.createTemp(
+            'cxv184-maintenance-settings-',
+          );
+          final file = File('${root.path}/viewer.sqlite');
+          await DatabaseMigrator(
+            sqlRoot: Directory('../sql'),
+          ).openAndMigrate(file);
+          maintenance = ApplicationMaintenance(
+            databaseFile: file,
+            coordinator: DatabaseMaintenanceCoordinator(
+              file,
+              pauseCollector: () async => throw StateError('raw pause failure'),
+            ),
+            diskSpace: const _AmpleMaintenanceDisk(),
+            reclaimMinimumDatabaseBytes: reclaim ? 0 : 1 << 40,
+          );
+          await maintenance.configure(
+            AppSettings.fromTomlMap({
+              'pricing': {'use_external_pricing': false},
+            }),
+          );
+          final db = openFileBackedDatabase(file);
+          try {
+            if (reclaim) {
+              db.execute(
+                "update maintenance_schedules set next_due_at_utc='2099-01-01T00:00:00Z' where job_type='database_optimize'",
+              );
+              db.execute(
+                'create table filler(body blob); insert into filler values(zeroblob(4000000)); drop table filler;',
+              );
+            } else {
+              db.execute(
+                "update maintenance_schedules set next_due_at_utc=null where job_type='database_optimize'",
+              );
+            }
+          } finally {
+            db.close();
+          }
+          await maintenance.runDueJobs();
+        });
+        final semantics = tester.ensureSemantics();
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: SettingsScreen(maintenanceProgress: maintenance.progress),
+            ),
+          );
+          expect(find.text(expected), findsOneWidget);
+          expect(maintenance.progress!.currentWork, isNot(expected));
+          expect(maintenance.progress!.errorMessage, expected);
+          expect(find.textContaining('Try again in a moment'), findsNothing);
+          // ignore: avoid_print
+          print(
+            'maintenance_settings_text="$expected" visible_text_nodes=1 semantics=${tester.getSemantics(find.text(expected)).label}',
+          );
+        } finally {
+          await tester.pumpWidget(const SizedBox.shrink());
+          semantics.dispose();
+          await tester.runAsync(() async {
+            await maintenance.stop();
+            maintenance.dispose();
+            await root.delete(recursive: true);
+          });
+        }
+      },
+    );
+  }
+  testWidgets(
+    'scanner helpers distinguish running checks from the scheduled periodic scan',
+    (tester) async {
+      final semantics = tester.ensureSemantics();
+      try {
+        await tester.binding.setSurfaceSize(const Size(1800, 1600));
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SettingsScreen(
+              initialSettings: AppSettings.defaults(),
+              onSave: (_) async {},
+              onReload: () async => AppSettings.defaults(),
+            ),
+          ),
+        );
+        final interval = find.text(
+          'How often session collection checks for new sessions while the viewer or Background collection runs. Background collection’s periodic scan (minutes) separately schedules additional checks.',
+        );
+        await tester.ensureVisible(interval);
+        await tester.pumpAndSettle();
+        expect(interval, findsOneWidget);
+        final intervalControl = tester.getSemantics(
+          find.bySemanticsLabel('Scan interval (seconds) input'),
+        );
+        expect(
+          intervalControl.hint,
+          contains('separately schedules additional checks'),
+        );
+        expect(
+          find.bySemanticsLabel((tester.widget<Text>(interval).data)!),
+          findsNothing,
+        );
+        final enabled = find.text(
+          'Check for new sessions periodically while the viewer or Background collection runs. Turning this off leaves Background collection’s separately scheduled periodic scan (minutes) and hooks unchanged.',
+        );
+        expect(enabled, findsOneWidget);
+        final enabledControl = tester.getSemantics(
+          find.bySemanticsLabel('Background scan enabled setting'),
+        );
+        expect(enabledControl.hint, contains('hooks unchanged'));
+        expect(
+          find.bySemanticsLabel((tester.widget<Text>(enabled).data)!),
+          findsNothing,
+        );
+        await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+        // ignore: avoid_print
+        print(
+          'scanner_helpers_control_hints="${intervalControl.hint}"; "${enabledControl.hint}" separate_helper_nodes=0',
+        );
+      } finally {
+        semantics.dispose();
+        await tester.binding.setSurfaceSize(null);
+      }
+    },
+  );
+
   testWidgets('persists parent-session filter', (tester) async {
     final semantics = tester.ensureSemantics();
 

@@ -1,6 +1,8 @@
 @TestOn('windows')
 library;
 
+import '../support/collector_fixture.dart';
+
 import 'dart:convert';
 import 'dart:io';
 
@@ -16,7 +18,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
 /// The Rust collector is the only session parser and writer. GUI Refresh
-/// (the collector over the writer-lease protocol) and the collector CLI must
+/// (the resident collector over its viewer bridge) and the collector CLI must
 /// converge on the same stored content, must not reparse unchanged sessions
 /// when interleaved, and the viewer's production reads must return the same
 /// rows, conversations, and usage from either database. The collector's own
@@ -434,7 +436,7 @@ class _Fixture {
   Future<void> deleteHistoryBaseSession() =>
       File(p.join(day.path, 'history_base_session.jsonl')).delete();
 
-  Future<void> dispose() => temp.delete(recursive: true);
+  Future<void> dispose() => deleteCollectorFixture(temp);
 }
 
 class _NoWslProjects extends WslProjectResolver {

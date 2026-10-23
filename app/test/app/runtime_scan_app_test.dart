@@ -1,3 +1,6 @@
+import 'package:codex_sessions_viewer/src/ui/widgets/collector_status.dart';
+import '../support/collector_fixture.dart';
+import '../support/scripted_collector_bridge.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -17,8 +20,8 @@ import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/database/collector_versions.dart';
 import 'package:codex_sessions_viewer/src/database/usage_path_context_migration.dart';
 import 'package:codex_sessions_viewer/src/scanner/collector_process.dart';
+import 'package:codex_sessions_viewer/src/scanner/resident_collector_client.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_batching.dart';
-import 'package:codex_sessions_viewer/src/scanner/scan_types.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
@@ -57,87 +60,53 @@ void main() {
     db.execute('pragma wal_checkpoint(TRUNCATE)');
     db.close();
   });
-  tearDownAll(() async => _collectorTemplateFolder.delete(recursive: true));
+  tearDownAll(() async => deleteCollectorFixture(_collectorTemplateFolder));
+
+  test('background refresh and detail reload share the app bridge', () async {
+    final root = await Directory.systemTemp.createTemp('cxv184-shared-bridge-');
+    final database = File(p.join(root.path, 'viewer.sqlite'));
+    final settings = File(p.join(root.path, 'settings.toml'));
+    final source = await Directory(p.join(root.path, 'sessions')).create();
+    await _writeJsonFixture(source, 'shared-bridge');
+    await SettingsRepository(settings).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(windowsCodexPath: source.path, wslCodexUncPath: ''),
+        logging: _testLogging(root),
+      ),
+    );
+    expect((await _migrateCollectorFixture(database)).canStartNormalUi, isTrue);
+    var starts = 0;
+    final client = ResidentCollectorClient(
+      databaseFile: database,
+      settingsFile: settings,
+      start: (exe, args) {
+        starts++;
+        return startCollectorProcess(exe, args);
+      },
+    );
+    try {
+      final controller = RuntimeSessionController(
+        databaseFile: database,
+        settingsFile: settings,
+        collectorClient: client,
+      );
+      final result = await controller.refreshInBackground();
+      expect(result.rows, hasLength(1));
+      final detail = await controller.reloadSessionDetailFromSource(
+        result.rows.single.id,
+      );
+      expect(detail, isNotNull);
+      expect(starts, 1);
+    } finally {
+      await client.dispose();
+      await deleteCollectorFixture(root);
+    }
+  });
 
   group('collector transport', () {
-    test('a cancel during a grant flush is written after it', () async {
-      final collector = _ScriptedCollector(flushDelay: 120);
-      final cancellation = ScanCancellationController();
-      collector.onLine = (line) {
-        if (line == 'grant') {
-          cancellation.cancel();
-          collector.emit({'event': 'write_released'});
-        }
-        if (line == 'cancel') collector.finish(cancelled: true);
-      };
-      final process = CollectorProcess(
-        executable: 'scripted',
-        start: (_, _) async => collector..emit({'event': 'write_requested'}),
-      );
-      final result = await process.scan(
-        settingsFile: File('unused.toml'),
-        databaseFile: File('unused.sqlite'),
-        cancellation: cancellation.token,
-        write: (work) => work(),
-        onProgress: (_, _) {},
-      );
-      expect(collector.received, ['grant', 'cancel']);
-      expect(result.cancelled, isTrue);
-    });
-
-    test(
-      'stdin errors after the collector exits keep a finished scan and cleanup',
-      () async {
-        final collector = _ScriptedCollector(failClose: true);
-        final process = CollectorProcess(
-          executable: 'scripted',
-          start: (_, _) async => collector..finish(cancelled: false),
-        );
-        final result = await process.scan(
-          settingsFile: File('unused.toml'),
-          databaseFile: File('unused.sqlite'),
-          cancellation: ScanCancellationController().token,
-          write: (work) => work(),
-          onProgress: (_, _) {},
-        );
-        expect(result.cancelled, isFalse);
-        expect(collector.killed, isTrue);
-      },
-    );
-
-    test(
-      'a lease held past the watchdog stops the collector and frees the writer',
-      () async {
-        final collector = _ScriptedCollector();
-        // Grants are accepted but the collector never releases the lease.
-        final process = CollectorProcess(
-          executable: 'scripted',
-          start: (_, _) async => collector..emit({'event': 'write_requested'}),
-          leaseTimeout: const Duration(milliseconds: 150),
-        );
-        var writerReleased = false;
-        await expectLater(
-          process.scan(
-            settingsFile: File('unused.toml'),
-            databaseFile: File('unused.sqlite'),
-            cancellation: ScanCancellationController().token,
-            write: (work) async {
-              await work();
-              writerReleased = true;
-            },
-            onProgress: (_, _) {},
-          ),
-          throwsA(isA<CollectorLeaseTimeoutException>()),
-        );
-        expect(collector.received, ['grant']);
-        expect(collector.killed, isTrue);
-        expect(writerReleased, isTrue);
-      },
-    );
-
     test('a missing collector executable fails with a clear message', () async {
       final temp = await Directory.systemTemp.createTemp('csv_no_collector_');
-      addTearDown(() => temp.delete(recursive: true));
+      addTearDown(() => deleteCollectorFixture(temp));
       final settingsFile = File(p.join(temp.path, 'settings.toml'));
       await SettingsRepository(settingsFile).save(
         AppSettings.defaults().copyWith(
@@ -179,10 +148,10 @@ void main() {
     });
 
     test(
-      'refresh collects Claude Code transcripts under the writer leases',
+      'refresh collects Claude Code transcripts through the resident',
       () async {
         final temp = await Directory.systemTemp.createTemp('csv_claude_scan_');
-        addTearDown(() => temp.delete(recursive: true));
+        addTearDown(() => deleteCollectorFixture(temp));
         final codexRoot = Directory(p.join(temp.path, '.codex', 'sessions'));
         await codexRoot.create(recursive: true);
         await _writeJsonFixture(codexRoot, 'codex-beside-claude');
@@ -241,7 +210,7 @@ void main() {
 
     test('loading cached rows never writes the database', () async {
       final temp = await Directory.systemTemp.createTemp('csv_cached_read_');
-      addTearDown(() => temp.delete(recursive: true));
+      addTearDown(() => deleteCollectorFixture(temp));
       final sessionsRoot = Directory(p.join(temp.path, '.codex', 'sessions'));
       await sessionsRoot.create(recursive: true);
       await _copyFixture('sample_windows_session.json', sessionsRoot);
@@ -357,7 +326,7 @@ void main() {
         await first.cancel();
         await second.cancel();
         await coordinator.idle;
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     },
   );
@@ -451,7 +420,7 @@ void main() {
         await maintenance.stop();
         maintenance.dispose();
         await coordinator.idle;
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     },
   );
@@ -459,7 +428,7 @@ void main() {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_writer_queue_',
     );
-    addTearDown(() => temp.delete(recursive: true));
+    addTearDown(() => deleteCollectorFixture(temp));
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
     final settingsFile = File(p.join(temp.path, 'settings.toml'));
     await SettingsRepository(
@@ -516,7 +485,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
     final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
@@ -615,7 +584,7 @@ void main() {
       final temp = await Directory.systemTemp.createTemp('csv_runtime_scan_');
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -706,7 +675,7 @@ void main() {
       expect(spanNames, contains('scan.runtime.refresh'));
       expect(spanNames, contains('scan.runtime.load_rows'));
       expect(spanNames, contains('scan.runtime.collector'));
-      expect(spanNames, contains('scan.runtime.collector_write'));
+      expect(spanNames, isNot(contains('scan.runtime.collector_write')));
     },
   );
 
@@ -716,7 +685,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -1201,7 +1170,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -1255,7 +1224,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1330,7 +1299,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1373,14 +1342,14 @@ void main() {
   );
 
   test(
-    'runtime refresh coalesces persistence flushes and row snapshots',
+    'runtime refresh uses resident batches and coalesces row snapshots',
     () async {
       final temp = await Directory.systemTemp.createTemp(
         'csv_runtime_scan_batching_',
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1417,13 +1386,13 @@ void main() {
       ).refresh(onProgress: progressEvents.add);
 
       expect(result.rows, hasLength(5));
-      expect(result.persistenceFlushCount, 3);
-      expect(result.fullRowSnapshotCount, 2);
+      expect(result.persistenceFlushCount, 1);
+      expect(result.fullRowSnapshotCount, 1);
       expect(
         progressEvents
             .where((event) => event.rows != null)
             .map((event) => event.rows!.length),
-        [4, 5],
+        [5],
       );
       expect(progressEvents.any((event) => event.rows == null), isTrue);
     },
@@ -1437,7 +1406,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1485,14 +1454,14 @@ void main() {
   );
 
   test(
-    'background runtime refresh preserves injected batching policy',
+    'background runtime refresh uses resident batching and viewer snapshot policy',
     () async {
       final temp = await Directory.systemTemp.createTemp(
         'csv_runtime_background_batching_',
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1530,13 +1499,13 @@ void main() {
       ).refreshInBackground(onProgress: progressEvents.add);
 
       expect(result.rows, hasLength(5));
-      expect(result.persistenceFlushCount, 5);
-      expect(result.fullRowSnapshotCount, 2);
+      expect(result.persistenceFlushCount, 1);
+      expect(result.fullRowSnapshotCount, 1);
       expect(
         progressEvents
             .where((event) => event.rows != null)
             .map((event) => event.rows!.length),
-        [4, 5],
+        [5],
       );
     },
   );
@@ -1549,7 +1518,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1606,7 +1575,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1655,7 +1624,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -1753,7 +1722,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -1841,7 +1810,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -2145,7 +2114,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -2316,7 +2285,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -2493,7 +2462,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -2567,7 +2536,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -2644,7 +2613,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
     final codexRoot = Directory(p.join(temp.path, '.codex'));
@@ -2706,7 +2675,7 @@ void main() {
       'csv_runtime_repair_backup_retention_',
     );
     addTearDown(() async {
-      if (await temp.exists()) await temp.delete(recursive: true);
+      if (await temp.exists()) await deleteCollectorFixture(temp);
     });
     final codexRoot = Directory(p.join(temp.path, '.codex'));
     await Directory(p.join(codexRoot.path, 'sessions')).create(recursive: true);
@@ -2757,8 +2726,9 @@ void main() {
         )
         .single['details']
         .toString();
-    expect(details, contains(jsonEncode(backup.path)));
-    expect(details, contains('"bytes":9'));
+    final entry = jsonDecode(details) as Map<String, dynamic>;
+    expect(p.equals(entry['path'] as String, backup.path), isTrue);
+    expect(entry['bytes'], 9);
   });
 
   test(
@@ -2769,7 +2739,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -2822,7 +2792,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -2892,7 +2862,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -2954,7 +2924,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -3012,7 +2982,7 @@ void main() {
       final temp = await Directory.systemTemp.createTemp(
         'csv_backfill_writer_',
       );
-      addTearDown(() => temp.delete(recursive: true));
+      addTearDown(() => deleteCollectorFixture(temp));
       final dbFile = await _prepareBackfillDatabase(temp, count: 4);
       final coordinator = DatabaseMaintenanceCoordinator(dbFile);
       final controller = RuntimeSessionController(
@@ -3090,7 +3060,7 @@ void main() {
 
   test('queued message backfill cancellation does not index a batch', () async {
     final temp = await Directory.systemTemp.createTemp('csv_backfill_queued_');
-    addTearDown(() => temp.delete(recursive: true));
+    addTearDown(() => deleteCollectorFixture(temp));
     final dbFile = await _prepareBackfillDatabase(temp, count: 4);
     final coordinator = DatabaseMaintenanceCoordinator(dbFile);
     final release = Completer<void>();
@@ -3229,9 +3199,229 @@ void main() {
 
     expect(calls, 1);
     expect(find.text('Refresh'), findsOneWidget);
-    expect(find.textContaining('Refresh failed'), findsOneWidget);
-    expect(find.textContaining('Invalid settings.toml'), findsOneWidget);
+    expect(
+      find.text('Refresh could not finish. Select Refresh to try again.'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Invalid settings.toml'), findsNothing);
   });
+
+  for (final (error, message) in <(Object, String)>[
+    (
+      const CollectorUnavailableException('missing', 'raw install path'),
+      'Session collection could not start. Saved sessions are still shown. Reinstall Codex Sessions Viewer to restore session collection.',
+    ),
+    (
+      const CollectorDisconnectedException('raw pipe error'),
+      'Refresh stopped because session collection restarted. Select Refresh to try again.',
+    ),
+    (
+      const CollectorRequestException('busy'),
+      'Session collection is busy. Try Refresh again in a moment.',
+    ),
+    (
+      const CollectorRequestException('refused'),
+      'Session collection is busy. Try Refresh again in a moment.',
+    ),
+  ]) {
+    testWidgets(
+      'refresh maps ${error.runtimeType} to retryable plain text: $message',
+      (tester) async {
+        final semantics = tester.ensureSemantics();
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: SessionsScreen(onRefreshResult: () async => throw error),
+            ),
+          );
+          await tester.tap(find.text('Refresh'));
+          await tester.pumpAndSettle();
+          expect(find.text(message), findsOneWidget);
+          expect(find.textContaining('Bad state:'), findsNothing);
+          expect(find.textContaining('raw pipe error'), findsNothing);
+          // ignore: avoid_print
+          print(
+            'refresh_label="$message" semantics=${tester.getSemantics(find.text(message)).label}',
+          );
+        } finally {
+          semantics.dispose();
+        }
+      },
+    );
+  }
+
+  for (final (hung, reconnect) in [
+    (false, false),
+    (true, false),
+    (true, true),
+  ]) {
+    testWidgets(
+      'saved startup and bounded app exit (hung bridge=$hung reconnect=$reconnect)',
+      (tester) async {
+        late Directory root;
+        late File file;
+        late File settings;
+        late ResidentCollectorClient client;
+        ScriptedBridge? hungBridge;
+        late Future<DatabaseStartupResult> startup;
+        late AppSettings configured;
+        await tester.binding.setSurfaceSize(const Size(1800, 1000));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.runAsync(() async {
+          root = await Directory.systemTemp.createTemp('cxv184-saved-missing-');
+          file = File(p.join(root.path, 'viewer.sqlite'));
+          settings = File(p.join(root.path, 'settings.toml'));
+          await _migrateCollectorFixture(file);
+          final db = openFileBackedDatabase(file);
+          _insertBackfillSession(db);
+          db.execute(
+            "update sessions set session_id='saved-startup-session', started_at_utc='2026-07-08T10:00:00Z', last_message_at_utc='2026-07-08T10:00:00Z'",
+          );
+          db.close();
+          configured = AppSettings.defaults().copyWith(
+            paths: const PathSettings(
+              windowsCodexPath: '',
+              wslCodexUncPath: '',
+            ),
+            logging: _testLogging(root),
+          );
+          await SettingsRepository(settings).save(configured);
+          if (hung) hungBridge = ScriptedBridge();
+          client = ResidentCollectorClient(
+            databaseFile: file,
+            settingsFile: settings,
+            start: (exe, args) async {
+              if (!hung) {
+                throw ProcessException(exe, args, 'missing executable');
+              }
+              final bridge = hungBridge!;
+              bridge.emit({'event': 'bridge', 'state': 'connected'});
+              return bridge;
+            },
+          );
+          startup = Future.value(
+            await DatabaseMigrator(
+              sqlRoot: Directory('../sql'),
+              pauseCollector: client.pause,
+            ).openAndMigrate(file),
+          );
+        });
+        final semantics = tester.ensureSemantics();
+        try {
+          await tester.pumpWidget(
+            CodexSessionsViewerApp(
+              databaseFile: file,
+              settingsFile: settings,
+              collectorClient: client,
+              databaseStartup: startup,
+              settingsStartup: Future.value(configured),
+              now: () => DateTime.utc(2026, 7, 9),
+            ),
+          );
+          for (var i = 0; i < 200; i++) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 30)),
+            );
+            await tester.pump(const Duration(milliseconds: 50));
+            if (hung
+                ? (hungBridge?.received.any((r) => r['op'] == 'scan') ??
+                          false) &&
+                      find.text('Backfill session').evaluate().isNotEmpty
+                : find
+                          .textContaining('Reinstall Codex Sessions Viewer')
+                          .evaluate()
+                          .isNotEmpty &&
+                      find.text('Refresh').evaluate().isNotEmpty) {
+              break;
+            }
+          }
+          await tester.pump(const Duration(milliseconds: 200));
+          expect(find.text('Backfill session'), findsOneWidget);
+          expect(
+            find.textContaining('SQLite database startup failed'),
+            findsNothing,
+          );
+          if (hung) {
+            expect(hungBridge!.received.any((r) => r['op'] == 'scan'), isTrue);
+            if (reconnect) {
+              await tester.runAsync(() async {
+                hungBridge!.emit({'event': 'bridge', 'state': 'reconnecting'});
+                await Future<void>.delayed(Duration.zero);
+              });
+              await tester.pump();
+              expect(client.statusText, 'Reconnecting to session collection…');
+            }
+          } else {
+            const label =
+                'Session collection could not start. Saved sessions are still shown. Reinstall Codex Sessions Viewer to restore session collection.';
+            expect(
+              find.descendant(
+                of: find.byType(CollectorStatus),
+                matching: find.text(label),
+              ),
+              findsOneWidget,
+            );
+            expect(
+              tester
+                  .getSemantics(
+                    find.descendant(
+                      of: find.byType(CollectorStatus),
+                      matching: find.bySemanticsLabel(label),
+                    ),
+                  )
+                  .getSemanticsData()
+                  .flagsCollection
+                  .isLiveRegion,
+              isTrue,
+            );
+            // ignore: avoid_print
+            print(
+              'startup_missing saved_session_visible=true fatal_screen=false unavailable_live_region=true reinstall_guidance=true',
+            );
+          }
+        } finally {
+          var exited = false;
+          final exitWatch = Stopwatch()..start();
+          final exit = tester.binding.handleRequestAppExit().then((value) {
+            exited = true;
+            return value;
+          });
+          final deadline = DateTime.now().add(const Duration(seconds: 5));
+          while (!exited && DateTime.now().isBefore(deadline)) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 10)),
+            );
+            await tester.pump();
+          }
+          final withinBound = exited;
+          if (!exited) await tester.runAsync(client.dispose);
+          while (!exited) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 10)),
+            );
+            await tester.pump();
+          }
+          await exit;
+          await tester.pumpWidget(const SizedBox.shrink());
+          await tester.runAsync(() async {
+            await client.dispose();
+            await deleteCollectorFixture(root);
+          });
+          semantics.dispose();
+          expect(
+            withinBound,
+            isTrue,
+            reason: 'App exit must not await a hung scan indefinitely.',
+          );
+          if (hung) expect(hungBridge!.killed, isTrue);
+          // ignore: avoid_print
+          print(
+            'app_exit_hung=$hung reconnect=$reconnect elapsed_ms=${exitWatch.elapsedMilliseconds} completed_within_5s=$withinBound',
+          );
+        }
+      },
+    );
+  }
 
   test('runtime refresh does not show root errors as session rows', () async {
     final temp = await Directory.systemTemp.createTemp(
@@ -3239,7 +3429,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -3276,7 +3466,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -3314,7 +3504,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -3540,121 +3730,118 @@ void main() {
     );
   });
 
-  testWidgets(
-    'settings save and reload update periodic rescans without restart',
-    (tester) async {
-      await tester.binding.setSurfaceSize(const Size(1400, 1200));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+  testWidgets('settings save and reload never start a viewer rescan timer', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 1200));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
 
-      final temp = Directory.systemTemp.createTempSync(
-        'csv_runtime_settings_rescan_',
-      );
-      addTearDown(() async {
-        await tester.pumpWidget(const SizedBox.shrink());
-        await tester.pump();
-        await tester.runAsync(() async {
-          if (!await temp.exists()) {
-            return;
-          }
-          await temp.delete(recursive: true);
-        });
+    final temp = Directory.systemTemp.createTempSync(
+      'csv_runtime_settings_rescan_',
+    );
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+      await tester.runAsync(() async {
+        if (!await temp.exists()) {
+          return;
+        }
+        await deleteCollectorFixture(temp);
       });
+    });
 
-      final settingsFile = File(p.join(temp.path, 'settings.toml'));
-      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final disabledSettings = AppSettings.defaults().copyWith(
-        scanner: const ScannerSettings(
-          backgroundRescanEnabled: false,
-          backgroundRescanIntervalSeconds: 1,
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final disabledSettings = AppSettings.defaults().copyWith(
+      scanner: const ScannerSettings(
+        backgroundRescanEnabled: false,
+        backgroundRescanIntervalSeconds: 1,
+      ),
+    );
+    var storedSettings = disabledSettings;
+    var refreshCalls = 0;
+
+    await tester.pumpWidget(
+      CodexSessionsViewerApp(
+        databaseStartup: Future.value(
+          DatabaseStartupResult.ready(lastAppliedSchemaVersion: 5),
         ),
-      );
-      var storedSettings = disabledSettings;
-      var refreshCalls = 0;
-
-      await tester.pumpWidget(
-        CodexSessionsViewerApp(
-          databaseStartup: Future.value(
-            DatabaseStartupResult.ready(lastAppliedSchemaVersion: 5),
-          ),
-          settingsFile: settingsFile,
-          databaseFile: databaseFile,
-          settingsStartup: Future.value(disabledSettings),
-          settingsSave: (settings) async {
-            storedSettings = settings;
-          },
-          settingsReload: () async => storedSettings,
-          sessionRefreshOperation: (_) {
-            refreshCalls++;
-            return SessionsRefreshOperation.fromFuture(
-              Future.value(
-                const SessionsRefreshResult(
-                  rows: [],
-                  statusMessage: 'Scan finished.',
-                ),
+        settingsFile: settingsFile,
+        databaseFile: databaseFile,
+        settingsStartup: Future.value(disabledSettings),
+        settingsSave: (settings) async {
+          storedSettings = settings;
+        },
+        settingsReload: () async => storedSettings,
+        sessionRefreshOperation: (_) {
+          refreshCalls++;
+          return SessionsRefreshOperation.fromFuture(
+            Future.value(
+              const SessionsRefreshResult(
+                rows: [],
+                statusMessage: 'Scan finished.',
               ),
-            );
-          },
-        ),
-      );
-      await tester.pump();
-      await tester.pump(const Duration(seconds: 2));
-      expect(refreshCalls, 0);
+            ),
+          );
+        },
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 2));
+    expect(refreshCalls, 0);
 
-      await tester.tap(
-        find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
-      );
-      await _pumpFrames(tester);
-      await tester.ensureVisible(
-        find.bySemanticsLabel('Background scan enabled setting'),
-      );
-      await tester.tap(
-        find.bySemanticsLabel('Background scan enabled setting'),
-      );
-      await tester.pump();
-      await tester.tap(find.text('Save settings'));
-      await _pumpFrames(tester);
-      expect(storedSettings.scanner.backgroundRescanEnabled, isTrue);
-      expect(
-        tester
-            .widget<SettingsScreen>(find.byType(SettingsScreen))
-            .initialSettings!
-            .scanner
-            .backgroundRescanEnabled,
-        isTrue,
-      );
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
+    );
+    await _pumpFrames(tester);
+    await tester.ensureVisible(
+      find.bySemanticsLabel('Background scan enabled setting'),
+    );
+    await tester.tap(find.bySemanticsLabel('Background scan enabled setting'));
+    await tester.pump();
+    await tester.tap(find.text('Save settings'));
+    await _pumpFrames(tester);
+    expect(storedSettings.scanner.backgroundRescanEnabled, isTrue);
+    expect(
+      tester
+          .widget<SettingsScreen>(find.byType(SettingsScreen))
+          .initialSettings!
+          .scanner
+          .backgroundRescanEnabled,
+      isTrue,
+    );
 
-      await tester.tap(
-        find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
-      );
-      await tester.pump();
-      expect(
-        tester
-            .widget<SessionsScreen>(find.byType(SessionsScreen))
-            .settings!
-            .scanner
-            .backgroundRescanEnabled,
-        isTrue,
-      );
-      await tester.pump(const Duration(milliseconds: 1001));
-      expect(refreshCalls, 1);
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
+    );
+    await tester.pump();
+    expect(
+      tester
+          .widget<SessionsScreen>(find.byType(SessionsScreen))
+          .settings!
+          .scanner
+          .backgroundRescanEnabled,
+      isTrue,
+    );
+    await tester.pump(const Duration(milliseconds: 1001));
+    expect(refreshCalls, 0);
 
-      storedSettings = disabledSettings;
-      await tester.tap(
-        find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
-      );
-      await _pumpFrames(tester);
-      await tester.tap(find.text('Reload from file'));
-      await _pumpFrames(tester);
+    storedSettings = disabledSettings;
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
+    );
+    await _pumpFrames(tester);
+    await tester.tap(find.text('Reload from file'));
+    await _pumpFrames(tester);
 
-      await tester.tap(
-        find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
-      );
-      await tester.pump();
-      final callsAfterReload = refreshCalls;
-      await tester.pump(const Duration(milliseconds: 1001));
-      expect(refreshCalls, callsAfterReload);
-    },
-  );
+    await tester.tap(
+      find.bySemanticsLabel(RegExp('^Sessions navigation\\nTab ')),
+    );
+    await tester.pump();
+    final callsAfterReload = refreshCalls;
+    await tester.pump(const Duration(milliseconds: 1001));
+    expect(refreshCalls, callsAfterReload);
+  });
 
   test('runtime loads cached sessions before refresh is clicked', () async {
     final temp = await Directory.systemTemp.createTemp(
@@ -3662,7 +3849,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -3721,7 +3908,7 @@ void main() {
 
   test('persisted cost lookup cannot create a database', () async {
     final temp = await Directory.systemTemp.createTemp('csv_cost_readonly_');
-    addTearDown(() => temp.delete(recursive: true));
+    addTearDown(() => deleteCollectorFixture(temp));
     final file = File(p.join(temp.path, 'missing.sqlite'));
     final controller = RuntimeSessionController(
       settingsFile: File(p.join(temp.path, 'unused.toml')),
@@ -3739,7 +3926,7 @@ void main() {
     final temp = await Directory.systemTemp.createTemp(
       'csv_runtime_historical_cost_',
     );
-    addTearDown(() => temp.delete(recursive: true));
+    addTearDown(() => deleteCollectorFixture(temp));
     final windowsRoot = await Directory(p.join(temp.path, 'windows')).create();
     await _writeAggregateJsonlFixture(windowsRoot);
     final settingsFile = File(p.join(temp.path, 'settings.toml'));
@@ -3881,7 +4068,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -3942,7 +4129,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -4011,7 +4198,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -4052,7 +4239,7 @@ void main() {
 
     final progressEvents = <SessionsRefreshProgress>[];
     final refreshed = await controller.refresh(onProgress: progressEvents.add);
-    expect(refreshed.persistenceFlushCount, greaterThan(1));
+    expect(refreshed.persistenceFlushCount, greaterThanOrEqualTo(1));
     expect(refreshed.rows.map((row) => row.project).toSet(), {
       'shared-root',
       'unresolved',
@@ -4091,7 +4278,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -4147,7 +4334,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -4199,7 +4386,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -4254,7 +4441,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -4318,7 +4505,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -4401,7 +4588,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -4457,7 +4644,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -4538,7 +4725,7 @@ void main() {
         final temp = await Directory.systemTemp.createTemp(
           'csv_runtime_project_precedence_',
         );
-        addTearDown(() => temp.delete(recursive: true));
+        addTearDown(() => deleteCollectorFixture(temp));
         final windowsRoot = await Directory(
           p.join(temp.path, 'windows'),
         ).create();
@@ -4648,7 +4835,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
     final settingsFile = File(p.join(temp.path, 'settings.toml'));
@@ -4952,7 +5139,7 @@ void main() {
       );
       addTearDown(() async {
         if (await temp.exists()) {
-          await temp.delete(recursive: true);
+          await deleteCollectorFixture(temp);
         }
       });
 
@@ -5021,7 +5208,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -5072,7 +5259,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -5118,7 +5305,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -5161,7 +5348,7 @@ void main() {
     );
     addTearDown(() async {
       if (await temp.exists()) {
-        await temp.delete(recursive: true);
+        await deleteCollectorFixture(temp);
       }
     });
 
@@ -5746,7 +5933,7 @@ void _insertBackfillMessage(Database db, int index) {
 Future<void> _deleteTempDirWithRetry(Directory directory) async {
   for (var attempt = 0; attempt < 5; attempt++) {
     try {
-      await directory.delete(recursive: true);
+      await deleteCollectorFixture(directory);
       return;
     } on FileSystemException {
       if (attempt == 4) {
@@ -5902,101 +6089,3 @@ Future<void> _copyTree(Directory from, Directory to) async {
 
 /// A collector process driven by the test: it emits protocol events and
 /// records the stdin lines it receives.
-class _ScriptedCollector implements Process {
-  _ScriptedCollector({this.flushDelay = 0, this.failClose = false}) {
-    stdin = IOSink(_ScriptedStdin(this));
-  }
-
-  /// Milliseconds each stdin flush takes to reach the collector.
-  final int flushDelay;
-
-  /// Closing stdin reports a broken pipe, as after the collector exited.
-  final bool failClose;
-  final _stdout = StreamController<List<int>>();
-  final _stderr = StreamController<List<int>>();
-  final _exit = Completer<int>();
-  final received = <String>[];
-  void Function(String line) onLine = (_) {};
-  var killed = false;
-
-  @override
-  late final IOSink stdin;
-
-  @override
-  Stream<List<int>> get stdout => _stdout.stream;
-
-  @override
-  Stream<List<int>> get stderr => _stderr.stream;
-
-  @override
-  Future<int> get exitCode => _exit.future;
-
-  @override
-  int get pid => 1;
-
-  void emit(Map<String, Object?> event) {
-    if (!_stdout.isClosed) _stdout.add(utf8.encode('${jsonEncode(event)}\n'));
-  }
-
-  void finish({required bool cancelled}) {
-    emit({
-      'event': 'finished',
-      'cancelled': cancelled,
-      'sessions_written': 0,
-      'persistence_flushes': 0,
-      'directories_scanned': 0,
-      'files_found': 0,
-      'files_skipped': 0,
-      'files_parsed': 0,
-      'files_failed': 0,
-      'sessions_missing': 0,
-      'errors': <Object>[],
-    });
-    _close(0);
-  }
-
-  void _close(int code) {
-    if (_exit.isCompleted) return;
-    unawaited(_stdout.close());
-    unawaited(_stderr.close());
-    _exit.complete(code);
-  }
-
-  @override
-  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
-    killed = true;
-    _close(-1);
-    return true;
-  }
-}
-
-class _ScriptedStdin implements StreamConsumer<List<int>> {
-  _ScriptedStdin(this.process);
-
-  final _ScriptedCollector process;
-  var _pending = '';
-
-  @override
-  Future<void> addStream(Stream<List<int>> stream) async {
-    await for (final chunk in stream) {
-      if (process.flushDelay > 0) {
-        await Future<void>.delayed(Duration(milliseconds: process.flushDelay));
-      }
-      _pending += utf8.decode(chunk);
-      while (_pending.contains('\n')) {
-        final end = _pending.indexOf('\n');
-        final line = _pending.substring(0, end).trim();
-        _pending = _pending.substring(end + 1);
-        process.received.add(line);
-        process.onLine(line);
-      }
-    }
-  }
-
-  @override
-  Future<void> close() async {
-    if (process.failClose) {
-      throw const FileSystemException('The pipe has been ended.');
-    }
-  }
-}

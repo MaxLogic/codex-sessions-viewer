@@ -16,6 +16,8 @@ import 'src/window/window_state.dart';
 import 'src/platform/startup_registration.dart';
 import 'src/platform/wsl_default_distro_detector.dart';
 import 'src/scanner/collector_process.dart';
+import 'src/scanner/resident_collector_client.dart';
+import 'src/app/runtime_session_controller.dart';
 
 final _processLifetimeInstanceLocks = <AppInstanceLock>[];
 
@@ -46,9 +48,17 @@ Future<void> main(List<String> arguments) async {
   await restoreWindowStateBestEffort(windowStateController.restoreAndTrack);
   final sqlRoot = defaultSqlRoot();
   final startupRegistration = StartupRegistration.forCurrentPlatform();
+  final resident = ResidentCollectorClient(
+    databaseFile: databaseFile,
+    settingsFile: defaultSettingsFile(),
+    claudeRoots: RuntimeSessionController.defaultClaudeProjectRoots(),
+  );
   final maintenance = ApplicationMaintenance(
     databaseFile: databaseFile,
-    coordinator: DatabaseMaintenanceCoordinator(databaseFile),
+    coordinator: DatabaseMaintenanceCoordinator(
+      databaseFile,
+      pauseCollector: resident.pause,
+    ),
   );
   final settingsStartup = _afterFirstFrame(
     () => SettingsRepository(
@@ -60,17 +70,20 @@ Future<void> main(List<String> arguments) async {
     CodexSessionsViewerApp(
       databaseFile: databaseFile,
       applicationMaintenance: maintenance,
+      collectorClient: resident,
       backgroundCollection: CollectorBackgroundCollection(
         collectorExecutable: CollectorProcess.defaultExecutable(),
         databaseFile: databaseFile.absolute.path,
         settingsFile: defaultSettingsFile().absolute.path,
       ),
       settingsStartup: settingsStartup,
-      databaseStartup: _afterFirstFrame(
-        () => DatabaseMigrator(
+      databaseStartup: _afterFirstFrame(() async {
+        await settingsStartup;
+        return DatabaseMigrator(
           sqlRoot: sqlRoot,
-        ).openAndMigrate(databaseFile, deferUsageMigration: true),
-      ),
+          pauseCollector: resident.pause,
+        ).openAndMigrate(databaseFile, deferUsageMigration: true);
+      }),
       databaseMaintenanceStartup: () async => startPendingDatabaseMigration(
         databaseFile,
         sqlRoot: sqlRoot,

@@ -3,10 +3,13 @@ import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:sqlite3/sqlite3.dart' show sqlite3, SqliteException;
 
 import '../third_party/sqlite_interrupt.g.dart' as native;
 import '../config/app_settings.dart';
+import '../scanner/resident_collector_client.dart';
 import 'database_connection.dart';
 import 'database_generation.dart';
 import 'database_maintenance_cancelled.dart';
@@ -331,11 +334,13 @@ enum DatabaseWriterPriority {
 final class DatabaseMaintenanceCoordinator {
   DatabaseMaintenanceCoordinator(
     this.databaseFile, {
+    this.pauseCollector,
     this.leaseDuration = const Duration(seconds: 30),
     DateTime Function()? clock,
   }) : _clock = clock ?? DateTime.now;
 
   final File databaseFile;
+  final CollectorPauser? pauseCollector;
   final Duration leaseDuration;
   final DateTime Function() _clock;
   final _writers =
@@ -357,6 +362,38 @@ final class DatabaseMaintenanceCoordinator {
     final result = _scanTail.then((_) => work());
     _scanTail = result.then<void>((_) {}, onError: (Object _, StackTrace _) {});
     return result;
+  }
+
+  /// Exclusive viewer operations hold a resident pause until every worker and
+  /// database connection has completed, including failure and cancellation.
+  Future<T> withCollectorPaused<T>(
+    Future<T> Function() work, {
+    bool startupMigration = false,
+    void Function()? onPauseLost,
+  }) async {
+    CollectorPauseHandle? pause;
+    var completed = false;
+    try {
+      if (pauseCollector != null) {
+        pause = await acquireCollectorPause(pauseCollector!);
+      }
+    } on Object {
+      if (!startupMigration) throw const CollectorPauseUnavailableException();
+      debugPrint(
+        'Session collection pause unavailable; startup migration is using SQLite transaction locking and the persisted migration guard.',
+      );
+    }
+    unawaited(
+      pause?.lost?.then((_) {
+        if (!completed) onPauseLost?.call();
+      }),
+    );
+    try {
+      return await work();
+    } finally {
+      completed = true;
+      await pause?.dispose();
+    }
   }
 
   Future<void> get idle => _idle?.future ?? Future<void>.value();
@@ -440,63 +477,87 @@ final class DatabaseMaintenanceCoordinator {
     final progress = StreamController<DatabaseMaintenanceProgress>();
     DatabaseMaintenanceOperation? active;
     var stopped = false;
-    final result = runWriter(
-      () async {
-        if (stopped) {
-          return const DatabaseMaintenanceResult(
-            state: DatabaseMaintenanceState.interrupted,
-          );
-        }
-        final operation = await _startWorker(
-          jobType: jobType,
-          initialPhase: initialPhase,
-          worker: worker,
-          bootstrapWorker: bootstrapWorker,
-          databaseGenerationId: databaseGenerationId,
-          totalUnits: totalUnits,
-          initialStatusMessage: initialStatusMessage,
-          payloadJson: payloadJson,
-          atomicPhases: atomicPhases,
+    Future<DatabaseMaintenanceResult> work() async {
+      if (stopped) {
+        return const DatabaseMaintenanceResult(
+          state: DatabaseMaintenanceState.interrupted,
         );
-        active = operation;
-        int? initialCompleted;
-        var committedProgress = false;
-        var yielding = false;
-        void tryYield() {
-          if (!yieldToQueuedWriters || !committedProgress || yielding) return;
-          if (!_writers.any(
-            (writer) =>
-                writer.priority == DatabaseWriterPriority.interactive ||
-                writer.priority == DatabaseWriterPriority.pricing ||
-                writer.priority == DatabaseWriterPriority.scan ||
-                writer.priority == DatabaseWriterPriority.optimize,
-          )) {
-            return;
-          }
-          yielding = true;
-          unawaited(operation.requestStop());
+      }
+      final operation = await _startWorker(
+        jobType: jobType,
+        initialPhase: initialPhase,
+        worker: worker,
+        bootstrapWorker: bootstrapWorker,
+        databaseGenerationId: databaseGenerationId,
+        totalUnits: totalUnits,
+        initialStatusMessage: initialStatusMessage,
+        payloadJson: payloadJson,
+        atomicPhases: atomicPhases,
+      );
+      active = operation;
+      int? initialCompleted;
+      var committedProgress = false;
+      var yielding = false;
+      void tryYield() {
+        if (!yieldToQueuedWriters || !committedProgress || yielding) return;
+        if (!_writers.any(
+          (writer) =>
+              writer.priority == DatabaseWriterPriority.interactive ||
+              writer.priority == DatabaseWriterPriority.pricing ||
+              writer.priority == DatabaseWriterPriority.scan ||
+              writer.priority == DatabaseWriterPriority.optimize,
+        )) {
+          return;
         }
+        yielding = true;
+        unawaited(operation.requestStop());
+      }
 
-        if (yieldToQueuedWriters) _requestActiveYield = tryYield;
-        final subscription = operation.progress.listen((value) {
-          initialCompleted ??= value.completedUnits;
-          if (value.state == DatabaseMaintenanceState.running &&
-              value.completedUnits > initialCompleted!) {
-            committedProgress = true;
-          }
-          progress.add(value);
-          tryYield();
-        });
-        try {
-          if (stopped) await operation.requestStop();
-          return await operation.result;
-        } finally {
-          if (identical(_requestActiveYield, tryYield)) {
-            _requestActiveYield = null;
-          }
-          await subscription.cancel();
+      if (yieldToQueuedWriters) _requestActiveYield = tryYield;
+      final subscription = operation.progress.listen((value) {
+        initialCompleted ??= value.completedUnits;
+        if (value.state == DatabaseMaintenanceState.running &&
+            value.completedUnits > initialCompleted!) {
+          committedProgress = true;
         }
-      },
+        progress.add(value);
+        tryYield();
+      });
+      try {
+        if (stopped) await operation.requestStop();
+        return await operation.result;
+      } finally {
+        if (identical(_requestActiveYield, tryYield)) {
+          _requestActiveYield = null;
+        }
+        await subscription.cancel();
+      }
+    }
+
+    final exclusive =
+        jobType == 'usage_projection_migration' || atomicPhases.isNotEmpty;
+    final result = runWriter(
+      exclusive
+          ? () async {
+              try {
+                return await withCollectorPaused(
+                  work,
+                  startupMigration: jobType == 'usage_projection_migration',
+                  onPauseLost: () {
+                    // A shadow migration spans transactions. Stop at the existing
+                    // durable boundaries rather than continuing across lost exclusion.
+                    stopped = true;
+                    unawaited(active?.requestStop());
+                  },
+                );
+              } on CollectorPauseUnavailableException {
+                return const DatabaseMaintenanceResult(
+                  state: DatabaseMaintenanceState.failed,
+                  errorMessage: CollectorPauseUnavailableException.message,
+                );
+              }
+            }
+          : work,
       priority: switch (jobType) {
         'usage_projection_migration' => DatabaseWriterPriority.migration,
         'usage_cost_repricing' => DatabaseWriterPriority.repair,

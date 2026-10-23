@@ -817,9 +817,9 @@ fn bridge_resident_stalled_refusals_isolate_other_clients() {
 #[test]
 fn bridge_starts_absent_resident_relays_and_exits_on_stdin_eof() {
     let mut fixture = Fixture::new();
-    std::fs::create_dir_all(fixture.root.join("caller-root")).unwrap();
+    std::fs::create_dir_all(fixture.root.join("Caller-Root")).unwrap();
     support::write_generated_session(
-        &fixture.root.join("caller-root/one.jsonl"),
+        &fixture.root.join("Caller-Root/one.jsonl"),
         "01a0aaaa-0000-7000-8000-000000000203",
         1,
     );
@@ -831,7 +831,7 @@ fn bridge_starts_absent_resident_relays_and_exits_on_stdin_eof() {
             "--db",
             "viewer.sqlite",
             "--windows-root",
-            "caller-root",
+            "Caller-Root",
             "--no-wsl-projects",
         ])
         .stdin(Stdio::piped())
@@ -891,6 +891,50 @@ fn bridge_starts_absent_resident_relays_and_exits_on_stdin_eof() {
             break;
         }
     }
+    let stored_path: String = rusqlite::Connection::open(&fixture.db)
+        .unwrap()
+        .query_row("select source_file_path from sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        stored_path,
+        fixture
+            .root
+            .join("Caller-Root")
+            .join("one.jsonl")
+            .to_string_lossy()
+    );
+    support::write_generated_session(
+        &fixture.root.join("Caller-Root/Reload.Two.jsonl"),
+        "01a0aaaa-0000-7000-8000-000000000299",
+        1,
+    );
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"reload","op":"ingest","harness":"codex","path":"Caller-Root/Reload.Two.jsonl"}),
+    )
+    .unwrap();
+    let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(event["id"], "reload", "{event}");
+    assert_eq!(event["event"], "finished", "{event}");
+    assert_eq!(event["sessions_written"], 1, "{event}");
+    let reloaded_path: String = rusqlite::Connection::open(&fixture.db)
+        .unwrap()
+        .query_row(
+            "select source_file_path from sessions where session_id=?",
+            ["01a0aaaa-0000-7000-8000-000000000299"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reloaded_path,
+        fixture
+            .root
+            .join("Caller-Root")
+            .join("Reload.Two.jsonl")
+            .to_string_lossy()
+    );
     protocol::send(
         &mut input,
         &serde_json::json!({"v":1,"id":"pause","op":"pause"}),
@@ -1017,9 +1061,13 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
         "build",
         "version",
         "viewer-protocol",
+        "lost-shutdown-reply",
     ] {
         eprintln!("bridge compatibility scenario={scenario}");
-        let incompatible = matches!(scenario, "build" | "version" | "viewer-protocol");
+        let incompatible = matches!(
+            scenario,
+            "build" | "version" | "viewer-protocol" | "lost-shutdown-reply"
+        );
         let fixture = Fixture::new();
         let key = instance::database_key(&fixture.db).unwrap();
         let lock = instance::InstanceLock::try_acquire(&fixture.db)
@@ -1076,30 +1124,43 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
                 }
                 let shutdown = next_event(&mut wire);
                 assert_eq!(shutdown["op"], "shutdown");
-                protocol::send(
-                    wire.get_mut(),
-                    &protocol::event("bridge-replace", "stopping"),
-                )
-                .unwrap();
+                if scenario != "lost-shutdown-reply" {
+                    protocol::send(
+                        wire.get_mut(),
+                        &protocol::event("bridge-replace", "stopping"),
+                    )
+                    .unwrap();
+                }
             }
             // false simulates a transient disconnect during hello, with no identity reply.
             drop(wire);
             drop(listener);
             drop(lock);
         });
-        let output = fixture
+        let mut bridge = fixture
             .command()
             .args(["client", "--db"])
             .arg(&fixture.db)
-            .stdin(Stdio::null())
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        let input = bridge.stdin.take().unwrap();
+        let mut events = Vec::new();
+        // Keep the viewer connected until the outcome is observed. EOF asks
+        // the bridge to cancel output, so it cannot be a readiness barrier.
+        for line in BufReader::new(bridge.stdout.take().unwrap()).lines() {
+            let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let terminal = matches!(event["state"].as_str(), Some("connected" | "failed"));
+            events.push(event);
+            if terminal {
+                break;
+            }
+        }
+        drop(input);
+        let output = bridge.wait_with_output().unwrap();
         fake.join().unwrap();
-        let events: Vec<Value> = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|s| serde_json::from_str(s).unwrap())
-            .collect();
         if incompatible {
             assert!(
                 output.status.success(),
@@ -1136,6 +1197,190 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_replacement_allows_a_slow_shutdown() {
+    slow_bridge_replacement(6500, false);
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_replacement_allows_shutdown_near_its_deadline() {
+    slow_bridge_replacement(9500, false);
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_replacement_survives_the_viewer_connection_deadline() {
+    slow_bridge_replacement(6500, true);
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_replacement_stops_at_the_shutdown_deadline_without_an_orphan() {
+    slow_bridge_replacement(10500, false);
+}
+
+#[cfg(windows)]
+fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
+    let mut fixture = Fixture::new();
+    let key = instance::database_key(&fixture.db).unwrap();
+    let lock = instance::InstanceLock::try_acquire(&fixture.db)
+        .unwrap()
+        .unwrap();
+    let mut listener = endpoint::Listener::bind(&key).unwrap();
+    let (shutdown_sent, shutdown_received) = std::sync::mpsc::channel();
+    let fake = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok(stream) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    assert!(Instant::now() < until)
+                }
+                Err(e) => panic!("fake accept: {e}"),
+            }
+        };
+        let mut wire = BufReader::new(stream);
+        assert_eq!(next_event(&mut wire)["op"], "hello");
+        protocol::send(
+            wire.get_mut(),
+            &serde_json::json!({"v":1,"id":"bridge-hello","event":"hello",
+            "database_key":key,"protocol":1,"viewer_protocol":1,"collector_version":"older-build",
+            "schema":30,"contract":2,"parsers":{"codex":1,"claude":1},"state":"ready"}),
+        )
+        .unwrap();
+        assert_eq!(next_event(&mut wire)["op"], "shutdown");
+        shutdown_sent.send(()).unwrap();
+        drop(wire); // Deliberately lose the shutdown reply.
+        drop(listener);
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        drop(lock);
+    });
+    let start = Instant::now();
+    let mut bridge = fixture
+        .command()
+        .args(["client", "--db"])
+        .arg(&fixture.db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = bridge.stdin.take().unwrap();
+    let stdout = bridge.stdout.take().unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let output = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if sent.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    shutdown_received
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let workers = DetachedWorkers::for_hook(bridge.id());
+    if abandon {
+        std::thread::sleep(
+            (start + Duration::from_secs(4)).saturating_duration_since(Instant::now()),
+        );
+        bridge.kill().unwrap();
+        bridge.wait().unwrap();
+        drop(input);
+        output.join().unwrap();
+        fixture.children.push(bridge);
+        fake.join().unwrap();
+        // A new viewer attempt must find a serving successor, even though no
+        // viewer/bridge survived to launch it after the old lock was released.
+        let until = Instant::now() + Duration::from_secs(4);
+        loop {
+            let status = fixture.cli("status");
+            if status.status.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "replacement died with the viewer attempt"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let reconnect = fixture
+            .command()
+            .args(["client", "--db"])
+            .arg(&fixture.db)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(reconnect.status.success());
+        assert!(String::from_utf8_lossy(&reconnect.stdout).contains("\"state\":\"connected\""));
+    } else {
+        let mut replaced = false;
+        loop {
+            let event = received
+                .recv_timeout(Duration::from_secs(16).saturating_sub(start.elapsed()))
+                .unwrap();
+            if delay_ms > 10000 {
+                assert_ne!(event["state"], "replaced");
+                assert_ne!(event["state"], "connected");
+                if event["state"] == "failed" {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(11),
+                        "shutdown exceeded its bound"
+                    );
+                    break;
+                }
+                continue;
+            }
+            assert_ne!(event["state"], "failed", "{event}");
+            if event["state"] == "replaced" {
+                assert!(
+                    fixture.cli("status").status.success(),
+                    "replaced was emitted before successor served"
+                );
+                replaced = true;
+            }
+            if event["state"] == "connected" {
+                assert!(replaced);
+                break;
+            }
+        }
+        drop(input);
+        fixture.children.push(bridge);
+        if delay_ms > 10000 {
+            let until = Instant::now() + Duration::from_secs(3);
+            while fixture.children[0].try_wait().unwrap().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            fixture.wait_all(Duration::from_secs(3));
+        }
+        output.join().unwrap();
+        fake.join().unwrap();
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(16),
+        "replacement exceeded its total bound"
+    );
+    if delay_ms > 10000 {
+        assert!(
+            !fixture.cli("status").status.success(),
+            "late successor escaped the shutdown deadline"
+        );
+    }
+    assert!(fixture.cli("stop").status.success());
+    drop(workers); // Retained native handles prove the detached process exited.
+    assert!(
+        instance::InstanceLock::try_acquire(&fixture.db)
+            .unwrap()
+            .is_some()
+    );
+    // Fixture teardown stops and reaps the detached successor before deleting
+    // its database; a surviving process/handle makes teardown fail.
 }
 
 #[cfg(windows)]
@@ -3602,4 +3847,121 @@ fn protocol_cli_info_status_shutdown() {
     fixture.wait_all(Duration::from_secs(5));
     assert!(!fixture.cli("status").status.success());
     assert!(fixture.cli("stop").status.success(), "stop is idempotent");
+}
+
+// Windows named pipes can disconnect before the shutdown acknowledgement is
+// consumed. The instance lock, not delivery of that last frame, proves stop.
+#[cfg(windows)]
+fn shutdown_peer(fixture: &Fixture, read_shutdown: bool) -> std::thread::JoinHandle<()> {
+    let lock = instance::InstanceLock::try_acquire(&fixture.db)
+        .unwrap()
+        .unwrap();
+    let key = instance::database_key(&fixture.db).unwrap();
+    let mut listener = endpoint::Listener::bind(&key).unwrap();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok(stream) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    assert!(Instant::now() < deadline);
+                }
+                Err(e) => panic!("shutdown peer accept: {e}"),
+            }
+        };
+        let mut wire = BufReader::new(stream);
+        if read_shutdown {
+            let shutdown = next_event(&mut wire);
+            assert_eq!(shutdown["op"], "shutdown");
+        }
+        // Deliberately send no reply, as if the process exited at this boundary.
+        drop(wire);
+        drop(listener);
+        drop(lock);
+    })
+}
+
+#[cfg(windows)]
+#[test]
+fn resident_stop_succeeds_after_shutdown_reply_is_lost() {
+    let fixture = Fixture::new();
+    let peer = shutdown_peer(&fixture, true);
+    let result = fixture.cli("stop");
+    peer.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        instance::InstanceLock::try_acquire(&fixture.db)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture.cli("stop").status.success(),
+        "already stopped is success"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn resident_stop_succeeds_if_peer_exits_before_shutdown_write() {
+    let fixture = Fixture::new();
+    let peer = shutdown_peer(&fixture, false);
+    let result = fixture.cli("stop");
+    peer.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        instance::InstanceLock::try_acquire(&fixture.db)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn resident_stop_times_out_if_disconnected_instance_stays_locked() {
+    let fixture = Fixture::new();
+    let lock = instance::InstanceLock::try_acquire(&fixture.db)
+        .unwrap()
+        .unwrap();
+    let key = instance::database_key(&fixture.db).unwrap();
+    let mut listener = endpoint::Listener::bind(&key).unwrap();
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok(stream) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    assert!(Instant::now() < deadline)
+                }
+                Err(e) => panic!("shutdown peer accept: {e}"),
+            }
+        };
+        let mut wire = BufReader::new(stream);
+        assert_eq!(next_event(&mut wire)["op"], "shutdown");
+        drop(wire);
+        drop(listener);
+    });
+    let started = Instant::now();
+    let result = fixture.cli("stop");
+    peer.join().unwrap();
+    drop(lock);
+    assert!(
+        !result.status.success(),
+        "a live instance must not be reported stopped"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("resident did not release its instance lock"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(started.elapsed() >= Duration::from_secs(9));
+    assert!(started.elapsed() < Duration::from_secs(13));
 }

@@ -18,6 +18,7 @@ import '../pricing/pricing_repository.dart';
 import '../platform/app_locations.dart';
 import '../scanner/scan_batching.dart';
 import '../scanner/collector_process.dart';
+import '../scanner/resident_collector_client.dart';
 import '../scanner/scan_types.dart';
 import '../search/message_search.dart';
 import '../search/session_search.dart';
@@ -68,7 +69,8 @@ class RuntimeSessionController implements ProjectsRepository {
     this.writerCoordinator,
     this.claudeProjectRoots,
     this.collectorExecutable,
-    this.collectorLeaseTimeout = CollectorProcess.defaultLeaseTimeout,
+    this.collectorClient,
+    this.collectorPort,
   }) : assert(
          parserWorkerCountOverride == null || parserWorkerCountOverride > 0,
        );
@@ -91,16 +93,27 @@ class RuntimeSessionController implements ProjectsRepository {
 
   /// The collector executable; null uses [CollectorProcess]'s default.
   final String? collectorExecutable;
-  final Duration collectorLeaseTimeout;
+  final ResidentCollectorClient? collectorClient;
+  final SendPort? collectorPort;
   SendPort? _backgroundWriterPort;
 
   List<String> get _claudeRoots =>
       claudeProjectRoots ?? defaultClaudeProjectRoots();
 
-  CollectorProcess _collector() => CollectorProcess(
-    executable: collectorExecutable,
-    leaseTimeout: collectorLeaseTimeout,
-  );
+  ResidentCollectorClient _collector() =>
+      collectorClient ??
+      (collectorPort == null
+          ? ResidentCollectorClient(
+              databaseFile: databaseFile,
+              settingsFile: settingsFile,
+              executable: collectorExecutable,
+              claudeRoots: _claudeRoots,
+            )
+          : ResidentCollectorClient.proxy(
+              databaseFile: databaseFile,
+              settingsFile: settingsFile,
+              owner: collectorPort!,
+            ));
 
   /// Whether the UI already holds the cached session rows, so a rescan can
   /// skip resending the full list before it starts scanning.
@@ -156,7 +169,7 @@ class RuntimeSessionController implements ProjectsRepository {
         parserWorkerCountOverride: parserWorkerCountOverride,
         claudeProjectRoots: _claudeRoots,
         collectorExecutable: collectorExecutable,
-        collectorLeaseTimeout: collectorLeaseTimeout,
+        collectorPort: collectorClient?.requestPort ?? collectorPort,
       ),
       onProgress: onProgress,
     );
@@ -345,7 +358,7 @@ class RuntimeSessionController implements ProjectsRepository {
           }
           if (message is _BackgroundRefreshError) {
             finishError(
-              StateError(message.error),
+              message.error,
               StackTrace.fromString(message.stackTrace),
             );
           }
@@ -437,7 +450,10 @@ class RuntimeSessionController implements ProjectsRepository {
           settingsFilePath: settingsFile.path,
           databaseFilePath: databaseFile.path,
           sessionId: sessionId,
+          claudeRoots: _claudeRoots,
           reloadFromSource: reloadFromSource,
+          collectorPort: collectorClient?.requestPort ?? collectorPort,
+          collectorExecutable: collectorExecutable,
           sendPort: messages.sendPort,
         ),
         onError: errors.sendPort,
@@ -463,10 +479,7 @@ class RuntimeSessionController implements ProjectsRepository {
           return;
         }
         if (message is _BackgroundRefreshError) {
-          finishError(
-            StateError(message.error),
-            StackTrace.fromString(message.stackTrace),
-          );
+          finishError(message.error, StackTrace.fromString(message.stackTrace));
         }
       });
       errorSubscription = errors.listen((message) {
@@ -554,6 +567,8 @@ class RuntimeSessionController implements ProjectsRepository {
     required File databaseFile,
     required String sessionId,
     String? collectorExecutable,
+    SendPort? collectorPort,
+    List<String> claudeRoots = const [],
   }) async {
     final db = openFileBackedDatabase(databaseFile);
     late String path;
@@ -570,12 +585,27 @@ class RuntimeSessionController implements ProjectsRepository {
       db.close();
     }
     if (path.isEmpty || !File(path).existsSync()) return null;
-    await CollectorProcess(executable: collectorExecutable).ingest(
-      settingsFile: settingsFile,
-      databaseFile: databaseFile,
-      sourcePath: path,
-      harness: harness,
-    );
+    final client = collectorPort == null
+        ? ResidentCollectorClient(
+            databaseFile: databaseFile,
+            settingsFile: settingsFile,
+            executable: collectorExecutable,
+            claudeRoots: claudeRoots,
+          )
+        : ResidentCollectorClient.proxy(
+            databaseFile: databaseFile,
+            settingsFile: settingsFile,
+            owner: collectorPort,
+          );
+    try {
+      await client.ingest(
+        sourcePath: path,
+        harness: harness,
+        claudeRoots: claudeRoots,
+      );
+    } finally {
+      await client.dispose();
+    }
     return _loadSessionDetailOnWorker(
       settingsFile: settingsFile,
       databaseFile: databaseFile,
@@ -627,7 +657,7 @@ class RuntimeSessionController implements ProjectsRepository {
           parserWorkerCountOverride: parserWorkerCountOverride,
           claudeProjectRoots: _claudeRoots,
           collectorExecutable: collectorExecutable,
-          collectorLeaseTimeout: collectorLeaseTimeout,
+          collectorPort: collectorClient?.requestPort ?? collectorPort,
         ),
         onError: errors.sendPort,
         onExit: exits.sendPort,
@@ -684,10 +714,7 @@ class RuntimeSessionController implements ProjectsRepository {
           return;
         }
         if (message is _BackgroundRefreshError) {
-          finishError(
-            StateError(message.error),
-            StackTrace.fromString(message.stackTrace),
-          );
+          finishError(message.error, StackTrace.fromString(message.stackTrace));
         }
       });
       errorSubscription = errors.listen((message) {
@@ -905,6 +932,7 @@ class RuntimeSessionController implements ProjectsRepository {
       final db = openFileBackedDatabase(databaseFile);
       StructuredLogger? logger;
       int? scanRunId;
+      final collector = _collector();
       var latestProgress = ScanProgress(startedAtUtc: DateTime.now().toUtc());
       try {
         await _writeScan(() async {
@@ -949,23 +977,14 @@ class RuntimeSessionController implements ProjectsRepository {
             ),
           ),
         );
-        final collector = _collector();
         final result = await Profiling.spanAsync(
           'scan.runtime.collector',
           () => collector.scan(
-            settingsFile: settingsFile,
-            databaseFile: databaseFile,
             cancellation: cancellationToken,
             claudeRoots: _claudeRoots,
             // An injected resolver supplies WSL names after the scan.
             resolveWslProjects: wslProjectResolver is ProcessWslProjectResolver,
             parserWorkers: parserWorkerCountOverride,
-            flushSessions: scanBatchingPolicy.parsedSessionFlushBatchSize,
-            flushBytes: scanBatchingPolicy.parsedSessionFlushSourceBytes,
-            write: (work) => Profiling.spanAsync(
-              'scan.runtime.collector_write',
-              () => _writeScan(work),
-            ),
             onProgress: (progress, committed) {
               latestProgress = progress;
               final emitRows =
@@ -1002,13 +1021,14 @@ class RuntimeSessionController implements ProjectsRepository {
                 .toSet(),
           );
           await _writeScan(
-            () => collector.applyProjectHints(databaseFile, [
-              for (final row in candidates)
-                {
-                  'session_id': row['session_id'],
-                  'source_path': row['source_file_path'],
-                },
-            ], hints),
+            () => CollectorProcess(executable: collectorExecutable)
+                .applyProjectHints(databaseFile, [
+                  for (final row in candidates)
+                    {
+                      'session_id': row['session_id'],
+                      'source_path': row['source_file_path'],
+                    },
+                ], hints),
           );
         }
         await _writeScan(
@@ -1097,6 +1117,7 @@ class RuntimeSessionController implements ProjectsRepository {
         rethrow;
       } finally {
         db.close();
+        if (collectorClient == null) await collector.dispose();
       }
     });
   }
@@ -1226,7 +1247,7 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
       parserWorkerCountOverride: request.parserWorkerCountOverride,
       claudeProjectRoots: request.claudeProjectRoots,
       collectorExecutable: request.collectorExecutable,
-      collectorLeaseTimeout: request.collectorLeaseTimeout,
+      collectorPort: request.collectorPort,
     );
     if (request.coordinateWrites) {
       controller._backgroundWriterPort = request.sendPort;
@@ -1246,7 +1267,7 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
     request.sendPort.send(_BackgroundRefreshDone(result));
   } on Object catch (error, stackTrace) {
     request.sendPort.send(
-      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+      _BackgroundRefreshError(error, stackTrace.toString()),
     );
   } finally {
     await cancelSubscription?.cancel();
@@ -1286,7 +1307,7 @@ Future<void> _backgroundCachedRowsEntry(
     }
   } on Object catch (error, stackTrace) {
     request.sendPort.send(
-      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+      _BackgroundRefreshError(error, stackTrace.toString()),
     );
   }
 }
@@ -1351,6 +1372,9 @@ Future<void> _backgroundSessionDetailEntry(
             settingsFile: File(request.settingsFilePath),
             databaseFile: File(request.databaseFilePath),
             sessionId: request.sessionId,
+            collectorPort: request.collectorPort,
+            collectorExecutable: request.collectorExecutable,
+            claudeRoots: request.claudeRoots,
           )
         : await RuntimeSessionController._loadSessionDetailOnWorker(
             settingsFile: File(request.settingsFilePath),
@@ -1360,7 +1384,7 @@ Future<void> _backgroundSessionDetailEntry(
     request.sendPort.send(_BackgroundSessionDetailDone(row));
   } on Object catch (error, stackTrace) {
     request.sendPort.send(
-      _BackgroundRefreshError(error.toString(), stackTrace.toString()),
+      _BackgroundRefreshError(error, stackTrace.toString()),
     );
   }
 }
@@ -1398,7 +1422,7 @@ class _BackgroundRefreshRequest {
     required this.parserWorkerCountOverride,
     required this.claudeProjectRoots,
     required this.collectorExecutable,
-    required this.collectorLeaseTimeout,
+    required this.collectorPort,
   });
 
   final String settingsFilePath;
@@ -1412,7 +1436,7 @@ class _BackgroundRefreshRequest {
   final int? parserWorkerCountOverride;
   final List<String> claudeProjectRoots;
   final String? collectorExecutable;
-  final Duration collectorLeaseTimeout;
+  final SendPort? collectorPort;
 }
 
 class _BackgroundScanWriteRequest {
@@ -1473,6 +1497,9 @@ class _BackgroundSessionDetailRequest {
     required this.sessionId,
     required this.reloadFromSource,
     required this.sendPort,
+    this.collectorPort,
+    this.collectorExecutable,
+    this.claudeRoots = const [],
   });
 
   final String settingsFilePath;
@@ -1480,6 +1507,9 @@ class _BackgroundSessionDetailRequest {
   final String sessionId;
   final bool reloadFromSource;
   final SendPort sendPort;
+  final SendPort? collectorPort;
+  final String? collectorExecutable;
+  final List<String> claudeRoots;
 }
 
 class _BackgroundSessionDetailDone {
@@ -1509,7 +1539,7 @@ class _BackgroundMessageSearchBackfillDone {
 class _BackgroundRefreshError {
   const _BackgroundRefreshError(this.error, this.stackTrace);
 
-  final String error;
+  final Object error;
   final String stackTrace;
 }
 
@@ -1660,10 +1690,7 @@ class _BackgroundMessageSearchBackfillOperation {
           return;
         }
         if (message is _BackgroundRefreshError) {
-          finishError(
-            StateError(message.error),
-            StackTrace.fromString(message.stackTrace),
-          );
+          finishError(message.error, StackTrace.fromString(message.stackTrace));
         }
       });
       errorSubscription = errors.listen((message) {

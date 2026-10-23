@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import '../../commands/resume_command_generator.dart';
 import '../../commands/windows_command_line.dart';
 import '../../config/app_settings.dart';
+import '../../scanner/resident_collector_client.dart';
 import '../../platform/app_locations.dart';
 import '../../export/session_list_exporter.dart';
 import '../dialogs/delayed_export_progress.dart';
@@ -312,7 +313,6 @@ class _SessionsScreenState extends State<SessionsScreen> {
   SessionOpenTarget? _pendingOpenTarget;
   int? _pendingOpenTargetSerial;
   Timer? _relativeDateTimer;
-  Timer? _backgroundRescanTimer;
   Timer? _filterDebounceTimer;
   Timer? _tableStateEmitTimer;
   SessionsRefreshOperation? _activeRefreshOperation;
@@ -348,7 +348,6 @@ class _SessionsScreenState extends State<SessionsScreen> {
         setState(() {});
       }
     });
-    _configureBackgroundRescanTimer();
     _queueOpenTargetFromWidget();
     _handledProjectFilterSerial = widget.projectFilterSerial;
     if (widget.projectFilterRequest case final project?) {
@@ -426,9 +425,6 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (widget.openTargetSerial != _handledOpenTargetSerial) {
       _queueOpenTargetFromWidget();
     }
-    if (_settingsFor(oldWidget).scanner != _settingsFor(widget).scanner) {
-      _configureBackgroundRescanTimer();
-    }
   }
 
   @override
@@ -437,7 +433,6 @@ class _SessionsScreenState extends State<SessionsScreen> {
       _emitTableState();
     }
     _requestRefreshCancel(updateUi: false);
-    _backgroundRescanTimer?.cancel();
     _filterDebounceTimer?.cancel();
     _searchController
       ..removeListener(_filtersChanged)
@@ -455,28 +450,6 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _filterAreaFocusNode.dispose();
     _filterScrollController.dispose();
     super.dispose();
-  }
-
-  AppSettings _settingsFor(SessionsScreen widget) =>
-      widget.settings ?? AppSettings.defaults();
-
-  void _configureBackgroundRescanTimer() {
-    _backgroundRescanTimer?.cancel();
-    _backgroundRescanTimer = null;
-    final scanner = (widget.settings ?? AppSettings.defaults()).scanner;
-    if (!scanner.backgroundRescanEnabled ||
-        scanner.backgroundRescanIntervalSeconds <= 0) {
-      return;
-    }
-    _backgroundRescanTimer = Timer.periodic(
-      Duration(seconds: scanner.backgroundRescanIntervalSeconds),
-      (_) {
-        if (!mounted || _isScanning) {
-          return;
-        }
-        unawaited(_refresh());
-      },
-    );
   }
 
   @override
@@ -2066,7 +2039,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
         return;
       }
       setState(() {
-        _scanAnnouncement = 'Refresh failed. $error';
+        _scanAnnouncement = collectionRefreshError(error);
       });
     } finally {
       if (operation != null && identical(_activeRefreshOperation, operation)) {
@@ -2792,10 +2765,14 @@ class _SessionsScreenState extends State<SessionsScreen> {
     SessionRowViewModel? reloaded;
     try {
       reloaded = await widget.onReloadSessionDetailFromSource!(row.id);
-    } on Object catch (error) {
+    } on Object {
       messenger
         ?..removeCurrentSnackBar()
-        ..showSnackBar(SnackBar(content: Text('Re-parse failed. $error')));
+        ..showSnackBar(
+          const SnackBar(
+            content: Text('Session reload could not finish. Try again.'),
+          ),
+        );
       return;
     }
     if (!mounted) {

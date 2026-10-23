@@ -12,12 +12,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
+import '../test/support/collector_fixture.dart';
+
 /// Runs against the built collector: set CODEX_SESSIONS_COLLECTOR_EXE to
 /// `collector\target\debug\codex-sessions-collector.exe` (cargo build).
 void main() {
   test('core local workflows work together on fixtures', () async {
     final temp = await Directory.systemTemp.createTemp('csv_integration_');
-    addTearDown(() => _deleteWithRetry(temp));
+    addTearDown(() => deleteCollectorFixture(temp));
 
     final settingsFile = File(p.join(temp.path, 'settings.toml'));
     final defaults = await SettingsRepository(settingsFile).loadOrCreate();
@@ -153,21 +155,6 @@ void main() {
     expect(find.text('Windows refreshed'), findsOneWidget);
     expect(find.text('WSL refreshed'), findsNothing);
   });
-}
-
-/// Deletes [directory], retrying while Windows still reports a file in use
-/// (a collector process or SQLite handle closing after a failed test).
-Future<void> _deleteWithRetry(Directory directory) async {
-  for (var attempt = 0; ; attempt++) {
-    if (!await directory.exists()) return;
-    try {
-      await directory.delete(recursive: true);
-      return;
-    } on FileSystemException {
-      if (attempt >= 20) rethrow;
-      await Future<void>.delayed(const Duration(milliseconds: 250));
-    }
-  }
 }
 
 Future<File> _copyFixture(String name, Directory destination) async {

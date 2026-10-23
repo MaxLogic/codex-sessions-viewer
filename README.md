@@ -68,6 +68,21 @@ their reports in ignored storage such as `.agents/private-session-corpus/` and
 `.agents/benchmark-results/`; reports contain aggregate timings and counts
 only.
 
+## Background collection
+
+The viewer connects to one resident collector per database. Refresh, startup
+refresh and detail reload use that connection; the viewer reads committed changes
+without restarting a collector for each scan. The resident schedules periodic scans
+from `scanner.background_rescan_enabled` and
+`scanner.background_rescan_interval_seconds`; the viewer has no periodic scan timer.
+Pending migrations, VACUUM and exclusive viewer maintenance request a collection pause for at most four seconds. Current-schema startup does not pause collection. Startup migrations proceed under SQLite transaction locking if collection is unavailable; other exclusive work asks you to retry. Pauses are released on completion, failure or cancellation, and re-acquired when the connection recovers. Saved sessions remain available if collection cannot start.
+
+A collector started by the viewer exits 30 seconds after the last viewer disconnects
+when its pending work is complete. A hook or login launcher keeps the resident alive
+for collection while the viewer is closed. Hook installation and Windows task
+registration remain managed by the Background collection panel; the login-task
+upgrade is a separate step.
+
 ## Configuration
 
 Configuration lives in a writable per-user `settings.toml`. On first launch the

@@ -5,14 +5,15 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import '../platform/app_locations.dart';
-import 'scan_types.dart';
 
 /// Starts the collector; tests substitute a scripted process.
 typedef CollectorProcessStarter =
     Future<Process> Function(String executable, List<String> arguments);
 
-Future<Process> _startProcess(String executable, List<String> arguments) =>
-    Process.start(executable, arguments, runInShell: false);
+Future<Process> startCollectorProcess(
+  String executable,
+  List<String> arguments,
+) => Process.start(executable, arguments, runInShell: false);
 
 /// The collector executable is missing or cannot run.
 class CollectorUnavailableException implements Exception {
@@ -20,6 +21,9 @@ class CollectorUnavailableException implements Exception {
 
   final String executable;
   final String reason;
+
+  static const recoveryMessage =
+      'Session collection could not start. Saved sessions are still shown. Reinstall Codex Sessions Viewer to restore session collection.';
 
   @override
   String toString() =>
@@ -29,27 +33,11 @@ class CollectorUnavailableException implements Exception {
       'CODEX_SESSIONS_COLLECTOR_EXE to its location. ($reason)';
 }
 
-/// The collector held the database writer lease longer than allowed.
-class CollectorLeaseTimeoutException implements Exception {
-  const CollectorLeaseTimeoutException(this.timeout);
-
-  final Duration timeout;
-
-  @override
-  String toString() =>
-      'The session collector held the database writer for more than '
-      '${timeout.inSeconds} s and was stopped. Other database work continues; '
-      'refresh again to finish collecting.';
-}
-
 /// The installed collector is the only writer of parsed session state.
 class CollectorProcess {
-  CollectorProcess({
-    String? executable,
-    CollectorProcessStarter? start,
-    this.leaseTimeout = defaultLeaseTimeout,
-  }) : executable = executable ?? defaultExecutable(),
-       _start = start ?? _startProcess;
+  CollectorProcess({String? executable, CollectorProcessStarter? start})
+    : executable = executable ?? defaultExecutable(),
+      _start = start ?? startCollectorProcess;
 
   /// The collector that sits next to the viewer, or the one named by
   /// `CODEX_SESSIONS_COLLECTOR_EXE`.
@@ -74,19 +62,8 @@ class CollectorProcess {
         );
   }
 
-  /// A write batch holds the lease for well under a second. The one-time
-  /// cache repair copies the database between two leases, not under one,
-  /// and a stopped repair backs off for a day, so anything longer is a hang.
-  static const defaultLeaseTimeout = Duration(minutes: 5);
-
   final String executable;
   final CollectorProcessStarter _start;
-  final Duration leaseTimeout;
-  int persistenceFlushCount = 0;
-
-  /// The collector's report of the legacy session cache repair, when the
-  /// last scan ran it.
-  Map<String, dynamic>? cacheRepair;
 
   Future<Process> _launch(List<String> arguments) async {
     try {
@@ -142,247 +119,6 @@ class CollectorProcess {
       );
     }
   }
-
-  Future<void> ingest({
-    required File settingsFile,
-    required File databaseFile,
-    required String sourcePath,
-    required String harness,
-  }) async {
-    if (harness != 'codex' && harness != 'claude') {
-      throw UnsupportedError('No collector for harness $harness.');
-    }
-    final result = await _run([
-      harness,
-      'ingest',
-      '--json',
-      '--settings',
-      settingsFile.absolute.path,
-      '--db',
-      databaseFile.absolute.path,
-      sourcePath,
-    ]);
-    if (result.exitCode != 0) {
-      throw StateError(
-        'Collector reparse failed (${result.exitCode}): ${result.stderr}',
-      );
-    }
-  }
-
-  /// Scans Codex homes, then Claude Code transcripts under [claudeRoots]
-  /// (skipped when empty), under the same writer-lease protocol.
-  Future<SessionScanResult> scan({
-    required File settingsFile,
-    required File databaseFile,
-    required ScanCancellationToken cancellation,
-    required Future<void> Function(Future<void> Function()) write,
-    required void Function(ScanProgress, int) onProgress,
-    List<String> claudeRoots = const [],
-    bool resolveWslProjects = true,
-    int? parserWorkers,
-    int flushSessions = 64,
-    int flushBytes = 8 * 1024 * 1024,
-  }) async {
-    final started = DateTime.now().toUtc();
-    persistenceFlushCount = 0;
-    cacheRepair = null;
-    final common = [
-      '--settings',
-      settingsFile.absolute.path,
-      '--db',
-      databaseFile.absolute.path,
-      '--coordinate-writes',
-      '--flush-sessions',
-      '$flushSessions',
-      '--flush-bytes',
-      '$flushBytes',
-      if (parserWorkers != null) ...['--parser-workers', '$parserWorkers'],
-      if (!resolveWslProjects) '--no-wsl-projects',
-    ];
-    final reports = <Map<String, dynamic>>[];
-    for (final harness in ['codex', if (claudeRoots.isNotEmpty) 'claude']) {
-      if (reports.isNotEmpty &&
-          (reports.last['cancelled'] == true ||
-              cancellation.isCancellationRequested)) {
-        break;
-      }
-      final before = [...reports];
-      final report = await _scanHarness(
-        [
-          harness,
-          'scan',
-          ...common,
-          if (harness == 'claude')
-            for (final root in claudeRoots) ...['--claude-root', root],
-        ],
-        cancellation: cancellation,
-        write: write,
-        onProgress: (counts, committed) => onProgress(
-          _progress([...before, counts], started),
-          _sum([...before], 'sessions_written') + committed,
-        ),
-      );
-      reports.add(report);
-      if (harness == 'codex') {
-        cacheRepair = report['cache_repair'] as Map<String, dynamic>?;
-      }
-    }
-    persistenceFlushCount = _sum(reports, 'persistence_flushes');
-    final cancelled = reports.any((report) => report['cancelled'] == true);
-    final failures = [
-      for (final report in reports)
-        for (final entry in report['errors'] as List<dynamic>)
-          ScanFileError(
-            sourcePath: entry['path'] as String,
-            status: SessionFileStatus.values.firstWhere(
-              (status) => status.wireName == entry['status'],
-              orElse: () => SessionFileStatus.parseError,
-            ),
-            message: entry['message'] as String? ?? '',
-          ),
-    ];
-    final progress = _progress(reports, started)..finish(cancelled: cancelled);
-    onProgress(progress, _sum(reports, 'sessions_written'));
-    return SessionScanResult(
-      progress: progress,
-      cancelled: cancelled,
-      allConfiguredRootsReachable: !failures.any(
-        (failure) => failure.status == SessionFileStatus.pathUnreachable,
-      ),
-      errors: failures,
-    );
-  }
-
-  /// One `<harness> scan --coordinate-writes` run. Returns its `finished`
-  /// report; [onProgress] receives the run's own counts.
-  Future<Map<String, dynamic>> _scanHarness(
-    List<String> arguments, {
-    required ScanCancellationToken cancellation,
-    required Future<void> Function(Future<void> Function()) write,
-    required void Function(Map<String, dynamic>, int) onProgress,
-  }) async {
-    final process = await _launch(arguments);
-    // Every stdin line goes through one writer, so a cancel never interleaves
-    // with a grant's flush, and a pipe closed by an exited collector is
-    // recorded instead of surfacing as an unhandled error.
-    final stdin = _LineWriter(process.stdin);
-    // Drain stderr immediately so errors cannot fill the pipe and deadlock.
-    final errors = process.stderr.transform(utf8.decoder).join();
-    var cancelSent = false;
-    void sendCancel() {
-      if (!cancelSent && cancellation.isCancellationRequested) {
-        cancelSent = true;
-        stdin.send('cancel');
-      }
-    }
-
-    final cancelPoll = Timer.periodic(
-      const Duration(milliseconds: 25),
-      (_) => sendCancel(),
-    );
-    Completer<void>? released;
-    Future<void>? lease;
-    var leaseStarted = false;
-    Timer? watchdog;
-    var leaseTimedOut = false;
-    Map<String, dynamic>? terminal;
-    Object? leaseError;
-    try {
-      sendCancel();
-      await for (final line
-          in process.stdout
-              .transform(utf8.decoder)
-              .transform(const LineSplitter())) {
-        final event = jsonDecode(line) as Map<String, dynamic>;
-        switch (event['event']) {
-          case 'write_requested':
-            sendCancel();
-            if (released != null) {
-              throw const FormatException(
-                'Collector requested overlapping writes.',
-              );
-            }
-            final release = Completer<void>();
-            released = release;
-            leaseStarted = false;
-            lease =
-                write(() async {
-                  // A request withdrawn before the queue reached it.
-                  if (release.isCompleted) return;
-                  leaseStarted = true;
-                  watchdog = Timer(leaseTimeout, () {
-                    leaseTimedOut = true;
-                    process.kill();
-                    if (!release.isCompleted) release.complete();
-                  });
-                  await stdin.send('grant');
-                  await release.future;
-                  watchdog?.cancel();
-                }).catchError((Object error) {
-                  leaseError = error;
-                  process.kill();
-                });
-          case 'write_released':
-            final release = released;
-            released = null;
-            if (release != null && !release.isCompleted) release.complete();
-            // A granted lease ends with the collector's write; a withdrawn
-            // request must not wait for the writer queue to reach it.
-            if (leaseStarted) await lease;
-            lease = null;
-          case 'progress':
-            onProgress(
-              event['counts'] as Map<String, dynamic>,
-              event['sessions_written'] as int,
-            );
-            sendCancel();
-          case 'finished':
-            terminal = event;
-          default:
-            throw FormatException('Unknown collector event: ${event['event']}');
-        }
-      }
-      final exit = await process.exitCode;
-      final stderr = await errors;
-      if (leaseTimedOut) throw CollectorLeaseTimeoutException(leaseTimeout);
-      if (leaseError != null) {
-        throw StateError('Collector writer failed: $leaseError');
-      }
-      if (exit != 0) {
-        throw StateError('Collector exited with code $exit. $stderr');
-      }
-      if (terminal == null) {
-        throw const FormatException('Collector exited without a scan result.');
-      }
-      return terminal;
-    } finally {
-      cancelPoll.cancel();
-      watchdog?.cancel();
-      final release = released;
-      if (release != null && !release.isCompleted) release.complete();
-      if (leaseStarted) await lease;
-      await stdin.close();
-      // On malformed output or a UI callback failure, the owning process must
-      // not keep writing after the controller reports failure.
-      process.kill();
-      await process.exitCode;
-      await errors;
-    }
-  }
-
-  static int _sum(List<Map<String, dynamic>> reports, String key) =>
-      reports.fold(0, (sum, report) => sum + (report[key] as int? ?? 0));
-
-  static ScanProgress _progress(
-    List<Map<String, dynamic>> counts,
-    DateTime started,
-  ) => ScanProgress(startedAtUtc: started)
-    ..directoriesScanned = _sum(counts, 'directories_scanned')
-    ..filesFound = _sum(counts, 'files_found')
-    ..filesSkipped = _sum(counts, 'files_skipped')
-    ..filesParsed = _sum(counts, 'files_parsed')
-    ..filesFailed = _sum(counts, 'files_failed')
-    ..sessionsMissing = _sum(counts, 'sessions_missing');
 }
 
 /// Writes lines to a process's stdin one at a time. Write and pipe errors

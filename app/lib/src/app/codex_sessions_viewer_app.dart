@@ -44,6 +44,8 @@ import '../ui/widgets/app_button.dart';
 import '../ui/widgets/session_stats_view.dart';
 import '../ui/widgets/database_migration_progress.dart';
 import '../usage/usage_summary.dart';
+import '../scanner/resident_collector_client.dart';
+import '../ui/widgets/collector_status.dart';
 import '../voice_over/voice_over_service.dart';
 import '../voice_over/windows_voice_over.dart';
 
@@ -78,6 +80,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
     this.usageSummaryLoader,
     this.databaseMaintenanceStartup,
     this.writerCoordinator,
+    this.collectorClient,
     this.applicationMaintenance,
     this.backgroundCollection,
     this.startupPreferenceApplier = _ignoreStartupPreference,
@@ -111,6 +114,7 @@ class CodexSessionsViewerApp extends StatefulWidget {
   final UsageSummaryLoader? usageSummaryLoader;
   final DatabaseMaintenanceStartup? databaseMaintenanceStartup;
   final DatabaseMaintenanceCoordinator? writerCoordinator;
+  final ResidentCollectorClient? collectorClient;
   final ApplicationMaintenance? applicationMaintenance;
   final BackgroundCollection? backgroundCollection;
   final StartupPreferenceApplier startupPreferenceApplier;
@@ -125,6 +129,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   final _navigatorKey = GlobalKey<NavigatorState>();
   final _scaffoldMessengerKey = GlobalKey<ScaffoldMessengerState>();
   late final DatabaseMaintenanceCoordinator _writerCoordinator;
+  late final ResidentCollectorClient _resident;
   AppSettings? _settings;
   UsageSummary? _usageSummary;
   UsageSummaryRequest? _usageRequest;
@@ -171,10 +176,20 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           ),
       'writerCoordinator must match applicationMaintenance.coordinator.',
     );
+    _resident =
+        widget.collectorClient ??
+        ResidentCollectorClient(
+          databaseFile: widget.databaseFile,
+          settingsFile: widget.settingsFile,
+          claudeRoots: RuntimeSessionController.defaultClaudeProjectRoots(),
+        );
     _writerCoordinator =
         widget.applicationMaintenance?.coordinator ??
         widget.writerCoordinator ??
-        DatabaseMaintenanceCoordinator(widget.databaseFile);
+        DatabaseMaintenanceCoordinator(
+          widget.databaseFile,
+          pauseCollector: _resident.pause,
+        );
     _lifecycleListener = AppLifecycleListener(onExitRequested: _prepareForExit);
     _seenMaintenanceRevision = widget.applicationMaintenance?.dataRevision ?? 0;
     widget.applicationMaintenance?.addListener(_maintenanceChanged);
@@ -260,8 +275,12 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     final backfillStop = _messageSearchBackfill?.cancel();
     final startupMaintenanceStop = _databaseMaintenanceOperation?.requestStop();
     final scheduledMaintenanceStop = widget.applicationMaintenance?.stop();
+    // Release pending bridge requests before joining their worker isolates.
+    // A bridge that never acknowledges cancellation must not hold app exit.
+    final collectionStop = _resident.stop();
     await Future.wait([
       refreshStop,
+      collectionStop,
       ?backfillStop,
       ?startupMaintenanceStop,
       ?scheduledMaintenanceStop,
@@ -272,6 +291,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       // Startup failures leave the prior database generation intact.
     }
     await _writerCoordinator.idle;
+    await _resident.dispose();
     return AppExitResponse.exit;
   }
 
@@ -357,7 +377,12 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         media.textScaler.scale(1) * factor,
                       ),
                     ),
-              child: child ?? const SizedBox.shrink(),
+              child: Column(
+                children: [
+                  Expanded(child: child ?? const SizedBox.shrink()),
+                  CollectorStatus(client: _resident, motionMode: ui.motion),
+                ],
+              ),
             ),
           );
         },
@@ -459,6 +484,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                                 settingsFile: widget.settingsFile,
                                 databaseFile: widget.databaseFile,
                                 writerCoordinator: _writerCoordinator,
+                                collectorClient: _resident,
                                 externalRevision: _externalRevision,
                                 pricingRevision: _pricingRevision,
                                 pricingUpdating: _pricingUpdating,
@@ -491,6 +517,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                             settingsFile: widget.settingsFile,
                             databaseFile: widget.databaseFile,
                             writerCoordinator: _writerCoordinator,
+                            collectorClient: _resident,
                           ),
                           viewState: _projectsViewState,
                           openProjectName: _projectsOpenName,
@@ -614,10 +641,19 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     widget.applicationMaintenance?.removeListener(_maintenanceChanged);
     _externalChanges?.dispose();
     _lifecycleListener.dispose();
-    unawaited(widget.applicationMaintenance?.stop());
-    unawaited(_databaseMaintenanceOperation?.requestStop());
-    unawaited(_messageSearchBackfill?.cancel());
-    unawaited(_cancelAndJoinRefresh(_activeSessionRefreshOperation));
+    unawaited(
+      Future.wait<void>([
+        ?widget.applicationMaintenance?.stop(),
+        if (_databaseMaintenanceOperation case final operation?)
+          operation
+              .requestStop()
+              .then((_) => operation.result)
+              .then<void>((_) {}),
+        ?_messageSearchBackfill?.cancel(),
+        _cancelAndJoinRefresh(_activeSessionRefreshOperation),
+        _resident.stop(),
+      ]).whenComplete(_resident.dispose),
+    );
     unawaited(_databaseMaintenanceSubscription?.cancel());
     _databaseMaintenanceProgress.dispose();
     super.dispose();
@@ -701,6 +737,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       settingsFile: widget.settingsFile,
       databaseFile: widget.databaseFile,
       writerCoordinator: _writerCoordinator,
+      collectorClient: _resident,
     ).startMessageSearchBackfillInBackgroundOperation();
   }
 
@@ -720,6 +757,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           settingsFile: widget.settingsFile,
           databaseFile: widget.databaseFile,
           writerCoordinator: _writerCoordinator,
+          collectorClient: _resident,
         ).startRefreshInBackgroundOperation(onProgress: onProgress);
         operation = SessionsRefreshOperation(
           result: runtimeOperation.result,
@@ -977,6 +1015,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           settingsFile: widget.settingsFile,
           databaseFile: widget.databaseFile,
           writerCoordinator: _writerCoordinator,
+          collectorClient: _resident,
         ).refresh();
         return;
     }
@@ -1049,6 +1088,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       settingsFile: widget.settingsFile,
       databaseFile: widget.databaseFile,
       writerCoordinator: _writerCoordinator,
+      collectorClient: _resident,
     );
     final assignment = await controller.loadSessionProjectAssignment(row.id);
     if (!mounted || !dialogContext.mounted) {
@@ -1394,6 +1434,7 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.externalRevision,
     required this.databaseFile,
     required this.writerCoordinator,
+    required this.collectorClient,
     required this.pricingRevision,
     required this.pricingUpdating,
     required this.onRefreshOperation,
@@ -1418,6 +1459,7 @@ class _SessionsScreenLoader extends StatefulWidget {
   final File settingsFile;
   final File databaseFile;
   final DatabaseMaintenanceCoordinator writerCoordinator;
+  final ResidentCollectorClient collectorClient;
   final int pricingRevision;
   final bool pricingUpdating;
   final SessionsRefreshOperationFactory onRefreshOperation;
@@ -1472,6 +1514,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
     settingsFile: widget.settingsFile,
     databaseFile: widget.databaseFile,
     writerCoordinator: widget.writerCoordinator,
+    collectorClient: widget.collectorClient,
   );
 
   @override

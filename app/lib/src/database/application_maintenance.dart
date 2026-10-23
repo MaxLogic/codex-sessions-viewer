@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import '../config/app_settings.dart';
 import '../logging/structured_logger.dart';
+import '../scanner/resident_collector_client.dart';
 import '../pricing/pricing_repository.dart';
 import '../pricing/hub_price_history.dart';
 import '../usage/usage_cost_projection.dart';
@@ -263,7 +264,9 @@ class ApplicationMaintenance extends ChangeNotifier {
     progress = DatabaseMaintenanceProgress(
       state: state,
       phase: phase,
-      currentWork: message,
+      currentWork: state == DatabaseMaintenanceState.failed
+          ? 'Database maintenance is not running.'
+          : message,
       unitLabel: 'items',
       completedUnits: 0,
       totalUnits: null,
@@ -298,6 +301,7 @@ class ApplicationMaintenance extends ChangeNotifier {
         worker: _repriceCosts(_settings!.pricing),
         yieldToQueuedWriters: true,
       ),
+      phase: 'reprice_costs',
     );
     _dataRevision++;
     if (!_disposed) notifyListeners();
@@ -310,22 +314,47 @@ class ApplicationMaintenance extends ChangeNotifier {
   }
 
   Future<DatabaseMaintenanceResult> _watchOperation(
-    DatabaseMaintenanceOperation operation,
-  ) async {
+    DatabaseMaintenanceOperation operation, {
+    required String phase,
+  }) async {
     _operation = operation;
     final subscription = operation.progress.listen((value) {
-      progress = value;
+      progress = value.state == DatabaseMaintenanceState.failed
+          ? DatabaseMaintenanceProgress(
+              state: value.state,
+              phase: value.phase,
+              currentWork: 'Database maintenance is not running.',
+              unitLabel: value.unitLabel,
+              completedUnits: value.completedUnits,
+              totalUnits: value.totalUnits,
+              ratePerSecond: value.ratePerSecond,
+              elapsed: value.elapsed,
+              estimatedRemaining: value.estimatedRemaining,
+              walBytes: value.walBytes,
+              errorMessage: _maintenanceFailureText(value.errorMessage, phase),
+            )
+          : value;
       if (!_disposed) notifyListeners();
     });
     try {
       if (_stopped) await operation.requestStop();
-      return await operation.result;
+      final result = await operation.result;
+      if (result.state == DatabaseMaintenanceState.failed) {
+        _report(
+          phase,
+          _maintenanceFailureText(result.errorMessage, phase),
+          state: DatabaseMaintenanceState.failed,
+        );
+      }
+      return result;
     } finally {
       await subscription.cancel();
       _operation = null;
     }
   }
 
+  // Coordinator.start holds the resident pause through the worker result;
+  // VACUUM below uses the same boundary, including interrupted/failed work.
   Future<void> _optimize() async {
     const type = 'database_optimize';
     await coordinator.runWriter(() async {
@@ -344,6 +373,7 @@ class ApplicationMaintenance extends ChangeNotifier {
         totalUnits: 1,
         atomicPhases: const {'optimize'},
       ),
+      phase: 'optimize',
     );
     await coordinator.runWriter(() async {
       _withDatabase(
@@ -354,6 +384,9 @@ class ApplicationMaintenance extends ChangeNotifier {
       );
     }, priority: DatabaseWriterPriority.optimize);
     _readStatus();
+    if (result.state == DatabaseMaintenanceState.failed) {
+      errorMessage = _maintenanceFailureText(result.errorMessage, 'optimize');
+    }
   }
 
   /// Once per Codex parser version, after every available local Codex
@@ -410,10 +443,13 @@ class ApplicationMaintenance extends ChangeNotifier {
         totalUnits: 1,
         atomicPhases: const {'reclaim_space'},
       ),
+      phase: 'reclaim_space',
     );
     if (result.state == DatabaseMaintenanceState.failed) {
       spaceReclaimWarning =
-          'Unused database space could not be reclaimed; retried on the next start.';
+          result.errorMessage == CollectorPauseUnavailableException.message
+          ? _maintenanceFailureText(result.errorMessage, 'reclaim_space')
+          : 'Unused database space could not be reclaimed; retried on the next start.';
     }
     _dataRevision++;
     if (!_disposed) notifyListeners();
@@ -692,6 +728,13 @@ class ApplicationMaintenance extends ChangeNotifier {
     super.dispose();
   }
 }
+
+String _maintenanceFailureText(String? message, String phase) =>
+    message == CollectorPauseUnavailableException.message
+    ? phase == 'reclaim_space'
+          ? 'Unused database space was not reclaimed because session collection could not pause. It will be retried the next time the viewer starts.'
+          : 'Database optimization was postponed because session collection could not pause. It will be retried automatically.'
+    : 'Database maintenance could not finish. Try again in a moment.';
 
 DatabaseMaintenanceWorker _repriceCosts(
   PricingSettings settings,

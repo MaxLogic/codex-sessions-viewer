@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart' show sqlite3;
@@ -8,6 +10,7 @@ import 'package:sqlite3/sqlite3.dart' show sqlite3;
 import '../platform/application_working_directory.dart';
 import '../platform/app_locations.dart';
 import 'database_connection.dart';
+import '../scanner/resident_collector_client.dart';
 import 'database_maintenance_cancelled.dart';
 import 'writer_version_agreement.dart';
 
@@ -34,11 +37,13 @@ const latestSchemaVersion = 30;
 class DatabaseMigrator {
   DatabaseMigrator({
     required this.sqlRoot,
+    this.pauseCollector,
     this.supportedSchemaVersion = latestSchemaVersion,
     this.fts5ProbeSql = 'create virtual table temp.fts_probe using fts5(value)',
   });
 
   final Directory sqlRoot;
+  final CollectorPauser? pauseCollector;
   final int supportedSchemaVersion;
   final String fts5ProbeSql;
 
@@ -84,6 +89,7 @@ class DatabaseMigrator {
     bool deferUsageMigration = false,
     Future<void> Function(void Function())? runAtomic,
   }) async {
+    CollectorPauseHandle? pause;
     try {
       if (!db.autocommit) {
         throw StateError(
@@ -123,6 +129,23 @@ class DatabaseMigrator {
 
       final deferPendingUsage =
           deferUsageMigration && _lastAppliedVersion(db) < 16;
+      final pending = migrations.any(
+        (migration) =>
+            migration.version <= supportedSchemaVersion &&
+            !(deferPendingUsage && migration.version >= 16) &&
+            !_isApplied(db, migration.version),
+      );
+      if (pending && pauseCollector != null) {
+        try {
+          pause = await acquireCollectorPause(pauseCollector!);
+        } on Object {
+          // Courtesy only: BEGIN IMMEDIATE and the configured busy timeout
+          // protect each schema migration and its version receipt atomically.
+          debugPrint(
+            'Session collection pause unavailable; startup migration is using SQLite transaction locking.',
+          );
+        }
+      }
       for (final migration in migrations) {
         if (migration.version > supportedSchemaVersion ||
             (deferPendingUsage && migration.version >= 16)) {
@@ -192,6 +215,8 @@ class DatabaseMigrator {
           details: error.toString(),
         ),
       );
+    } finally {
+      await pause?.dispose();
     }
   }
 

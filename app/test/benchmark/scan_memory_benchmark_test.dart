@@ -5,6 +5,8 @@ import 'package:codex_sessions_viewer/src/benchmark/scan_memory_benchmark.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
+import '../support/collector_fixture.dart';
+
 void main() {
   test('parses a valid isolated scan-memory benchmark request', () {
     final request = ScanMemoryBenchmarkRequest.tryParse([
@@ -49,7 +51,7 @@ void main() {
       final temp = await Directory.systemTemp.createTemp(
         'csv_scan_memory_benchmark_',
       );
-      addTearDown(() => temp.delete(recursive: true));
+      addTearDown(() => deleteCollectorFixture(temp));
       final corpus = Directory(p.join(temp.path, 'corpus'))..createSync();
       final work = Directory(p.join(temp.path, 'work'));
       final resultFile = File(p.join(temp.path, 'result.json'));

@@ -489,10 +489,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       children: [
                         _TextSetting(
                           label: 'Scan interval (seconds)',
+                          helperText:
+                              'How often session collection checks for new sessions while the viewer or Background collection runs. Background collection’s periodic scan (minutes) separately schedules additional checks.',
                           controller: _scanInterval,
                         ),
                         _SwitchSetting(
                           label: 'Background scan enabled',
+                          helperText:
+                              'Check for new sessions periodically while the viewer or Background collection runs. Turning this off leaves Background collection’s separately scheduled periodic scan (minutes) and hooks unchanged.',
                           value: _settings.scanner.backgroundRescanEnabled,
                           onChanged: (value) {
                             setState(() {
@@ -961,6 +965,7 @@ class _TextSetting extends StatelessWidget {
           Expanded(
             child: Semantics(
               label: semanticsLabel ?? '$label input',
+              hint: helperText,
               textField: true,
               child: TextField(
                 controller: controller,
@@ -968,7 +973,10 @@ class _TextSetting extends StatelessWidget {
                 decoration: InputDecoration(
                   isDense: true,
                   border: const OutlineInputBorder(),
-                  helperText: helperText,
+                  helper: helperText == null
+                      ? null
+                      : ExcludeSemantics(child: Text(helperText!)),
+                  helperMaxLines: 3,
                 ),
               ),
             ),
@@ -998,34 +1006,31 @@ class _SwitchSetting extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Row(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(
-            width: 220,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label),
-                if (helperText != null) ...[
-                  const SizedBox(height: 2),
-                  Text(
-                    helperText!,
-                    style: textTheme.bodySmall?.copyWith(
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ],
+          Row(
+            children: [
+              SizedBox(width: 220, child: Text(label)),
+              Semantics(
+                label: '$label setting',
+                hint: helperText,
+                toggled: value,
+                excludeSemantics: true,
+                onTap: () => onChanged(!value),
+                child: Switch(value: value, onChanged: onChanged),
+              ),
+            ],
+          ),
+          if (helperText != null)
+            ExcludeSemantics(
+              child: Text(
+                helperText!,
+                style: textTheme.bodySmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
             ),
-          ),
-          Semantics(
-            label: '$label setting',
-            toggled: value,
-            excludeSemantics: true,
-            onTap: () => onChanged(!value),
-            child: Switch(value: value, onChanged: onChanged),
-          ),
         ],
       ),
     );

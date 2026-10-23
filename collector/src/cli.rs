@@ -70,7 +70,6 @@ SCAN OPTIONS:
   --json                Print a machine-readable summary
   --progress-json       Stream progress JSON lines (at most one per 100 ms) before the summary
   --cancel-stdin        Gracefully cancel when stdin receives cancel or closes
-  --coordinate-writes  Request a GUI writer lease before each database batch
   --flush-sessions <N>  Sessions per persistence batch (default: 64)
   --flush-bytes <N>     Source bytes per persistence batch (default: 8388608)
 
@@ -103,7 +102,6 @@ pub(crate) struct Options {
     pub(crate) json: bool,
     pub(crate) progress_json: bool,
     pub(crate) cancel_stdin: bool,
-    pub(crate) coordinate_writes: bool,
     pub(crate) flush_sessions: usize,
     pub(crate) flush_bytes: u64,
     pub(crate) input: Option<PathBuf>,
@@ -148,7 +146,6 @@ pub(crate) fn parse_options(args: &[String]) -> Result<Options, CliError> {
         json: false,
         progress_json: false,
         cancel_stdin: false,
-        coordinate_writes: false,
         flush_sessions: codex::FLUSH_SESSIONS,
         flush_bytes: codex::FLUSH_SOURCE_BYTES,
         input: None,
@@ -227,12 +224,6 @@ pub(crate) fn parse_options(args: &[String]) -> Result<Options, CliError> {
                 options.json = true;
             }
             "--cancel-stdin" => options.cancel_stdin = true,
-            "--coordinate-writes" => {
-                options.coordinate_writes = true;
-                options.cancel_stdin = true;
-                options.progress_json = true;
-                options.json = true;
-            }
             flag if flag.starts_with("--") => {
                 return Err(CliError::Usage(format!("unknown option {flag}")));
             }
@@ -262,30 +253,38 @@ pub fn run(args: &[String]) -> i32 {
             crate::resident::bridge::run(&options)
                 .map_err(|error| CliError::Failed(error.to_string()))
         }),
-        ["serve", ..] => parse_options(&args[1..]).and_then(|options| {
-            if !options.positional.is_empty() {
-                return Err(CliError::Usage(
-                    "serve needs --db or --standalone and no positional arguments".into(),
-                ));
-            }
-            let database = options
-                .db
-                .clone()
-                .or_else(|| options.standalone.clone())
-                .or_else(default_viewer_database)
-                .ok_or_else(|| {
-                    CliError::Usage("database location unavailable; pass --db".into())
-                })?;
-            crate::resident::run_configured(&database, options.lifetime, options.clone()).map_err(
-                |error| {
+        // Internal detached successor entry point: the viewer-owned bridge may
+        // disappear while an incompatible resident is still shutting down.
+        [mode @ ("serve" | "serve-replacement"), ..] => {
+            parse_options(&args[1..]).and_then(|options| {
+                if !options.positional.is_empty() {
+                    return Err(CliError::Usage(
+                        "serve needs --db or --standalone and no positional arguments".into(),
+                    ));
+                }
+                let database = options
+                    .db
+                    .clone()
+                    .or_else(|| options.standalone.clone())
+                    .or_else(default_viewer_database)
+                    .ok_or_else(|| {
+                        CliError::Usage("database location unavailable; pass --db".into())
+                    })?;
+                crate::resident::run_configured_after_stop(
+                    &database,
+                    options.lifetime,
+                    options.clone(),
+                    *mode == "serve-replacement",
+                )
+                .map_err(|error| {
                     if error.kind() == std::io::ErrorKind::PermissionDenied {
                         CliError::Refused(error.to_string())
                     } else {
                         CliError::Failed(error.to_string())
                     }
-                },
-            )
-        }),
+                })
+            })
+        }
         ["resident", action @ ("stop" | "status" | "info")] => {
             parse_options(&args[2..]).and_then(|options| {
                 if options.standalone.is_some() || !options.positional.is_empty() {
@@ -553,7 +552,7 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     phases.mark("open store");
     let scan = scan_options(options, &settings, configured_roots(&settings));
     phases.mark("read thread names");
-    let mut report = scan_transport(options, out, |cancel, progress, gate| {
+    let mut report = scan_progress(options, out, |cancel, progress, gate| {
         codex::collect_coordinated(
             &store,
             &scan,
@@ -567,17 +566,7 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
             },
         )
     })?;
-    // After the repair, delete its backups once they are past the retention.
-    if let Some(repair) = report.cache_repair.as_mut() {
-        let pruned = crate::backup_retention::prune_repair_backups(
-            &store.conn,
-            Path::new(&store.path),
-            crate::backup_retention::retention(settings.backup_retention_days),
-            std::time::SystemTime::now(),
-        );
-        repair.pruned_backups = pruned.deleted;
-        repair.prune_failures = pruned.failed;
-    }
+    finish_codex_report(&store, &settings, &mut report);
     crate::t3::import_optional(&store.conn, &settings);
     report.write_hold = holds.report();
     phases.mark("collect and prune");
@@ -590,21 +579,27 @@ fn codex_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
 /// The shortest gap between two progress events unless a batch committed.
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// A line from the GUI on stdin.
-enum Control {
-    Grant,
-    Cancel,
+pub(crate) fn finish_codex_report(
+    store: &Store,
+    settings: &CollectorSettings,
+    report: &mut CollectReport,
+) {
+    // After the repair, delete its backups once they are past the retention.
+    if let Some(repair) = report.cache_repair.as_mut() {
+        let pruned = crate::backup_retention::prune_repair_backups(
+            &store.conn,
+            Path::new(&store.path),
+            crate::backup_retention::retention(settings.backup_retention_days),
+            std::time::SystemTime::now(),
+        );
+        repair.pruned_backups = pruned.deleted;
+        repair.prune_failures = pruned.failed;
+    }
 }
 
-/// The stdin/stdout protocol of a GUI-driven scan.
-///
-/// stdin carries `grant` (for the pending `write_requested`) and `cancel`;
-/// closing stdin also cancels. stdout carries `progress` events, at most one
-/// per [`PROGRESS_INTERVAL`] unless a batch committed, and with
-/// `--coordinate-writes` a `write_requested`/`write_released` pair around
-/// every database write. A cancel while waiting for a grant withdraws the
-/// request with `write_released`; after a cancel no further lease is asked for.
-fn scan_transport<W: Write>(
+/// Optional CLI progress stream. Stdin cancellation is independent of the
+/// resident viewer protocol and never grants a database writer lease.
+fn scan_progress<W: Write>(
     options: &Options,
     out: &mut W,
     collect: impl FnOnce(
@@ -615,27 +610,19 @@ fn scan_transport<W: Write>(
 ) -> Result<CollectReport, CliError> {
     use std::sync::atomic::Ordering;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (controls, control) = std::sync::mpsc::channel::<Control>();
     if options.cancel_stdin {
         let cancellation = std::sync::Arc::clone(&cancel);
         std::thread::spawn(move || {
             for line in std::io::stdin().lock().lines() {
                 match line.as_deref().map(str::trim) {
-                    Ok("grant") => {
-                        if controls.send(Control::Grant).is_err() {
-                            return;
-                        }
-                    }
                     Ok("cancel") => {
                         cancellation.store(true, Ordering::Relaxed);
-                        let _ = controls.send(Control::Cancel);
                     }
                     Ok(_) => {}
                     Err(_) => break,
                 }
             }
             cancellation.store(true, Ordering::Relaxed);
-            let _ = controls.send(Control::Cancel);
         });
     }
     let output = std::cell::RefCell::new(out);
@@ -665,28 +652,7 @@ fn scan_transport<W: Write>(
             cancel.store(true, Ordering::Relaxed);
         }
     };
-    let mut gate = |acquire: bool| -> Result<bool, StoreError> {
-        if !options.coordinate_writes {
-            return Ok(true);
-        }
-        if !acquire {
-            emit(json!({"event": "write_released"}))?;
-            return Ok(true);
-        }
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        emit(json!({"event": "write_requested"}))?;
-        match control.recv() {
-            Ok(Control::Grant) => Ok(true),
-            Ok(Control::Cancel) | Err(_) => {
-                cancel.store(true, Ordering::Relaxed);
-                // Withdraw the request so the GUI's writer queue moves on.
-                emit(json!({"event": "write_released"}))?;
-                Ok(false)
-            }
-        }
-    };
+    let mut gate = |_: bool| Ok(true);
     let report = collect(&cancel, &mut progress, &mut gate)?;
     if let Some(error) = output_error {
         return Err(CliError::Failed(error.to_string()));
@@ -904,12 +870,13 @@ pub(crate) fn claude_roots(options: &Options) -> Vec<crate::claude::ClaudeRoot> 
     let mut roots: Vec<crate::claude::ClaudeRoot> = options
         .claude_roots
         .iter()
+        .filter(|path| !path.is_empty())
         .map(|path| crate::claude::ClaudeRoot {
             path: path.clone(),
             source_type: SourceType::native(),
         })
         .collect();
-    if roots.is_empty()
+    if options.claude_roots.is_empty()
         && options.claude_wsl_roots.is_empty()
         && let Some(root) = crate::claude::default_root()
     {
@@ -963,7 +930,7 @@ fn claude_scan(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
     } else {
         options.flush_sessions
     };
-    let mut report = scan_transport(options, out, |cancel, progress, gate| {
+    let mut report = scan_progress(options, out, |cancel, progress, gate| {
         crate::claude::collect_coordinated(&store, &scan, cancel, progress, gate, flush_sessions)
     })?;
     crate::t3::import_optional(&store.conn, &settings);

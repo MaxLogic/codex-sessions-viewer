@@ -1,4 +1,6 @@
+import '../support/collector_fixture.dart';
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/database/external_database_changes.dart';
@@ -16,6 +18,9 @@ import 'package:codex_sessions_viewer/src/ui/screens/context_search_screen.dart'
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/session_detail_pane.dart';
+import 'package:codex_sessions_viewer/src/scanner/collector_process.dart';
+import 'package:codex_sessions_viewer/src/scanner/resident_collector_client.dart';
+import 'package:path/path.dart' as p;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
@@ -601,6 +606,230 @@ void main() {
   );
 
   testWidgets(
+    'resident periodic scans and hook ingest refresh the open viewer without Refresh',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1800, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final root = Directory.systemTemp.createTempSync(
+        'csv_external_resident_',
+      );
+      final database = File(p.join(root.path, 'viewer.sqlite'));
+      final settingsFile = File(p.join(root.path, 'settings.toml'));
+      final codex = Directory(p.join(root.path, 'codex'));
+      final sessions = Directory(p.join(codex.path, 'sessions'))
+        ..createSync(recursive: true);
+      final queue = p.join(root.path, 'queue');
+      final environment = {
+        'CODEX_SESSIONS_COLLECTOR_QUEUE': queue,
+        'CODEX_HOME': codex.path,
+      };
+      final settings = AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: codex.path,
+          wslCodexUncPath: p.join(root.path, 'absent'),
+        ),
+        scanner: const ScannerSettings(
+          backgroundRescanEnabled: true,
+          backgroundRescanIntervalSeconds: 1,
+        ),
+        logging: LoggingSettings(
+          level: 'info',
+          logFile: p.join(root.path, 'viewer.log'),
+          maxLogFiles: 1,
+          maxLogSizeMb: 1,
+        ),
+      );
+      final executable = CollectorProcess.defaultExecutable();
+      final bridges = <Process>[];
+      final client = ResidentCollectorClient(
+        databaseFile: database,
+        settingsFile: settingsFile,
+        claudeRoots: const [],
+        start: (executable, arguments) async {
+          final process = await Process.start(
+            executable,
+            arguments,
+            environment: environment,
+          );
+          bridges.add(process);
+          return process;
+        },
+      );
+      final controller = RuntimeSessionController(
+        settingsFile: settingsFile,
+        databaseFile: database,
+        claudeProjectRoots: const [],
+        collectorClient: client,
+      );
+      var viewerRefreshes = 0;
+      var startupRefreshFinished = false;
+      Future<void> until(bool Function() predicate) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 12));
+        while (!predicate() && DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 25));
+          await tester.pump();
+        }
+        expect(predicate(), isTrue);
+      }
+
+      List<SessionRowViewModel> rows() =>
+          find.byType(SessionsScreen).evaluate().isEmpty
+          ? []
+          : tester
+                .widget<SessionsScreen>(find.byType(SessionsScreen))
+                .initialRows;
+      Future<void> writeCodex(File source, String title) => source
+          .writeAsString(
+            [
+              jsonEncode({
+                'type': 'session_meta',
+                'payload': {
+                  'id': 'periodic-session',
+                  'title': title,
+                  'timestamp': '2026-06-10T10:00:00Z',
+                  'cwd': root.path,
+                },
+              }),
+              jsonEncode({
+                'type': 'response_item',
+                'timestamp': '2026-06-10T10:00:01Z',
+                'payload': {
+                  'type': 'message',
+                  'role': 'user',
+                  'content': [
+                    {'type': 'input_text', 'text': title},
+                  ],
+                },
+              }),
+              '',
+            ].join('\n'),
+          )
+          .then((_) {});
+
+      try {
+        await tester.runAsync(() async {
+          await SettingsRepository(settingsFile).save(settings);
+          final startup = await DatabaseMigrator(
+            sqlRoot: Directory('../sql'),
+          ).openAndMigrate(database, deferUsageMigration: true);
+          expect(startup.canStartNormalUi, isTrue);
+          final migration = await startPendingDatabaseMigration(
+            database,
+            sqlRoot: Directory('../sql'),
+          );
+          if (migration != null) {
+            expect((await migration.result).succeeded, isTrue);
+          }
+          await client.connect();
+          await tester.pumpWidget(
+            CodexSessionsViewerApp(
+              databaseFile: database,
+              settingsFile: settingsFile,
+              databaseStartup: Future.value(startup),
+              settingsStartup: Future.value(settings),
+              collectorClient: client,
+              // Count viewer scan requests independently of native resident work.
+              sessionRefresh: () async {
+                viewerRefreshes++;
+                final result = await controller.refresh();
+                startupRefreshFinished = true;
+                return result;
+              },
+              usageSummaryLoader: (_, _) async => null,
+              now: () => DateTime.utc(2026, 6, 15),
+            ),
+          );
+          await until(
+            () =>
+                startupRefreshFinished &&
+                find.byType(SessionsScreen).evaluate().isNotEmpty,
+          );
+          final initialViewerRefreshes = viewerRefreshes;
+          final source = File(
+            p.join(sessions.path, 'rollout-periodic-session.jsonl'),
+          );
+          await writeCodex(source, 'Periodic arrival');
+          await until(
+            () => find.text('Periodic arrival').evaluate().isNotEmpty,
+          );
+          expect(rows().single.title, 'Periodic arrival');
+
+          await writeCodex(source, 'Periodic update');
+          await until(() => find.text('Periodic update').evaluate().isNotEmpty);
+          expect(rows().single.title, 'Periodic update');
+          expect(find.text('Periodic arrival'), findsNothing);
+
+          // Outside every periodic scan root: only the hook can ingest this file.
+          final transcript = File(p.join(root.path, 'hook-only.jsonl'));
+          await transcript.writeAsString(
+            [
+              jsonEncode({
+                'type': 'user',
+                'timestamp': '2026-06-10T10:01:00Z',
+                'sessionId': 'hook-only-session',
+                'uuid': 'hook-user',
+                'cwd': root.path,
+                'message': {'role': 'user', 'content': 'Hook arrival'},
+              }),
+              jsonEncode({
+                'type': 'ai-title',
+                'sessionId': 'hook-only-session',
+                'aiTitle': 'Hook arrival',
+              }),
+              '',
+            ].join('\n'),
+          );
+          final hook = await Process.start(executable, [
+            'claude',
+            'hook',
+            '--db',
+            database.path,
+            '--settings',
+            settingsFile.path,
+          ], environment: environment);
+          final output = hook.stdout.drain<void>();
+          final errors = hook.stderr.transform(utf8.decoder).join();
+          hook.stdin.writeln(
+            jsonEncode({
+              'hook_event_name': 'Stop',
+              'session_id': 'hook-only-session',
+              'transcript_path': transcript.path,
+            }),
+          );
+          await hook.stdin.close();
+          expect(await hook.exitCode, 0, reason: await errors);
+          await output;
+          await until(() => find.text('Hook arrival').evaluate().isNotEmpty);
+          expect(rows(), hasLength(2));
+          expect(
+            viewerRefreshes,
+            initialViewerRefreshes,
+            reason: 'External commits update the list without a viewer scan.',
+          );
+          expect(
+            find.widgetWithText(ElevatedButton, 'Cancel scan'),
+            findsNothing,
+          );
+          await tester.pumpWidget(const SizedBox.shrink());
+          await client.dispose();
+          for (final bridge in bridges) {
+            await bridge.exitCode.timeout(const Duration(seconds: 3));
+          }
+          await deleteCollectorFixture(root);
+          expect(await root.exists(), isFalse);
+        });
+      } finally {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.runAsync(() async {
+          await client.dispose();
+          if (await root.exists()) await deleteCollectorFixture(root);
+        });
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
     'collector snapshots update production selection without scanning',
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(1800, 1000));
@@ -794,7 +1023,7 @@ void main() {
       } finally {
         await tester.pumpWidget(const SizedBox.shrink());
         watcher.dispose();
-        dir.deleteSync(recursive: true);
+        await tester.runAsync(() => deleteCollectorFixture(dir));
       }
     },
     timeout: const Timeout(Duration(minutes: 4)),

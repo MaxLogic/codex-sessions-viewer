@@ -853,7 +853,7 @@ impl Scheduler {
                 break;
             }
             progress(harness, &crate::codex::scanner::ScanCounts::default(), 0);
-            let report = match harness.as_str() {
+            let mut report = match harness.as_str() {
                 "codex" => {
                     let scan =
                         cli::scan_options(options, &settings, cli::configured_roots(&settings));
@@ -904,6 +904,9 @@ impl Scheduler {
                 }
                 _ => return Err(StoreError::Refused("unknown scan harness".into())),
             };
+            if harness == "codex" {
+                cli::finish_codex_report(store, &settings, &mut report);
+            }
             reports.push((format!("{harness} scan"), report));
         }
         if let Some(error) = work.into_inner().1 {

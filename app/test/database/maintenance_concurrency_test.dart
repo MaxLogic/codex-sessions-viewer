@@ -15,9 +15,11 @@ import 'package:codex_sessions_viewer/src/database/database_maintenance_cancelle
 import 'package:codex_sessions_viewer/src/database/database_migration_preflight.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/maintenance_job.dart';
+import 'package:codex_sessions_viewer/src/scanner/resident_collector_client.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import '../support/scripted_collector_bridge.dart';
 
 void main() {
   late Directory temp;
@@ -38,6 +40,149 @@ void main() {
     if (await temp.exists()) {
       await temp.delete(recursive: true);
     }
+  });
+
+  test(
+    'exclusive maintenance refuses an unacknowledged pause without starting work',
+    () async {
+      final bridge = ScriptedBridge();
+      final client = ResidentCollectorClient(
+        databaseFile: databaseFile,
+        settingsFile: File('${temp.path}/settings.toml'),
+        start: (_, _) async {
+          bridge.emit({'event': 'bridge', 'state': 'connected'});
+          return bridge;
+        },
+      );
+      addTearDown(client.dispose);
+      final operation =
+          await DatabaseMaintenanceCoordinator(
+            databaseFile,
+            pauseCollector: client.pause,
+          ).start(
+            jobType: 'database_reclaim_space',
+            initialPhase: 'reclaim_space',
+            atomicPhases: const {'reclaim_space'},
+            worker: _mustNotStart,
+          );
+      final result = await operation.result.timeout(const Duration(seconds: 5));
+      expect(result.state, DatabaseMaintenanceState.failed);
+      expect(
+        result.errorMessage,
+        'Database maintenance could not start because session collection could not pause. Try again in a moment.',
+      );
+      expect(File('${temp.path}/unexpected-worker').existsSync(), isFalse);
+      expect(bridge.killed, isTrue);
+    },
+  );
+
+  test(
+    'multi-transaction maintenance stops durably if its pause is lost',
+    () async {
+      final bridge = ScriptedBridge();
+      bridge.onRequest = (request) => bridge.emit({
+        'id': request['id'],
+        'event': request['op'] == 'pause' ? 'paused' : 'resumed',
+      });
+      final client = ResidentCollectorClient(
+        databaseFile: databaseFile,
+        settingsFile: File('${temp.path}/settings.toml'),
+        start: (_, _) async {
+          bridge.emit({'event': 'bridge', 'state': 'connected'});
+          return bridge;
+        },
+      );
+      addTearDown(client.dispose);
+      final operation =
+          await DatabaseMaintenanceCoordinator(
+            databaseFile,
+            pauseCollector: client.pause,
+          ).start(
+            jobType: 'pause_loss_probe',
+            initialPhase: 'first_partition',
+            atomicPhases: const {'first_partition'},
+            worker: _pauseLossWorker,
+          );
+      addTearDown(() async {
+        await operation.requestStop();
+        await operation.result;
+      });
+      final running = File('${temp.path}/first-partition');
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (!running.existsSync() && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(running.existsSync(), isTrue);
+      bridge.emit({'event': 'bridge', 'state': 'reconnecting'});
+      final result = await operation.result.timeout(const Duration(seconds: 5));
+      expect(result.state, DatabaseMaintenanceState.interrupted);
+      final db = openFileBackedDatabase(databaseFile);
+      try {
+        expect(
+          db
+              .select('select value from pause_loss_probe')
+              .map((r) => r['value']),
+          [1],
+        );
+      } finally {
+        db.close();
+      }
+      expect(File('${temp.path}/second-partition').existsSync(), isFalse);
+    },
+  );
+
+  test(
+    'exclusive maintenance pauses before work and resumes after failure',
+    () async {
+      final events = <String>[];
+      final coordinator = DatabaseMaintenanceCoordinator(
+        databaseFile,
+        pauseCollector: () async {
+          events.add('pause');
+          await File('${temp.path}/collector-paused').create();
+          return CollectorPauseHandle(() async {
+            await File('${temp.path}/collector-paused').delete();
+            events.add('resume');
+          });
+        },
+      );
+      final operation = await coordinator.start(
+        jobType: 'database_optimize',
+        initialPhase: 'optimize',
+        atomicPhases: const {'optimize'},
+        worker: (context) async {
+          if (!File(
+            '${context.databaseFile.parent.path}/collector-paused',
+          ).existsSync()) {
+            throw StateError('collector was not paused while worker ran');
+          }
+          throw StateError('injected maintenance failure');
+        },
+      );
+      final result = await operation.result;
+      expect(result.state, DatabaseMaintenanceState.failed);
+      expect(result.errorMessage, contains('injected maintenance failure'));
+      expect(events, ['pause', 'resume']);
+    },
+  );
+
+  test('non-exclusive cost repricing leaves the collector running', () async {
+    final events = <String>[];
+    final coordinator = DatabaseMaintenanceCoordinator(
+      databaseFile,
+      pauseCollector: () async {
+        events.add('pause');
+        return CollectorPauseHandle(() async => events.add('resume'));
+      },
+    );
+    final operation = await coordinator.start(
+      jobType: 'usage_cost_repricing',
+      initialPhase: 'reprice_costs',
+      worker: _succeedImmediately,
+      yieldToQueuedWriters: true,
+    );
+    expect((await operation.result).state, DatabaseMaintenanceState.succeeded);
+    expect(events, isEmpty);
   });
 
   test(
@@ -1545,6 +1690,40 @@ Future<DatabaseMaintenanceWorkerOutcome> _holdAtomicWriter(
 Future<DatabaseMaintenanceWorkerOutcome> _succeedImmediately(
   DatabaseMaintenanceWorkerContext context,
 ) async => DatabaseMaintenanceWorkerOutcome.succeeded;
+
+Future<DatabaseMaintenanceWorkerOutcome> _mustNotStart(
+  DatabaseMaintenanceWorkerContext context,
+) async {
+  await File('${context.databaseFile.parent.path}/unexpected-worker').create();
+  return DatabaseMaintenanceWorkerOutcome.succeeded;
+}
+
+Future<DatabaseMaintenanceWorkerOutcome> _pauseLossWorker(
+  DatabaseMaintenanceWorkerContext context,
+) async {
+  context.database.execute('create table pause_loss_probe(value integer)');
+  context.commitBatch(
+    phase: 'first_partition',
+    currentWork: 'First partition committed.',
+    unitLabel: 'partitions',
+    completedUnits: 1,
+    totalUnits: 2,
+    lastProcessedRowId: 1,
+    apply: (db) => db.execute('insert into pause_loss_probe values(1)'),
+  );
+  await File('${context.databaseFile.parent.path}/first-partition').create();
+  while (!context.stopRequested &&
+      !File(
+        '${context.databaseFile.parent.path}/allow-second-partition',
+      ).existsSync()) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  if (context.stopRequested) {
+    return DatabaseMaintenanceWorkerOutcome.interrupted;
+  }
+  await File('${context.databaseFile.parent.path}/second-partition').create();
+  return DatabaseMaintenanceWorkerOutcome.succeeded;
+}
 
 Future<DatabaseMaintenanceWorkerOutcome> _failBackupVerification(
   DatabaseMaintenanceWorkerContext context,
