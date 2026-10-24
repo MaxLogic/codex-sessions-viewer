@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:io';
 
 import 'startup_registration.dart';
@@ -11,7 +12,7 @@ class WindowsStartupRegistration implements StartupRegistration {
     bool? isWindows,
     StartupProcessRunner? runProcess,
   }) : _isWindows = isWindows ?? Platform.isWindows,
-       _runProcess = runProcess ?? Process.run;
+       _runProcess = runProcess ?? AppEnvironment.run;
 
   static const runKey = r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run';
   static const runValueName = 'Codex Session Viewer';

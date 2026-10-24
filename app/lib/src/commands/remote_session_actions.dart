@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:io';
 
 import 'package:sqlite3/sqlite3.dart';
@@ -149,8 +150,8 @@ class RemoteSessionActions {
     try {
       final result =
           await (distro == null
-                  ? Process.run('where.exe', [harness])
-                  : Process.run('wsl.exe', [
+                  ? AppEnvironment.run('where.exe', [harness])
+                  : AppEnvironment.run('wsl.exe', [
                       '-d',
                       distro,
                       '--',

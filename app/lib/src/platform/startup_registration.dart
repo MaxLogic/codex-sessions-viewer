@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -24,7 +25,7 @@ abstract interface class StartupRegistration {
         runProcess: runProcess,
       );
     }
-    final env = environment ?? Platform.environment;
+    final env = environment ?? AppEnvironment.current;
     String home() {
       final value = env['HOME'] ?? '';
       if (!p.posix.isAbsolute(value)) {

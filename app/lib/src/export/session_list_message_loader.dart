@@ -1,5 +1,5 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
@@ -22,7 +22,7 @@ loadSessionListExportMessages(
     return const {};
   }
   final path = databaseFile.path;
-  return Isolate.run(() {
+  return AppEnvironment.runIsolate(() {
     final db = openSessionListExportDatabase(File(path));
     try {
       final result = <String, List<ConversationMessageViewModel>>{};

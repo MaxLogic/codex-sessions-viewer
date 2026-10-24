@@ -1,5 +1,7 @@
 import 'dart:ui' show Tristate;
 import 'dart:io';
+import 'package:codex_sessions_viewer/src/background_collection/background_collection.dart';
+import 'package:codex_sessions_viewer/src/background_collection/collector_autostart.dart';
 import 'package:codex_sessions_viewer/src/database/application_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_connection.dart'
     hide Row;
@@ -22,7 +24,39 @@ final class _AmpleMaintenanceDisk implements DiskSpaceProbe {
       const DiskVolumeSpace(volumeKey: 'test', availableBytes: 1 << 50);
 }
 
+final class _SettingsCollection implements BackgroundCollection {
+  @override
+  bool get scheduleSupported => true;
+  @override
+  Future<BackgroundCollectionStatus> status() async =>
+      const BackgroundCollectionStatus(
+        hooks: {
+          CollectionHarness.codex: HookStatus(HookInstallState.notInstalled),
+          CollectionHarness.claude: HookStatus(HookInstallState.notInstalled),
+        },
+        schedule: ScheduledScanState(installed: false),
+        scheduleSupported: true,
+      );
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 void main() {
+  testWidgets('viewer and Background collection sign-in labels differ', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          initialSettings: AppSettings.defaults(),
+          backgroundCollection: _SettingsCollection(),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Open viewer at sign-in'), findsOneWidget);
+    expect(find.text('Start at sign-in'), findsOneWidget);
+  });
   for (final reclaim in [false, true]) {
     testWidgets(
       'unavailable maintenance pause shows one accurate message (reclaim=$reclaim)',
@@ -101,7 +135,7 @@ void main() {
     );
   }
   testWidgets(
-    'scanner helpers distinguish running checks from the scheduled periodic scan',
+    'scanner helpers distinguish resident rescans from the autostart watchdog',
     (tester) async {
       final semantics = tester.ensureSemantics();
       try {
@@ -116,7 +150,7 @@ void main() {
           ),
         );
         final interval = find.text(
-          'How often session collection checks for new sessions while the viewer or Background collection runs. Background collection’s periodic scan (minutes) separately schedules additional checks.',
+          'How often session collection checks for new sessions while the viewer is open or Background collection runs.',
         );
         await tester.ensureVisible(interval);
         await tester.pumpAndSettle();
@@ -126,20 +160,23 @@ void main() {
         );
         expect(
           intervalControl.hint,
-          contains('separately schedules additional checks'),
+          contains('while the viewer is open or Background collection runs'),
         );
         expect(
           find.bySemanticsLabel((tester.widget<Text>(interval).data)!),
           findsNothing,
         );
         final enabled = find.text(
-          'Check for new sessions periodically while the viewer or Background collection runs. Turning this off leaves Background collection’s separately scheduled periodic scan (minutes) and hooks unchanged.',
+          'Check for new sessions at the scan interval. Turning this off leaves hooks and Background collection at sign-in unchanged.',
         );
         expect(enabled, findsOneWidget);
         final enabledControl = tester.getSemantics(
           find.bySemanticsLabel('Background scan enabled setting'),
         );
-        expect(enabledControl.hint, contains('hooks unchanged'));
+        expect(
+          enabledControl.hint,
+          contains('hooks and Background collection at sign-in unchanged'),
+        );
         expect(
           find.bySemanticsLabel((tester.widget<Text>(enabled).data)!),
           findsNothing,
@@ -674,7 +711,7 @@ void main() {
     }
 
     for (final label in const [
-      'Start at login',
+      'Open viewer at sign-in',
       'Windows Codex path',
       'WSL Codex UNC path',
       'WSL distro name',
@@ -740,10 +777,10 @@ void main() {
       ),
     );
 
-    expect(find.text('Start at login'), findsOneWidget);
+    expect(find.text('Open viewer at sign-in'), findsOneWidget);
 
     final startupRow = find.ancestor(
-      of: find.text('Start at login'),
+      of: find.text('Open viewer at sign-in'),
       matching: find.byType(Row),
     );
     final startupSwitch = find.descendant(
@@ -786,7 +823,10 @@ void main() {
     await tester.pump();
 
     expect(find.text('Changes canceled.'), findsOneWidget);
-    expect(find.text(r'C:\Users\pawel\.codex'), findsOneWidget);
+    expect(
+      find.text(AppSettings.defaults().paths.windowsCodexPath),
+      findsOneWidget,
+    );
 
     await tester.tap(find.text('Reload from file'));
     await tester.pump();

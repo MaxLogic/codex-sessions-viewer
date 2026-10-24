@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 
 import 'package:path/path.dart' as p;
 
@@ -72,8 +72,8 @@ final class DefaultSessionFolders {
   static DefaultSessionFolders? _current;
 
   /// The defaults for this process's environment, without WSL detection.
-  static DefaultSessionFolders current() =>
-      _current ??= DefaultSessionFolders.fromEnvironment(Platform.environment);
+  static DefaultSessionFolders current() => _current ??=
+      DefaultSessionFolders.fromEnvironment(AppEnvironment.current);
 
   final String windowsCodexPath;
   final String claudeProjectsRoot;

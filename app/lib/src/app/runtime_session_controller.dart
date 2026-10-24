@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -180,7 +181,7 @@ class RuntimeSessionController implements ProjectsRepository {
   ) {
     final path = databaseFile.path;
     final ids = sessionIds.toList(growable: false);
-    return Isolate.run(() {
+    return AppEnvironment.runIsolate(() {
       final db = sqlite3.open(path, mode: OpenMode.readOnly);
       try {
         db.execute('pragma busy_timeout = $defaultSqliteBusyTimeoutMs');
@@ -223,7 +224,7 @@ class RuntimeSessionController implements ProjectsRepository {
 
   Future<ExternalSessionRows> loadExternalRowChanges({int? afterRevision}) {
     final path = databaseFile.path;
-    return Isolate.run(() {
+    return AppEnvironment.runIsolate(() {
       final db = _openReader(path);
       try {
         db.execute('begin');
@@ -288,16 +289,17 @@ class RuntimeSessionController implements ProjectsRepository {
       final exits = ReceivePort();
       Isolate? isolate;
       try {
-        isolate = await Isolate.spawn<_BackgroundCachedRowsRequest>(
-          _backgroundCachedRowsEntry,
-          _BackgroundCachedRowsRequest(
-            databaseFilePath: databaseFile.path,
-            sendPort: messages.sendPort,
-            batchSize: batchSize,
-          ),
-          onError: errors.sendPort,
-          onExit: exits.sendPort,
-        );
+        isolate =
+            await AppEnvironment.spawnIsolate<_BackgroundCachedRowsRequest>(
+              _backgroundCachedRowsEntry,
+              _BackgroundCachedRowsRequest(
+                databaseFilePath: databaseFile.path,
+                sendPort: messages.sendPort,
+                batchSize: batchSize,
+              ),
+              onError: errors.sendPort,
+              onExit: exits.sendPort,
+            );
 
         final result = Completer<SessionsRefreshResult>();
         late StreamSubscription<Object?> messageSubscription;
@@ -444,21 +446,22 @@ class RuntimeSessionController implements ProjectsRepository {
     final exits = ReceivePort();
     Isolate? isolate;
     try {
-      isolate = await Isolate.spawn<_BackgroundSessionDetailRequest>(
-        _backgroundSessionDetailEntry,
-        _BackgroundSessionDetailRequest(
-          settingsFilePath: settingsFile.path,
-          databaseFilePath: databaseFile.path,
-          sessionId: sessionId,
-          claudeRoots: _claudeRoots,
-          reloadFromSource: reloadFromSource,
-          collectorPort: collectorClient?.requestPort ?? collectorPort,
-          collectorExecutable: collectorExecutable,
-          sendPort: messages.sendPort,
-        ),
-        onError: errors.sendPort,
-        onExit: exits.sendPort,
-      );
+      isolate =
+          await AppEnvironment.spawnIsolate<_BackgroundSessionDetailRequest>(
+            _backgroundSessionDetailEntry,
+            _BackgroundSessionDetailRequest(
+              settingsFilePath: settingsFile.path,
+              databaseFilePath: databaseFile.path,
+              sessionId: sessionId,
+              claudeRoots: _claudeRoots,
+              reloadFromSource: reloadFromSource,
+              collectorPort: collectorClient?.requestPort ?? collectorPort,
+              collectorExecutable: collectorExecutable,
+              sendPort: messages.sendPort,
+            ),
+            onError: errors.sendPort,
+            onExit: exits.sendPort,
+          );
 
       final result = Completer<SessionRowViewModel?>();
       late StreamSubscription<Object?> messageSubscription;
@@ -641,7 +644,7 @@ class RuntimeSessionController implements ProjectsRepository {
     final exits = ReceivePort();
     Isolate? isolate;
     try {
-      isolate = await Isolate.spawn<_BackgroundRefreshRequest>(
+      isolate = await AppEnvironment.spawnIsolate<_BackgroundRefreshRequest>(
         _backgroundRefreshEntry,
         _BackgroundRefreshRequest(
           settingsFilePath: settingsFile.path,
@@ -1151,7 +1154,7 @@ class ProcessWslProjectResolver extends WslProjectResolver {
     try {
       // `-e` runs sh directly; without it the default shell reparses the
       // script and nothing resolves (T-171). Scans use the collector's copy.
-      process = await Process.start('wsl.exe', [
+      process = await AppEnvironment.start('wsl.exe', [
         '-e',
         'sh',
         '-lc',
@@ -1218,7 +1221,7 @@ Map<String, String> _parseWslProjectResolutionOutput(
 /// Reads the project list (null [projectId]) or one project's detail on a
 /// background isolate; detail counts walk every session.
 Future<Object> _readProjectsInBackground(String databasePath, int? projectId) {
-  return Isolate.run(() {
+  return AppEnvironment.runIsolate(() {
     final db = openFileBackedDatabase(File(databasePath));
     try {
       final store = ProjectTagStateStore(db);
@@ -1653,19 +1656,22 @@ class _BackgroundMessageSearchBackfillOperation {
     final exits = ReceivePort();
     Isolate? isolate;
     try {
-      isolate = await Isolate.spawn<_BackgroundMessageSearchBackfillRequest>(
-        _backgroundMessageSearchBackfillEntry,
-        _BackgroundMessageSearchBackfillRequest(
-          databaseFilePath: databaseFile.path,
-          sendPort: messages.sendPort,
-          batchSize: batchSize,
-          pauseBetweenBatches: pauseBetweenBatches,
-          singleBatch: singleBatch,
-          initiallyCancelled: cancellationHandle._cancelRequested,
-        ),
-        onError: errors.sendPort,
-        onExit: exits.sendPort,
-      );
+      isolate =
+          await AppEnvironment.spawnIsolate<
+            _BackgroundMessageSearchBackfillRequest
+          >(
+            _backgroundMessageSearchBackfillEntry,
+            _BackgroundMessageSearchBackfillRequest(
+              databaseFilePath: databaseFile.path,
+              sendPort: messages.sendPort,
+              batchSize: batchSize,
+              pauseBetweenBatches: pauseBetweenBatches,
+              singleBatch: singleBatch,
+              initiallyCancelled: cancellationHandle._cancelRequested,
+            ),
+            onError: errors.sendPort,
+            onExit: exits.sendPort,
+          );
 
       final result = Completer<MessageSearchBackfillResult>();
       late StreamSubscription<Object?> messageSubscription;

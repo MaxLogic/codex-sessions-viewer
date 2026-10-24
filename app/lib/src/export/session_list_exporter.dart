@@ -1,5 +1,5 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:convert';
-import 'dart:isolate';
 import 'first_instruction.dart';
 
 import '../commands/resume_command_generator.dart';
@@ -22,7 +22,7 @@ Future<String> formatSessionListMarkdown(
       ),
     );
   }
-  return Isolate.run(
+  return AppEnvironment.runIsolate(
     () => SessionListExporter(settings: settings).exportMarkdown(
       rows,
       includeFirstMessage: includeFirstMessage,

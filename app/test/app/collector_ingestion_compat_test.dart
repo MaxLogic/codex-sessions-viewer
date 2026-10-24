@@ -1,6 +1,8 @@
 @TestOn('windows')
 library;
 
+import '../support/test_environment.dart';
+
 import '../support/collector_fixture.dart';
 
 import 'dart:convert';
@@ -62,11 +64,11 @@ void main() {
       collector = File(override);
     } else {
       // Always rebuild so the test never runs a stale executable.
-      final build = await Process.run('cargo', [
+      final build = await runTestProcess('cargo', [
         'build',
         '--quiet',
         '--manifest-path',
-        p.join('..', 'collector', 'Cargo.toml'),
+        p.absolute('..', 'collector', 'Cargo.toml'),
         '--bin',
         'codex-sessions-collector',
       ]);
@@ -76,7 +78,7 @@ void main() {
         reason: 'cargo build failed:\n${build.stdout}\n${build.stderr}',
       );
       collector = File(
-        p.join(
+        p.absolute(
           '..',
           'collector',
           'target',
@@ -209,7 +211,7 @@ void main() {
     final fixture = await _Fixture.create();
     addTearDown(fixture.dispose);
     final standalone = File(p.join(fixture.temp.path, 'standalone.sqlite'));
-    final created = await Process.run(collector.path, [
+    final created = await runTestProcess(collector.path, [
       'codex',
       'scan',
       '--no-wsl-projects',
@@ -254,7 +256,7 @@ void main() {
       } finally {
         connection.close();
       }
-      final result = await Process.run(collector.path, [
+      final result = await runTestProcess(collector.path, [
         'codex',
         'scan',
         '--json',
@@ -410,7 +412,7 @@ class _Fixture {
   }
 
   Future<void> collectorScan(File exe, File db) async {
-    final result = await Process.run(exe.path, [
+    final result = await runTestProcess(exe.path, [
       'codex',
       'scan',
       '--no-wsl-projects',

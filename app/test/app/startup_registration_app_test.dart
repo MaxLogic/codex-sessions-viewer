@@ -52,7 +52,7 @@ void main() {
       find.bySemanticsLabel(RegExp('^Settings navigation\\nTab ')),
     );
     await _pumpFrames(tester);
-    await tester.tap(find.bySemanticsLabel('Start at login setting'));
+    await tester.tap(find.bySemanticsLabel('Open viewer at sign-in setting'));
     await tester.pump();
     await tester.tap(find.text('Save settings'));
     await _pumpFrames(tester);

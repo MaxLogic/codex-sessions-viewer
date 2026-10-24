@@ -325,6 +325,15 @@ class PackageTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows retained process handle")
+    def test_timeout_uses_retained_process_not_numeric_pid_or_tree(self):
+        job = mock.Mock()
+        with mock.patch.object(release.subprocess, 'run') as numeric_kill:
+            release.stop_group(job, .1)
+        job.kill.assert_called_once_with()
+        job.wait.assert_called_once_with(timeout=30)
+        numeric_kill.assert_not_called()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cxv runner ")
         self.addCleanup(self.temp.cleanup)

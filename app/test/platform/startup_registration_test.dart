@@ -1,3 +1,5 @@
+import '../support/test_environment.dart';
+
 import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
@@ -80,19 +82,24 @@ void main() {
           if (symbolic) {
             await Link(owned.path).create(target.path);
           } else if (Platform.isWindows) {
-            final result = await Process.run('fsutil', [
-              'hardlink',
-              'create',
-              owned.path,
-              target.path,
-            ]);
+            final result = await runTestProcess(
+              p.join(
+                Platform.environment['SYSTEMROOT']!,
+                'System32',
+                'fsutil.exe',
+              ),
+              ['hardlink', 'create', owned.path, target.path],
+            );
             expect(
               result.exitCode,
               0,
               reason: '${result.stdout} ${result.stderr}',
             );
           } else {
-            final result = await Process.run('ln', [target.path, owned.path]);
+            final result = await runTestProcess('ln', [
+              target.path,
+              owned.path,
+            ]);
             expect(
               result.exitCode,
               0,

@@ -1,3 +1,5 @@
+import '../support/test_environment.dart';
+
 import 'dart:convert';
 import 'dart:io';
 
@@ -249,7 +251,7 @@ void main() {
             'machines': {'machine-a': 'machine-token-fixture-1234567890'},
           }),
         );
-      final process = await Process.start(executable.absolute.path, [
+      final process = await startTestProcess(executable.absolute.path, [
         '127.0.0.1:$port',
         '${temp.path}/data',
         config.path,

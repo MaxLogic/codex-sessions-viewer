@@ -1,6 +1,6 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:ui' show AppExitResponse;
 
 import 'package:file_selector/file_selector.dart';
@@ -944,7 +944,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     UsageSummaryRequest request,
   ) async {
     final databasePath = widget.databaseFile.path;
-    return Isolate.run(() {
+    return AppEnvironment.runIsolate(() {
       final db = openFileBackedDatabase(File(databasePath));
       try {
         db.execute('pragma query_only = on');
@@ -1183,10 +1183,10 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     }
     final targetType = await FileSystemEntity.type(trimmed);
     if (targetType == FileSystemEntityType.directory) {
-      await Process.start('explorer.exe', [trimmed]);
+      await AppEnvironment.start('explorer.exe', [trimmed]);
       return;
     }
-    await Process.start('explorer.exe', ['/select,', trimmed]);
+    await AppEnvironment.start('explorer.exe', ['/select,', trimmed]);
   }
 
   var _databaseErrorAnnounced = false;

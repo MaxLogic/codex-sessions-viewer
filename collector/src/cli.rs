@@ -90,6 +90,7 @@ separately; local collection never waits for network delivery.
 #[derive(Clone)]
 pub(crate) struct Options {
     pub(crate) lifetime: crate::resident::Lifetime,
+    pub(crate) replacement_deadline_ms: Option<u64>,
     pub(crate) db: Option<PathBuf>,
     pub(crate) standalone: Option<PathBuf>,
     pub(crate) settings: Option<PathBuf>,
@@ -134,6 +135,7 @@ impl From<StoreError> for CliError {
 pub(crate) fn parse_options(args: &[String]) -> Result<Options, CliError> {
     let mut options = Options {
         lifetime: crate::resident::Lifetime::Resident,
+        replacement_deadline_ms: None,
         db: None,
         standalone: None,
         settings: None,
@@ -165,6 +167,13 @@ pub(crate) fn parse_options(args: &[String]) -> Result<Options, CliError> {
                 .ok_or_else(|| CliError::Usage(format!("{name} needs a value")))
         };
         match arg.as_str() {
+            "--replacement-deadline-ms" => {
+                options.replacement_deadline_ms = Some(
+                    value("--replacement-deadline-ms")?
+                        .parse()
+                        .map_err(|_| CliError::Usage("invalid replacement deadline".into()))?,
+                );
+            }
             "--lifetime" => {
                 options.lifetime = match value("--lifetime")?.as_str() {
                     "resident" => crate::resident::Lifetime::Resident,
@@ -1102,6 +1111,7 @@ fn codex_notify(args: &[String]) {
 }
 
 fn handoff(mut item: crate::hooks::WorkItem, options: &Options, args: &[String]) {
+    let mut timings = crate::timing::Phases::start();
     let queue = crate::hooks::queue_dir();
     let database = options
         .db
@@ -1130,11 +1140,16 @@ fn handoff(mut item: crate::hooks::WorkItem, options: &Options, args: &[String])
     if options.no_drain {
         return;
     }
-    match crate::resident::notify_hook(&key, entry.file_name().unwrap().to_str().unwrap()) {
+    timings.mark("hook queue persistence");
+    let notification =
+        crate::resident::notify_hook(&key, entry.file_name().unwrap().to_str().unwrap());
+    timings.mark("hook resident notification");
+    match notification {
         crate::resident::HookNotify::Handled => (),
         crate::resident::HookNotify::OtherQueue => start_hook_worker(args, false),
         crate::resident::HookNotify::Unavailable => start_hook_worker(args, true),
     }
+    timings.mark("hook worker startup");
 }
 
 /// Claude Code passes the hook event as JSON on stdin.

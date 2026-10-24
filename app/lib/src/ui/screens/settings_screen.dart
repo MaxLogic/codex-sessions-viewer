@@ -377,7 +377,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           }),
                         ),
                         _SwitchSetting(
-                          label: 'Start at login',
+                          label: 'Open viewer at sign-in',
                           helperText:
                               'Launch Codex Session Viewer after signing in.',
                           value: _settings.app.startWithWindows,
@@ -490,13 +490,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         _TextSetting(
                           label: 'Scan interval (seconds)',
                           helperText:
-                              'How often session collection checks for new sessions while the viewer or Background collection runs. Background collection’s periodic scan (minutes) separately schedules additional checks.',
+                              'How often session collection checks for new sessions while the viewer is open or Background collection runs.',
                           controller: _scanInterval,
                         ),
                         _SwitchSetting(
                           label: 'Background scan enabled',
                           helperText:
-                              'Check for new sessions periodically while the viewer or Background collection runs. Turning this off leaves Background collection’s separately scheduled periodic scan (minutes) and hooks unchanged.',
+                              'Check for new sessions at the scan interval. Turning this off leaves hooks and Background collection at sign-in unchanged.',
                           value: _settings.scanner.backgroundRescanEnabled,
                           onChanged: (value) {
                             setState(() {

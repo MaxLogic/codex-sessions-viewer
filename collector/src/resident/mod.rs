@@ -4,6 +4,7 @@ pub mod endpoint;
 pub mod instance;
 pub mod protocol;
 pub mod scheduler;
+mod stop_deadline;
 mod transport;
 pub mod viewer;
 
@@ -664,12 +665,20 @@ pub(crate) fn run_configured_after_stop(
     options: crate::cli::Options,
     replacement: bool,
 ) -> io::Result<()> {
+    let shutdown_deadline = if replacement {
+        Some(match options.replacement_deadline_ms {
+            Some(ticks) => stop_deadline::import(ticks)?,
+            None => Instant::now() + STOP_TIMEOUT,
+        })
+    } else {
+        None
+    };
     let log = LifecycleLog::new()?;
-    let total_deadline = Instant::now() + STOP_TIMEOUT + START_TIMEOUT;
+    let total_deadline = shutdown_deadline.unwrap_or_else(Instant::now) + START_TIMEOUT;
     let result = (|| {
         let startup_deadline = if replacement {
             log.record("replacement waiting for instance lock")?;
-            wait_for_stop(database, Instant::now() + STOP_TIMEOUT)?;
+            wait_for_stop(database, shutdown_deadline.unwrap())?;
             Some((Instant::now() + START_TIMEOUT).min(total_deadline))
         } else {
             None
@@ -891,16 +900,12 @@ fn instance_stopped(database: &Path) -> io::Result<bool> {
 /// A final IPC reply is best effort; only lock release proves the owner stopped.
 fn wait_for_stop(database: &Path, deadline: Instant) -> io::Result<()> {
     loop {
+        stop_deadline::remaining(deadline)?;
         if instance_stopped(database)? {
+            stop_deadline::remaining(deadline)?;
             return Ok(());
         }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "resident did not release its instance lock",
-            ));
-        };
-        thread::sleep(remaining.min(Duration::from_millis(20)));
+        thread::sleep(stop_deadline::remaining(deadline)?.min(Duration::from_millis(20)));
     }
 }
 
@@ -991,6 +996,29 @@ mod signals {
 mod tests {
     use super::*;
     use std::sync::{TryLockError, mpsc};
+
+    #[test]
+    fn expired_shutdown_deadline_rejects_even_an_already_free_lock() {
+        let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-sandboxes");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = parent.join(format!(
+            "expired-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("viewer.sqlite");
+        let result = wait_for_stop(&database, Instant::now() - Duration::from_millis(1));
+        let lock = instance::lock_path(&database).unwrap();
+        if lock.exists() {
+            std::fs::remove_file(lock).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
 
     fn idle_shared() -> Arc<Shared> {
         let now = Instant::now();

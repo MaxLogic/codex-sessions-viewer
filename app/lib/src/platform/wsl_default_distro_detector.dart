@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -37,7 +38,7 @@ final class WindowsWslDefaultDistroDetector
   Future<WslDistroDefaults?> detect() async {
     final Process process;
     try {
-      process = await Process.start('wsl.exe', [
+      process = await AppEnvironment.start('wsl.exe', [
         '--exec',
         'printenv',
         'WSL_DISTRO_NAME',

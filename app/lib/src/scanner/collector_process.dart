@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import '../platform/app_locations.dart';
+import '../platform/app_environment.dart';
 
 /// Starts the collector; tests substitute a scripted process.
 typedef CollectorProcessStarter =
@@ -13,7 +14,7 @@ typedef CollectorProcessStarter =
 Future<Process> startCollectorProcess(
   String executable,
   List<String> arguments,
-) => Process.start(executable, arguments, runInShell: false);
+) => AppEnvironment.start(executable, arguments);
 
 /// The collector executable is missing or cannot run.
 class CollectorUnavailableException implements Exception {
@@ -47,7 +48,7 @@ class CollectorProcess {
     String? viewerExecutable,
   }) {
     final platform = hostPlatform ?? AppLocations.currentPlatform;
-    final variables = environment ?? Platform.environment;
+    final variables = environment ?? AppEnvironment.current;
     final context = p.Context(
       style: platform == AppHostPlatform.windows
           ? p.Style.windows

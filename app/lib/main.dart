@@ -66,16 +66,18 @@ Future<void> main(List<String> arguments) async {
       wslDetector: WslDefaultDistroDetector.forCurrentPlatform(),
     ).loadOrCreate(),
   );
+  final backgroundCollection = CollectorBackgroundCollection(
+    collectorExecutable: CollectorProcess.defaultExecutable(),
+    databaseFile: databaseFile.absolute.path,
+    settingsFile: defaultSettingsFile().absolute.path,
+  );
+  unawaited(_afterFirstFrame(backgroundCollection.initialize));
   runApp(
     CodexSessionsViewerApp(
       databaseFile: databaseFile,
       applicationMaintenance: maintenance,
       collectorClient: resident,
-      backgroundCollection: CollectorBackgroundCollection(
-        collectorExecutable: CollectorProcess.defaultExecutable(),
-        databaseFile: databaseFile.absolute.path,
-        settingsFile: defaultSettingsFile().absolute.path,
-      ),
+      backgroundCollection: backgroundCollection,
       settingsStartup: settingsStartup,
       databaseStartup: _afterFirstFrame(() async {
         await settingsStartup;

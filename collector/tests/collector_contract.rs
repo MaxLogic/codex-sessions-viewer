@@ -1,16 +1,23 @@
 mod support;
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use support::{TempDir, collector};
 
 fn example(source: &Path, args: &[&str]) -> Value {
-    let output = Command::new("python")
-        .arg("../samples/collector-contract/example_collector.py")
-        .arg(source)
+    let output = support::test_command("python")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../samples/collector-contract/example_collector.py"),
+        )
+        .arg(if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(source)
+        })
         .args(args)
         .output()
         .expect("run independent example collector");

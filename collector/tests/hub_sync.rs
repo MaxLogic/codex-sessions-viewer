@@ -1,7 +1,7 @@
 mod support;
 
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ impl Drop for Hub {
 impl Hub {
     fn restart(&mut self, temp: &TempDir) {
         let address = self.url.trim_start_matches("http://");
-        self.child = Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
+        self.child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
             .arg(address)
             .arg(temp.path().join("hub-data"))
             .arg(temp.path().join("hub.json"))
@@ -70,7 +70,7 @@ fn start_with(temp: &TempDir, extra: Value) -> Hub {
     }
     std::fs::write(&config, value.to_string()).unwrap();
     let url = format!("http://127.0.0.1:{port}");
-    let child = Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
+    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
         .arg(format!("127.0.0.1:{port}"))
         .arg(temp.path().join("hub-data"))
         .arg(config)
@@ -325,7 +325,7 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
             )
             .unwrap();
     }
-    let enable = Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    let enable = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", "enable", "--hub-url", &hub.url, "--standalone"])
         .arg(&db)
         .output()
@@ -369,14 +369,14 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
     }
     let _ = hub.child.kill();
     let _ = hub.child.wait();
-    let offline = Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    let offline = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", "sync", "--standalone"])
         .arg(&db)
         .env("CODEX_SESSIONS_HUB_MACHINE_TOKEN", MACHINE_A_TOKEN)
         .output()
         .unwrap();
     assert!(!offline.status.success());
-    let local_query = Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    let local_query = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["query", "sessions", "--db"])
         .arg(&db)
         .args(["--limit", "10"])
@@ -390,7 +390,7 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
     let local: Value = serde_json::from_slice(&local_query.stdout).unwrap();
     assert_eq!(local["results"].as_array().unwrap().len(), 1);
     hub.restart(&temp);
-    let denied = Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    let denied = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", "sync", "--standalone"])
         .arg(&db)
         .env("CODEX_SESSIONS_HUB_MACHINE_TOKEN", "wrong-token")
@@ -430,7 +430,7 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
             false
         );
     }
-    let delivered = Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    let delivered = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", "sync", "--standalone"])
         .arg(&db)
         .env("CODEX_SESSIONS_HUB_MACHINE_TOKEN", MACHINE_A_TOKEN)
@@ -451,7 +451,7 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
         (Some(1), Some(0), Some(1))
     );
     assert_eq!(session_count(&hub, "machine-a"), 1);
-    let again = Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    let again = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", "sync", "--standalone"])
         .arg(&db)
         .env("CODEX_SESSIONS_HUB_MACHINE_TOKEN", MACHINE_A_TOKEN)
@@ -565,7 +565,7 @@ fn paired_database(temp: &TempDir, url: &str) -> std::path::PathBuf {
 }
 
 fn hub_command(db: &std::path::Path, command: &str, token: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", command, "--standalone"])
         .arg(db)
         .env("CODEX_SESSIONS_HUB_MACHINE_TOKEN", token)

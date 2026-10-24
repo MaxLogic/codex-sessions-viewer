@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
+import '../support/autostart_fixture.dart';
+import 'package:xml/xml.dart';
 
 import 'package:codex_sessions_viewer/src/background_collection/background_collection.dart';
-import 'package:codex_sessions_viewer/src/background_collection/scan_scheduler.dart';
+import 'package:codex_sessions_viewer/src/background_collection/collector_autostart.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 ProcessResult _ok([String out = '']) => ProcessResult(0, 0, out, '');
@@ -14,32 +16,58 @@ const _listWithTask =
     '"\\Codex Session Viewer\\Background collection","01.10.2026 20:00:00","Ready"\r\n';
 const _listWithoutTask = '"\\Adobe Task","01.10.2026 20:00:00","Ready"\r\n';
 
-class _FakeScheduler implements ScanScheduler {
+class _FakeScheduler implements CollectorAutostart {
   _FakeScheduler({this.supported = true});
 
   final bool supported;
   ScheduledScanState state = const ScheduledScanState(installed: false);
-  ScanScheduleRequest? installed;
+  CollectorAutostartRequest? installed;
   int removed = 0;
-  ScanSchedulerException? failure;
-  ScanSchedulerException? queryFailure;
+  CollectorAutostartException? failure;
+  CollectorAutostartException? queryFailure;
 
   @override
   bool get isSupported => supported;
 
   @override
-  Future<ScheduledScanState> query() async {
+  Future<ScheduledScanState> query({
+    CollectorAutostartRequest? expected,
+  }) async {
     if (queryFailure != null) throw queryFailure!;
     return state;
   }
 
   @override
-  Future<void> install(ScanScheduleRequest request) async {
+  Future<void> install(CollectorAutostartRequest request) async {
     if (failure != null) throw failure!;
     installed = request;
     state = ScheduledScanState(
       installed: true,
-      intervalMinutes: request.intervalMinutes,
+      intervalMinutes: 5,
+      enabled: request.enabled,
+    );
+  }
+
+  int upgrades = 0;
+  @override
+  Future<String?> upgrade(
+    CollectorAutostartRequest request,
+    Directory backups,
+  ) async {
+    upgrades++;
+    if (failure != null) throw failure!;
+    if (!state.installed || !state.outdated) return null;
+    final enabled = state.enabled;
+    await install(request);
+    state = ScheduledScanState(installed: true, enabled: enabled);
+    return '${backups.path}/old-task.xml';
+  }
+
+  @override
+  Future<void> enable() async {
+    state = ScheduledScanState(
+      installed: state.installed,
+      outdated: state.outdated,
     );
   }
 
@@ -51,6 +79,174 @@ class _FakeScheduler implements ScanScheduler {
 }
 
 void main() {
+  group('resident autostart upgrade', () {
+    late Directory root;
+    setUp(() async {
+      root = await Directory.systemTemp.createTemp('cxv185-unit-');
+    });
+    tearDown(() async {
+      await root.delete(recursive: true);
+    });
+    test(
+      'outdated installed task is backed up before automatic rewrite, once',
+      () async {
+        final fixture = AutostartFixture(root);
+        await Future.wait([
+          fixture.collection.initialize(),
+          fixture.collection.initialize(),
+        ]);
+        final status = await fixture.collection.status();
+        expect(fixture.creates, 1);
+        expect(fixture.backupBeforeCreate, isTrue);
+        expect(status.schedule.outdated, isFalse);
+        expect(status.autostartUpdate?.backupPath, fixture.backups.single.path);
+        expect(
+          XmlDocument.parse(
+            fixture.backups.single.readAsStringSync(),
+          ).rootElement.toXmlString(),
+          XmlDocument.parse(fixture.original!).rootElement.toXmlString(),
+        );
+      },
+    );
+    test('outdated disabled task stays disabled after rewrite', () async {
+      final fixture = AutostartFixture(root, enabled: false);
+      final status = await fixture.collection.status();
+      expect(fixture.creates, 1);
+      expect(status.schedule.outdated, isFalse);
+      expect(status.schedule.enabled, isFalse);
+      expect(status.autostartUpdate?.keptDisabled, isTrue);
+    });
+    test(
+      'explicit enable turns on a disabled installed task without rewriting it',
+      () async {
+        final fixture = AutostartFixture(root, enabled: false);
+        await fixture.collection.initialize();
+        expect((await fixture.collection.status()).schedule.enabled, isFalse);
+        final creates = fixture.creates;
+        await fixture.collection.enableSchedule();
+        expect((await fixture.collection.status()).schedule.enabled, isTrue);
+        expect(fixture.creates, creates);
+      },
+    );
+    test(
+      'absent and current tasks are never automatically registered',
+      () async {
+        final fixture = AutostartFixture(root, installed: false);
+        await fixture.collection.status();
+        expect(fixture.creates, 0);
+        expect(fixture.backups, isEmpty);
+        final current = AutostartFixture(root);
+        current.xml = WindowsTaskScheduler.buildTaskXml(
+          current.request,
+          userId: AutostartFixture.sid,
+        );
+        await current.collection.status();
+        expect(current.creates, 0);
+      },
+    );
+    test('backup failure prevents replacement and is reported', () async {
+      final fixture = AutostartFixture(root);
+      File('${root.path}/logs').writeAsStringSync('blocks directory');
+      final status = await fixture.collection.status();
+      expect(fixture.creates, 0);
+      expect(status.schedule.outdated, isTrue);
+      expect(
+        status.autostartUpdate?.error,
+        contains('backup could not be saved'),
+      );
+    });
+    test(
+      'registration failure keeps outdated status and supports explicit retry',
+      () async {
+        final fixture = AutostartFixture(root)
+          ..createFailure = 'Access is denied.';
+        final failed = await fixture.collection.status();
+        expect(failed.schedule.outdated, isTrue);
+        expect(failed.autostartUpdate?.error, contains('Access is denied.'));
+        await fixture.collection.status();
+        expect(fixture.creates, 1);
+        fixture.createFailure = null;
+        await fixture.collection.installSchedule();
+        expect((await fixture.collection.status()).schedule.outdated, isFalse);
+      },
+    );
+    test(
+      'registration success without a changed task is a verification failure',
+      () async {
+        final fixture = AutostartFixture(root)..ignoreCreate = true;
+        final status = await fixture.collection.status();
+        expect(status.schedule.outdated, isTrue);
+        expect(
+          status.autostartUpdate?.detail,
+          contains('could not be verified'),
+        );
+      },
+    );
+    for (final failRestore in [false, true]) {
+      test(
+        'verification failure restores the previous task; restore fails=$failRestore',
+        () async {
+          final fixture = AutostartFixture(root)
+            ..disableReplacement = true
+            ..failRestore = failRestore;
+          final status = await fixture.collection.status();
+          expect(fixture.creates, 2);
+          expect(
+            status.autostartUpdate?.error,
+            contains(
+              failRestore
+                  ? 'previous setting could not be put back'
+                  : 'previous setting was restored',
+            ),
+          );
+          if (failRestore) {
+            expect(
+              status.autostartUpdate?.backupPath,
+              fixture.backups.single.path,
+            );
+          } else {
+            expect(
+              XmlDocument.parse(fixture.xml!).rootElement.toXmlString(),
+              XmlDocument.parse(fixture.original!).rootElement.toXmlString(),
+            );
+            expect(status.schedule.enabled, isTrue);
+            expect(status.schedule.outdated, isTrue);
+          }
+        },
+      );
+    }
+    test(
+      'query detects settings, action, principal and trigger drift',
+      () async {
+        final fixture = AutostartFixture(root);
+        final good = WindowsTaskScheduler.buildTaskXml(
+          fixture.request,
+          userId: AutostartFixture.sid,
+        );
+        for (final xml in [
+          good.replaceFirst('PT0S', 'PT1H'),
+          good
+              .replaceFirst('<LogonTrigger>', '<BootTrigger>')
+              .replaceFirst('</LogonTrigger>', '</BootTrigger>'),
+          good.replaceFirst('PT5M', 'PT15M'),
+          good.replaceFirst('IgnoreNew', 'Parallel'),
+          good.replaceFirst('InteractiveToken', 'Password'),
+          good.replaceFirst('launcher.exe', 'other.exe'),
+          good.replaceFirst(
+            '<StartWhenAvailable>true',
+            '<StartWhenAvailable>false',
+          ),
+        ]) {
+          fixture.xml = xml;
+          expect(
+            (await fixture.scheduler.query(expected: fixture.request)).outdated,
+            isTrue,
+          );
+        }
+      },
+    );
+  });
+
   group('ScheduledScanState', () {
     test('running and never-run results are not failures', () {
       expect(
@@ -95,17 +291,39 @@ void main() {
   });
 
   group('WindowsTaskScheduler', () {
-    const request = ScanScheduleRequest(
+    const request = CollectorAutostartRequest(
       launcherExecutable:
           r'C:\Apps\Viewer & Co\codex-sessions-scan-launcher.exe',
       databaseFile: r'C:\Users\a\AppData\Roaming\db.sqlite',
       settingsFile: r'C:\Apps\settings.toml',
-      intervalMinutes: 45,
     );
 
     test('the definition is one windowless launcher run as the user', () {
-      final xml = WindowsTaskScheduler.buildTaskXml(request);
-      expect(xml, contains('<Interval>PT45M</Interval>'));
+      final xml = WindowsTaskScheduler.buildTaskXml(
+        request,
+        userId: 'S-1-5-21-123',
+      );
+      expect(xml, contains('<Interval>PT5M</Interval>'));
+      expect(xml, contains('<LogonTrigger>'));
+      expect(xml, contains('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'));
+      expect(xml, contains('<StopAtDurationEnd>false</StopAtDurationEnd>'));
+      expect(xml, contains('<StartWhenAvailable>true</StartWhenAvailable>'));
+      expect(
+        xml,
+        contains(
+          '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+        ),
+      );
+      expect(
+        xml,
+        contains('<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'),
+      );
+      final evidence = Platform.environment['CXV_EVIDENCE_DIR'];
+      if (evidence != null) {
+        File('$evidence/background-collection-sample.xml').writeAsStringSync(
+          xml.replaceFirst('encoding="UTF-16"', 'encoding="UTF-8"'),
+        );
+      }
       expect(xml, contains('<LogonType>InteractiveToken</LogonType>'));
       expect(xml, contains('<RunLevel>LeastPrivilege</RunLevel>'));
       expect(xml, contains('<MultipleInstancesPolicy>IgnoreNew<'));
@@ -126,22 +344,17 @@ void main() {
       expect(xml, isNot(contains('codex scan')));
     });
 
-    test('refuses paths and intervals a task cannot carry', () {
-      ScanScheduleRequest with_({String? exe, int? minutes}) =>
-          ScanScheduleRequest(
+    test('refuses paths a task cannot carry', () {
+      CollectorAutostartRequest with_({String? exe}) =>
+          CollectorAutostartRequest(
             launcherExecutable: exe ?? request.launcherExecutable,
             databaseFile: request.databaseFile,
             settingsFile: request.settingsFile,
-            intervalMinutes: minutes ?? request.intervalMinutes,
           );
-      for (final bad in [
-        with_(exe: 'a"b.exe'),
-        with_(minutes: 0),
-        with_(minutes: 1441),
-      ]) {
+      for (final bad in [with_(exe: 'a"b.exe'), with_(exe: 'a\nb.exe')]) {
         expect(
-          () => WindowsTaskScheduler.buildTaskXml(bad),
-          throwsA(isA<ScanSchedulerException>()),
+          () => WindowsTaskScheduler.buildTaskXml(bad, userId: 'S-1-5-21-123'),
+          throwsA(isA<CollectorAutostartException>()),
         );
       }
     });
@@ -184,6 +397,7 @@ void main() {
     }) => WindowsTaskScheduler(
       runProcess: (exe, args) async {
         calls?.add([exe, ...args]);
+        if (exe == 'whoami.exe') return _ok('S-1-5-21-123');
         if (exe == 'powershell.exe') return info ?? _fail();
         if (args.contains('/XML')) return xml ?? _fail();
         if (args.first == '/Query') return list ?? _ok(_listWithTask);
@@ -200,7 +414,7 @@ void main() {
       await expectLater(
         scheduler(list: _fail('Access is denied.')).query(),
         throwsA(
-          isA<ScanSchedulerException>().having(
+          isA<CollectorAutostartException>().having(
             (e) => e.message,
             'message',
             contains('Access is denied.'),
@@ -210,7 +424,7 @@ void main() {
       // Listed but unreadable definition: an error too.
       await expectLater(
         scheduler(xml: _fail('denied')).query(),
-        throwsA(isA<ScanSchedulerException>()),
+        throwsA(isA<CollectorAutostartException>()),
       );
     });
 
@@ -222,7 +436,7 @@ void main() {
       await expectLater(
         missing.query(),
         throwsA(
-          isA<ScanSchedulerException>().having(
+          isA<CollectorAutostartException>().having(
             (e) => e.message,
             'message',
             contains('schtasks.exe'),
@@ -264,6 +478,7 @@ void main() {
         taskName: r'CxvTest\Unit',
         temporaryDirectory: temp,
         runProcess: (exe, arguments) async {
+          if (exe == 'whoami.exe') return _ok('S-1-5-21-123');
           expect(exe, 'schtasks');
           args = arguments;
           staged = await File(
@@ -283,12 +498,14 @@ void main() {
       'install failure names the scheduler message, not the paths',
       () async {
         final failing = WindowsTaskScheduler(
-          runProcess: (exe, arguments) async => _fail('Access is denied.'),
+          runProcess: (exe, arguments) async => exe == 'whoami.exe'
+              ? _ok('S-1-5-21-123')
+              : _fail('Access is denied.'),
         );
         await expectLater(
           failing.install(request),
           throwsA(
-            isA<ScanSchedulerException>().having(
+            isA<CollectorAutostartException>().having(
               (e) => e.message,
               'message',
               allOf(contains('Access is denied.'), isNot(contains('settings'))),
@@ -304,6 +521,7 @@ void main() {
       final s = WindowsTaskScheduler(
         runProcess: (exe, args) async {
           calls.add([exe, ...args]);
+          if (exe == 'whoami.exe') return _ok('S-1-5-21-123');
           if (exe == 'powershell.exe') return _ok('|267011');
           if (args.contains('/XML')) return _ok('<Interval>PT5M</Interval>');
           if (args.first == '/Query') return _ok(listed);
@@ -323,6 +541,7 @@ void main() {
       final s = WindowsTaskScheduler(
         runProcess: (exe, args) async {
           calls.add([exe, ...args]);
+          if (exe == 'whoami.exe') return _ok('S-1-5-21-123');
           if (exe == 'powershell.exe') return _ok('|267011');
           if (args.contains('/XML')) return _ok('<Interval>PT5M</Interval>');
           if (args.first == '/Query') {
@@ -343,34 +562,33 @@ void main() {
       expect(calls.where((c) => c.contains('/Delete')), isEmpty);
       await expectLater(
         scheduler(list: _fail('Access is denied.')).remove(),
-        throwsA(isA<ScanSchedulerException>()),
+        throwsA(isA<CollectorAutostartException>()),
       );
     });
 
     test('the factory picks the implementation in one place', () {
       expect(
-        ScanScheduler.forCurrentPlatform().isSupported,
+        CollectorAutostart.forCurrentPlatform().isSupported,
         Platform.isWindows,
       );
     });
   });
 
   test('an unsupported platform says so and installs nothing', () async {
-    const scheduler = UnsupportedScanScheduler();
+    const scheduler = UnsupportedCollectorAutostart();
     expect(scheduler.isSupported, isFalse);
     expect((await scheduler.query()).installed, isFalse);
     await scheduler.remove();
     await expectLater(
       scheduler.install(
-        const ScanScheduleRequest(
+        const CollectorAutostartRequest(
           launcherExecutable: 'c',
           databaseFile: 'd',
           settingsFile: 's',
-          intervalMinutes: 30,
         ),
       ),
       throwsA(
-        isA<ScanSchedulerException>().having(
+        isA<CollectorAutostartException>().having(
           (e) => e.message,
           'message',
           contains('not available'),
@@ -522,7 +740,7 @@ void main() {
 
     test('an unreadable scheduler keeps the hook rows', () async {
       statuses('registered', 'absent');
-      scheduler.queryFailure = const ScanSchedulerException(
+      scheduler.queryFailure = const CollectorAutostartException(
         'Windows Task Scheduler (schtasks.exe) could not be started.',
       );
       final result = await build().status();
@@ -533,7 +751,7 @@ void main() {
       );
       expect(result.schedule.error, contains('schtasks.exe'));
       expect(result.summary, BackgroundCollectionSummary.attention);
-      expect(result.gaps, contains('the periodic scan cannot be checked'));
+      expect(result.gaps, contains('start at sign-in cannot be checked'));
     });
 
     test(
@@ -639,7 +857,7 @@ void main() {
           isA<BackgroundCollectionException>().having(
             (e) => e.message,
             'message',
-            contains('collector could not be started'),
+            contains('Session collection could not be started'),
           ),
         ),
       );
@@ -647,7 +865,7 @@ void main() {
 
     test('the schedule runs the launcher next to the collector', () async {
       final collection = build();
-      await collection.installSchedule(15);
+      await collection.installSchedule();
       final request = scheduler.installed!;
       expect(
         request.launcherExecutable,
@@ -655,10 +873,10 @@ void main() {
       );
       expect(request.databaseFile, r'C:\db.sqlite');
       expect(request.settingsFile, r'C:\settings.toml');
-      expect(request.intervalMinutes, 15);
-      scheduler.failure = const ScanSchedulerException('denied');
+      expect(request.enabled, isTrue);
+      scheduler.failure = const CollectorAutostartException('denied');
       await expectLater(
-        collection.installSchedule(30),
+        collection.installSchedule(),
         throwsA(isA<BackgroundCollectionException>()),
       );
       await collection.removeSchedule();
@@ -670,12 +888,12 @@ void main() {
       () async {
         launcherPresent = false;
         await expectLater(
-          build().installSchedule(5),
+          build().installSchedule(),
           throwsA(
             isA<BackgroundCollectionException>().having(
               (e) => e.message,
               'message',
-              contains('codex-sessions-scan-launcher.exe'),
+              contains('component is missing'),
             ),
           ),
         );

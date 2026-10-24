@@ -1,3 +1,5 @@
+import '../support/test_environment.dart';
+
 import '../support/collector_fixture.dart';
 import 'dart:async';
 import 'dart:convert';
@@ -619,10 +621,11 @@ void main() {
       final sessions = Directory(p.join(codex.path, 'sessions'))
         ..createSync(recursive: true);
       final queue = p.join(root.path, 'queue');
-      final environment = {
-        'CODEX_SESSIONS_COLLECTOR_QUEUE': queue,
-        'CODEX_HOME': codex.path,
-      };
+      final environment = TestEnvironment.current.fixtureEnvironment(
+        root,
+        queue: queue,
+        codex: codex.path,
+      );
       final settings = AppSettings.defaults().copyWith(
         paths: PathSettings(
           windowsCodexPath: codex.path,
@@ -646,7 +649,7 @@ void main() {
         settingsFile: settingsFile,
         claudeRoots: const [],
         start: (executable, arguments) async {
-          final process = await Process.start(
+          final process = await startTestProcess(
             executable,
             arguments,
             environment: environment,
@@ -779,24 +782,25 @@ void main() {
               '',
             ].join('\n'),
           );
-          final hook = await Process.start(executable, [
-            'claude',
-            'hook',
-            '--db',
-            database.path,
-            '--settings',
-            settingsFile.path,
-          ], environment: environment);
-          final output = hook.stdout.drain<void>();
-          final errors = hook.stderr.transform(utf8.decoder).join();
-          hook.stdin.writeln(
-            jsonEncode({
+          final hook = await startTestProcess(
+            executable,
+            [
+              'claude',
+              'hook',
+              '--db',
+              database.path,
+              '--settings',
+              settingsFile.path,
+            ],
+            environment: environment,
+            hookInput: {
               'hook_event_name': 'Stop',
               'session_id': 'hook-only-session',
               'transcript_path': transcript.path,
-            }),
+            },
           );
-          await hook.stdin.close();
+          final output = hook.stdout.drain<void>();
+          final errors = hook.stderr.transform(utf8.decoder).join();
           expect(await hook.exitCode, 0, reason: await errors);
           await output;
           await until(() => find.text('Hook arrival').evaluate().isNotEmpty);
@@ -870,9 +874,9 @@ void main() {
       });
       final executable =
           Platform.environment['CODEX_SESSIONS_COLLECTOR_EXE'] ??
-          '../collector/target/debug/codex-sessions-collector.exe';
+          p.absolute('../collector/target/debug/codex-sessions-collector.exe');
       Future<void> collect() async {
-        final result = await Process.run(executable, [
+        final result = await runTestProcess(executable, [
           'codex',
           'scan',
           '--no-wsl-projects',

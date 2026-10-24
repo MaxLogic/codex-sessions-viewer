@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -118,7 +119,8 @@ class _HubSessionsScreenState extends State<HubSessionsScreen> {
   void initState() {
     super.initState();
     _url = TextEditingController(text: widget.settings.hub.url);
-    _token.text = Platform.environment['CODEX_SESSIONS_HUB_OWNER_TOKEN'] ?? '';
+    _token.text =
+        AppEnvironment.current['CODEX_SESSIONS_HUB_OWNER_TOKEN'] ?? '';
     _machine = widget.settings.hub.machine.isEmpty
         ? null
         : widget.settings.hub.machine;
@@ -575,7 +577,7 @@ class _HubSessionsScreenState extends State<HubSessionsScreen> {
                                                 'Resume unavailable.',
                                           );
                                         }
-                                        await Process.start(
+                                        await AppEnvironment.start(
                                           spec.executable,
                                           spec.arguments,
                                         );
@@ -592,9 +594,10 @@ class _HubSessionsScreenState extends State<HubSessionsScreen> {
                                             'The mapped directory no longer exists.',
                                           );
                                         }
-                                        await Process.start('explorer.exe', [
-                                          path,
-                                        ]);
+                                        await AppEnvironment.start(
+                                          'explorer.exe',
+                                          [path],
+                                        );
                                       }),
                                 child: const Text('Open local directory'),
                               ),

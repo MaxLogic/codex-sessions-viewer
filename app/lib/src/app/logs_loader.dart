@@ -1,6 +1,6 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -48,7 +48,7 @@ class _LogsLoaderState extends State<LogsLoader> {
     final settings = widget.settings;
     List<LogEntry> entries;
     try {
-      entries = await Isolate.run(_logQueryJob(path, settings));
+      entries = await AppEnvironment.runIsolate(_logQueryJob(path, settings));
     } on Object {
       entries = const [];
     }
@@ -79,7 +79,7 @@ class _LogsLoaderState extends State<LogsLoader> {
       _notify('The log file has not been created yet: ${file.path}');
       return;
     }
-    await Process.start('explorer.exe', ['/select,', file.path]);
+    await AppEnvironment.start('explorer.exe', ['/select,', file.path]);
   }
 
   Future<void> _openLogsFolder() async {
@@ -88,7 +88,7 @@ class _LogsLoaderState extends State<LogsLoader> {
       _notify('The logs folder does not exist yet: ${folder.path}');
       return;
     }
-    await Process.start('explorer.exe', [folder.path]);
+    await AppEnvironment.start('explorer.exe', [folder.path]);
   }
 
   Future<void> _clearOldLogs() async {

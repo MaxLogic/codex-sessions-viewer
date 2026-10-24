@@ -1,6 +1,6 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
 
@@ -60,7 +60,7 @@ class ApplicationMaintenance extends ChangeNotifier {
   final String? Function() hubMachineToken;
 
   static String? _environmentHubMachineToken() =>
-      Platform.environment['CODEX_SESSIONS_HUB_MACHINE_TOKEN'];
+      AppEnvironment.current['CODEX_SESSIONS_HUB_MACHINE_TOKEN'];
 
   /// The last hub price sync problem in this session; also persisted as the
   /// price schedule's fixed-text warning for Settings.
@@ -946,7 +946,7 @@ Future<void> _applyCatalog(
   DateTime observed,
   String origin,
   int refreshIntervalHours,
-) => Isolate.run(() {
+) => AppEnvironment.runIsolate(() {
   final db = openFileBackedDatabase(File(path));
   try {
     PricingRepository(db).applyCatalog(
@@ -965,7 +965,7 @@ Future<void> _mergeHubHistory(
   String path,
   HubPriceSyncResult snapshot,
   String url,
-) => Isolate.run(() {
+) => AppEnvironment.runIsolate(() {
   final db = openFileBackedDatabase(File(path));
   try {
     PricingRepository(db).mergePriceObservations(
@@ -983,7 +983,7 @@ Future<void> _mergeHubHistory(
 
 /// Null when the database has no machine identity to sync as.
 Future<(List<PriceObservation>, HubPriceSyncResult, String)?>
-_prepareHubHistory(String path, String url) => Isolate.run(() {
+_prepareHubHistory(String path, String url) => AppEnvironment.runIsolate(() {
   final db = openFileBackedDatabase(File(path));
   try {
     final rows = db.select(

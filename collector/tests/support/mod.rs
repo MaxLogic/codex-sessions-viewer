@@ -2,8 +2,14 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
+mod test_environment;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[allow(unused_imports)]
+pub use test_environment::{
+    TestCommand as Command, command_with_inherited_profile, own_endpoint, temp_dir, test_command,
+    test_root,
+};
 
 use codex_sessions_collector::contract::{
     MessageRecord, SessionRecord, SessionSnapshot, Source, ToolCallRecord, UsageEventRecord,
@@ -22,13 +28,13 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "csv_collector_{label}_{}_{}",
-            std::process::id(),
+        // Leave room for Windows SQLite backup names under the shared sandbox.
+        let short_label: String = label.chars().take(12).collect();
+        let path = temp_dir().join(format!(
+            "{}-{short_label}",
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         Self(path)
     }
 
@@ -44,7 +50,7 @@ impl Drop for TempDir {
 }
 
 pub fn collector() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+    test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
 }
 
 /// Opens like the viewer does: WAL journal, foreign keys, 30 s busy wait.

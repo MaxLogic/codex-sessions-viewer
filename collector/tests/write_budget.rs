@@ -452,7 +452,10 @@ fn chunk_gap_admits_a_waiting_viewer_between_consecutive_transactions() {
     let (success, max) = probe.join().unwrap();
     assert_eq!(success, 8);
     assert_eq!(gaps.len(), 3, "all four chunks must run independently");
-    assert!(max < Duration::from_millis(1250), "viewer wait {max:?}");
+    // User decision (2026-10-24, CXV-185): background-isolate viewer writes
+    // may wait about 2 seconds. Product transaction/gap budgets stay unchanged.
+    eprintln!("chunk gap viewer_wait_ms={:.3}", max.as_secs_f64() * 1000.0);
+    assert!(max < Duration::from_millis(2500), "viewer wait {max:?}");
     assert!(
         gaps.iter().all(|gap| *gap >= Duration::from_millis(150)),
         "gaps: {gaps:?}"

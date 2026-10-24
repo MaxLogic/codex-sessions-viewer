@@ -24,9 +24,6 @@ class BackgroundCollectionPanel extends StatefulWidget {
   /// Opens a folder in the file manager; the button is hidden without it.
   final Future<void> Function(String folder)? onOpenFolder;
 
-  static const intervalChoices = [5, 15, 30, 60];
-  static const defaultIntervalMinutes = 5;
-
   /// Local time, one format for every timestamp on the panel.
   static String formatLocal(DateTime time) {
     final local = time.toLocal();
@@ -51,8 +48,6 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
   String? _loadError;
   bool _busy = false;
   String _message = '';
-  int _interval = BackgroundCollectionPanel.defaultIntervalMinutes;
-  bool _intervalTouched = false;
   final _focus = <String, FocusNode>{};
 
   FocusNode _node(String name) =>
@@ -103,10 +98,11 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
       setState(() {
         _status = status;
         _loadError = null;
-        final installed = status.schedule.intervalMinutes;
-        // A choice the user made and has not applied stays across refreshes.
-        if (installed != null && !_intervalTouched) _interval = installed;
       });
+      if (!keepBusy && widget.announcer != null) {
+        final update = status.autostartUpdate?.takeAnnouncement();
+        if (update != null) await widget.announcer!.announce(update);
+      }
       if (announce) await _tell(_summaryText(status));
     } on Object catch (error) {
       if (!mounted) return;
@@ -143,9 +139,11 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
       final done = await action();
       succeeded = true;
       await _refresh(announce: false, keepBusy: true);
+      _status?.autostartUpdate?.takeAnnouncement();
       await _tell(done);
     } on BackgroundCollectionException catch (error) {
       await _refresh(announce: false, keepBusy: true);
+      _status?.autostartUpdate?.takeAnnouncement();
       await _tell('$failure ${error.message}');
     } on Object {
       await _refresh(announce: false, keepBusy: true);
@@ -204,7 +202,7 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
       children: [
         Text(
           'Collect sessions while the viewer is closed. Hooks add each '
-          'finished turn as it happens; the periodic scan catches anything a '
+          'finished turn as it happens; session collection catches anything a '
           'hook missed and also runs while the viewer is open.',
           style: muted,
         ),
@@ -214,7 +212,7 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
           'settings. Hooks edit your Codex config.toml and Claude Code '
           'settings.json: a backup is kept beside each file, and an existing '
           'Codex notify command is chained, then restored when you remove the '
-          'hook. The periodic scan is a per-user scheduled task.',
+          'hook. Start at sign-in uses a per-user scheduled task.',
           key: const Key('background-explanation'),
           style: muted,
         ),
@@ -422,36 +420,23 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
     const stateKey = Key('background-schedule-state');
     if (!status.scheduleSupported) {
       return _row(
-        label: 'Periodic scan',
+        label: 'Start at sign-in',
         state: 'Not available on this operating system yet.',
         stateKey: stateKey,
         actions: const [],
       );
     }
-    if (schedule.error != null) {
-      return _row(
-        label: 'Periodic scan',
-        state: 'Needs attention: ${schedule.error}',
-        stateKey: stateKey,
-        actions: const [],
-      );
-    }
-    final choices = {
-      ...BackgroundCollectionPanel.intervalChoices,
-      _interval,
-      ?schedule.intervalMinutes,
-    }.toList()..sort();
-    final pending =
-        schedule.installed &&
-        schedule.intervalMinutes != null &&
-        schedule.intervalMinutes != _interval;
     String state;
-    if (!schedule.installed) {
+    if (schedule.error != null) {
+      state = 'Needs attention: ${schedule.error}';
+    } else if (!schedule.installed) {
       state = 'Not scheduled';
     } else {
-      final every = schedule.intervalMinutes == null
-          ? 'Scheduled'
-          : 'Scheduled every ${schedule.intervalMinutes} minutes';
+      final every = schedule.outdated
+          ? 'Needs an update'
+          : !schedule.enabled
+          ? 'Background collection is installed but turned off.'
+          : 'Starts at sign-in; checked every 5 minutes';
       final ran = schedule.running
           ? 'running now'
           : schedule.lastRun == null
@@ -462,70 +447,80 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
                     : schedule.stopped
                     ? 'stopped'
                     : 'succeeded'}';
-      state = '$every; $ran';
+      state = !schedule.enabled || schedule.outdated ? every : '$every; $ran';
     }
     return _row(
-      label: 'Periodic scan',
+      label: 'Start at sign-in',
       state: state,
       stateKey: stateKey,
       details: [
-        if (pending)
-          Semantics(
-            liveRegion: true,
-            container: true,
-            child: const Padding(
-              padding: EdgeInsets.only(top: 4),
-              child: Text(
-                'Not applied yet. Press Update schedule.',
-                key: Key('background-interval-pending'),
-              ),
+        const Text(
+          'Session collection checks for new sessions at the Scan interval (seconds) set in Settings above.',
+        ),
+        if (schedule.outdated && !schedule.enabled)
+          const Text('Background collection is installed but turned off.'),
+        if (status.autostartUpdate case final update?) ...[
+          Text(update.message, key: const Key('background-autostart-update')),
+          if (update.detail case final detail?)
+            Text(detail, key: const Key('background-autostart-detail')),
+          if (update.backupPath case final path?) ...[
+            SelectableText(path, key: const Key('background-backup-path')),
+            AppButton.outlined(
+              key: const Key('background-backup-copy'),
+              icon: const AppSvgIcon(AppIcons.copy),
+              onPressed: _busy ? null : () => _copyPath(path),
+              label: const Text('Copy backup path'),
             ),
-          ),
+          ],
+        ],
       ],
       actions: [
-        Semantics(
-          label: 'Periodic scan interval',
-          container: true,
-          child: DropdownButton<int>(
-            key: const Key('background-interval'),
-            value: _interval,
-            items: [
-              for (final minutes in choices)
-                DropdownMenuItem(
-                  value: minutes,
-                  child: Text('Every $minutes minutes'),
-                ),
-            ],
-            onChanged: _busy
+        if (schedule.installed && !schedule.enabled)
+          AppButton.filled(
+            key: const Key('background-schedule-enable'),
+            icon: const AppSvgIcon(AppIcons.play),
+            focusNode: _node('schedule-enable'),
+            onPressed: _busy
                 ? null
-                : (value) {
-                    if (value != null) {
-                      setState(() {
-                        _interval = value;
-                        _intervalTouched = true;
-                      });
-                    }
-                  },
+                : () => _change(
+                    progress: 'Turning on Background collection…',
+                    failure: 'Could not turn on Background collection.',
+                    focusAfter: 'schedule-install',
+                    focusOnFail: 'schedule-enable',
+                    action: () async {
+                      await widget.collection.enableSchedule();
+                      return 'Background collection was turned on.';
+                    },
+                  ),
+            label: const Text('Turn on'),
           ),
-        ),
         AppButton.filled(
           key: const Key('background-schedule-install'),
           focusNode: _node('schedule-install'),
           onPressed: _busy
               ? null
               : () => _change(
-                  progress: 'Setting the periodic scan…',
-                  failure: 'Could not set the periodic scan.',
+                  progress: 'Setting start at sign-in…',
+                  failure: 'Could not set start at sign-in.',
                   focusAfter: 'schedule-install',
                   focusOnFail: 'schedule-install',
                   action: () async {
-                    await widget.collection.installSchedule(_interval);
-                    if (mounted) setState(() => _intervalTouched = false);
-                    return 'Periodic scan set to every $_interval minutes.';
+                    await widget.collection.installSchedule();
+                    return schedule.installed
+                        ? 'Start at sign-in was updated.'
+                        : 'Start at sign-in was installed.';
                   },
                 ),
           icon: const AppSvgIcon(AppIcons.play),
-          label: Text(schedule.installed ? 'Update schedule' : 'Schedule scan'),
+          label: Text(
+            schedule.outdated ||
+                    schedule.error != null ||
+                    status.autostartUpdate?.error != null
+                ? 'Retry update'
+                : schedule.installed
+                ? 'Reinstall start at sign-in'
+                : 'Install start at sign-in',
+          ),
         ),
         if (schedule.installed)
           AppButton.outlined(
@@ -534,18 +529,17 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
             onPressed: _busy
                 ? null
                 : () => _change(
-                    progress: 'Removing the periodic scan…',
-                    failure: 'Could not remove the periodic scan.',
+                    progress: 'Removing start at sign-in…',
+                    failure: 'Could not remove start at sign-in.',
                     focusAfter: 'schedule-install',
                     focusOnFail: 'schedule-remove',
                     action: () async {
                       await widget.collection.removeSchedule();
-                      if (mounted) setState(() => _intervalTouched = false);
-                      return 'Periodic scan removed.';
+                      return 'Start at sign-in was removed.';
                     },
                   ),
             icon: const AppSvgIcon(AppIcons.cancel),
-            label: const Text('Remove schedule'),
+            label: const Text('Remove start at sign-in'),
           ),
       ],
     );

@@ -20,8 +20,11 @@ class CollectorDisconnectedException implements Exception {
 }
 
 class CollectorRequestException implements Exception {
-  const CollectorRequestException(this.code);
+  const CollectorRequestException(this.code, [this.message = '']);
   final String code;
+  final String message;
+  @override
+  String toString() => 'Collector request failed ($code): $message';
 }
 
 class CollectorPauseUnavailableException implements Exception {
@@ -565,7 +568,10 @@ class ResidentCollectorClient extends ChangeNotifier {
           event['message'] as String? ?? 'Collector disconnected.',
         );
       }
-      throw CollectorRequestException(event['code'] as String? ?? 'unknown');
+      throw CollectorRequestException(
+        event['code'] as String? ?? 'unknown',
+        event['message'] as String? ?? '',
+      );
     }
   }
 
@@ -574,6 +580,36 @@ class ResidentCollectorClient extends ChangeNotifier {
     required void Function(ScanProgress, int) onProgress,
     List<String> claudeRoots = const [],
     bool resolveWslProjects = true,
+    int? parserWorkers,
+  }) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await _scanOnce(
+          cancellation: cancellation,
+          onProgress: onProgress,
+          claudeRoots: claudeRoots,
+          resolveWslProjects: resolveWslProjects,
+          parserWorkers: parserWorkers,
+        );
+      } on CollectorRequestException catch (error) {
+        if (error.code != 'busy' ||
+            attempt >= 2 ||
+            cancellation.isCancellationRequested) {
+          rethrow;
+        }
+        // The failed request is terminal. A new scan reconciles any committed
+        // batches; it must not reuse the previous attempt's counts or request ID.
+        await Future<void>.delayed(Duration(milliseconds: 200 * (attempt + 1)));
+        if (cancellation.isCancellationRequested) rethrow;
+      }
+    }
+  }
+
+  Future<SessionScanResult> _scanOnce({
+    required ScanCancellationToken cancellation,
+    required void Function(ScanProgress, int) onProgress,
+    required List<String> claudeRoots,
+    required bool resolveWslProjects,
     int? parserWorkers,
   }) async {
     final request = _command('scan')

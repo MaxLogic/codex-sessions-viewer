@@ -1,11 +1,30 @@
+use support::Command;
 mod support;
 
 use codex_sessions_collector::resident::{endpoint, instance, protocol};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// Hook latency is measured against the real executable and durable queue.
+// Competing tests in this binary start dozens of residents and fsync-heavy
+// databases. Keep those fixtures parallel, but give the two <1 s measurements
+// an exclusive lane. Concurrency within each test is unchanged.
+static FIXTURE_LOAD: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn ordinary_fixture_lane() -> impl Drop {
+    FIXTURE_LOAD
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn latency_fixture_lane() -> impl Drop {
+    FIXTURE_LOAD
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 trait Wire: Read + Write + Send {}
 impl<T: Read + Write + Send> Wire for T {}
@@ -39,6 +58,7 @@ impl Fixture {
 
 #[test]
 fn scan_request_streams_progress_before_finished_and_done() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.rollout("01a0aaaa-0000-7000-8000-000000000201");
     fixture.start("resident");
@@ -67,6 +87,7 @@ fn scan_request_streams_progress_before_finished_and_done() {
 
 #[test]
 fn scan_request_refuses_missing_relative_or_foreign_context() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -110,6 +131,7 @@ fn await_scanning(fixture: &Fixture) {
 
 #[test]
 fn scan_request_cancel_detaches_one_coalesced_waiter() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.rollout("01a0aaaa-0000-7000-8000-000000000204");
     fixture.start("resident");
@@ -196,6 +218,7 @@ fn scan_request_cancel_detaches_one_coalesced_waiter() {
 
 #[test]
 fn scan_request_cancel_on_same_connection_abandons_a_lease_wait() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.rollout("01a0aaaa-0000-7000-8000-000000000202");
     fixture.start("resident");
@@ -245,6 +268,7 @@ fn scan_request_cancel_on_same_connection_abandons_a_lease_wait() {
 
 #[test]
 fn bridge_pause_abandons_scan_and_resume_starts_no_old_plan() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let sessions = fixture.root.join("codex/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -333,6 +357,7 @@ fn bridge_pause_abandons_scan_and_resume_starts_no_old_plan() {
 
 #[test]
 fn bridge_pause_waits_for_closed_database_and_disconnect_releases() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -388,21 +413,25 @@ fn bridge_pause_waits_for_closed_database_and_disconnect_releases() {
 
 #[test]
 fn bridge_pause_survives_cancel_flood() {
+    let _fixture_load = ordinary_fixture_lane();
     bridge_pause_survives_flood("cancel", 3000, 0, false);
 }
 
 #[test]
 fn bridge_pause_survives_large_id_flood() {
+    let _fixture_load = ordinary_fixture_lane();
     bridge_pause_survives_flood("status", 20, 60_000, false);
 }
 
 #[test]
 fn bridge_pause_survives_oversized_frame() {
+    let _fixture_load = ordinary_fixture_lane();
     bridge_pause_survives_flood("oversized", 1, 70_000, false);
 }
 
 #[test]
 fn bridge_resident_pause_survives_direct_control_flood() {
+    let _fixture_load = ordinary_fixture_lane();
     for (op, count, padding) in [
         ("cancel", 3000, 0),
         ("status", 20, 60_000),
@@ -526,6 +555,7 @@ fn bridge_pause_survives_flood(op: &'static str, count: usize, padding: usize, d
 
 #[test]
 fn bridge_controls_remain_admissible_at_work_capacity() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -644,6 +674,7 @@ fn bridge_controls_remain_admissible_at_work_capacity() {
 
 #[test]
 fn bridge_stalled_stdout_does_not_delay_stdin_eof() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -706,6 +737,7 @@ fn bridge_stalled_stdout_does_not_delay_stdin_eof() {
 
 #[test]
 fn bridge_resident_disconnect_releases_pause_with_full_output_queue() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -743,6 +775,7 @@ fn bridge_resident_disconnect_releases_pause_with_full_output_queue() {
 
 #[test]
 fn bridge_resident_stalled_refusals_isolate_other_clients() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -787,8 +820,32 @@ fn bridge_resident_stalled_refusals_isolate_other_clients() {
     });
     std::thread::sleep(Duration::from_secs(1));
     let started = Instant::now();
-    let status = fixture.cli("status");
-    let shutdown = fixture.cli("stop");
+    let control = |action| {
+        let phase = Instant::now();
+        let output = fixture
+            .command()
+            .env("CODEX_SESSIONS_COLLECTOR_TIMINGS", "1")
+            .args(["resident", action, "--db"])
+            .arg(&fixture.db)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        eprintln!(
+            "independent control {action}_ms={:.3}",
+            phase.elapsed().as_secs_f64() * 1000.0
+        );
+        output
+    };
+    let status = control("status");
+    let shutdown = control("stop");
+    eprintln!(
+        "independent controls completed_ms={:.3}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
     // Stop the fixture before joining the producer, including on a regression.
     for child in &mut fixture.children {
         if child.try_wait().unwrap().is_none() {
@@ -798,6 +855,10 @@ fn bridge_resident_stalled_refusals_isolate_other_clients() {
     }
     let _ = release.send(());
     writer.join().unwrap();
+    eprintln!(
+        "independent controls plus cleanup_ms={:.3}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
     assert!(
         status.status.success(),
         "independent status blocked: {}",
@@ -816,6 +877,7 @@ fn bridge_resident_stalled_refusals_isolate_other_clients() {
 
 #[test]
 fn bridge_starts_absent_resident_relays_and_exits_on_stdin_eof() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     std::fs::create_dir_all(fixture.root.join("Caller-Root")).unwrap();
     support::write_generated_session(
@@ -966,6 +1028,7 @@ fn bridge_starts_absent_resident_relays_and_exits_on_stdin_eof() {
 
 #[test]
 fn bridge_reports_inflight_disconnect_and_reconnects_without_replaying() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.rollout("01a0aaaa-0000-7000-8000-000000000205");
     fixture.start("resident");
@@ -1055,6 +1118,7 @@ fn bridge_reports_inflight_disconnect_and_reconnects_without_replaying() {
 #[cfg(windows)]
 #[test]
 fn bridge_replaces_only_a_positively_incompatible_resident() {
+    let _fixture_load = ordinary_fixture_lane();
     for scenario in [
         "disconnect",
         "malformed",
@@ -1201,25 +1265,96 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
 
 #[cfg(windows)]
 #[test]
+fn worker_identity_rejects_a_stale_process_from_before_the_hook() {
+    let _fixture_load = ordinary_fixture_lane();
+    use std::os::windows::io::AsRawHandle;
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    let (older, _) = process_times(fixture.children[0].as_raw_handle());
+    let mut hook = fixture.command().arg("version").spawn().unwrap();
+    let identity = HookIdentity::capture(&hook);
+    assert!(hook.wait().unwrap().success());
+    let (start, end) = process_times(identity.handle.as_raw_handle());
+    assert!(older < start);
+    assert!(end >= start);
+    assert!(
+        !identity.owns_creation(older),
+        "a stale parent-PID match must not be owned"
+    );
+    assert!(identity.owns_creation(start));
+    assert!(
+        !identity.owns_creation(end + 1),
+        "a reused child PID must not be owned"
+    );
+}
+
+#[test]
+fn replacement_started_after_its_shared_deadline_does_not_become_a_resident() {
+    let _fixture_load = ordinary_fixture_lane();
+    let fixture = Fixture::new();
+    let mut child = fixture
+        .command()
+        .args(["serve-replacement", "--db"])
+        .arg(&fixture.db)
+        .args(["--replacement-deadline-ms", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= until {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("expired replacement remained running");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("resident did not release its instance lock")
+    );
+    assert!(!fixture.cli("status").status.success());
+    assert!(
+        instance::InstanceLock::try_acquire(&fixture.db)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn bridge_replacement_allows_a_slow_shutdown() {
+    let _fixture_load = ordinary_fixture_lane();
     slow_bridge_replacement(6500, false);
 }
 
 #[cfg(windows)]
 #[test]
 fn bridge_replacement_allows_shutdown_near_its_deadline() {
+    let _fixture_load = ordinary_fixture_lane();
     slow_bridge_replacement(9500, false);
 }
 
 #[cfg(windows)]
 #[test]
 fn bridge_replacement_survives_the_viewer_connection_deadline() {
+    let _fixture_load = ordinary_fixture_lane();
     slow_bridge_replacement(6500, true);
 }
 
 #[cfg(windows)]
 #[test]
 fn bridge_replacement_stops_at_the_shutdown_deadline_without_an_orphan() {
+    let _fixture_load = ordinary_fixture_lane();
     slow_bridge_replacement(10500, false);
 }
 
@@ -1283,7 +1418,7 @@ fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
     shutdown_received
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
-    let workers = DetachedWorkers::for_hook(bridge.id());
+    let workers = DetachedWorkers::for_hook(&HookIdentity::capture(&bridge));
     if abandon {
         std::thread::sleep(
             (start + Duration::from_secs(4)).saturating_duration_since(Instant::now()),
@@ -1386,6 +1521,7 @@ fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
 #[cfg(windows)]
 #[test]
 fn database_identity_survives_creation_through_a_junction() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let junction = Junction::new(fixture.root.join("alias"), &fixture.root);
     fixture.db = fixture.root.join("missing/nested/new.sqlite");
@@ -1456,6 +1592,7 @@ fn database_identity_survives_creation_through_a_junction() {
 
 #[test]
 fn alternate_queue_detached_drain_keeps_caller_context_and_retries() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -1489,14 +1626,14 @@ fn alternate_queue_detached_drain_keeps_caller_context_and_retries() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let hook_pid = hook.id();
+    let hook_identity = HookIdentity::capture(&hook);
     let output = hook.wait_with_output().unwrap();
     assert!(output.status.success());
     eprintln!(
         "alternate queue hook returned_ms={:.3}",
         start.elapsed().as_secs_f64() * 1000.0
     );
-    let _workers = DetachedWorkers::for_hook(hook_pid);
+    let _workers = DetachedWorkers::for_hook(&hook_identity);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if std::fs::read_dir(&queue)
@@ -1550,6 +1687,7 @@ fn alternate_queue_detached_drain_keeps_caller_context_and_retries() {
 
 #[test]
 fn alternate_queue_detached_drain_recovers_from_database_unavailability() {
+    let _fixture_load = latency_fixture_lane();
     for unavailable in ["migration", "locked"] {
         eprintln!("detached drain database recovery: {unavailable}");
         let mut fixture = Fixture::new();
@@ -1575,6 +1713,7 @@ fn alternate_queue_detached_drain_recovers_from_database_unavailability() {
             .command()
             .current_dir(&fixture.root)
             .env("CODEX_SESSIONS_COLLECTOR_QUEUE", "alternate-queue")
+            .env("CODEX_SESSIONS_COLLECTOR_TIMINGS", "1")
             .env("CODEX_SESSIONS_COLLECTOR_BUSY_TIMEOUT_MS", "50")
             .args([
                 "codex",
@@ -1590,10 +1729,14 @@ fn alternate_queue_detached_drain_recovers_from_database_unavailability() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let pid = hook.id();
+        let hook_identity = HookIdentity::capture(&hook);
         let output = hook.wait_with_output().unwrap();
         let hook_elapsed = started.elapsed();
-        let _workers = DetachedWorkers::for_hook(pid);
+        eprintln!(
+            "database recovery {unavailable} hook phases:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _workers = DetachedWorkers::for_hook(&hook_identity);
         assert!(output.status.success());
         eprintln!(
             "database recovery {unavailable} hook_returned_ms={:.3}",
@@ -1628,16 +1771,19 @@ fn alternate_queue_detached_drain_recovers_from_database_unavailability() {
 
 #[test]
 fn direct_drain_newer_schema_exits_promptly() {
+    let _fixture_load = ordinary_fixture_lane();
     drain_newer_schema_is_permanent(false, false);
 }
 
 #[test]
 fn direct_drain_newer_schema_after_claim_exits_promptly() {
+    let _fixture_load = ordinary_fixture_lane();
     drain_newer_schema_is_permanent(true, false);
 }
 
 #[test]
 fn alternate_queue_detached_drain_newer_schema_logs_refusal() {
+    let _fixture_load = ordinary_fixture_lane();
     drain_newer_schema_is_permanent(true, true);
 }
 
@@ -1687,9 +1833,9 @@ fn drain_newer_schema_is_permanent(after_claim: bool, detached: bool) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let hook_pid = hook.id();
+    let hook_identity = HookIdentity::capture(&hook);
     assert!(hook.wait_with_output().unwrap().status.success());
-    let _workers = detached.then(|| DetachedWorkers::for_hook(hook_pid));
+    let _workers = detached.then(|| DetachedWorkers::for_hook(&hook_identity));
     let direct = if !detached {
         let child = fixture
             .command()
@@ -1763,6 +1909,7 @@ fn drain_newer_schema_is_permanent(after_claim: bool, detached: bool) {
 
 #[test]
 fn direct_drain_recovers_when_migration_starts_after_claim() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000198";
     fixture.rollout(id);
@@ -1817,6 +1964,7 @@ fn direct_drain_recovers_when_migration_starts_after_claim() {
 
 #[test]
 fn alternate_queue_detached_drain_logs_permanent_refusal() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -1831,9 +1979,9 @@ fn alternate_queue_detached_drain_logs_permanent_refusal() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let pid = hook.id();
+    let hook_identity = HookIdentity::capture(&hook);
     let output = hook.wait_with_output().unwrap();
-    let _workers = DetachedWorkers::for_hook(pid);
+    let _workers = DetachedWorkers::for_hook(&hook_identity);
     assert!(output.status.success());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1904,8 +2052,49 @@ fn wait_for_queue_ingest(fixture: &Fixture, queue: &Path, id: &str) {
     }
 }
 
-// Retain handles to this hook's detached children so a failing test also stops
-// its own retry worker. Never select a process by executable name alone.
+// Hold the original process object across wait_with_output: a numeric parent
+// PID alone can match an old orphan or a process that reused the hook PID.
+struct HookIdentity {
+    pid: u32,
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
+}
+impl HookIdentity {
+    fn capture(child: &Child) -> Self {
+        #[cfg(windows)]
+        use std::os::windows::io::AsHandle;
+        Self {
+            pid: child.id(),
+            #[cfg(windows)]
+            handle: child.as_handle().try_clone_to_owned().unwrap(),
+        }
+    }
+    #[cfg(windows)]
+    fn owns_creation(&self, created: u64) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        let (start, end) = process_times(self.handle.as_raw_handle());
+        created >= start && (end == 0 || created <= end)
+    }
+}
+#[cfg(windows)]
+fn process_times(handle: windows_sys::Win32::Foundation::HANDLE) -> (u64, u64) {
+    use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut start, mut end, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: retained process handle and four writable FILETIME values.
+    assert_ne!(
+        unsafe { GetProcessTimes(handle, &mut start, &mut end, &mut kernel, &mut user) },
+        0
+    );
+    let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+    (ticks(start), ticks(end))
+}
+
+// Detached processes are observed with wait-only handles. Numeric PIDs from
+// IPC or a census never confer termination rights, even after parent checks.
 struct DetachedWorkers {
     #[cfg(windows)]
     handles: Vec<std::os::windows::io::OwnedHandle>,
@@ -1920,11 +2109,11 @@ impl DetachedWorkers {
         {
             use std::os::windows::io::FromRawHandle;
             use windows_sys::Win32::System::Threading::*;
-            // SAFETY: the PID came from this fixture's resident endpoint. A
-            // newly opened handle is retained until shutdown and process exit.
+            // SAFETY: a stale/reused PID is harmless here: the handle has only
+            // query/synchronization rights and is never used for termination.
             let handle = unsafe {
                 OpenProcess(
-                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                     0,
                     pid,
                 )
@@ -1943,15 +2132,21 @@ impl DetachedWorkers {
             Self {}
         }
     }
-    fn for_hook(pid: u32) -> Self {
+    fn for_hook(hook: &HookIdentity) -> Self {
+        let pid = hook.pid;
         #[cfg(windows)]
         {
-            use std::os::windows::{io::FromRawHandle, process::CommandExt};
+            use std::os::windows::io::FromRawHandle;
             use windows_sys::Win32::System::Threading::*;
-            let output = Command::new("powershell.exe")
+            let census_started = Instant::now();
+            let output = support::test_command("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", &format!(
                     "Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}' | Select-Object -ExpandProperty ProcessId")])
                 .creation_flags(0x08000000).output().unwrap();
+            eprintln!(
+                "worker census_ms={:.3}",
+                census_started.elapsed().as_secs_f64() * 1000.0
+            );
             assert!(output.status.success());
             let handles = String::from_utf8(output.stdout)
                 .unwrap()
@@ -1962,9 +2157,7 @@ impl DetachedWorkers {
                     // child can disappear before OpenProcess and is ignored.
                     let handle = unsafe {
                         OpenProcess(
-                            PROCESS_TERMINATE
-                                | PROCESS_QUERY_LIMITED_INFORMATION
-                                | PROCESS_SYNCHRONIZE,
+                            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                             0,
                             pid,
                         )
@@ -1973,7 +2166,14 @@ impl DetachedWorkers {
                         None
                     } else {
                         // SAFETY: OpenProcess returned a new owned handle.
-                        Some(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+                        let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) };
+                        let (created, _) = process_times(handle);
+                        if !hook.owns_creation(created) {
+                            eprintln!("worker census rejected stale parent PID: parent={} candidate={} created={created}", hook.pid, pid);
+                            return None;
+                        }
+                        eprintln!("worker census retained parent={} child={} created={created}", hook.pid, pid);
+                        Some(owned)
                     }
                 })
                 .collect();
@@ -1994,13 +2194,11 @@ impl Drop for DetachedWorkers {
             use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::*};
             for handle in &self.handles {
                 // SAFETY: owned process handle stays valid throughout wait,
-                // optional termination and reap. Only this hook's child is used.
+                // and wait. Status/census PIDs never grant termination authority:
+                // they may have been reused before OpenProcess. Only directly
+                // spawned Child objects elsewhere in this fixture can be killed.
                 let finished = unsafe {
                     let result = WaitForSingleObject(handle.as_raw_handle(), 30_000);
-                    if result != WAIT_OBJECT_0 {
-                        TerminateProcess(handle.as_raw_handle(), 1);
-                        WaitForSingleObject(handle.as_raw_handle(), 5_000);
-                    }
                     result == WAIT_OBJECT_0
                 };
                 if !std::thread::panicking() {
@@ -2009,6 +2207,28 @@ impl Drop for DetachedWorkers {
             }
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn status_pid_handles_cannot_terminate_a_reused_process() {
+    let _fixture_load = ordinary_fixture_lane();
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    // This process belongs to another fixture. Simulate stale IPC returning
+    // its PID: even a successfully opened handle must have no kill authority.
+    let mut other = Fixture::new();
+    other.start("resident");
+    other.ready();
+    let observed = DetachedWorkers::for_pid(other.children[0].id());
+    assert_eq!(observed.handles.len(), 1);
+    // SAFETY: the target is our retained spawned fixture, not an actual user
+    // process. A permissive regression would terminate only this owned child.
+    let result = unsafe { TerminateProcess(observed.handles[0].as_raw_handle(), 1) };
+    assert_eq!(result, 0, "status PID must not confer termination rights");
+    assert!(other.children[0].try_wait().unwrap().is_none());
+    assert!(other.cli("stop").status.success());
+    other.children[0].wait().unwrap();
 }
 
 fn resident_queue_delayed_recovery(restart: bool, legacy_stale_claim: bool) {
@@ -2108,19 +2328,23 @@ fn resident_queue_delayed_recovery(restart: bool, legacy_stale_claim: bool) {
 
 #[test]
 fn resident_queue_retries_without_another_hook() {
+    let _fixture_load = ordinary_fixture_lane();
     resident_queue_delayed_recovery(false, false);
 }
 #[test]
 fn resident_queue_retries_after_resident_restart() {
+    let _fixture_load = ordinary_fixture_lane();
     resident_queue_delayed_recovery(true, false);
 }
 #[test]
 fn resident_queue_legacy_stale_claim_recovers_after_restart() {
+    let _fixture_load = ordinary_fixture_lane();
     resident_queue_delayed_recovery(true, true);
 }
 
 #[test]
 fn shared_queue_new_database_starts_its_own_retry_owner() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut first = Fixture::new();
     first.start("resident");
     first.ready();
@@ -2199,8 +2423,8 @@ struct Junction(PathBuf);
 #[cfg(windows)]
 impl Junction {
     fn new(path: PathBuf, target: &Path) -> Self {
-        let mut command = Command::new("cmd");
-        use std::os::windows::process::CommandExt;
+        let mut command = support::test_command("cmd");
+
         command.creation_flags(0x08000000);
         let output = command
             .args(["/c", "mklink", "/J"])
@@ -2226,6 +2450,7 @@ impl Drop for Junction {
 
 #[test]
 fn database_identity_aliases_share_every_derived_name() {
+    let _fixture_load = ordinary_fixture_lane();
     let fixture = Fixture::new();
     let mut aliases = vec![
         fixture.db.clone(),
@@ -2298,6 +2523,7 @@ fn database_identity_aliases_share_every_derived_name() {
 
 #[test]
 fn hook_with_another_queue_is_processed_without_stranding() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000193";
     fixture.rollout(id);
@@ -2332,6 +2558,7 @@ fn hook_with_another_queue_is_processed_without_stranding() {
 #[cfg(windows)]
 #[test]
 fn hook_database_aliases_are_drained_by_the_one_resident() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000194";
     fixture.rollout(id);
@@ -2377,6 +2604,7 @@ fn hook_database_aliases_are_drained_by_the_one_resident() {
 
 #[test]
 fn cli_scan_and_drain_run_directly_and_wait_for_the_lease() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000195";
     fixture.rollout(id);
@@ -2464,9 +2692,7 @@ impl Fixture {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-        let parent = std::env::var_os("CXV_RESIDENT_TEST_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        let parent = support::temp_dir();
         let root = parent.join(format!(
             "resident-{}-{}-{}",
             std::process::id(),
@@ -2487,20 +2713,10 @@ impl Fixture {
     }
     fn command(&self) -> Command {
         let mut command = support::collector();
-        command
-            .env("LOCALAPPDATA", &self.root)
-            .env("APPDATA", &self.root)
-            .env("XDG_CONFIG_HOME", &self.root)
-            .env("XDG_DATA_HOME", &self.root)
-            .env("USERPROFILE", &self.root)
-            .env("HOME", &self.root)
-            .env("CODEX_HOME", self.root.join("codex"))
-            .env("CODEX_SESSIONS_COLLECTOR_QUEUE", self.root.join("queue"))
-            .env("XDG_RUNTIME_DIR", &self.root)
-            .env("XDG_CACHE_HOME", &self.root);
+        command.profile(&self.root);
+        command.env("CODEX_SESSIONS_COLLECTOR_QUEUE", self.root.join("queue"));
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
         command
@@ -2646,6 +2862,7 @@ impl Fixture {
 
 #[test]
 fn hook_ack_is_validated_and_durable_across_kill_before_claim() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000182";
     fixture.rollout(id);
@@ -2677,6 +2894,7 @@ fn hook_ack_is_validated_and_durable_across_kill_before_claim() {
 
 #[test]
 fn hook_handoff_returns_under_one_second_and_busy_never_counts_as_attempt() {
+    let _fixture_load = latency_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000183";
     fixture.rollout(id);
@@ -2704,6 +2922,7 @@ fn hook_handoff_returns_under_one_second_and_busy_never_counts_as_attempt() {
 
 #[test]
 fn hook_queue_partition_and_notify_path_validation() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     assert!(fixture.hook("other", true).status.success());
     let entry = fixture.entries().pop().unwrap();
@@ -2730,6 +2949,7 @@ fn hook_queue_partition_and_notify_path_validation() {
 
 #[test]
 fn hook_enqueue_only_starts_nothing_and_absent_resident_is_started() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000184";
     fixture.rollout(id);
@@ -2758,6 +2978,7 @@ fn hook_enqueue_only_starts_nothing_and_absent_resident_is_started() {
 
 #[test]
 fn hook_recovery_sweep_drains_legacy_but_leaves_foreign_partition() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000185";
     fixture.rollout(id);
@@ -2795,6 +3016,7 @@ fn hook_recovery_sweep_drains_legacy_but_leaves_foreign_partition() {
 
 #[test]
 fn cli_scan_and_ingest_run_alongside_the_resident() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000186";
     fixture.rollout(id);
@@ -2843,11 +3065,13 @@ fn cli_scan_and_ingest_run_alongside_the_resident() {
 
 #[test]
 fn hook_notify_preempts_a_long_periodic_scan_between_writer_calls() {
+    let _fixture_load = ordinary_fixture_lane();
     preempts_periodic_scan(false);
 }
 
 #[test]
 fn scan_request_ingest_preempts_periodic_scan() {
+    let _fixture_load = ordinary_fixture_lane();
     preempts_periodic_scan(true);
 }
 
@@ -2990,6 +3214,7 @@ fn preempts_periodic_scan(viewer_ingest: bool) {
 
 #[test]
 fn resident_recovery_periodic_rescan_uses_settings_fixed_delay() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let settings = fixture.root.join("settings.toml");
     std::fs::write(
@@ -3042,6 +3267,7 @@ fn resident_recovery_periodic_rescan_uses_settings_fixed_delay() {
 
 #[test]
 fn resident_shutdown_interrupts_a_scan_waiting_for_the_collector_lease() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.rollout("01a0aaaa-0000-7000-8000-000000000189");
     fixture.start("resident");
@@ -3082,6 +3308,7 @@ fn resident_shutdown_interrupts_a_scan_waiting_for_the_collector_lease() {
 
 #[test]
 fn scan_request_coalesces_waiters_into_one_followup_scan() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.rollout("01a0aaaa-0000-7000-8000-000000000190");
     fixture.start("resident");
@@ -3187,6 +3414,10 @@ impl Drop for Fixture {
             })
         }
         assert!(no_links(&self.root));
+        if std::thread::panicking() {
+            eprintln!("failed fixture retained at {}", self.root.display());
+            return;
+        }
         if let Err(error) = std::fs::remove_dir_all(&self.root) {
             eprintln!("fixture cleanup left {}: {error}", self.root.display());
             assert!(std::thread::panicking(), "fixture cleanup failed");
@@ -3196,6 +3427,7 @@ impl Drop for Fixture {
 
 #[test]
 fn protocol_connect_close_preserves_endpoint_and_resident() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let key = instance::database_key(&fixture.db).unwrap();
     for _ in 0..16 {
@@ -3234,6 +3466,7 @@ fn protocol_connect_close_preserves_endpoint_and_resident() {
 
 #[test]
 fn single_instance_eight_concurrent_starters() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let start = Instant::now();
     for _ in 0..8 {
@@ -3284,6 +3517,7 @@ fn single_instance_eight_concurrent_starters() {
 #[cfg(windows)]
 #[test]
 fn single_instance_database_key_uses_absolute_case_normalization() {
+    let _fixture_load = ordinary_fixture_lane();
     // Independently computed with .NET SHA256 over UTF-8 c:\viewer\db.sqlite.
     assert_eq!(
         instance::database_key(Path::new("C:/Viewer/DB.sqlite")).unwrap(),
@@ -3305,6 +3539,7 @@ fn single_instance_database_key_uses_absolute_case_normalization() {
 
 #[test]
 fn bridge_protocol_wire_version_and_validation() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("viewer");
     fixture.ready();
@@ -3373,6 +3608,7 @@ fn bridge_protocol_wire_version_and_validation() {
 
 #[test]
 fn single_instance_hard_kill_releases_lock_and_restarts() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -3388,6 +3624,7 @@ fn single_instance_hard_kill_releases_lock_and_restarts() {
 
 #[test]
 fn single_instance_waits_for_lock_when_no_endpoint_is_available() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let lock = instance::InstanceLock::try_acquire(&fixture.db)
         .unwrap()
@@ -3406,6 +3643,7 @@ fn single_instance_waits_for_lock_when_no_endpoint_is_available() {
 
 #[test]
 fn protocol_missing_database_waits_without_creating_it() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     std::fs::remove_file(&fixture.db).unwrap();
     fixture.start("resident");
@@ -3430,6 +3668,7 @@ fn protocol_missing_database_waits_without_creating_it() {
 
 #[test]
 fn protocol_viewer_idle_exit_after_last_viewer_disconnects() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("viewer");
     fixture.ready();
@@ -3462,6 +3701,7 @@ fn protocol_viewer_idle_exit_after_last_viewer_disconnects() {
 
 #[test]
 fn protocol_pending_migration_recovers_without_writing() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     support::insert_running_usage_migration(&fixture.db);
     fixture.start("resident");
@@ -3496,6 +3736,7 @@ fn protocol_pending_migration_recovers_without_writing() {
 
 #[test]
 fn protocol_saturated_clients_do_not_break_accept_or_shutdown() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -3522,6 +3763,7 @@ fn protocol_saturated_clients_do_not_break_accept_or_shutdown() {
 
 #[test]
 fn protocol_shutdown_interrupts_a_continuously_partial_request() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -3550,6 +3792,7 @@ fn protocol_shutdown_interrupts_a_continuously_partial_request() {
 
 #[test]
 fn protocol_running_resident_newer_schema_exits_three() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let stderr = fixture.root.join("resident.stderr");
     let child = fixture
@@ -3604,6 +3847,7 @@ fn protocol_running_resident_newer_schema_exits_three() {
 
 #[test]
 fn protocol_newer_schema_exits_three() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let conn = rusqlite::Connection::open(&fixture.db).unwrap();
     conn.execute(
@@ -3632,6 +3876,7 @@ fn protocol_newer_schema_exits_three() {
 #[cfg(windows)]
 #[test]
 fn protocol_windows_first_instance_security_and_handle_cleanup() {
+    let _fixture_load = ordinary_fixture_lane();
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::{
         Foundation::*,
@@ -3640,8 +3885,7 @@ fn protocol_windows_first_instance_security_and_handle_cleanup() {
         System::Threading::*,
     };
     if std::env::var_os("CXV_HANDLE_CHECK_CHILD").is_none() {
-        use std::os::windows::process::CommandExt;
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = support::test_command(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "protocol_windows_first_instance_security_and_handle_cleanup",
@@ -3817,6 +4061,7 @@ fn protocol_windows_first_instance_security_and_handle_cleanup() {
 
 #[test]
 fn protocol_cli_info_status_shutdown() {
+    let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
     let info = fixture.cli("info");
     assert!(
@@ -3884,6 +4129,7 @@ fn shutdown_peer(fixture: &Fixture, read_shutdown: bool) -> std::thread::JoinHan
 #[cfg(windows)]
 #[test]
 fn resident_stop_succeeds_after_shutdown_reply_is_lost() {
+    let _fixture_load = ordinary_fixture_lane();
     let fixture = Fixture::new();
     let peer = shutdown_peer(&fixture, true);
     let result = fixture.cli("stop");
@@ -3907,6 +4153,7 @@ fn resident_stop_succeeds_after_shutdown_reply_is_lost() {
 #[cfg(windows)]
 #[test]
 fn resident_stop_succeeds_if_peer_exits_before_shutdown_write() {
+    let _fixture_load = ordinary_fixture_lane();
     let fixture = Fixture::new();
     let peer = shutdown_peer(&fixture, false);
     let result = fixture.cli("stop");
@@ -3926,6 +4173,7 @@ fn resident_stop_succeeds_if_peer_exits_before_shutdown_write() {
 #[cfg(windows)]
 #[test]
 fn resident_stop_times_out_if_disconnected_instance_stays_locked() {
+    let _fixture_load = ordinary_fixture_lane();
     let fixture = Fixture::new();
     let lock = instance::InstanceLock::try_acquire(&fixture.db)
         .unwrap()

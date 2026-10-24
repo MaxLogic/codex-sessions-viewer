@@ -1,4 +1,7 @@
 import 'dart:io';
+import 'dart:async';
+
+import 'app_environment.dart';
 
 import 'package:path/path.dart' as p;
 
@@ -6,6 +9,11 @@ enum AppHostPlatform { windows, macos, linux }
 
 /// The only source of platform-specific app storage and bundled resource paths.
 class AppLocations {
+  static AppLocations? testLocations;
+  static final Object _currentKey = Object();
+
+  static T scoped<T>(AppLocations locations, T Function() body) =>
+      runZoned(body, zoneValues: {_currentKey: locations});
   const AppLocations({
     required this.databaseFile,
     required this.settingsFile,
@@ -33,11 +41,14 @@ class AppLocations {
     throw UnsupportedError('Unsupported application platform');
   }
 
-  factory AppLocations.current() => AppLocations.resolve(
-    platform: currentPlatform,
-    environment: Platform.environment,
-    executablePath: Platform.resolvedExecutable,
-  );
+  factory AppLocations.current() =>
+      Zone.current[_currentKey] as AppLocations? ??
+      testLocations ??
+      AppLocations.resolve(
+        platform: currentPlatform,
+        environment: AppEnvironment.current,
+        executablePath: Platform.resolvedExecutable,
+      );
 
   factory AppLocations.resolve({
     required AppHostPlatform platform,

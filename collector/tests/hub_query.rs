@@ -1,7 +1,7 @@
 mod support;
 
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ fn start(temp: &TempDir) -> Hub {
     )
     .unwrap();
     let url = format!("http://127.0.0.1:{port}");
-    let child = Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
+    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
         .arg(format!("127.0.0.1:{port}"))
         .arg(temp.path().join("hub-data"))
         .arg(config)
@@ -205,7 +205,7 @@ fn remote_query_never_forwards_to_another_hub_with_the_server_credential() {
     .unwrap();
     // The hub process has an owner credential in its environment, which a
     // forwarded `--hub` would send to the chosen destination.
-    let child = Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
+    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
         .arg(format!("127.0.0.1:{port}"))
         .arg(temp.path().join("hub-data"))
         .arg(config)

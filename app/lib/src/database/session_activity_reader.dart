@@ -1,5 +1,5 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:sqlite3/sqlite3.dart';
 
@@ -15,7 +15,7 @@ Future<Map<String, SessionActivityStats>> loadSessionActivity(
 ) {
   final path = databaseFile.path;
   final ids = [...sessionIds];
-  return Isolate.run(() {
+  return AppEnvironment.runIsolate(() {
     final db = sqlite3.open(path, mode: OpenMode.readOnly);
     try {
       db.execute('pragma busy_timeout = $defaultSqliteBusyTimeoutMs');

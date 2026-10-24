@@ -9,17 +9,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
+import test_environment
 
 REPO = Path(__file__).resolve().parents[4]
 
 
 def collector_exe() -> Path:
     """CODEX_SESSIONS_COLLECTOR, else a fresh debug build of the repository."""
-    configured = os.environ.get("CODEX_SESSIONS_COLLECTOR")
+    configured = os.environ.get("CODEX_SESSIONS_COLLECTOR_EXE") or os.environ.get("CODEX_SESSIONS_COLLECTOR")
     if configured:
         return Path(configured)
-    subprocess.run(
+    test_environment.run(
         ["cargo", "build", "--quiet", "--manifest-path", str(REPO / "collector" / "Cargo.toml")],
         check=True,
     )
@@ -99,7 +99,7 @@ def build(database: Path, exe: Path | None = None) -> Path:
     """Create `database` with the fixture sessions and return it."""
     exe = exe or collector_exe()
     lines = "\n".join(json.dumps(record) for record in records())
-    result = subprocess.run(
+    result = test_environment.run(
         [str(exe), "apply", "--standalone", str(database)],
         input=lines,
         capture_output=True,

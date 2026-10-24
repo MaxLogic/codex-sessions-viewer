@@ -1,9 +1,10 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
-import 'scan_scheduler.dart';
+import 'collector_autostart.dart';
 
 enum CollectionHarness {
   codex('codex', 'Codex notify hook'),
@@ -47,6 +48,7 @@ class BackgroundCollectionStatus {
     required this.hooks,
     required this.schedule,
     required this.scheduleSupported,
+    this.autostartUpdate,
     this.lastScanFinishedUtc,
     this.lastCollectionUtc,
   });
@@ -54,6 +56,7 @@ class BackgroundCollectionStatus {
   final Map<CollectionHarness, HookStatus> hooks;
   final ScheduledScanState schedule;
   final bool scheduleSupported;
+  final AutostartUpdate? autostartUpdate;
 
   /// When any scan, from the viewer, a hook or the schedule, last finished.
   final String? lastScanFinishedUtc;
@@ -66,6 +69,7 @@ class BackgroundCollectionStatus {
   /// scheduler, or a scheduled scan that failed on its last run.
   bool get needsAttention =>
       hooks.values.any((hook) => hook.state == HookInstallState.error) ||
+      autostartUpdate?.error != null ||
       schedule.error != null ||
       schedule.lastRunFailed;
 
@@ -83,9 +87,13 @@ class BackgroundCollectionStatus {
       ].whereType<String>().toList() +
       [
         if (scheduleSupported && schedule.error != null)
-          'the periodic scan cannot be checked'
+          'start at sign-in cannot be checked'
         else if (scheduleSupported && !schedule.installed)
-          'the periodic scan is not scheduled'
+          'start at sign-in is not installed'
+        else if (schedule.outdated)
+          'start at sign-in needs an update'
+        else if (schedule.installed && !schedule.enabled)
+          'start at sign-in is turned off'
         else if (schedule.lastRunFailed)
           'the last scheduled scan failed (code ${schedule.lastResult})',
       ];
@@ -101,6 +109,31 @@ class BackgroundCollectionStatus {
         ? BackgroundCollectionSummary.on
         : BackgroundCollectionSummary.partial;
   }
+}
+
+class AutostartUpdate {
+  AutostartUpdate({
+    this.backupPath,
+    this.error,
+    this.detail,
+    this.keptDisabled = false,
+  });
+  final String? backupPath;
+  final String? error;
+  final String? detail;
+  final bool keptDisabled;
+  bool _announced = false;
+  String? takeAnnouncement() {
+    if (_announced) return null;
+    _announced = true;
+    return message;
+  }
+
+  String get message => error != null
+      ? detail != null
+            ? error!
+            : 'Could not update start at sign-in. $error'
+      : 'Start at sign-in was updated. A backup of the previous setting was saved.';
 }
 
 /// A change to the background collection failed; the message is safe to show.
@@ -125,7 +158,9 @@ abstract interface class BackgroundCollection {
   /// whether a previous hook was restored.
   Future<bool> removeHook(CollectionHarness harness);
 
-  Future<void> installSchedule(int intervalMinutes);
+  Future<void> installSchedule();
+
+  Future<void> enableSchedule();
 
   Future<void> removeSchedule();
 }
@@ -141,7 +176,7 @@ Future<ProcessResult> _runCollector(
   String executable,
   List<String> arguments, {
   Map<String, String>? environment,
-}) => Process.run(executable, arguments, environment: environment);
+}) => AppEnvironment.run(executable, arguments, environment: environment);
 
 /// Installs and removes the collector's `setup` hooks and the scheduled scan.
 /// Configuration content never passes through here: the collector edits its
@@ -153,7 +188,7 @@ class CollectorBackgroundCollection implements BackgroundCollection {
     required this.databaseFile,
     required this.settingsFile,
     String? launcherExecutable,
-    ScanScheduler? scheduler,
+    CollectorAutostart? scheduler,
     CollectorCommandRunner? run,
     bool Function(String path)? fileExists,
     this.environment,
@@ -163,7 +198,7 @@ class CollectorBackgroundCollection implements BackgroundCollection {
              p.dirname(collectorExecutable),
              'codex-sessions-scan-launcher.exe',
            ),
-       _scheduler = scheduler ?? ScanScheduler.forCurrentPlatform(),
+       _scheduler = scheduler ?? CollectorAutostart.forCurrentPlatform(),
        _run = run ?? _runCollector,
        _fileExists = fileExists ?? ((path) => File(path).existsSync());
 
@@ -174,9 +209,59 @@ class CollectorBackgroundCollection implements BackgroundCollection {
   final String databaseFile;
   final String settingsFile;
   final Map<String, String>? environment;
-  final ScanScheduler _scheduler;
+  final CollectorAutostart _scheduler;
   final CollectorCommandRunner _run;
   final bool Function(String path) _fileExists;
+
+  AutostartUpdate? _autostartUpdate;
+  Future<void>? _initialization;
+  CollectorAutostartRequest get _request => CollectorAutostartRequest(
+    launcherExecutable: launcherExecutable,
+    databaseFile: databaseFile,
+    settingsFile: settingsFile,
+  );
+
+  /// Called after the first viewer frame; status shares the same single attempt.
+  Future<void> initialize() => _initialization ??= _upgrade();
+
+  Future<void> _upgrade() async {
+    try {
+      final before = await _scheduler.query(expected: _request);
+      if (!before.installed || !before.outdated) {
+        _autostartUpdate = null;
+        return;
+      }
+      if (!_fileExists(launcherExecutable)) {
+        throw const CollectorAutostartException(
+          'A required session collection component is missing. Reinstall Codex Sessions Viewer.',
+        );
+      }
+      final backup = await _scheduler.upgrade(
+        _request,
+        Directory(p.join(p.dirname(databaseFile), 'logs', 'task-backups')),
+      );
+      if (backup != null) {
+        _autostartUpdate = AutostartUpdate(
+          backupPath: backup,
+          keptDisabled: !before.enabled,
+        );
+      }
+    } on CollectorAutostartException catch (error) {
+      _autostartUpdate = AutostartUpdate(
+        error: error.message,
+        backupPath: error.backupPath,
+        detail: error.detail,
+      );
+    } on FileSystemException catch (error) {
+      _autostartUpdate = AutostartUpdate(
+        error: 'The task backup could not be saved: ${error.message}',
+      );
+    } on ProcessException {
+      _autostartUpdate = AutostartUpdate(
+        error: 'The Windows task update could not be started.',
+      );
+    }
+  }
 
   @override
   bool get scheduleSupported => _scheduler.isSupported;
@@ -196,8 +281,8 @@ class CollectorBackgroundCollection implements BackgroundCollection {
       ], environment: environment);
     } on ProcessException {
       throw const BackgroundCollectionException(
-        'The session collector could not be started. Reinstall Codex '
-        'Sessions Viewer so the collector sits next to the viewer.',
+        'Session collection could not be started. Reinstall Codex '
+        'Sessions Viewer to restore its required components.',
       );
     }
     try {
@@ -211,6 +296,7 @@ class CollectorBackgroundCollection implements BackgroundCollection {
 
   @override
   Future<BackgroundCollectionStatus> status() async {
+    await initialize();
     final hooks = <CollectionHarness, HookStatus>{};
     String? lastScan;
     String? lastCollection;
@@ -219,7 +305,7 @@ class CollectorBackgroundCollection implements BackgroundCollection {
       if (report == null) {
         hooks[harness] = const HookStatus(
           HookInstallState.error,
-          detail: 'The collector returned no status.',
+          detail: 'Session collection returned no status.',
         );
         continue;
       }
@@ -264,12 +350,13 @@ class CollectorBackgroundCollection implements BackgroundCollection {
     // A scheduler that cannot be read must not hide the hook rows.
     ScheduledScanState schedule;
     try {
-      schedule = await _scheduler.query();
-    } on ScanSchedulerException catch (error) {
+      schedule = await _scheduler.query(expected: _request);
+    } on CollectorAutostartException catch (error) {
       schedule = ScheduledScanState(installed: false, error: error.message);
     }
     return BackgroundCollectionStatus(
       hooks: hooks,
+      autostartUpdate: _autostartUpdate,
       schedule: schedule,
       scheduleSupported: _scheduler.isSupported,
       lastScanFinishedUtc: lastScan,
@@ -287,7 +374,7 @@ class CollectorBackgroundCollection implements BackgroundCollection {
       throw BackgroundCollectionException(
         error is String
             ? error
-            : 'The collector could not change the configuration.',
+            : 'Session collection could not change the configuration.',
       );
     }
     return report;
@@ -306,23 +393,47 @@ class CollectorBackgroundCollection implements BackgroundCollection {
   }
 
   @override
-  Future<void> installSchedule(int intervalMinutes) async {
+  Future<void> installSchedule() async {
     if (!_fileExists(launcherExecutable)) {
       throw BackgroundCollectionException(
-        'The scan launcher is missing: ${p.basename(launcherExecutable)} '
-        'should sit next to the viewer. Reinstall Codex Sessions Viewer.',
+        'A required session collection component is missing. Reinstall Codex Sessions Viewer.',
       );
     }
     try {
-      await _scheduler.install(
-        ScanScheduleRequest(
-          launcherExecutable: launcherExecutable,
-          databaseFile: databaseFile,
-          settingsFile: settingsFile,
-          intervalMinutes: intervalMinutes,
-        ),
-      );
-    } on ScanSchedulerException catch (error) {
+      if (_autostartUpdate?.error != null) {
+        await _upgrade();
+        if (_autostartUpdate?.error case final error?) {
+          throw BackgroundCollectionException(error);
+        }
+        return;
+      }
+      final current = await _scheduler.query(expected: _request);
+      if (current.installed &&
+          (current.outdated || _autostartUpdate?.error != null)) {
+        await _upgrade();
+        if (_autostartUpdate?.error case final error?) {
+          throw BackgroundCollectionException(error);
+        }
+      } else {
+        await _scheduler.install(
+          CollectorAutostartRequest(
+            launcherExecutable: launcherExecutable,
+            databaseFile: databaseFile,
+            settingsFile: settingsFile,
+            enabled: !current.installed || current.enabled,
+          ),
+        );
+      }
+    } on CollectorAutostartException catch (error) {
+      throw BackgroundCollectionException(error.message);
+    }
+  }
+
+  @override
+  Future<void> enableSchedule() async {
+    try {
+      await _scheduler.enable();
+    } on CollectorAutostartException catch (error) {
       throw BackgroundCollectionException(error.message);
     }
   }
@@ -331,7 +442,7 @@ class CollectorBackgroundCollection implements BackgroundCollection {
   Future<void> removeSchedule() async {
     try {
       await _scheduler.remove();
-    } on ScanSchedulerException catch (error) {
+    } on CollectorAutostartException catch (error) {
       throw BackgroundCollectionException(error.message);
     }
   }

@@ -1,3 +1,5 @@
+import 'test_environment.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -57,21 +59,12 @@ Future<void> deleteCollectorFixture(Directory root) async {
   }
   if (Platform.isWindows) {
     final checked = await _run(
-      'pwsh',
+      r'C:\Program Files\PowerShell\7\pwsh.exe',
       [
         '-NoProfile',
         '-NonInteractive',
-        '-Command',
-        r'''
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-# Exclusive opens catch handles even when they allow deletion. Check the whole
-# fixture before removing any evidence; do not retry or ignore sharing errors.
-foreach ($file in Get-ChildItem -LiteralPath $env:CSV_TEST_FIXTURE_ROOT -Recurse -File) {
-  $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
-  $stream.Dispose()
-}
-''',
+        '-File',
+        p.absolute('test/support/fixture_process_0.ps1'),
       ],
       environment: {'CSV_TEST_FIXTURE_ROOT': path},
     );
@@ -92,7 +85,7 @@ Future<ProcessResult> _run(
   List<String> arguments, {
   Map<String, String>? environment,
 }) async {
-  final process = await Process.start(
+  final process = await startTestProcess(
     executable,
     arguments,
     environment: environment,
@@ -117,20 +110,12 @@ typedef _FixtureProcess = ({int pid, bool resident});
 Future<List<_FixtureProcess>> _fixtureProcesses(String root) async {
   final result = Platform.isWindows
       ? await _run(
-          'pwsh',
+          r'C:\Program Files\PowerShell\7\pwsh.exe',
           [
             '-NoProfile',
             '-NonInteractive',
-            '-Command',
-            r'''
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$root = $env:CSV_TEST_FIXTURE_ROOT.Replace('/', '\').ToLowerInvariant() + '\'
-@(Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -and $_.CommandLine.Replace('/', '\').ToLowerInvariant().Contains($root) } |
-  ForEach-Object { @{pid = [int]$_.ProcessId; resident = ($_.CommandLine -match '\sserve(?:-replacement)?\s')} }) |
-  ConvertTo-Json -Compress
-''',
+            '-File',
+            p.absolute('test/support/fixture_process_1.ps1'),
           ],
           environment: {'CSV_TEST_FIXTURE_ROOT': root},
         )
@@ -162,27 +147,12 @@ Future<void> _waitForExit(Iterable<_FixtureProcess> processes) async {
   if (pids.isEmpty) return;
   if (Platform.isWindows) {
     final result = await _run(
-      'pwsh',
+      r'C:\Program Files\PowerShell\7\pwsh.exe',
       [
         '-NoProfile',
         '-NonInteractive',
-        '-Command',
-        r'''
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$deadline = [DateTime]::UtcNow.AddSeconds(5)
-foreach ($processId in $env:CSV_TEST_FIXTURE_PIDS.Split(',')) {
-  $ownedProcess = Get-Process -Id ([int]$processId) -ErrorAction SilentlyContinue
-  if ($null -eq $ownedProcess) { continue }
-  try {
-    $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-    if (-not $ownedProcess.WaitForExit($remainingMs)) {
-      throw "Fixture leaked process $processId; dispose its client before teardown."
-    }
-  } finally { $ownedProcess.Dispose() }
-}
-exit 0
-''',
+        '-File',
+        p.absolute('test/support/fixture_process_2.ps1'),
       ],
       environment: {'CSV_TEST_FIXTURE_PIDS': pids.join(',')},
     );

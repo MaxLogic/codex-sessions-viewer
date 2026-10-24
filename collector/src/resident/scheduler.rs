@@ -77,6 +77,18 @@ pub(super) fn cli_message(error: cli::CliError) -> String {
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const SWEEP: Duration = Duration::from_secs(30);
 
+fn scan_error(error: &StoreError) -> Value {
+    protocol::error(
+        "",
+        if error.is_database_unavailable() {
+            "busy"
+        } else {
+            "refused"
+        },
+        &error.to_string(),
+    )
+}
+
 struct Entry {
     due: Instant,
 }
@@ -1028,7 +1040,7 @@ impl Scheduler {
             }
             Err(error) => {
                 for waiter in &waiters {
-                    waiter.emit(protocol::error("", "refused", &error.to_string()));
+                    waiter.emit(scan_error(&error));
                 }
                 self.unavailable(error)?;
             }
@@ -1119,6 +1131,20 @@ fn ingest_request(store: &Store, base: &cli::Options, request: &Request) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scan_errors_distinguish_transient_database_contention_from_refusal() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = StoreError::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("database is locked".into()),
+            ));
+            let reply = scan_error(&error);
+            assert_eq!(reply["code"], "busy");
+            assert_eq!(reply["message"], error.to_string());
+        }
+        let error = StoreError::Refused("incompatible database schema".into());
+        assert_eq!(scan_error(&error)["code"], "refused");
+    }
     #[test]
     fn transport_stalled_progress_keeps_terminal_replies() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(32);

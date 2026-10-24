@@ -2,7 +2,7 @@ mod support;
 
 use codex_sessions_collector::price_history::{self, FetchConfig, History, Observation};
 use serde_json::{Value, json};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 use support::TempDir;
 
@@ -25,7 +25,7 @@ fn hub() -> Hub {
     drop(listener);
     let config = temp.path().join("hub.json");
     std::fs::write(&config, json!({"owner_token":"synthetic-pricing-owner-token-123456789","machines":{"machine-a":TOKEN}}).to_string()).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
+    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
         .arg(address.to_string())
         .arg(temp.path().join("data"))
         .arg(config)

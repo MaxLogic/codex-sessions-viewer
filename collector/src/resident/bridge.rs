@@ -50,7 +50,8 @@ fn replace(
     // The viewer can kill this bridge after four seconds. Transfer startup to
     // a detached process *before* asking the old owner to exit. That process
     // waits for exclusion and becomes the successor, independently of stdio.
-    start(context, true)?;
+    super::stop_deadline::remaining(deadline)?;
+    start(context, Some(deadline))?;
     // Identity was positively checked by attach. The old owner can exit before
     // the last frame is read, so replacement waits for exclusion, not delivery.
     let _ = protocol::send(
@@ -59,14 +60,10 @@ fn replace(
     ).and_then(|()| receive_until(reader, deadline));
     let key = instance::database_key(&context.database)?;
     loop {
+        super::stop_deadline::remaining(deadline)?;
         if super::instance_stopped(&context.database)? {
+            super::stop_deadline::remaining(deadline)?;
             return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "resident did not release its instance lock",
-            ));
         }
         // The successor can acquire the lock before this bridge observes its
         // release. A positive successor hello also proves the old owner exited.
@@ -85,6 +82,7 @@ fn replace(
                 && compatible(&hello)
                 && hello["state"] != "stopping"
             {
+                super::stop_deadline::remaining(deadline)?;
                 return Ok(());
             }
         }
@@ -125,9 +123,9 @@ fn receive_until(reader: &mut BufReader<endpoint::Stream>, until: Instant) -> io
     }
 }
 
-fn start(context: &Context, replacement: bool) -> io::Result<()> {
+fn start(context: &Context, replacement_deadline: Option<Instant>) -> io::Result<()> {
     let mut args = vec![
-        if replacement {
+        if replacement_deadline.is_some() {
             "serve-replacement"
         } else {
             "serve"
@@ -138,6 +136,12 @@ fn start(context: &Context, replacement: bool) -> io::Result<()> {
         "--lifetime".into(),
         "viewer".into(),
     ];
+    if let Some(deadline) = replacement_deadline {
+        args.extend([
+            "--replacement-deadline-ms".into(),
+            super::stop_deadline::export(deadline)?.to_string(),
+        ]);
+    }
     if let Some(path) = &context.settings {
         args.extend(["--settings".into(), path.to_string_lossy().into_owned()]);
     }
@@ -260,7 +264,7 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                 };
                 if absent && !started {
                     state(out, "starting", "")?;
-                    start(context, false)?;
+                    start(context, None)?;
                     started = true;
                 } else if Instant::now() >= deadline {
                     return Err(error);

@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -22,7 +23,7 @@ class ProcessWavPlayer implements VoiceOverPlayer {
   _Playback? _active;
 
   static Future<Process> _start(String command, List<String> arguments) =>
-      Process.start(command, arguments, runInShell: false);
+      AppEnvironment.start(command, arguments, runInShell: false);
 
   @override
   Future<bool> play(String wavPath) async {

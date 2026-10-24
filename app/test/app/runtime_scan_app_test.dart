@@ -120,12 +120,25 @@ void main() {
         isTrue,
       );
       final missing = p.join(temp.path, 'codex-sessions-collector.exe');
+      final unavailableClient = ResidentCollectorClient(
+        databaseFile: databaseFile,
+        settingsFile: settingsFile,
+        executable: missing,
+        start: (executable, arguments) async => throw ProcessException(
+          executable,
+          arguments,
+          'Fixture executable is absent',
+          2,
+        ),
+      );
+      addTearDown(unavailableClient.dispose);
       Object? failure;
       try {
         await RuntimeSessionController(
           settingsFile: settingsFile,
           databaseFile: databaseFile,
           collectorExecutable: missing,
+          collectorClient: unavailableClient,
         ).refresh();
       } on Object catch (error) {
         failure = error;
@@ -381,11 +394,16 @@ void main() {
       }
 
       maintenance.addListener(captureCommit);
+      final collector = ResidentCollectorClient(
+        databaseFile: file,
+        settingsFile: settingsFile,
+      );
       final operation =
           RuntimeSessionController(
             settingsFile: settingsFile,
             databaseFile: file,
             writerCoordinator: coordinator,
+            collectorClient: collector,
             scanBatchingPolicy: const ScanBatchingPolicy(
               parsedSessionFlushBatchSize: 1,
               fullRowSnapshotBatchSize: 1,
@@ -417,12 +435,16 @@ void main() {
         }
       } finally {
         await operation.cancel();
+        await collector.dispose();
         await maintenance.stop();
         maintenance.dispose();
         await coordinator.idle;
         await deleteCollectorFixture(temp);
       }
     },
+    // The runner includes migration and isolated native-process teardown;
+    // the scan itself retains its independent 30-second bound above.
+    timeout: const Timeout(Duration(minutes: 2)),
   );
   test('runtime project edits wait for the application writer queue', () async {
     final temp = await Directory.systemTemp.createTemp(
@@ -4532,7 +4554,13 @@ void main() {
       final startup = await _migrateCollectorFixture(databaseFile);
       expect(startup.canStartNormalUi, isTrue);
 
+      final collector = ResidentCollectorClient(
+        databaseFile: databaseFile,
+        settingsFile: settingsFile,
+      );
+      addTearDown(collector.dispose);
       final controller = RuntimeSessionController(
+        collectorClient: collector,
         settingsFile: settingsFile,
         databaseFile: databaseFile,
       );
@@ -4580,6 +4608,9 @@ void main() {
       expect(scanRunStatuses.first, 'succeeded');
       expect(scanRunStatuses.last, 'cancelled');
     },
+    // This native fixture creates 120 files and completes two scans. Full-suite
+    // runs can exceed the runner's 30-second default before all state checks.
+    timeout: const Timeout(Duration(minutes: 2)),
   );
 
   test('background cancellable refresh acknowledges cancellation', () async {
@@ -6086,6 +6117,3 @@ Future<void> _copyTree(Directory from, Directory to) async {
     }
   }
 }
-
-/// A collector process driven by the test: it emits protocol events and
-/// records the stdin lines it receives.

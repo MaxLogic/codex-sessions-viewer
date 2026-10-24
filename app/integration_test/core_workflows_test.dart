@@ -13,10 +13,13 @@ import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
 import '../test/support/collector_fixture.dart';
+import '../test/support/test_environment.dart';
 
 /// Runs against the built collector: set CODEX_SESSIONS_COLLECTOR_EXE to
 /// `collector\target\debug\codex-sessions-collector.exe` (cargo build).
-void main() {
+Future<void> main() => TestEnvironment.testMain(_main);
+
+void _main() {
   test('core local workflows work together on fixtures', () async {
     final temp = await Directory.systemTemp.createTemp('csv_integration_');
     addTearDown(() => deleteCollectorFixture(temp));

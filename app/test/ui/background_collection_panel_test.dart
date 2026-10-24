@@ -3,11 +3,12 @@ import 'package:codex_sessions_viewer/src/ui/widgets/collector_status.dart';
 import '../support/scripted_collector_bridge.dart';
 import 'dart:async';
 import 'dart:io';
+import '../support/autostart_fixture.dart';
 import 'dart:ui' as ui;
 
 import 'package:codex_sessions_viewer/src/accessibility/announcement_service.dart';
 import 'package:codex_sessions_viewer/src/background_collection/background_collection.dart';
-import 'package:codex_sessions_viewer/src/background_collection/scan_scheduler.dart';
+import 'package:codex_sessions_viewer/src/background_collection/collector_autostart.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/settings_screen.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/app_button.dart';
 import 'package:codex_sessions_viewer/src/ui/widgets/background_collection_panel.dart';
@@ -24,6 +25,7 @@ class _FakeCollection implements BackgroundCollection {
     this.supported = true,
     this.claudeDetail,
     this.scan,
+    this.update,
   }) : hooks = {
          CollectionHarness.codex: codex,
          CollectionHarness.claude: claude,
@@ -34,6 +36,7 @@ class _FakeCollection implements BackgroundCollection {
   final bool supported;
   final String? claudeDetail;
   final String? scan;
+  final AutostartUpdate? update;
   final calls = <String>[];
   String? failWith;
   Object? statusFailure;
@@ -61,6 +64,7 @@ class _FakeCollection implements BackgroundCollection {
         ),
       },
       schedule: schedule,
+      autostartUpdate: update,
       scheduleSupported: supported,
       lastScanFinishedUtc: scan,
       lastCollectionUtc: scan,
@@ -88,13 +92,17 @@ class _FakeCollection implements BackgroundCollection {
   }
 
   @override
-  Future<void> installSchedule(int intervalMinutes) async {
-    calls.add('schedule $intervalMinutes');
+  Future<void> installSchedule() async {
+    calls.add('schedule');
     await _work();
-    schedule = ScheduledScanState(
-      installed: true,
-      intervalMinutes: intervalMinutes,
-    );
+    schedule = ScheduledScanState(installed: true, intervalMinutes: 5);
+  }
+
+  @override
+  Future<void> enableSchedule() async {
+    calls.add('enable');
+    await _work();
+    schedule = ScheduledScanState(installed: true, outdated: schedule.outdated);
   }
 
   @override
@@ -225,7 +233,181 @@ void main() {
     }
   });
 
-  testWidgets('off: explains what changes, offers 5-minute default', (
+  for (final disabled in [false, true]) {
+    testWidgets(
+      'outdated task automatically rewrites with backup; disabled=$disabled',
+      (tester) async {
+        final root = (await tester.runAsync(
+          () => Directory.systemTemp.createTemp('cxv185-panel-'),
+        ))!;
+        addTearDown(() => root.delete(recursive: true));
+        final fixture = AutostartFixture(root, enabled: !disabled);
+        // The real startup action completes before opening Settings.
+        await tester.runAsync(fixture.collection.initialize);
+        final semantics = tester.ensureSemantics();
+        final status = (await tester.runAsync(fixture.collection.status))!;
+        await _show(
+          tester,
+          _FakeCollection(
+            schedule: status.schedule,
+            update: status.autostartUpdate,
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(fixture.creates, 1);
+        expect(fixture.backupBeforeCreate, isTrue);
+        expect(
+          find.textContaining('Start at sign-in was updated.'),
+          findsOneWidget,
+        );
+        final node = tester.getSemantics(
+          find.byKey(const Key('background-autostart-update')),
+        );
+        expect(node.flagsCollection.isLiveRegion, isFalse);
+        expect(node.label, isNot(contains(fixture.backups.single.path)));
+        expect(find.byKey(const Key('background-backup-path')), findsOneWidget);
+        expect(
+          RegExp('installed but turned off').allMatches(node.label).length,
+          disabled ? 1 : 0,
+        );
+        debugPrint(
+          'autostart_update label="${node.label}" live_region=${node.flagsCollection.isLiveRegion}',
+        );
+        semantics.dispose();
+      },
+    );
+  }
+  testWidgets('outdated task failure is reported with Retry update', (
+    tester,
+  ) async {
+    final root = (await tester.runAsync(
+      () => Directory.systemTemp.createTemp('cxv185-panel-'),
+    ))!;
+    addTearDown(() => root.delete(recursive: true));
+    final fixture = AutostartFixture(root)..createFailure = 'Access is denied.';
+    await tester.runAsync(fixture.collection.initialize);
+    final status = (await tester.runAsync(fixture.collection.status))!;
+    await _show(
+      tester,
+      _FakeCollection(
+        schedule: status.schedule,
+        update: status.autostartUpdate,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.textContaining('Could not update start at sign-in.'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Access is denied.'), findsOneWidget);
+    expect(find.text('Retry update'), findsOneWidget);
+    expect(fixture.creates, 1);
+  });
+
+  for (final failRestore in [false, true]) {
+    testWidgets('outdated recovery is actionable; failRestore=$failRestore', (
+      tester,
+    ) async {
+      final root = (await tester.runAsync(
+        () => Directory.systemTemp.createTemp('cxv185-panel-'),
+      ))!;
+      addTearDown(() => root.delete(recursive: true));
+      final fixture = AutostartFixture(root)
+        ..disableReplacement = true
+        ..failRestore = failRestore;
+      final status = (await tester.runAsync(fixture.collection.status))!;
+      final message = failRestore
+          ? 'Start at sign-in could not be updated, and the previous setting could not be put back, so it may not run. Choose Retry update. If that fails, import the saved backup shown below in Windows Task Scheduler.'
+          : 'Could not update start at sign-in. The previous setting was restored. Choose Retry update.';
+      final semantics = tester.ensureSemantics();
+      final announcer = await _show(
+        tester,
+        _FakeCollection(
+          schedule: status.schedule,
+          update: status.autostartUpdate,
+        ),
+      );
+      expect(find.text(message), findsOneWidget);
+      final note = tester.getSemantics(
+        find.byKey(const Key('background-autostart-update')),
+      );
+      expect(note.label, contains(message));
+      expect(note.label, isNot(contains(root.path)));
+      expect(note.flagsCollection.isLiveRegion, isFalse);
+      expect(announcer.messages, [message]);
+      expect(announcer.messages.single, isNot(contains(root.path)));
+      expect(find.text('Retry update'), findsOneWidget);
+      expect(find.text('Copy backup path'), findsOneWidget);
+      expect(
+        find.byKey(const Key('background-autostart-detail')),
+        findsOneWidget,
+      );
+      expect(
+        tester
+            .getSemantics(find.byKey(const Key('background-autostart-detail')))
+            .label,
+        contains('could not be verified'),
+      );
+      semantics.dispose();
+    });
+  }
+
+  testWidgets(
+    'outdated upgrade note is announced once across two panel opens',
+    (tester) async {
+      final update = AutostartUpdate(backupPath: r'C:\fixture\previous.xml');
+      final collection = _FakeCollection(
+        schedule: const ScheduledScanState(installed: true),
+        update: update,
+      );
+      final first = await _show(tester, collection);
+      expect(first.messages, [update.message]);
+      expect(first.messages.single, isNot(contains('C:')));
+      final semantics = tester.ensureSemantics();
+      final node = tester.getSemantics(
+        find.byKey(const Key('background-autostart-update')),
+      );
+      expect(node.flagsCollection.isLiveRegion, isFalse);
+      expect(find.text('Copy backup path'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+      final second = await _show(tester, collection);
+      expect(second.messages, isEmpty);
+      semantics.dispose();
+    },
+  );
+  testWidgets('disabled Background collection has an explicit Turn on action', (
+    tester,
+  ) async {
+    final collection = _FakeCollection(
+      schedule: const ScheduledScanState(installed: true, enabled: false),
+    );
+    final announcer = await _show(tester, collection);
+    expect(
+      find.text('Background collection is installed but turned off.'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Turn on'));
+    await tester.pumpAndSettle();
+    expect(collection.calls, ['enable']);
+    expect(announcer.messages.last, 'Background collection was turned on.');
+    expect(collection.schedule.enabled, isTrue);
+  });
+
+  testWidgets('outdated Retry update announces updated rather than installed', (
+    tester,
+  ) async {
+    final collection = _FakeCollection(
+      schedule: const ScheduledScanState(installed: true, outdated: true),
+      update: AutostartUpdate(error: 'Access is denied.'),
+    );
+    final announcer = await _show(tester, collection);
+    await tester.tap(find.text('Retry update'));
+    await tester.pumpAndSettle();
+    expect(collection.calls, ['schedule']);
+    expect(announcer.messages.last, 'Start at sign-in was updated.');
+  });
+
+  testWidgets('off: explains autostart without an interval control', (
     tester,
   ) async {
     await _show(tester, _FakeCollection());
@@ -241,13 +423,7 @@ void main() {
     expect(explanation, contains('scheduled task'));
     expect(_text(tester, 'background-codex-state'), 'Not installed');
     expect(_text(tester, 'background-schedule-state'), 'Not scheduled');
-    expect(find.text('Every 5 minutes'), findsOneWidget);
-    await tester.tap(find.byKey(const Key('background-interval')));
-    await tester.pumpAndSettle();
-    for (final minutes in [5, 15, 30, 60]) {
-      expect(find.text('Every $minutes minutes'), findsWidgets);
-    }
-    expect(find.text('Every 120 minutes'), findsNothing);
+    expect(find.byKey(const Key('background-interval')), findsNothing);
   });
 
   testWidgets('installing shows progress, announces it and keeps focus', (
@@ -272,7 +448,7 @@ void main() {
     expect(
       find.text(
         'Background collection is partly on: '
-        'Claude Code hooks not installed; the periodic scan is not scheduled.',
+        'Claude Code hooks not installed; start at sign-in is not installed.',
       ),
       findsOneWidget,
     );
@@ -325,7 +501,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(
       announcer.messages.last,
-      'Could not set the periodic scan. Access is denied.',
+      'Could not set start at sign-in. Access is denied.',
     );
     expect(_text(tester, 'background-message'), announcer.messages.last);
     expect(_text(tester, 'background-schedule-state'), 'Not scheduled');
@@ -337,46 +513,6 @@ void main() {
       'Could not install Claude Code hooks. Access is denied.',
     );
   });
-
-  testWidgets(
-    'the interval choice is pending until applied and survives refresh',
-    (tester) async {
-      final collection = _FakeCollection(
-        schedule: const ScheduledScanState(installed: true, intervalMinutes: 5),
-      );
-      await _show(tester, collection);
-      expect(
-        find.byKey(const Key('background-interval-pending')),
-        findsNothing,
-      );
-      await tester.tap(find.byKey(const Key('background-interval')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Every 30 minutes').last);
-      await tester.pumpAndSettle();
-      expect(
-        find.text('Not applied yet. Press Update schedule.'),
-        findsOneWidget,
-      );
-      await tester.tap(find.byKey(const Key('background-refresh')));
-      await tester.pumpAndSettle();
-      expect(
-        find.text('Not applied yet. Press Update schedule.'),
-        findsOneWidget,
-      );
-      expect(find.text('Every 30 minutes'), findsOneWidget);
-      await tester.tap(find.byKey(const Key('background-schedule-install')));
-      await tester.pumpAndSettle();
-      expect(collection.calls, ['schedule 30']);
-      expect(
-        find.byKey(const Key('background-interval-pending')),
-        findsNothing,
-      );
-      expect(
-        _text(tester, 'background-schedule-state'),
-        'Scheduled every 30 minutes; has not run yet',
-      );
-    },
-  );
 
   testWidgets('a failed last run needs attention, a running one does not', (
     tester,
@@ -400,7 +536,7 @@ void main() {
     );
     expect(
       _text(tester, 'background-schedule-state'),
-      'Scheduled every 5 minutes; last ran 2026-09-30 20:14, '
+      'Starts at sign-in; checked every 5 minutes; last ran 2026-09-30 20:14, '
       'failed with code 3',
     );
     collection.schedule = ScheduledScanState(
@@ -414,7 +550,7 @@ void main() {
     expect(_text(tester, 'background-summary'), 'Background collection is on.');
     expect(
       _text(tester, 'background-schedule-state'),
-      'Scheduled every 5 minutes; running now',
+      'Starts at sign-in; checked every 5 minutes; running now',
     );
   });
 
@@ -566,26 +702,6 @@ void main() {
     expect(_focusedButton(), const Key('background-refresh'));
   });
 
-  testWidgets('the pending-interval line is announced as a live region', (
-    tester,
-  ) async {
-    final semantics = tester.ensureSemantics();
-    final collection = _FakeCollection(
-      schedule: const ScheduledScanState(installed: true, intervalMinutes: 5),
-    );
-    await _show(tester, collection);
-    await tester.tap(find.byKey(const Key('background-interval')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Every 15 minutes').last);
-    await tester.pumpAndSettle();
-    final pending = tester.getSemantics(
-      find.byKey(const Key('background-interval-pending')),
-    );
-    expect(pending.flagsCollection.isLiveRegion, isTrue);
-    expect(pending.label, 'Not applied yet. Press Update schedule.');
-    semantics.dispose();
-  });
-
   testWidgets('a folder that cannot be opened is announced', (tester) async {
     final collection = _FakeCollection(
       claude: HookInstallState.error,
@@ -617,7 +733,7 @@ void main() {
     expect(_text(tester, 'background-summary'), 'Background collection is on.');
     expect(
       _text(tester, 'background-schedule-state'),
-      'Scheduled every 5 minutes; last ran 2026-09-30 20:14, stopped',
+      'Starts at sign-in; checked every 5 minutes; last ran 2026-09-30 20:14, stopped',
     );
   });
 
@@ -641,43 +757,39 @@ void main() {
     expect(_focusedButton(), const Key('background-codex-remove'));
   });
 
-  testWidgets('semantics: live summary, named buttons and interval control', (
-    tester,
-  ) async {
-    final semantics = tester.ensureSemantics();
-    final collection = _FakeCollection(codex: HookInstallState.installed);
-    await _show(tester, collection);
-    final summary = tester.getSemantics(
-      find.byKey(const Key('background-summary')),
-    );
-    expect(
-      summary.label,
-      'Background collection is partly on: Claude Code hooks not installed; '
-      'the periodic scan is not scheduled.',
-    );
-    expect(summary.flagsCollection.isLiveRegion, isTrue);
-    final remove = tester.getSemantics(
-      find.byKey(const Key('background-codex-remove')),
-    );
-    expect(remove.label, contains('Remove Codex notify hook'));
-    expect(remove.flagsCollection.isButton, isTrue);
-    expect(remove.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
-    final install = tester.getSemantics(
-      find.byKey(const Key('background-claude-install')),
-    );
-    expect(install.label, contains('Install Claude Code hooks'));
-    final interval = tester.getSemantics(
-      find.bySemanticsLabel(RegExp('Periodic scan interval')),
-    );
-    expect(interval.label, contains('Periodic scan interval'));
-    expect(interval.label, contains('Every 5 minutes'));
-    expect(interval.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
-    final message = tester.getSemantics(
-      find.byKey(const Key('background-message')),
-    );
-    expect(message.flagsCollection.isLiveRegion, isTrue);
-    semantics.dispose();
-  });
+  testWidgets(
+    'semantics: live summary and named buttons without interval control',
+    (tester) async {
+      final semantics = tester.ensureSemantics();
+      final collection = _FakeCollection(codex: HookInstallState.installed);
+      await _show(tester, collection);
+      final summary = tester.getSemantics(
+        find.byKey(const Key('background-summary')),
+      );
+      expect(
+        summary.label,
+        'Background collection is partly on: Claude Code hooks not installed; '
+        'start at sign-in is not installed.',
+      );
+      expect(summary.flagsCollection.isLiveRegion, isTrue);
+      final remove = tester.getSemantics(
+        find.byKey(const Key('background-codex-remove')),
+      );
+      expect(remove.label, contains('Remove Codex notify hook'));
+      expect(remove.flagsCollection.isButton, isTrue);
+      expect(remove.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
+      final install = tester.getSemantics(
+        find.byKey(const Key('background-claude-install')),
+      );
+      expect(install.label, contains('Install Claude Code hooks'));
+      expect(find.byKey(const Key('background-interval')), findsNothing);
+      final message = tester.getSemantics(
+        find.byKey(const Key('background-message')),
+      );
+      expect(message.flagsCollection.isLiveRegion, isTrue);
+      semantics.dispose();
+    },
+  );
 
   testWidgets('a narrow window stacks each row instead of overflowing', (
     tester,
@@ -709,173 +821,256 @@ void main() {
 
   // Headless screenshots for the UX review. Set CXV_EVIDENCE_DIR to write them.
   final evidenceDir = Platform.environment['CXV_EVIDENCE_DIR'];
-  testWidgets(
-    'evidence: panel screenshots per state',
-    skip: evidenceDir == null,
-    (tester) async {
-      await tester.runAsync(() async {
-        final loader = FontLoader('Segoe UI');
-        loader.addFont(
-          File(
-            r'C:\Windows\Fonts\segoeui.ttf',
-          ).readAsBytes().then((b) => ByteData.view(b.buffer)),
-        );
-        await loader.load();
-      });
-      Future<void> shoot(
-        String name,
-        _FakeCollection collection, {
-        Brightness brightness = Brightness.light,
-        double width = 1100,
-        Future<void> Function()? act,
-      }) async {
-        final key = GlobalKey();
-        tester.view.physicalSize = Size(width, 760);
-        tester.view.devicePixelRatio = 1;
-        addTearDown(tester.view.reset);
-        await tester.pumpWidget(
-          RepaintBoundary(
-            key: key,
-            child: MaterialApp(
-              theme: ThemeData(
+  testWidgets('evidence: panel screenshots per state', skip: evidenceDir == null, (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final loader = FontLoader('Segoe UI');
+      loader.addFont(
+        File(
+          r'C:\Windows\Fonts\segoeui.ttf',
+        ).readAsBytes().then((b) => ByteData.view(b.buffer)),
+      );
+      await loader.load();
+    });
+    Future<void> shoot(
+      String name,
+      _FakeCollection collection, {
+      Brightness brightness = Brightness.light,
+      bool highContrast = false,
+      double width = 1100,
+      Future<void> Function()? act,
+    }) async {
+      final key = GlobalKey();
+      tester.view.physicalSize = Size(width, 760);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        RepaintBoundary(
+          key: key,
+          child: MaterialApp(
+            theme: ThemeData(
+              brightness: brightness,
+              fontFamily: 'Segoe UI',
+              colorScheme: ColorScheme.fromSeed(
+                seedColor: Colors.blueGrey,
                 brightness: brightness,
-                fontFamily: 'Segoe UI',
-                colorSchemeSeed: Colors.blueGrey,
+                contrastLevel: highContrast ? 1 : 0,
               ),
-              home: Scaffold(
-                body: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Settings / Background collection',
-                          style: TextStyle(fontSize: 20),
-                        ),
-                        const SizedBox(height: 12),
-                        BackgroundCollectionPanel(
-                          collection: collection,
-                          onOpenFolder: (_) async {},
-                        ),
-                      ],
-                    ),
+            ),
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(context).copyWith(highContrast: highContrast),
+              child: child!,
+            ),
+            home: Scaffold(
+              body: Padding(
+                padding: const EdgeInsets.all(24),
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Settings / Background collection',
+                        style: TextStyle(fontSize: 20),
+                      ),
+                      const SizedBox(height: 12),
+                      BackgroundCollectionPanel(
+                        collection: collection,
+                        onOpenFolder: (_) async {},
+                      ),
+                    ],
                   ),
                 ),
               ),
             ),
           ),
-        );
-        await tester.pumpAndSettle();
-        await act?.call();
-        await tester.runAsync(() async {
-          final boundary =
-              key.currentContext!.findRenderObject() as RenderRepaintBoundary;
-          final image = await boundary.toImage();
-          final data = await image.toByteData(format: ui.ImageByteFormat.png);
-          await File(
-            '$evidenceDir/$name.png',
-          ).writeAsBytes(data!.buffer.asUint8List());
-        });
-      }
+        ),
+      );
+      await tester.pumpAndSettle();
+      await act?.call();
+      await tester.runAsync(() async {
+        final boundary =
+            key.currentContext!.findRenderObject() as RenderRepaintBoundary;
+        final image = await boundary.toImage();
+        final data = await image.toByteData(format: ui.ImageByteFormat.png);
+        await File(
+          '$evidenceDir/$name.png',
+        ).writeAsBytes(data!.buffer.asUint8List());
+      });
+    }
 
-      final ran = DateTime(2026, 9, 30, 20, 14, 44);
-      const scan = '2026-09-30T18:14:44.000Z';
-      await shoot('background-off', _FakeCollection());
-      await shoot(
-        'background-installed',
-        _FakeCollection(
-          codex: HookInstallState.installed,
-          claude: HookInstallState.installed,
-          schedule: ScheduledScanState(
-            installed: true,
-            intervalMinutes: 5,
-            lastRun: ran,
-            lastResult: 0,
+    for (final failRestore in [false, true]) {
+      final root = (await tester.runAsync(
+        () => Directory.systemTemp.createTemp('cxv185-panel-'),
+      ))!;
+      addTearDown(() => root.delete(recursive: true));
+      final fixture = AutostartFixture(root)
+        ..disableReplacement = true
+        ..failRestore = failRestore;
+      final status = (await tester.runAsync(fixture.collection.status))!;
+      for (final dark in [false, true]) {
+        await shoot(
+          'background-recovery-${failRestore ? 'failed' : 'restored'}-${dark ? 'dark' : 'light'}',
+          _FakeCollection(
+            schedule: status.schedule,
+            update: status.autostartUpdate,
           ),
-          scan: scan,
+          brightness: dark ? Brightness.dark : Brightness.light,
+          highContrast: dark,
+        );
+      }
+    }
+    final ran = DateTime(2026, 9, 30, 20, 14, 44);
+    const scan = '2026-09-30T18:14:44.000Z';
+    await shoot('background-off', _FakeCollection());
+    await shoot(
+      'background-updated',
+      _FakeCollection(
+        schedule: const ScheduledScanState(installed: true),
+        update: AutostartUpdate(
+          backupPath:
+              r'C:\AppData\CodexSessionViewer\logs\task-backups\background-collection-2026-10-23.xml',
         ),
-      );
-      await shoot(
-        'background-partial',
-        _FakeCollection(
-          codex: HookInstallState.installed,
-          claude: HookInstallState.outdated,
-          schedule: ScheduledScanState(
-            installed: true,
-            intervalMinutes: 15,
-            lastRun: ran,
-            lastResult: 0,
+      ),
+    );
+    await shoot(
+      'background-updated-disabled',
+      _FakeCollection(
+        schedule: const ScheduledScanState(installed: true, enabled: false),
+        update: AutostartUpdate(
+          backupPath:
+              r'C:\AppData\CodexSessionViewer\logs\task-backups\background-collection-2026-10-23.xml',
+          keptDisabled: true,
+        ),
+      ),
+    );
+    await shoot(
+      'background-outdated-retry',
+      _FakeCollection(
+        schedule: const ScheduledScanState(installed: true, outdated: true),
+        update: AutostartUpdate(
+          error: 'Task Scheduler refused the task: Access is denied.',
+        ),
+      ),
+    );
+
+    for (final dark in [false, true]) {
+      for (final contrast in [false, true]) {
+        if (!dark && !contrast) continue;
+        final suffix =
+            '${dark ? 'dark' : 'light'}${contrast ? '-high-contrast' : ''}';
+        await shoot(
+          'background-updated-disabled-$suffix',
+          _FakeCollection(
+            schedule: const ScheduledScanState(installed: true, enabled: false),
+            update: AutostartUpdate(
+              backupPath:
+                  r'C:\AppData\CodexSessionViewer\logs\task-backups\previous.xml',
+              keptDisabled: true,
+            ),
           ),
-          scan: scan,
-        ),
-        act: () async {
-          await tester.tap(find.byKey(const Key('background-interval')));
-          await tester.pumpAndSettle();
-          await tester.tap(find.text('Every 30 minutes').last);
-          await tester.pumpAndSettle();
-        },
-      );
-      await shoot(
-        'background-attention-failed-run',
-        _FakeCollection(
-          codex: HookInstallState.installed,
-          claude: HookInstallState.installed,
-          schedule: ScheduledScanState(
-            installed: true,
-            intervalMinutes: 5,
-            lastRun: ran,
-            lastResult: 3,
+          brightness: dark ? Brightness.dark : Brightness.light,
+          highContrast: contrast,
+        );
+        await shoot(
+          'background-outdated-retry-$suffix',
+          _FakeCollection(
+            schedule: const ScheduledScanState(installed: true, outdated: true),
+            update: AutostartUpdate(
+              error: 'Windows could not update the setting. Access is denied.',
+            ),
           ),
-          scan: scan,
+          brightness: dark ? Brightness.dark : Brightness.light,
+          highContrast: contrast,
+        );
+      }
+    }
+    await shoot(
+      'background-installed',
+      _FakeCollection(
+        codex: HookInstallState.installed,
+        claude: HookInstallState.installed,
+        schedule: ScheduledScanState(
+          installed: true,
+          intervalMinutes: 5,
+          lastRun: ran,
+          lastResult: 0,
         ),
-      );
-      await shoot(
-        'background-error-config-path',
-        _FakeCollection(
-          codex: HookInstallState.installed,
-          claude: HookInstallState.error,
-          claudeDetail:
-              'invalid Claude JSON; repair configuration before setup',
+        scan: scan,
+      ),
+    );
+    await shoot(
+      'background-partial',
+      _FakeCollection(
+        codex: HookInstallState.installed,
+        claude: HookInstallState.outdated,
+        schedule: ScheduledScanState(
+          installed: true,
+          intervalMinutes: 15,
+          lastRun: ran,
+          lastResult: 0,
         ),
-      );
-      await shoot(
-        'background-focus-after-install',
-        _FakeCollection(),
-        act: () async {
-          await tester.tap(find.byKey(const Key('background-codex-install')));
-          await tester.pumpAndSettle();
-        },
-      );
-      await shoot(
-        'background-keyboard-focus-ring',
-        _FakeCollection(),
-        act: () async {
-          // Keyboard highlight mode: the ring shows on the surviving button.
-          FocusManager.instance.highlightStrategy =
-              FocusHighlightStrategy.alwaysTraditional;
-          addTearDown(
-            () => FocusManager.instance.highlightStrategy =
-                FocusHighlightStrategy.automatic,
-          );
-          await tester.tap(find.byKey(const Key('background-codex-install')));
-          await tester.pumpAndSettle();
-          expect(_focusedButton(), const Key('background-codex-remove'));
-        },
-      );
-      await shoot(
-        'background-narrow',
-        _FakeCollection(
-          codex: HookInstallState.installed,
-          claude: HookInstallState.notInstalled,
+        scan: scan,
+      ),
+    );
+    await shoot(
+      'background-attention-failed-run',
+      _FakeCollection(
+        codex: HookInstallState.installed,
+        claude: HookInstallState.installed,
+        schedule: ScheduledScanState(
+          installed: true,
+          intervalMinutes: 5,
+          lastRun: ran,
+          lastResult: 3,
         ),
-        width: 560,
-      );
-      await shoot(
-        'background-unsupported-dark',
-        _FakeCollection(codex: HookInstallState.installed, supported: false),
-        brightness: Brightness.dark,
-      );
-    },
-  );
+        scan: scan,
+      ),
+    );
+    await shoot(
+      'background-error-config-path',
+      _FakeCollection(
+        codex: HookInstallState.installed,
+        claude: HookInstallState.error,
+        claudeDetail: 'invalid Claude JSON; repair configuration before setup',
+      ),
+    );
+    await shoot(
+      'background-focus-after-install',
+      _FakeCollection(),
+      act: () async {
+        await tester.tap(find.byKey(const Key('background-codex-install')));
+        await tester.pumpAndSettle();
+      },
+    );
+    await shoot(
+      'background-keyboard-focus-ring',
+      _FakeCollection(),
+      act: () async {
+        // Keyboard highlight mode: the ring shows on the surviving button.
+        FocusManager.instance.highlightStrategy =
+            FocusHighlightStrategy.alwaysTraditional;
+        addTearDown(
+          () => FocusManager.instance.highlightStrategy =
+              FocusHighlightStrategy.automatic,
+        );
+        await tester.tap(find.byKey(const Key('background-codex-install')));
+        await tester.pumpAndSettle();
+        expect(_focusedButton(), const Key('background-codex-remove'));
+      },
+    );
+    await shoot(
+      'background-narrow',
+      _FakeCollection(
+        codex: HookInstallState.installed,
+        claude: HookInstallState.notInstalled,
+      ),
+      width: 560,
+    );
+    await shoot(
+      'background-unsupported-dark',
+      _FakeCollection(codex: HookInstallState.installed, supported: false),
+      brightness: Brightness.dark,
+    );
+  });
 }

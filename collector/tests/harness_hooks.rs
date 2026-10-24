@@ -2,9 +2,10 @@
 //! executable: hooks queue work, drains ingest it, and scans reconcile.
 
 mod support;
+use support::Command;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
@@ -51,26 +52,20 @@ impl Env {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = collector();
+        command.profile(self.temp.path());
         command
             .args(args)
             .env("CODEX_SESSIONS_COLLECTOR_QUEUE", &self.queue)
-            .env("LOCALAPPDATA", self.temp.path())
-            .env("APPDATA", self.temp.path())
-            .env("XDG_CONFIG_HOME", self.temp.path())
-            .env("XDG_DATA_HOME", self.temp.path())
-            .env("USERPROFILE", self.temp.path())
-            .env("HOME", self.temp.path())
-            .env("XDG_RUNTIME_DIR", self.temp.path())
-            .env("XDG_CACHE_HOME", self.temp.path())
             .arg("--db")
             .arg(&self.db)
             .arg("--windows-root")
             .arg(&self.codex_home)
             .args(["--wsl-root", "", "--no-wsl-projects", "--claude-root"])
-            .arg(&self.claude_root);
+            .arg(&self.claude_root)
+            .arg("--wsl-unc-root")
+            .arg(self.temp.path().join("wsl-root"));
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
         command
@@ -85,19 +80,11 @@ impl Env {
         if !drain {
             args.push("--no-drain");
         }
-        let mut child = self
+        let child = self
             .command(&args)
-            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        use std::io::Write as _;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(event.to_string().as_bytes())
+            .spawn_with_input(&event.to_string())
             .unwrap();
         child.wait_with_output().unwrap()
     }
@@ -639,7 +626,7 @@ fn codex_notify_keeps_the_previous_notify_command_running() {
         "notify",
         "--no-drain",
         "--previous-notify",
-        "[\"C:\\\\missing\\\\notify.exe\"]",
+        &json!([env.temp.path().join("missing-notify.exe")]).to_string(),
         &notify_payload(thread),
     ]);
     assert!(output.status.success());
@@ -665,7 +652,6 @@ fn codex_notify_keeps_the_previous_notify_command_running() {
 #[test]
 #[cfg(unix)]
 fn detached_work_outlives_the_hook_process_group_on_unix() {
-    use std::os::unix::process::CommandExt;
     let env = Env::new("detached-group");
     let marker = env.temp.path().join("survived");
     let script = format!("sleep 1; echo alive > '{}'", marker.display());
@@ -691,7 +677,7 @@ fn detached_work_outlives_the_hook_process_group_on_unix() {
     assert!(child.wait_with_output().unwrap().status.success());
     // With the detached work in its own group the hook's group is already
     // empty, so `kill` may report that nothing matched.
-    let _ = Command::new("kill")
+    let _ = support::test_command("kill")
         .args(["-KILL", "--", &group])
         .stderr(Stdio::null())
         .status();

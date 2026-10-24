@@ -96,19 +96,26 @@ def group_alive(pgid):
             except (OSError, ValueError, IndexError):
                 continue
         return False
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except ProcessLookupError:
-        return False
+    # On other POSIX hosts the deliberately unreaped leader can be a zombie.
+    # A signal-0 probe would count that zombie as live forever. System ps only
+    # supplies group/state metadata; no command lines or user files are read.
+    rows = subprocess.run(['/bin/ps', '-axo', 'pgid=,stat='], check=True,
+                          capture_output=True, text=True).stdout.splitlines()
+    return any(int(fields[0]) == pgid and not fields[1].startswith('Z')
+               for line in rows if len(fields := line.split()) == 2)
 
 
 def stop_group(job, grace):
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(job.pid), "/T", "/F"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=30, check=False)
+        # Popen retains the original Windows process handle. A PID/tree kill
+        # could select a replacement process after the original child exits.
+        job.kill()
     else:
+        # The runner leaves its original session leader unreaped until group
+        # cleanup finishes. Its PID/PGID cannot be reused during this window.
+        # Never signal a numeric group after that ownership token was reaped.
+        if job.returncode is not None:
+            return
         try:
             os.killpg(job.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -153,6 +160,8 @@ class Runner:
         print(f"==> {name}", flush=True)
         with log.open("wb") as output:
             try:
+                if os.name != 'nt' and not all(hasattr(os, key) for key in ('waitid', 'WNOWAIT')):
+                    raise OSError('Safe process-group cleanup requires waitid/WNOWAIT')
                 options = {"start_new_session": True} if os.name != "nt" else {
                     "creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
                 job = subprocess.Popen([str(x) for x in args], cwd=cwd, env=env,
@@ -162,9 +171,16 @@ class Runner:
                 record["pid"] = job.pid
                 until = start + self.deadline
                 while True:
-                    code = job.poll()
+                    if os.name == 'nt':
+                        code = job.poll()
+                    else:
+                        # Observe without reaping: retain the original PID as
+                        # a kernel-owned token even if its descendants outlive it.
+                        exited = os.waitid(os.P_PID, job.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        code = None if exited is None else exited.si_status if exited.si_code == os.CLD_EXITED else -exited.si_status
                     alive = group_alive(job.pid) if os.name != "nt" else code is None
                     if code is not None and not alive:
+                        code = job.wait()
                         break
                     if time.monotonic() >= until:
                         expired = True

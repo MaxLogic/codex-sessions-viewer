@@ -1,6 +1,8 @@
 @TestOn('windows')
 library;
 
+import '../support/test_environment.dart';
+
 import '../support/collector_fixture.dart';
 
 import 'dart:io';
@@ -79,7 +81,7 @@ void main() {
       ['codex', 'scan'],
       ['claude', 'scan', '--claude-root', claudeRoot.path],
     ]) {
-      final result = await Process.run(executable, [
+      final result = await runTestProcess(executable, [
         ...harness,
         '--no-wsl-projects',
         '--settings',
@@ -264,16 +266,16 @@ Future<String> _collector() async {
   if (override != null && override.isNotEmpty) {
     return override;
   }
-  final build = await Process.run('cargo', [
+  final build = await runTestProcess('cargo', [
     'build',
     '--quiet',
     '--manifest-path',
-    p.join('..', 'collector', 'Cargo.toml'),
+    p.absolute('..', 'collector', 'Cargo.toml'),
     '--bin',
     'codex-sessions-collector',
   ]);
   expect(build.exitCode, 0, reason: '${build.stdout}\n${build.stderr}');
-  return p.join(
+  return p.absolute(
     '..',
     'collector',
     'target',

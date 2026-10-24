@@ -29,7 +29,7 @@ impl Fixture {
             harness,
         }
     }
-    fn command(&self, action: &str) -> std::process::Command {
+    fn command(&self, action: &str) -> support::Command {
         let mut cmd = collector();
         cmd.args([self.harness, action, "--json", "--root"])
             .arg(&self.root)
@@ -151,7 +151,7 @@ fn absent_or_unreadable_root_and_invalid_config_are_actionable_and_secret_safe()
 
 #[test]
 fn explicit_hub_verification_authenticates_without_uploads_and_preserves_local_status() {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
     let f = Fixture::new("codex");
     f.setup();
@@ -170,7 +170,7 @@ fn explicit_hub_verification_authenticates_without_uploads_and_preserves_local_s
         }
     }
     let mut server = Server(
-        Command::new(env!("CARGO_BIN_EXE_codex-sessions-hub"))
+        support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
             .arg(address.to_string())
             .arg(&data)
             .arg(&config)
@@ -274,15 +274,13 @@ fn text_diagnostics_and_json_usage_errors_are_useful_without_secret_disclosure()
             .contains("needs a value")
     );
     f.setup();
-    let report = f.run(
-        "verify",
-        &[
-            "--check-hub",
-            "--hub-url",
-            "https://private-user:private-password@example.invalid",
-        ],
-        1,
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "https://private-user:private-password@{}",
+        listener.local_addr().unwrap()
     );
+    support::own_endpoint(&url);
+    let report = f.run("verify", &["--check-hub", "--hub-url", &url], 1);
     assert!(!report.to_string().contains("private-password"));
     assert_eq!(report["local_ok"], true);
 }
@@ -319,9 +317,7 @@ fn hook_registration_preserves_root_kinds_and_rejects_ambiguous_codex_roots() {
 #[test]
 #[cfg(windows)]
 fn generated_hooks_execute_and_queue_synthetic_events_on_windows() {
-    use std::io::Write;
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     for harness in ["codex", "claude"] {
         let f = Fixture::new(harness);
         f.setup();
@@ -334,7 +330,7 @@ fn generated_hooks_execute_and_queue_synthetic_events_on_windows() {
                 .iter()
                 .map(|v| v.as_str().unwrap().to_owned())
                 .collect();
-            let mut cmd = Command::new(&args[0]);
+            let mut cmd = support::test_command(&args[0]);
             cmd.args(&args[1..])
                 .arg("--no-drain")
                 .arg(r#"{"type":"agent-turn-complete","thread-id":"synthetic-hook"}"#);
@@ -344,21 +340,24 @@ fn generated_hooks_execute_and_queue_synthetic_events_on_windows() {
             let command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap();
-            let mut cmd = Command::new("cmd.exe");
+            let mut cmd = support::test_command("cmd.exe");
             cmd.args(["/D", "/S", "/C"])
                 .raw_arg(format!("\"{command} --no-drain\""));
             cmd
         };
-        let mut child = cmd
+        let input = if harness == "claude" {
+            serde_json::json!({"session_id":"synthetic-hook", "hook_event_name":"Stop",
+                "transcript_path":f.root.join("transcript.jsonl")})
+            .to_string()
+        } else {
+            String::new()
+        };
+        let child = cmd
             .env("CODEX_SESSIONS_COLLECTOR_QUEUE", &f.queue)
-            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_with_input(&input)
             .unwrap();
-        if harness == "claude" {
-            child.stdin.take().unwrap().write_all(br#"{"session_id":"synthetic-hook","hook_event_name":"Stop","transcript_path":"C:/synthetic/transcript.jsonl"}"#).unwrap();
-        }
         let result = child.wait_with_output().unwrap();
         assert!(
             result.status.success(),

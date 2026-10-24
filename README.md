@@ -80,8 +80,22 @@ Pending migrations, VACUUM and exclusive viewer maintenance request a collection
 A collector started by the viewer exits 30 seconds after the last viewer disconnects
 when its pending work is complete. A hook or login launcher keeps the resident alive
 for collection while the viewer is closed. Hook installation and Windows task
-registration remain managed by the Background collection panel; the login-task
-upgrade is a separate step.
+registration remain managed by the Background collection panel. On Windows the
+per-user task starts the resident at login, with a five-minute watchdog, no
+execution time limit and one task instance at a time. Rescan timing uses Scan
+interval (seconds) in Settings, independently of the watchdog.
+
+On first viewer start after an upgrade, an installed outdated task is updated
+automatically. The old XML is saved with a timestamp under the app data folder
+in `logs/task-backups` before replacement. A disabled task stays disabled. The
+panel reports the result and offers Retry update on failure. If verification
+fails, the previous setting is restored and verified; a failed restore includes
+the backup location. A Turn on action explicitly enables a disabled setting. No task is created
+unless you install autostart. Hook registration is unchanged. macOS and Linux
+autostart currently report unsupported. Release builds identify and verify the running process before requesting
+shutdown over the same connection. A session collection process from another
+installation is left running. Remaining processes inside the selected output
+folder are stopped before copying; `scripts/build_windows.ps1 -OutputDirectory <folder>` selects that folder.
 
 ## Configuration
 

@@ -27,6 +27,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
+$script:benchmarkEnvironment = New-TestEnvironment
 
 function ConvertTo-CommandLineArgument {
   param([Parameter(Mandatory = $true)][string]$Value)
@@ -41,23 +43,8 @@ function Invoke-SampledProcess {
     [Parameter(Mandatory = $true)][string]$WorkingDirectory
   )
 
-  $argumentText = (($Arguments | ForEach-Object {
-        ConvertTo-CommandLineArgument -Value $_
-      }) -join ' ')
-  $startInfo = [Diagnostics.ProcessStartInfo]::new()
-  $startInfo.FileName = $Executable
-  $startInfo.Arguments = $argumentText
-  $startInfo.WorkingDirectory = $WorkingDirectory
-  $startInfo.UseShellExecute = $false
-  $startInfo.CreateNoWindow = $true
-  $startInfo.RedirectStandardOutput = $true
-  $startInfo.RedirectStandardError = $true
-  $process = [Diagnostics.Process]::new()
-  $process.StartInfo = $startInfo
   $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-  if (-not $process.Start()) {
-    throw "Failed to start $Executable."
-  }
+  $process = Start-TestProcess -Context $script:benchmarkEnvironment -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -RedirectOutput
   $stdoutTask = $process.StandardOutput.ReadToEndAsync()
   $stderrTask = $process.StandardError.ReadToEndAsync()
   $peakPrivateBytes = [int64]0
@@ -88,7 +75,8 @@ function Invoke-SampledProcess {
   }
   finally {
     if (-not $process.HasExited) {
-      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      $process.Kill()
+      $process.WaitForExit()
     }
     $process.Dispose()
   }
@@ -216,6 +204,7 @@ function Invoke-ProbeRun {
     [Parameter(Mandatory = $true)][int]$BatchSize
   )
 
+  if (-not (Test-Path -LiteralPath $AppDirectory -PathType Container)) { throw 'Benchmark app directory is missing.' }
   $resultFile = Join-Path $WorkDirectory 'result.json'
   $sample = Invoke-SampledProcess `
     -Executable $ProbeExecutable `
@@ -228,7 +217,7 @@ function Invoke-ProbeRun {
       '--sql-root', $SqlRoot,
       '--result', $resultFile
     ) `
-    -WorkingDirectory $AppDirectory
+    -WorkingDirectory $script:benchmarkEnvironment.Root
   if ($sample.ExitCode -ne 0) {
     throw "Memory probe failed with exit code $($sample.ExitCode). $($sample.Stderr.Trim())"
   }
@@ -336,7 +325,7 @@ if ($Mode -eq 'InternalSelfTestChild') {
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$resultsDirectory = Join-Path $repoRoot '.agents\benchmark-results'
+$resultsDirectory = $script:benchmarkEnvironment.Root
 New-Item -ItemType Directory -Path $resultsDirectory -Force | Out-Null
 
 if ($Mode -eq 'SelfTest') {
@@ -344,15 +333,15 @@ if ($Mode -eq 'SelfTest') {
   $baseline = Invoke-SampledProcess `
     -Executable $hostExecutable `
     -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Mode', 'InternalSelfTestChild', '-ChildExitCode', '0', '-ChildAllocationMb', '0') `
-    -WorkingDirectory $repoRoot
+    -WorkingDirectory $script:benchmarkEnvironment.Root
   $allocated = Invoke-SampledProcess `
     -Executable $hostExecutable `
     -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Mode', 'InternalSelfTestChild', '-ChildExitCode', '0', '-ChildAllocationMb', '32') `
-    -WorkingDirectory $repoRoot
+    -WorkingDirectory $script:benchmarkEnvironment.Root
   $failure = Invoke-SampledProcess `
     -Executable $hostExecutable `
     -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Mode', 'InternalSelfTestChild', '-ChildExitCode', '7') `
-    -WorkingDirectory $repoRoot
+    -WorkingDirectory $script:benchmarkEnvironment.Root
   $allocationDelta = $allocated.PeakPrivateBytes - $baseline.PeakPrivateBytes
   if ($baseline.ExitCode -ne 0 -or $allocated.ExitCode -ne 0 -or $allocationDelta -lt 24MB -or $failure.ExitCode -ne 7) {
     throw (

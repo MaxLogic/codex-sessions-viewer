@@ -1,5 +1,5 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
-import 'dart:isolate';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -3117,7 +3117,7 @@ _SessionTextFilterResult _matchSessionTextFilters(
 Future<_SessionTextFilterResult> _runSessionTextFilterOnWorker(
   _SessionTextFilterRequest request,
 ) {
-  return Isolate.run(() => _matchSessionTextFilters(request));
+  return AppEnvironment.runIsolate(() => _matchSessionTextFilters(request));
 }
 
 class _SessionHierarchy {

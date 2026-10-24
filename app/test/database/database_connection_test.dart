@@ -1,3 +1,5 @@
+import '../support/test_environment.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -318,7 +320,7 @@ Future<_ActorProcess> _startActor(
     'helpers',
     'database_process_actor.dart',
   ].join(Platform.pathSeparator);
-  final process = await Process.start(_dartExecutable(), [
+  final process = await startTestProcess(_dartExecutable(), [
     '--packages=.dart_tool/package_config.json',
     helper,
     databaseFile.path,

@@ -19,12 +19,15 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import sqlite3
+from contextlib import closing
 
 REPO = Path(__file__).resolve().parents[1]
 SKILL = REPO / "docs" / "skills" / "session-history"
 LAUNCHER = SKILL / "scripts" / "session_history.py"
 sys.path.insert(0, str(SKILL / "evals"))
 import fixture  # noqa: E402
+import test_environment  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -45,7 +48,7 @@ def documented_commands(text: str) -> list[list[str]]:
 
 
 def run_launcher(exe: Path, db: Path, args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    return test_environment.run(
         [sys.executable, str(LAUNCHER), "--exe", str(exe), "--db", str(db), *args],
         capture_output=True,
         text=True,
@@ -75,13 +78,11 @@ def main() -> int:
         )
 
     exe = fixture.collector_exe()
-    with tempfile.TemporaryDirectory(prefix="verify-session-query-") as temp:
+    with tempfile.TemporaryDirectory(prefix="verify-session-query-", dir=test_environment.ROOT) as temp:
         db = fixture.build(Path(temp) / "fixture.sqlite", exe)
         # Settle the WAL so the fingerprint covers all committed content.
-        subprocess.run(
-            [sys.executable, "-c", f"import sqlite3; c=sqlite3.connect(r'{db}'); c.execute('pragma wal_checkpoint(TRUNCATE)'); c.close()"],
-            check=True,
-        )
+        with closing(sqlite3.connect(db)) as connection:
+            connection.execute('pragma wal_checkpoint(TRUNCATE)')
         before = fingerprint(db)
 
         status = json.loads(run_launcher(exe, db, ["status"]).stdout)

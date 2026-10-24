@@ -1,3 +1,5 @@
+import 'test_environment.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -49,7 +51,7 @@ class HubFixture {
   }
 
   Future<void> restart() async {
-    _process = await Process.start(executable, [
+    _process = await startTestProcess(executable, [
       '127.0.0.1:$port',
       p.join(root.path, 'data'),
       p.join(root.path, 'hub.json'),
@@ -75,6 +77,7 @@ class HubFixture {
       const Duration(seconds: 10),
       onTimeout: () => throw StateError('Hub failed to start: $errors'),
     );
+    TestEnvironment.current.ownEndpoint(Uri.parse(url));
     while (true) {
       try {
         await request('/v1/health');

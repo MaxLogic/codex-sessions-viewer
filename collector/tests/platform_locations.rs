@@ -1,3 +1,4 @@
+mod support;
 use codex_sessions_collector::platform_locations::{HostPlatform, PlatformLocations};
 use std::path::Path;
 
@@ -7,7 +8,7 @@ fn normalized(path: &Path) -> String {
 
 #[test]
 fn windows_defaults_and_adjacent_settings() {
-    let temp = std::env::temp_dir().join(format!("cxv-locations-{}", std::process::id()));
+    let temp = support::temp_dir().join(format!("cxv-locations-{}", std::process::id()));
     std::fs::create_dir_all(&temp).unwrap();
     let exe = temp.join("viewer.exe");
     std::fs::write(temp.join("settings.toml"), "").unwrap();

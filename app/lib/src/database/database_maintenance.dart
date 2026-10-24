@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
@@ -686,7 +687,7 @@ final class DatabaseMaintenanceCoordinator {
     });
 
     try {
-      await Isolate.spawn(
+      await AppEnvironment.spawnIsolate(
         _databaseMaintenanceWorkerEntry,
         _DatabaseMaintenanceWorkerRequest(
           databaseFilePath: databaseFile.path,

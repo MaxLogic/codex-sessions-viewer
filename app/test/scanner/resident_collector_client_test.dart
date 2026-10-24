@@ -1,3 +1,5 @@
+import '../support/test_environment.dart';
+
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
@@ -114,7 +116,7 @@ void main(List<String> args) {
         settingsFile: File('fixture.toml'),
         start: (_, _) async {
           if (processes.isNotEmpty) expect(firstReaped, isTrue);
-          final process = await Process.start(dart, [
+          final process = await startTestProcess(dart, [
             script.path,
             if (processes.isNotEmpty) 'ready',
           ]);
@@ -276,6 +278,108 @@ void main(List<String> args) {
       } finally {
         await client.dispose();
       }
+    },
+  );
+
+  test(
+    'scan retries a busy writer without retaining partial attempt counts',
+    () async {
+      final ids = <String>[];
+      bridge.onRequest = (request) {
+        if (request['op'] != 'scan') return;
+        final id = request['id'] as String;
+        ids.add(id);
+        if (ids.length == 1) {
+          bridge.emit({
+            'id': id,
+            'event': 'progress',
+            'harness': 'codex',
+            'counts': {'files_parsed': 1},
+            'sessions_written': 1,
+          });
+          bridge.emit({
+            'id': id,
+            'event': 'error',
+            'code': 'busy',
+            'message': 'SQLite error 5 (DatabaseBusy): database is locked',
+          });
+        } else {
+          bridge.emit({
+            'id': id,
+            'event': 'finished',
+            'command': 'codex scan',
+            'files_parsed': 2,
+            'sessions_written': 2,
+            'persistence_flushes': 1,
+            'errors': [],
+          });
+          bridge.emit({'id': id, 'event': 'done', 'cancelled': false});
+        }
+      };
+      final result = await client.scan(
+        cancellation: ScanCancellationController().token,
+        onProgress: (_, _) {},
+      );
+      expect(ids, hasLength(2));
+      expect(ids.toSet(), hasLength(2));
+      expect(result.progress.filesParsed, 2);
+      expect(client.persistenceFlushCount, 1);
+    },
+  );
+
+  for (final code in [
+    'busy',
+    'refused',
+    'bad_request',
+    'unsupported_version',
+  ]) {
+    test('scan bounds $code failures and preserves their diagnostic', () async {
+      var attempts = 0;
+      bridge.onRequest = (request) {
+        if (request['op'] != 'scan') return;
+        attempts++;
+        bridge.emit({
+          'id': request['id'],
+          'event': 'error',
+          'code': code,
+          'message': 'specific failure cause',
+        });
+      };
+      await expectLater(
+        client.scan(
+          cancellation: ScanCancellationController().token,
+          onProgress: (_, _) {},
+        ),
+        throwsA(
+          isA<CollectorRequestException>()
+              .having((error) => error.code, 'code', code)
+              .having(
+                (error) => error.toString(),
+                'diagnostic',
+                contains('specific failure cause'),
+              ),
+        ),
+      );
+      expect(attempts, code == 'busy' ? 3 : 1);
+    });
+  }
+
+  test(
+    'cancellation during busy backoff does not start another scan',
+    () async {
+      final cancellation = ScanCancellationController();
+      var attempts = 0;
+      bridge.onRequest = (request) {
+        if (request['op'] != 'scan') return;
+        attempts++;
+        bridge.emit({'id': request['id'], 'event': 'error', 'code': 'busy'});
+        Timer(const Duration(milliseconds: 50), cancellation.cancel);
+      };
+      await expectLater(
+        client.scan(cancellation: cancellation.token, onProgress: (_, _) {}),
+        throwsA(isA<CollectorRequestException>()),
+      );
+      expect(attempts, 1);
     },
   );
 

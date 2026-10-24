@@ -16,6 +16,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/'scripts/test_support'))
+import isolated_process as test_environment  # noqa: E402
 EXAMPLE = ROOT / "samples/collector-contract/example_collector.py"
 FIXTURE = ROOT / "samples/collector-contract/session.json"
 CONTRACT_DOC = ROOT / "docs/collectors/contract-v1.md"
@@ -33,9 +35,8 @@ def check(condition: bool, message: str) -> None:
 
 
 def run(*args: object) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return test_environment.run(
         [str(arg) for arg in args],
-        cwd=ROOT,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -108,10 +109,10 @@ def documented_commands(folder: Path) -> None:
 
 def main() -> int:
     succeeded(
-        run("cargo", "build", "--locked", "--manifest-path", "collector/Cargo.toml"),
+        run("cargo", "build", "--locked", "--manifest-path", str(ROOT / "collector/Cargo.toml")),
         "cargo build",
     )
-    with tempfile.TemporaryDirectory(prefix="collector_contract_") as name:
+    with tempfile.TemporaryDirectory(prefix="collector_contract_", dir=test_environment.ROOT) as name:
         folder = Path(name)
         documented_commands(folder)
 

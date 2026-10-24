@@ -1,3 +1,4 @@
+import '../support/test_environment.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -19,7 +20,11 @@ void main() {
   test(
     'reprices a fixed sample of partitions and reports the rate',
     () {
+      TestEnvironment.current.guard(path!);
       final settingsPath = Platform.environment['CSV_REPRICE_BENCH_SETTINGS'];
+      if (settingsPath != null) {
+        TestEnvironment.current.guard(settingsPath);
+      }
       final settings = settingsPath == null
           ? AppSettings.defaults().pricing
           : AppSettings.fromTomlMap(
@@ -30,7 +35,7 @@ void main() {
             Platform.environment['CSV_REPRICE_BENCH_SAMPLE'] ?? '',
           ) ??
           20;
-      final db = openFileBackedDatabase(File(path!), maintenanceWriter: true);
+      final db = openFileBackedDatabase(File(path), maintenanceWriter: true);
       addTearDown(db.close);
       db.execute('delete from usage_cost_dirty_partitions');
       db.execute(

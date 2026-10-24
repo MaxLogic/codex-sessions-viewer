@@ -79,7 +79,7 @@ use codex_sessions_collector::{
 };
 use std::{
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, atomic::AtomicBool, mpsc},
     time::Instant,
 };
@@ -478,7 +478,7 @@ fn l3_process_death_releases_the_lease_without_unlinking() {
     let temp = support::TempDir::new("lease_process");
     let path = temp.path().join("db.sqlite");
     let store = Store::open(&path, OwnerMode::Standalone).unwrap();
-    let mut command = Command::new(std::env::current_exe().unwrap());
+    let mut command = support::test_command(std::env::current_exe().unwrap());
     command
         .args(["--exact", "lease_child_helper", "--nocapture"])
         .env("CSV_TEST_LEASE_CHILD", &path)
@@ -486,7 +486,6 @@ fn l3_process_death_releases_the_lease_without_unlinking() {
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
     let mut child = command.spawn().unwrap();

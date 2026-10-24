@@ -2,7 +2,7 @@
 mod support;
 use codex_sessions_collector::resident::instance;
 use std::{
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -10,25 +10,17 @@ use std::{
 fn launcher_is_the_resident_and_killing_it_releases_ownership() {
     let temp = support::TempDir::new("launcher-resident");
     let db = support::viewer_database(&temp);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-sessions-scan-launcher"));
+    let mut command = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-scan-launcher"));
+    command.profile(temp.path());
     command
         .args(["--db"])
         .arg(&db)
-        .env("LOCALAPPDATA", temp.path())
-        .env("APPDATA", temp.path())
         .env("CODEX_SESSIONS_COLLECTOR_QUEUE", temp.path().join("queue"))
-        .env("XDG_CACHE_HOME", temp.path())
-        .env("XDG_CONFIG_HOME", temp.path())
-        .env("XDG_RUNTIME_DIR", temp.path())
-        .env("USERPROFILE", temp.path())
-        .env("HOME", temp.path())
-        .env("CODEX_HOME", temp.path().join("codex"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
     struct Child(std::process::Child);
@@ -44,9 +36,6 @@ fn launcher_is_the_resident_and_killing_it_releases_ownership() {
         let output = support::collector()
             .args(["resident", "status", "--db"])
             .arg(&db)
-            .env("XDG_RUNTIME_DIR", temp.path())
-            .env("HOME", temp.path())
-            .env("XDG_CACHE_HOME", temp.path())
             .output()
             .unwrap();
         if output.status.success() {

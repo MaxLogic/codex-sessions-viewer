@@ -1,3 +1,4 @@
+import 'package:codex_sessions_viewer/src/platform/app_environment.dart';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -93,7 +94,7 @@ void main() {
   test('reports free bytes and one stable volume for the home folder and '
       'a missing nested folder', () async {
     final home =
-        Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'];
+        AppEnvironment.current['USERPROFILE'] ?? AppEnvironment.current['HOME'];
     expect(home, isNotNull);
     final existing = probe.probe(Directory(home!));
     expect(existing.availableBytes, greaterThan(0));

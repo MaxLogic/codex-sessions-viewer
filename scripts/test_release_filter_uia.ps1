@@ -5,17 +5,21 @@ param(
     [ValidateRange(5, 120)][int]$TimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
+Write-Output 'SKIPPED: packaged UIA startup requires Registry/Task Scheduler virtualization; profile environment isolation alone cannot protect native stores. Headless Flutter semantics coverage remains enabled.'
+return
+$testEnvironment = New-TestEnvironment
 
 
 if (-not $ReleaseDirectory) { $ReleaseDirectory = Join-Path $PSScriptRoot '..\release\package' }
 $python = Get-Command python -ErrorAction SilentlyContinue
 if ($null -eq $python) { throw 'Windows Python with the uiautomation package is required.' }
-& $python.Source -c "import sys; assert sys.platform == 'win32'; import uiautomation" 2>$null
+Invoke-TestProcess -Context $testEnvironment -FilePath $python.Source -ArgumentList @('-c', "import sys; assert sys.platform == 'win32'; import uiautomation") 2>$null
 if ($LASTEXITCODE -ne 0) { throw 'Windows Python with the uiautomation package is required. Install it in the Python environment used by this command.' }
 $release = (Resolve-Path -LiteralPath $ReleaseDirectory).Path
 $sourceExe = Join-Path $release 'codex_session_viewer.exe'
 if (-not (Test-Path -LiteralPath $sourceExe)) { throw "Missing packaged executable: $sourceExe" }
-$runRoot = Join-Path ([IO.Path]::GetTempPath()) ('csv-uia-smoke-' + [guid]::NewGuid().ToString('N'))
+$runRoot = $testEnvironment.Root
 $appDirectory = Join-Path $runRoot 'app'
 $process = $null
 try {
@@ -42,15 +46,8 @@ use_external_pricing = false
 enabled = false
 "@
     [IO.File]::WriteAllText((Join-Path $appDirectory 'settings.toml'), $settings, (New-Object Text.UTF8Encoding($false)))
-    $start = New-Object System.Diagnostics.ProcessStartInfo
-    $start.FileName = Join-Path $appDirectory 'codex_session_viewer.exe'
-    $start.WorkingDirectory = $appDirectory
-    $start.UseShellExecute = $false
-    $start.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-    $start.EnvironmentVariables['APPDATA'] = Join-Path $runRoot 'roaming'
-    $start.EnvironmentVariables['LOCALAPPDATA'] = Join-Path $runRoot 'local'
-    $start.EnvironmentVariables['USERPROFILE'] = Join-Path $runRoot 'profile'
-    $process = [System.Diagnostics.Process]::Start($start)
+    $process = Start-TestProcess -Context $testEnvironment -FilePath (Join-Path $appDirectory 'codex_session_viewer.exe') -WorkingDirectory $appDirectory
+    $start = $process.StartInfo
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $process.Refresh()
@@ -102,16 +99,15 @@ for name, value in [('Project filter', 'All projects'), ('Model filter', 'All mo
     print(f'PASS: {name}; Button; enabled; onscreen; Invoke opened menu; selection closed menu; value={actual}', flush=True)
 '@
     [IO.File]::WriteAllText($probePath, $probeSource, (New-Object Text.UTF8Encoding($false)))
-    & $python.Source -E $probePath $process.MainWindowHandle $TimeoutSeconds
+    Invoke-TestProcess -Context $testEnvironment -FilePath $python.Source -ArgumentList @('-E', $probePath, [string]$process.MainWindowHandle, [string]$TimeoutSeconds)
     if ($LASTEXITCODE -ne 0) { throw "UIA probe failed with exit code $LASTEXITCODE." }
     Write-Output "PASS: packaged executable SHA256=$((Get-FileHash -LiteralPath $start.FileName -Algorithm SHA256).Hash)"
     Write-Output "PASS: packaged Dart payload SHA256=$((Get-FileHash -LiteralPath (Join-Path $appDirectory 'data\app.so') -Algorithm SHA256).Hash)"
 }
 finally {
-    if ($null -ne $process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit() }
-    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
-    $resolvedRun = [IO.Path]::GetFullPath($runRoot)
-    if (-not $resolvedRun.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Refusing cleanup outside temporary directory.' }
+    if ($null -ne $process -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+    $resolvedRun = $testEnvironment.Root
+    Assert-TestPath -Context $testEnvironment -LiteralPath $resolvedRun
     if (Test-Path -LiteralPath $resolvedRun) {
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
             try { Remove-Item -LiteralPath $resolvedRun -Recurse -Force; break }

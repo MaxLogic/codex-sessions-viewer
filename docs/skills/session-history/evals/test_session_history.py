@@ -8,6 +8,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import importlib.util
+import test_environment
 
 HERE = Path(__file__).resolve().parent
 # The schema the collector creates is the newest migration in sql/migration.
@@ -21,13 +24,23 @@ EXE = fixture.collector_exe()
 
 
 class HistoryTests(unittest.TestCase):
+    def test_system_locations_and_endpoints_fail_before_spawn(self):
+        for key in test_environment.SYSTEM_KEYS:
+            with self.assertRaisesRegex(RuntimeError, 'system'):
+                test_environment.validate_system({**test_environment.ENV, key: str(test_environment.ROOT/'poison-system')})
+        for url in ('https://example.invalid','http://127.0.0.1:12345'):
+            with mock.patch.object(test_environment.subprocess, 'run') as spawn:
+                with self.assertRaisesRegex(RuntimeError, 'endpoint'):
+                    test_environment.run([str(EXE), 'query', 'status', '--db', str(test_environment.ROOT/'probe.sqlite'), '--hub', url])
+                spawn.assert_not_called()
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='session-history-test-')
+        self.temp = tempfile.TemporaryDirectory(prefix='history-', dir=test_environment.ROOT)
         self.addCleanup(self.temp.cleanup)
         self.db = fixture.build(Path(self.temp.name) / 'history space.sqlite', EXE)
 
     def invoke(self, *args, expected=0):
-        result = subprocess.run(
+        result = test_environment.run(
             [sys.executable, str(SCRIPT), '--exe', str(EXE), '--db', str(self.db), *args],
             capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, expected, result.stderr)
@@ -90,7 +103,7 @@ class HistoryTests(unittest.TestCase):
         self.invoke('search', '--query', 'queue', '--limit', '999', expected=2)
 
     def test_leading_options_in_either_form(self):
-        result = subprocess.run(
+        result = test_environment.run(
             [sys.executable, str(SCRIPT), '--exe', str(EXE), f'--db={self.db}', '--format', 'text',
              'search', '--query', 'shutdown queue', '--limit', '1'],
             capture_output=True, text=True, encoding='utf-8')
@@ -99,7 +112,7 @@ class HistoryTests(unittest.TestCase):
 
     def test_missing_and_old_schema(self):
         missing = Path(self.temp.name) / 'absent.sqlite'
-        result = subprocess.run(
+        result = test_environment.run(
             [sys.executable, str(SCRIPT), '--exe', str(EXE), '--db', str(missing), 'status'],
             capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 1)
@@ -112,7 +125,7 @@ class HistoryTests(unittest.TestCase):
             db.commit()
         finally:
             db.close()
-        result = subprocess.run(
+        result = test_environment.run(
             [sys.executable, str(SCRIPT), '--exe', str(EXE), '--db', str(unrelated), 'status'],
             capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 3)
@@ -142,46 +155,55 @@ class HistoryTests(unittest.TestCase):
         self.assertIn('Atlas renamed', names)
 
 
-def wsl_available():
-    try:
-        return subprocess.run(['wsl.exe', '-e', 'python3', '--version'], capture_output=True,
-                              timeout=60).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
 def to_wsl(path):
     drive, rest = str(path)[0].lower(), str(path)[2:].replace('\\', '/')
     return f'/mnt/{drive}{rest}'
 
 
-@unittest.skipUnless(wsl_available(), 'WSL with python3 is not available')
 class WslLauncherTests(unittest.TestCase):
-    """The launcher inside WSL runs the Windows executable through interop."""
-
+    """Exercise WSL routing with the default-profile lookup mocked, never WSL."""
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='session-history-wsl-')
+        self.temp = tempfile.TemporaryDirectory(prefix='wsl-', dir=test_environment.ROOT)
         self.addCleanup(self.temp.cleanup)
         self.db = fixture.build(Path(self.temp.name) / 'wsl.sqlite', EXE)
-
-    def run_wsl(self, *args):
-        return subprocess.run(
-            ['wsl.exe', '-e', 'python3', to_wsl(SCRIPT), '--exe', to_wsl(EXE), *args],
-            capture_output=True, text=True, encoding='utf-8', timeout=120)
+        spec = importlib.util.spec_from_file_location('history_launcher', SCRIPT)
+        self.launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.launcher)
 
     def test_wsl_paths_reach_the_windows_database(self):
-        result = self.run_wsl('--db', to_wsl(self.db), 'search', '--query', 'shutdown queue',
-                              '--path', '/mnt/f/projects/Atlas')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        keys = {row['session_key'] for row in json.loads(result.stdout)['results']}
-        self.assertEqual(keys, {'s-a', 'c-1'})
+        with mock.patch.object(self.launcher, 'in_wsl', return_value=True), \
+             mock.patch.object(self.launcher, 'find_exe', return_value=str(EXE)), \
+             mock.patch.object(self.launcher, 'to_windows', return_value=str(self.db)) as convert, \
+             mock.patch.object(self.launcher.subprocess, 'run') as spawn:
+            spawn.return_value.returncode = 0
+            self.assertEqual(self.launcher.main(['--exe', str(EXE), '--db', to_wsl(self.db), 'status']), 0)
+            args = spawn.call_args.args[0]
+            convert.assert_called_once_with(to_wsl(self.db))
+            self.assertIn(str(self.db), args)
+            test_environment.guard(args[args.index('--db')+1])
 
     def test_default_database_comes_from_windows_appdata(self):
-        result = self.run_wsl('status')
-        # Whatever the local database holds, the launcher must have found
-        # the Windows default instead of failing on a missing APPDATA.
-        self.assertNotIn('APPDATA is not set', result.stderr)
-        self.assertIn('CodexSessionViewer', result.stdout + result.stderr)
+        with mock.patch.object(self.launcher, 'in_wsl', return_value=True), \
+             mock.patch.object(self.launcher, 'find_exe', return_value=str(EXE)), \
+             mock.patch.object(self.launcher, 'windows_appdata_database', return_value=str(self.db)) as lookup, \
+             mock.patch.object(self.launcher.subprocess, 'run') as spawn:
+            spawn.return_value.returncode = 0
+            self.assertEqual(self.launcher.main(['--exe', str(EXE), 'status']), 0)
+            lookup.assert_called_once_with()
+            self.assertEqual(spawn.call_args.args[0], [str(EXE), 'query', 'status', '--db', str(self.db)])
+            test_environment.guard(spawn.call_args.args[0][-1])
+
+    def test_default_profile_database_is_rejected_by_native_boundary(self):
+        with self.assertRaisesRegex(RuntimeError, 'explicit fixture database'):
+            test_environment.run([str(EXE), 'query', 'status'])
+
+
+class LaunchBoundaryTests(unittest.TestCase):
+    def test_unknown_tools_and_inline_executable_escape_are_denied(self):
+        with self.assertRaisesRegex(RuntimeError, 'rejected executable'):
+            test_environment.run(['wsl.exe', '-e', 'python3', '--version'])
+        with self.assertRaisesRegex(RuntimeError, 'launcher executable'):
+            test_environment.run([sys.executable, str(SCRIPT), '--exe=C:/synthetic-real-profile/schtasks.exe', '--db', str(test_environment.ROOT/'owned.sqlite'), 'status'])
 
 
 if __name__ == '__main__':
