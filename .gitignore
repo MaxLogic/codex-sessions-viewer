@@ -20,3 +20,6 @@ app/flutter_*.log
 # Python bytecode and local Windows shortcuts
 __pycache__/
 /*.lnk
+
+# Local reference material; never published
+/references/
