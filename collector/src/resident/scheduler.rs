@@ -1021,18 +1021,7 @@ impl Scheduler {
         match result {
             Ok(reports) => {
                 for (command, report) in reports {
-                    let mut bytes = Vec::new();
-                    cli::print_report(
-                        &mut bytes,
-                        &command,
-                        self.store.as_ref().unwrap(),
-                        &report,
-                        true,
-                    )
-                    .map_err(|e| io::Error::other(cli_message(e)))?;
-                    let mut event: Value = serde_json::from_slice(&bytes)?;
-                    event["v"] = json!(1);
-                    events.push(event);
+                    events.push(super::report::finished(&command, &report));
                 }
             }
             Err(error) if interrupted => {

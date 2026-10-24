@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:xml/xml.dart';
 
+import '../commands/windows_command_line.dart';
+
 typedef SchedulerProcessRunner =
     Future<ProcessResult> Function(String executable, List<String> arguments);
 
@@ -224,6 +226,7 @@ class WindowsTaskScheduler implements CollectorAutostart {
     final (outdated, enabled) = inspectDefinition(
       xml,
       userId: userId,
+      userAccount: _userAccount,
       expected: expected,
     );
     final info = await _lastRun();
@@ -375,6 +378,7 @@ class WindowsTaskScheduler implements CollectorAutostart {
   }
 
   String? _userId;
+  String? _userAccount;
   Future<String> _currentUser() async {
     if (_userId case final user?) return user;
     final result = await _run('whoami.exe', ['/user', '/fo', 'csv', '/nh']);
@@ -386,55 +390,149 @@ class WindowsTaskScheduler implements CollectorAutostart {
         'The current Windows user could not be identified.',
       );
     }
+    // whoami supplies the account and SID from the same token. Do not accept
+    // arbitrary account spellings supplied by the installed task itself.
+    for (final line in result.stdout.toString().split(RegExp(r'\r?\n'))) {
+      final fields = parseVerboseCsv(line);
+      if (fields.length >= 2 && fields[1].trim() == sid) {
+        _userAccount = fields[0].trim();
+        break;
+      }
+    }
     return _userId = sid;
   }
 
-  /// Read actual XML elements, independent of namespace prefixes and whitespace.
+  /// Compare the task's behavior, including defaults omitted by Task Scheduler.
+  /// [userAccount] must come from the current token (whoami), never from XML.
   static (bool, bool) inspectDefinition(
     String xml, {
     required String userId,
+    String? userAccount,
     CollectorAutostartRequest? expected,
   }) {
     try {
       final task = XmlDocument.parse(xml).rootElement;
-      XmlElement? child(XmlElement? parent, String name) =>
-          parent?.childElements.where((e) => e.name.local == name).firstOrNull;
+      XmlElement? child(XmlElement? parent, String name) {
+        final matches =
+            parent?.childElements.where((e) => e.name.local == name).toList() ??
+            [];
+        if (matches.length > 1) {
+          throw const FormatException('Duplicate task element');
+        }
+        return matches.firstOrNull;
+      }
+
       String? value(XmlElement? parent, String name) =>
           child(parent, name)?.innerText.trim();
+      bool boolean(XmlElement? parent, String name, bool fallback) =>
+          switch (value(parent, name)?.toLowerCase()) {
+            null => fallback,
+            'true' || '1' => true,
+            'false' || '0' => false,
+            _ => throw const FormatException('Invalid task boolean'),
+          };
+      bool currentUser(String? text) {
+        if (text == null) return false;
+        final identity = text.toLowerCase();
+        final account = userAccount?.toLowerCase();
+        return identity == userId.toLowerCase() ||
+            (account != null &&
+                (identity == account || identity == account.split(r'\').last));
+      }
+
+      bool noEnd(XmlElement? trigger) => value(trigger, 'EndBoundary') == null;
+      final now = DateTime.now();
+      bool activeLogon(XmlElement? trigger) {
+        final startText = value(trigger, 'StartBoundary');
+        final endText = value(trigger, 'EndBoundary');
+        final start = startText == null ? null : DateTime.tryParse(startText);
+        final end = endText == null ? null : DateTime.tryParse(endText);
+        return (startText == null || (start != null && !start.isAfter(now))) &&
+            (endText == null || (end != null && end.isAfter(now)));
+      }
+
+      bool immediate(XmlElement? trigger) =>
+          _durationSeconds(value(trigger, 'Delay'), fallback: 0) == 0;
       final settings = child(task, 'Settings');
       final triggers = child(task, 'Triggers');
       final logon = child(triggers, 'LogonTrigger');
       final timer = child(triggers, 'TimeTrigger');
       final repetition = child(timer, 'Repetition');
-      final principal = child(child(task, 'Principals'), 'Principal');
+      final principals = child(task, 'Principals');
+      final principal = child(principals, 'Principal');
       final actions = child(task, 'Actions');
       final exec = child(actions, 'Exec');
-      final enabled = value(settings, 'Enabled') != 'false';
+      final enabled = boolean(settings, 'Enabled', true);
+      final start = DateTime.tryParse(value(timer, 'StartBoundary') ?? '');
+      final args = splitWindowsCommandLine(value(exec, 'Arguments') ?? '');
+      final command = value(exec, 'Command') ?? '';
+      final commandTokens = command.startsWith('"')
+          ? splitWindowsCommandLine(command)
+          : [command];
       final good =
           task.name.local == 'Task' &&
+          triggers?.childElements.length == 2 &&
           logon != null &&
-          value(logon, 'UserId') == userId &&
-          value(logon, 'Enabled') == 'true' &&
-          value(timer, 'Enabled') == 'true' &&
-          value(repetition, 'Interval') == 'PT5M' &&
-          value(repetition, 'StopAtDurationEnd') == 'false' &&
-          value(settings, 'ExecutionTimeLimit') == 'PT0S' &&
-          value(settings, 'MultipleInstancesPolicy') == 'IgnoreNew' &&
-          value(settings, 'StartWhenAvailable') == 'true' &&
-          value(settings, 'DisallowStartIfOnBatteries') == 'false' &&
-          value(settings, 'StopIfGoingOnBatteries') == 'false' &&
-          value(principal, 'UserId') == userId &&
+          currentUser(value(logon, 'UserId')) &&
+          boolean(logon, 'Enabled', true) &&
+          activeLogon(logon) &&
+          immediate(logon) &&
+          _durationSeconds(value(logon, 'ExecutionTimeLimit'), fallback: 0) ==
+              0 &&
+          child(logon, 'Repetition') == null &&
+          timer != null &&
+          boolean(timer, 'Enabled', true) &&
+          noEnd(timer) &&
+          _durationSeconds(value(timer, 'ExecutionTimeLimit'), fallback: 0) ==
+              0 &&
+          start != null &&
+          !start.isAfter(now) &&
+          _durationSeconds(value(timer, 'RandomDelay'), fallback: 0) == 0 &&
+          _durationSeconds(value(repetition, 'Interval')) == 300 &&
+          _durationSeconds(value(repetition, 'Duration'), fallback: 0) == 0 &&
+          !boolean(repetition, 'StopAtDurationEnd', false) &&
+          _durationSeconds(
+                value(settings, 'ExecutionTimeLimit'),
+                fallback: 72 * 60 * 60,
+              ) ==
+              0 &&
+          (value(settings, 'MultipleInstancesPolicy') ?? 'IgnoreNew') ==
+              'IgnoreNew' &&
+          boolean(settings, 'StartWhenAvailable', false) &&
+          !boolean(settings, 'DisallowStartIfOnBatteries', true) &&
+          !boolean(settings, 'StopIfGoingOnBatteries', true) &&
+          !boolean(settings, 'RunOnlyIfIdle', false) &&
+          !boolean(settings, 'RunOnlyIfNetworkAvailable', false) &&
+          principals?.childElements.length == 1 &&
+          currentUser(value(principal, 'UserId')) &&
           value(principal, 'LogonType') == 'InteractiveToken' &&
-          value(principal, 'RunLevel') == 'LeastPrivilege' &&
+          (value(principal, 'RunLevel') ?? 'LeastPrivilege') ==
+              'LeastPrivilege' &&
+          (actions?.getAttribute('Context') == null ||
+              actions?.getAttribute('Context') ==
+                  principal?.getAttribute('id')) &&
           actions?.childElements.length == 1 &&
+          exec != null &&
+          (value(exec, 'WorkingDirectory') ?? '').isEmpty &&
           (expected == null ||
-              (value(exec, 'Command') == expected.launcherExecutable &&
-                  value(exec, 'Arguments') ==
-                      '--db "${expected.databaseFile}" --settings "${expected.settingsFile}"'));
+              (commandTokens.length == 1 &&
+                  p.windows.equals(
+                    commandTokens.single,
+                    expected.launcherExecutable,
+                  ) &&
+                  args.length == 4 &&
+                  args[0] == '--db' &&
+                  p.windows.equals(args[1], expected.databaseFile) &&
+                  args[2] == '--settings' &&
+                  p.windows.equals(args[3], expected.settingsFile)));
       return (!good, enabled);
     } on XmlException {
       throw const CollectorAutostartException(
         'The installed task definition is invalid XML; it was not changed.',
+      );
+    } on FormatException {
+      throw const CollectorAutostartException(
+        'The installed task definition is invalid; it was not changed.',
       );
     }
   }
@@ -456,6 +554,7 @@ class WindowsTaskScheduler implements CollectorAutostart {
     final (_, enabled) = inspectDefinition(
       old.stdout.toString(),
       userId: await _currentUser(),
+      userAccount: _userAccount,
       expected: request,
     );
     await backups.create(recursive: true);
@@ -494,6 +593,7 @@ class WindowsTaskScheduler implements CollectorAutostart {
       final (outdated, actualEnabled) = inspectDefinition(
         rejectedDefinition,
         userId: await _currentUser(),
+        userAccount: _userAccount,
         expected: request,
       );
       if (!outdated && actualEnabled == enabled) return backup.path;
@@ -611,16 +711,45 @@ class WindowsTaskScheduler implements CollectorAutostart {
   static String _escape(String value) =>
       const HtmlEscape(HtmlEscapeMode.element).convert(value);
 
+  static int? _durationSeconds(String? text, {int? fallback}) {
+    if (text == null) return fallback;
+    final match = RegExp(
+      r'^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$',
+    ).firstMatch(text);
+    if (match == null || !RegExp(r'\d').hasMatch(text)) return null;
+    final total =
+        (double.tryParse(match[1] ?? '') ?? 0) * 86400 +
+        (double.tryParse(match[2] ?? '') ?? 0) * 3600 +
+        (double.tryParse(match[3] ?? '') ?? 0) * 60 +
+        (double.tryParse(match[4] ?? '') ?? 0);
+    return total.isFinite &&
+            total <= 2147483647 &&
+            total == total.roundToDouble()
+        ? total.toInt()
+        : null;
+  }
+
   /// The repeat interval of a task definition, in minutes.
   static int? parseIntervalMinutes(String xml) {
-    final match = RegExp(
-      r'<Interval>PT(?:(\d+)H)?(?:(\d+)M)?</Interval>',
-    ).firstMatch(xml);
-    if (match == null) return null;
-    final minutes =
-        (int.tryParse(match.group(1) ?? '') ?? 0) * 60 +
-        (int.tryParse(match.group(2) ?? '') ?? 0);
-    return minutes == 0 ? null : minutes;
+    try {
+      XmlElement? child(XmlElement? parent, String name) =>
+          parent?.childElements.where((e) => e.name.local == name).firstOrNull;
+      final task = XmlDocument.parse(xml).rootElement;
+      final repetition = child(
+        child(child(task, 'Triggers'), 'TimeTrigger'),
+        'Repetition',
+      );
+      final seconds = _durationSeconds(
+        (task.name.local == 'Interval' ? task : child(repetition, 'Interval'))
+            ?.innerText
+            .trim(),
+      );
+      return seconds == null || seconds == 0 || seconds % 60 != 0
+          ? null
+          : seconds ~/ 60;
+    } on XmlException {
+      return null;
+    }
   }
 
   /// The quoted fields of the first non-blank `/FO CSV /NH` row.

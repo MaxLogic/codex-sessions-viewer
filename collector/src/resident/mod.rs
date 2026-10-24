@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod endpoint;
 pub mod instance;
 pub mod protocol;
+mod report;
 pub mod scheduler;
 mod stop_deadline;
 mod transport;
@@ -120,6 +121,7 @@ fn register_hello(request: &protocol::Request, state: &mut State, viewer: &mut b
 fn hello(id: &str, state: &State) -> Value {
     json!({"v":protocol::VERSION,"id":id,"event":"hello", "protocol":protocol::VERSION,
         "viewer_protocol":protocol::VERSION,
+        "capabilities":[protocol::BOUNDED_FINISHED_REPORT],
         "collector_version":env!("CARGO_PKG_VERSION"), "schema":schema::SUPPORTED_SCHEMA_VERSION,
         "contract":crate::contract::CONTRACT_VERSION,
         "parsers":{"codex":crate::codex::parser::PARSER_VERSION,"claude":crate::claude::parser::CLAUDE_PARSER_VERSION},
@@ -659,6 +661,13 @@ pub(crate) fn run_configured(
     run_configured_after_stop(database, lifetime, options, false)
 }
 
+fn replacement_shutdown_deadline(options: &crate::cli::Options) -> io::Result<Instant> {
+    match options.replacement_deadline_ms {
+        Some(ticks) => stop_deadline::import(ticks),
+        None => Ok(stop_deadline::now() + STOP_TIMEOUT),
+    }
+}
+
 pub(crate) fn run_configured_after_stop(
     database: &Path,
     lifetime: Lifetime,
@@ -666,10 +675,7 @@ pub(crate) fn run_configured_after_stop(
     replacement: bool,
 ) -> io::Result<()> {
     let shutdown_deadline = if replacement {
-        Some(match options.replacement_deadline_ms {
-            Some(ticks) => stop_deadline::import(ticks)?,
-            None => Instant::now() + STOP_TIMEOUT,
-        })
+        Some(replacement_shutdown_deadline(&options)?)
     } else {
         None
     };
@@ -900,6 +906,8 @@ fn instance_stopped(database: &Path) -> io::Result<bool> {
 /// A final IPC reply is best effort; only lock release proves the owner stopped.
 fn wait_for_stop(database: &Path, deadline: Instant) -> io::Result<()> {
     loop {
+        #[cfg(all(test, windows))]
+        bridge::deadline_tests::checkpoint(bridge::deadline_tests::Phase::Wait);
         stop_deadline::remaining(deadline)?;
         if instance_stopped(database)? {
             stop_deadline::remaining(deadline)?;

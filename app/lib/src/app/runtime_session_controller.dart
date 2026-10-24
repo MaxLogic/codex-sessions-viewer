@@ -1051,6 +1051,7 @@ class RuntimeSessionController implements ProjectsRepository {
         if (collector.cacheRepair case final repair?) {
           await _writeScan(() => _logCacheRepair(activeLogger, repair));
         }
+        await _writeScan(() => _logOmittedDiagnostics(activeLogger, result));
         final rows = Profiling.spanSync(
           'scan.runtime.final_load_rows',
           () => _loadRowsProfiled(db, pricing: pricing),
@@ -2257,27 +2258,69 @@ String _statusMessage(
 }) {
   final available = _plural(visibleSessionCount, 'session');
   final parsed = _plural(result.progress.filesParsed, 'new or changed session');
+  final omitted =
+      '${result.errorsOmitted > 0 ? ' ${result.errorsOmitted} additional session collection errors omitted.' : ''}'
+      '${result.unreachablePathsOmitted > 0 ? ' ${result.unreachablePathsOmitted} additional unreachable paths omitted.' : ''}'
+      '${result.pruneFailuresOmitted > 0 ? ' ${result.pruneFailuresOmitted} more repair problems were not listed; see the log.' : ''}'
+      '${result.prunedBackupsOmitted > 0 ? ' ${result.prunedBackupsOmitted} more deleted backups were not listed; see the log.' : ''}';
   if (cancelled ?? result.cancelled) {
-    return 'Scan cancelled. $available available. $parsed parsed before cancellation.';
+    return 'Scan cancelled. $available available. $parsed parsed before cancellation.$omitted';
   }
-  if (result.errors.any(
-    (error) => error.status == SessionFileStatus.pathUnreachable,
-  )) {
+  if (!result.allConfiguredRootsReachable ||
+      result.errors.any(
+        (error) => error.status == SessionFileStatus.pathUnreachable,
+      )) {
     final paths = result.errors
         .where((error) => error.status == SessionFileStatus.pathUnreachable)
         .map((error) => error.sourcePath)
         .join('; ');
     return 'Scan finished. $available available. $parsed parsed. '
-        'Session root is unreachable. Unreachable paths: $paths';
+        '${paths.isEmpty ? 'Session root is unreachable. Check your Windows and WSL Codex paths in Settings, then run Refresh.' : 'Session root is unreachable. Unreachable paths: $paths'}$omitted';
   }
   if (result.progress.filesFound == 0 && visibleSessionCount == 0) {
-    return 'Scan finished. No supported files found.';
+    return 'Scan finished. No supported files found.$omitted';
   }
   final failed = result.progress.filesFailed;
   final failures = failed == 0
       ? ''
       : ' ${_plural(failed, 'file')} could not be parsed.';
-  return 'Scan finished. $available available. $parsed parsed.$failures';
+  return 'Scan finished. $available available. $parsed parsed.$failures$omitted';
+}
+
+Future<void> _logOmittedDiagnostics(
+  StructuredLogger logger,
+  SessionScanResult result,
+) async {
+  for (final (key, omitted, retained, label) in [
+    (
+      'errors_omitted',
+      result.errorsOmitted,
+      result.errors.length,
+      'session collection errors',
+    ),
+    (
+      'unreachable_paths_omitted',
+      result.unreachablePathsOmitted,
+      result.errors
+          .where((error) => error.status == SessionFileStatus.pathUnreachable)
+          .length,
+      'unreachable paths',
+    ),
+  ]) {
+    if (omitted <= 0) continue;
+    await logger.writeBestEffort(
+      LogEntryDraft(
+        level: LogLevel.warning,
+        category: LogCategory.scanner,
+        message: '$omitted additional $label were omitted.',
+        details: {
+          key: omitted,
+          'retained_count': retained,
+          'total_count': retained + omitted,
+        },
+      ),
+    );
+  }
 }
 
 /// Logs the collector's report of the legacy session cache repair, and each
@@ -2310,6 +2353,32 @@ Future<void> _logCacheRepair(
         message:
             'An old database backup could not be deleted; it may be open in another program.',
         details: {'path': '$path'},
+      ),
+    );
+  }
+  for (final (key, noun, outcome, level) in [
+    ('pruned_backups', 'old database backups', 'were deleted', LogLevel.info),
+    (
+      'prune_failures',
+      'old database backups',
+      'could not be deleted',
+      LogLevel.warning,
+    ),
+  ]) {
+    final omitted = repair['${key}_omitted'] as int? ?? 0;
+    if (omitted <= 0) continue;
+    final retained = (repair[key] as List? ?? const []).length;
+    await logger.writeBestEffort(
+      LogEntryDraft(
+        level: level,
+        category: LogCategory.database,
+        message:
+            '$omitted additional $noun $outcome; their details were omitted.',
+        details: {
+          '${key}_omitted': omitted,
+          'retained_count': retained,
+          'total_count': retained + omitted,
+        },
       ),
     );
   }

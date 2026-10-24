@@ -4,6 +4,9 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 pub const VERSION: u64 = 1;
+/// Additive v1 capability: finished events fit within MAX_EVENT_BYTES.
+/// Old bridges ignore capabilities and can safely consume these summaries.
+pub const BOUNDED_FINISHED_REPORT: &str = "bounded_finished_report_v1";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ID_BYTES: usize = 256;

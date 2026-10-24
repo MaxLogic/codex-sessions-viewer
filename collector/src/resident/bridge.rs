@@ -1,4 +1,5 @@
 //! Viewer stdio bridge. Database access belongs exclusively to the resident.
+use super::stop_deadline::now;
 use super::{endpoint, instance, protocol, transport, viewer::Context};
 use crate::cli;
 use serde_json::{Value, json};
@@ -10,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(test, windows))]
+pub(super) mod deadline_tests;
+
 fn state(out: &mut impl Write, name: &str, detail: &str) -> io::Result<()> {
     protocol::send(
         out,
@@ -19,6 +23,13 @@ fn state(out: &mut impl Write, name: &str, detail: &str) -> io::Result<()> {
 
 fn compatible(hello: &Value) -> bool {
     hello["protocol"] == protocol::VERSION
+        && hello["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|value| value == protocol::BOUNDED_FINISHED_REPORT)
+            })
         && hello["viewer_protocol"] == protocol::VERSION
         && hello["collector_version"] == env!("CARGO_PKG_VERSION")
         && hello["schema"] == crate::store::schema::SUPPORTED_SCHEMA_VERSION
@@ -60,6 +71,8 @@ fn replace(
     ).and_then(|()| receive_until(reader, deadline));
     let key = instance::database_key(&context.database)?;
     loop {
+        #[cfg(all(test, windows))]
+        deadline_tests::checkpoint(deadline_tests::Phase::Wait);
         super::stop_deadline::remaining(deadline)?;
         if super::instance_stopped(&context.database)? {
             super::stop_deadline::remaining(deadline)?;
@@ -69,7 +82,7 @@ fn replace(
         // release. A positive successor hello also proves the old owner exited.
         if let Ok(stream) = endpoint::connect(
             &key,
-            Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+            Duration::from_millis(200).min(deadline.saturating_duration_since(now())),
         ) {
             let mut probe = BufReader::new(stream);
             if protocol::send(
@@ -87,18 +100,19 @@ fn replace(
             }
         }
         std::thread::sleep(
-            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+            Duration::from_millis(20).min(deadline.saturating_duration_since(now())),
         );
     }
 }
 
 fn receive_until(reader: &mut BufReader<endpoint::Stream>, until: Instant) -> io::Result<Value> {
     let mut line = Vec::new();
-    let deadline = (Instant::now() + Duration::from_secs(2)).min(until);
+    let deadline = (now() + Duration::from_secs(2)).min(until);
     loop {
         match protocol::read_frame(reader, &mut line, protocol::MAX_EVENT_BYTES) {
             Ok(protocol::Frame::Complete) => {
-                return serde_json::from_slice(&line).map_err(io::Error::other);
+                return serde_json::from_slice(&line)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
             }
             Ok(protocol::Frame::Eof) => {
                 return Err(io::Error::new(
@@ -114,7 +128,7 @@ fn receive_until(reader: &mut BufReader<endpoint::Stream>, until: Instant) -> io
                 ) => {}
             Err(e) => return Err(e),
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "resident handshake timed out",
@@ -170,6 +184,10 @@ fn start(context: &Context, replacement_deadline: Option<Instant>) -> io::Result
     if !context.wsl_projects {
         args.push("--no-wsl-projects".into());
     }
+    #[cfg(all(test, windows))]
+    if let Some(result) = deadline_tests::spawn(&args) {
+        return result;
+    }
     crate::hooks::spawn_detached(&std::env::current_exe()?, &args)
 }
 
@@ -178,12 +196,14 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
     const ATTACH_TIMEOUT: Duration = Duration::from_secs(6);
     // Shutdown and successor attachment have separate budgets, within this
     // fixed overall bound. Repeated attempts never extend the total deadline.
-    let total_deadline = Instant::now() + ATTACH_TIMEOUT + super::STOP_TIMEOUT + ATTACH_TIMEOUT;
-    let mut deadline = Instant::now() + ATTACH_TIMEOUT;
+    let total_deadline = now() + ATTACH_TIMEOUT + super::STOP_TIMEOUT + ATTACH_TIMEOUT;
+    let mut deadline = now() + ATTACH_TIMEOUT;
     let mut started = false;
     let mut replaced = false;
     loop {
-        if Instant::now() >= deadline {
+        #[cfg(all(test, windows))]
+        deadline_tests::checkpoint(deadline_tests::Phase::Attach);
+        if now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "resident start timed out",
@@ -191,7 +211,7 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
         }
         match endpoint::connect(
             &key,
-            Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+            Duration::from_millis(200).min(deadline.saturating_duration_since(now())),
         ) {
             Ok(stream) => {
                 let mut reader = BufReader::new(stream);
@@ -217,11 +237,11 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                         &mut reader,
                         context,
                         hello["v"].as_u64().unwrap(),
-                        (Instant::now() + super::STOP_TIMEOUT).min(total_deadline),
+                        (now() + super::STOP_TIMEOUT).min(total_deadline),
                     )?;
                     replaced = true;
                     started = true;
-                    deadline = (Instant::now() + ATTACH_TIMEOUT).min(total_deadline);
+                    deadline = (now() + ATTACH_TIMEOUT).min(total_deadline);
                 } else if !valid_hello(&hello, &key) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -243,11 +263,11 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                         &mut reader,
                         context,
                         protocol::VERSION,
-                        (Instant::now() + super::STOP_TIMEOUT).min(total_deadline),
+                        (now() + super::STOP_TIMEOUT).min(total_deadline),
                     )?;
                     replaced = true;
                     started = true;
-                    deadline = (Instant::now() + ATTACH_TIMEOUT).min(total_deadline);
+                    deadline = (now() + ATTACH_TIMEOUT).min(total_deadline);
                 }
             }
             Err(error) => {
@@ -266,12 +286,12 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
                     state(out, "starting", "")?;
                     start(context, None)?;
                     started = true;
-                } else if Instant::now() >= deadline {
+                } else if now() >= deadline {
                     return Err(error);
                 }
             }
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "resident start timed out",
@@ -296,7 +316,10 @@ fn connect(
     wake: &Arc<transport::Wake>,
 ) -> io::Result<Connected> {
     let reader = attach(context, out).inspect_err(|error| {
-        let _ = state(out, "failed", &error.to_string());
+        let _ = protocol::send(out, &json!({
+            "v":1, "event":"bridge", "state":"failed", "detail":error.to_string(),
+            "code": if error.kind() == io::ErrorKind::InvalidData { "protocol_error" } else { "disconnected" },
+        }));
     })?;
     let writer = reader.get_ref().try_clone()?;
     let incoming = transport::Incoming::new(reader, false, wake.clone())?;
@@ -308,17 +331,29 @@ fn reconnect(
     context: &Context,
     out: &mut impl Write,
     inflight: &mut HashMap<String, Pending>,
-    detail: &str,
+    error: &io::Error,
     wake: &Arc<transport::Wake>,
 ) -> io::Result<()> {
     connection.take(); // Stop and join both endpoint I/O paths before reattaching.
     for (id, _) in inflight.drain() {
         protocol::send(
             out,
-            &protocol::error(&id, "disconnected", "resident endpoint disconnected"),
+            &protocol::error(
+                &id,
+                if error.kind() == io::ErrorKind::InvalidData {
+                    "protocol_error"
+                } else {
+                    "disconnected"
+                },
+                if error.kind() == io::ErrorKind::InvalidData {
+                    "resident sent an invalid protocol frame"
+                } else {
+                    "resident endpoint disconnected"
+                },
+            ),
         )?;
     }
-    state(out, "reconnecting", detail)?;
+    state(out, "reconnecting", &error.to_string())?;
     *connection = Some(connect(context, out, wake)?);
     Ok(())
 }
@@ -370,7 +405,21 @@ fn relay(
             active = true;
             match event {
                 transport::Event::Frame(bytes) => {
-                    let event: Value = serde_json::from_slice(&bytes)?;
+                    let event: Value = match serde_json::from_slice(&bytes) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            forwarding = None;
+                            reconnect(
+                                &mut connection,
+                                &context,
+                                out,
+                                &mut inflight,
+                                &io::Error::new(io::ErrorKind::InvalidData, error),
+                                wake,
+                            )?;
+                            break;
+                        }
+                    };
                     if let Some(id) = event["id"].as_str() {
                         let terminal = event["event"] != "progress"
                             && (event["event"] != "finished"
@@ -388,14 +437,7 @@ fn relay(
                 }
                 transport::Event::Closed(error) => {
                     forwarding = None;
-                    reconnect(
-                        &mut connection,
-                        &context,
-                        out,
-                        &mut inflight,
-                        &error.to_string(),
-                        wake,
-                    )?;
+                    reconnect(&mut connection, &context, out, &mut inflight, &error, wake)?;
                     break;
                 }
                 transport::Event::Rejected(error) => protocol::send(out, &error)?,
@@ -411,7 +453,7 @@ fn relay(
                         &context,
                         out,
                         &mut inflight,
-                        "resident writer closed",
+                        &io::Error::new(io::ErrorKind::BrokenPipe, "resident writer closed"),
                         wake,
                     )?;
                 }

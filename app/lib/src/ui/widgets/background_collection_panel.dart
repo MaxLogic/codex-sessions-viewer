@@ -435,7 +435,7 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
       final every = schedule.outdated
           ? 'Needs an update'
           : !schedule.enabled
-          ? 'Background collection is installed but turned off.'
+          ? 'Installed but turned off.'
           : 'Starts at sign-in; checked every 5 minutes';
       final ran = schedule.running
           ? 'running now'
@@ -458,7 +458,7 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
           'Session collection checks for new sessions at the Scan interval (seconds) set in Settings above.',
         ),
         if (schedule.outdated && !schedule.enabled)
-          const Text('Background collection is installed but turned off.'),
+          const Text('Installed but turned off.'),
         if (status.autostartUpdate case final update?) ...[
           Text(update.message, key: const Key('background-autostart-update')),
           if (update.detail case final detail?)

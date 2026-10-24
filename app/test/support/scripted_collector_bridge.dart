@@ -14,6 +14,7 @@ class ScriptedBridge implements Process {
   bool killed = false;
   void emit(Map<String, Object?> event) =>
       _out.add(utf8.encode('${jsonEncode(event)}\n'));
+  void emitBytes(List<int> bytes) => _out.add(bytes);
   @override
   late final IOSink stdin;
   @override

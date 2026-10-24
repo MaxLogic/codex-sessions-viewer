@@ -3,6 +3,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 fn ticks_ms() -> io::Result<u64> {
+    #[cfg(all(test, windows))]
+    if let Some(ticks) = super::bridge::deadline_tests::ticks_ms() {
+        return Ok(ticks);
+    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Performance::{
@@ -39,9 +43,21 @@ fn ticks_ms() -> io::Result<u64> {
     }
 }
 
+pub(super) fn now() -> Instant {
+    #[cfg(all(test, windows))]
+    if let Some(now) = super::bridge::deadline_tests::now() {
+        return now;
+    }
+    Instant::now()
+}
+
 pub(super) fn remaining(deadline: Instant) -> io::Result<Duration> {
+    remaining_at(deadline, now())
+}
+
+fn remaining_at(deadline: Instant, now: Instant) -> io::Result<Duration> {
     deadline
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(now)
         .filter(|duration| !duration.is_zero())
         .ok_or_else(|| {
             io::Error::new(
@@ -61,7 +77,7 @@ pub(super) fn export(deadline: Instant) -> io::Result<u64> {
 }
 
 pub(super) fn import(ticks: u64) -> io::Result<Instant> {
-    let now = Instant::now();
+    let now = now();
     let milliseconds = ticks.saturating_sub(ticks_ms()?);
     let deadline = now + Duration::from_millis(milliseconds).min(super::STOP_TIMEOUT);
     remaining(deadline)?;
@@ -71,6 +87,26 @@ pub(super) fn import(ticks: u64) -> io::Result<Instant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_boundary_uses_the_original_budget() {
+        let started = Instant::now();
+        let deadline = started + super::super::STOP_TIMEOUT;
+        // Independent literals pin the 10 s contract. No real sleep or host
+        // scheduling margin is involved in the near/at/after boundary cases.
+        assert_eq!(
+            remaining_at(deadline, started + Duration::from_millis(9500)).unwrap(),
+            Duration::from_millis(500)
+        );
+        for elapsed_ms in [10000, 10500] {
+            assert_eq!(
+                remaining_at(deadline, started + Duration::from_millis(elapsed_ms))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
+    }
 
     #[test]
     fn shared_deadline_cannot_restart_the_shutdown_budget() {

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:path/path.dart' as p;
 import '../support/autostart_fixture.dart';
 import 'package:xml/xml.dart';
 
@@ -215,6 +216,179 @@ void main() {
         },
       );
     }
+
+    String normalizedFixture(String name, AutostartFixture fixture) =>
+        File(p.join('test', 'background_collection', 'fixtures', name))
+            .readAsStringSync()
+            .replaceAll('{{USER_SID}}', AutostartFixture.sid)
+            .replaceAll('{{USER_ACCOUNT}}', r'FIXTURE\viewer')
+            .replaceAll('{{USER_NAME}}', 'viewer')
+            .replaceAll('{{LAUNCHER}}', fixture.request.launcherExecutable)
+            .replaceAll('{{DATABASE}}', fixture.request.databaseFile)
+            .replaceAll('{{SETTINGS}}', fixture.request.settingsFile);
+
+    test(
+      'normalized Windows export is current; old export is outdated',
+      () async {
+        final fixture = AutostartFixture(root);
+        fixture.xml = normalizedFixture('task-final.xml', fixture);
+        final current = await fixture.scheduler.query(
+          expected: fixture.request,
+        );
+        expect(current.outdated, isFalse);
+        expect(current.enabled, isTrue);
+        fixture.xml = normalizedFixture('task-backup.xml', fixture);
+        final old = await fixture.scheduler.query(expected: fixture.request);
+        expect(old.outdated, isTrue);
+        expect(old.enabled, isFalse);
+      },
+    );
+
+    test(
+      'normalized automatic upgrade verifies once without rollback',
+      () async {
+        final fixture = AutostartFixture(root);
+        fixture.normalizeRegistration = (_) =>
+            normalizedFixture('task-final.xml', fixture);
+        final updated = await fixture.collection.status();
+        expect(updated.schedule.outdated, isFalse);
+        expect(updated.autostartUpdate?.error, isNull);
+        expect(fixture.creates, 1);
+        await fixture.collection.status();
+        expect(fixture.creates, 1);
+        expect(fixture.backups, hasLength(1));
+      },
+    );
+
+    test(
+      'normalized namespaces defaults dates booleans and Windows quoting',
+      () async {
+        final fixture = AutostartFixture(root);
+        final good = normalizedFixture('task-final.xml', fixture);
+        final doc = XmlDocument.parse(good);
+        final task = doc.rootElement;
+        final children = task.childElements.toList();
+        task.children.clear();
+        task.children.addAll(children.reversed);
+        final reordered = doc.toXmlString();
+        final explicit = good
+            .replaceAll('<StartWhenAvailable>true', '<StartWhenAvailable>TRUE')
+            .replaceAll('>false<', '>FALSE<')
+            .replaceFirst(
+              '<LogonTrigger>',
+              '<LogonTrigger><Enabled>TRUE</Enabled><Delay>PT0S</Delay>',
+            )
+            .replaceFirst('<TimeTrigger>', '<TimeTrigger><Enabled>1</Enabled>')
+            .replaceFirst(
+              '<Interval>PT5M</Interval>',
+              '<Interval>PT300S</Interval><Duration>PT0S</Duration><StopAtDurationEnd>FALSE</StopAtDurationEnd>',
+            )
+            .replaceFirst('<Settings>', '<Settings><Enabled>TRUE</Enabled>')
+            .replaceFirst(
+              '<LogonType>',
+              '<RunLevel>LeastPrivilege</RunLevel><LogonType>',
+            )
+            .replaceFirst('2026-10-24T10:58:32', '2020-01-01T00:00:00.000Z');
+        final prefixed = good
+            .replaceAllMapped(
+              RegExp(r'<(/?)([A-Z][A-Za-z]*)'),
+              (m) => '<${m[1]}t:${m[2]}',
+            )
+            .replaceFirst('xmlns=', 'xmlns:t=');
+        final alternateQuotes = good
+            .replaceFirst('<Arguments>--db "', '<Arguments>"--db" "')
+            .replaceFirst(' --settings "', '  "--settings"  "');
+        for (final xml in [
+          reordered,
+          explicit,
+          prefixed,
+          alternateQuotes,
+          good
+              .replaceFirst('<Command>', '<Command>"')
+              .replaceFirst('</Command>', '"</Command>'),
+        ]) {
+          fixture.xml = xml;
+          expect(
+            (await fixture.scheduler.query(expected: fixture.request)).outdated,
+            isFalse,
+            reason: xml,
+          );
+        }
+        for (final xml in [
+          good.replaceFirst('FIXTURE\\viewer', 'OTHER\\viewer'),
+          good.replaceFirst(
+            '<Interval>PT5M</Interval>',
+            '<Interval>PT5M</Interval><Duration>PT1H</Duration>',
+          ),
+          good.replaceFirst(
+            '<LogonTrigger>',
+            '<LogonTrigger><Enabled>false</Enabled>',
+          ),
+          good.replaceFirst(
+            '<TimeTrigger>',
+            '<TimeTrigger><EndBoundary>2020-01-01T00:00:00Z</EndBoundary>',
+          ),
+          good.replaceFirst(
+            '<Settings>',
+            '<Settings><RunOnlyIfIdle>true</RunOnlyIfIdle>',
+          ),
+          good.replaceFirst(
+            '<Actions Context="Author">',
+            '<Actions Context="Other">',
+          ),
+          good.replaceFirst('</Arguments>', ' --extra</Arguments>'),
+        ]) {
+          fixture.xml = xml;
+          expect(
+            (await fixture.scheduler.query(expected: fixture.request)).outdated,
+            isTrue,
+            reason: xml,
+          );
+        }
+      },
+    );
+
+    test('normalized missing task limit uses Windows PT72H default', () async {
+      final fixture = AutostartFixture(root);
+      fixture.xml = normalizedFixture(
+        'task-final.xml',
+        fixture,
+      ).replaceFirst('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>', '');
+      expect(
+        (await fixture.scheduler.query(expected: fixture.request)).outdated,
+        isTrue,
+      );
+    });
+
+    test('normalized logon trigger must be active now', () async {
+      final fixture = AutostartFixture(root);
+      final good = normalizedFixture('task-final.xml', fixture);
+      for (final boundary in [
+        '<StartBoundary>2099-01-01T00:00:00Z</StartBoundary>',
+        '<EndBoundary>2020-01-01T00:00:00Z</EndBoundary>',
+        '<Enabled>false</Enabled>',
+      ]) {
+        fixture.xml = good.replaceFirst(
+          '<LogonTrigger>',
+          '<LogonTrigger>$boundary',
+        );
+        expect(
+          (await fixture.scheduler.query(expected: fixture.request)).outdated,
+          isTrue,
+          reason: boundary,
+        );
+      }
+      fixture.xml = good.replaceFirst(
+        '<LogonTrigger>',
+        '<LogonTrigger><StartBoundary>2020-01-01T00:00:00Z</StartBoundary>'
+            '<EndBoundary>2099-01-01T00:00:00Z</EndBoundary>',
+      );
+      expect(
+        (await fixture.scheduler.query(expected: fixture.request)).outdated,
+        isFalse,
+      );
+    });
+
     test(
       'query detects settings, action, principal and trigger drift',
       () async {

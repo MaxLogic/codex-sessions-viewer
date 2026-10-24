@@ -46,6 +46,7 @@ class AutostartFixture {
   bool ignoreCreate = false;
   bool disableReplacement = false;
   bool failRestore = false;
+  String Function(String)? normalizeRegistration;
   int creates = 0;
   bool backupBeforeCreate = false;
   List<File> get backups =>
@@ -56,7 +57,7 @@ class AutostartFixture {
       : [];
   Future<ProcessResult> run(String exe, List<String> args) async {
     ProcessResult ok([String out = '']) => ProcessResult(0, 0, out, '');
-    if (exe == 'whoami.exe') return ok(sid);
+    if (exe == 'whoami.exe') return ok('"FIXTURE\\viewer","$sid"');
     if (exe == 'powershell.exe') return ok('|267011');
     if (args.first == '/Create') {
       creates++;
@@ -72,6 +73,7 @@ class AutostartFixture {
       }
       if (!ignoreCreate) {
         xml = String.fromCharCodes(units);
+        xml = normalizeRegistration?.call(xml!) ?? xml;
         if (creates == 1 && disableReplacement) {
           xml = xml!.replaceFirst(
             '<Enabled>true</Enabled><ExecutionTimeLimit>',

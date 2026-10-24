@@ -2582,7 +2582,18 @@ void main() {
         logging: _testLogging(temp),
       ),
     );
-    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    // The adjacent recovery copy has a longer name than the viewer database.
+    // Exercise Windows backup creation and verification beyond MAX_PATH even
+    // when the test runner allocates a short temporary root.
+    var databaseDirectory = temp;
+    if (Platform.isWindows) {
+      while (databaseDirectory.path.length < 200) {
+        databaseDirectory = Directory(
+          p.join(databaseDirectory.path, 'long-path'),
+        );
+      }
+    }
+    final databaseFile = File(p.join(databaseDirectory.path, 'viewer.sqlite'));
     final startup = await _migrateCollectorFixture(databaseFile);
     expect(startup.canStartNormalUi, isTrue);
     final db = openFileBackedDatabase(databaseFile);
@@ -2625,8 +2636,15 @@ void main() {
       1,
     );
     expect(await legacyArtifact.exists(), isTrue);
-    final backups = Directory(p.join(temp.path, 'backups'));
-    expect(await backups.list().where((entity) => entity is File).length, 1);
+    final backups = Directory(p.join(databaseFile.parent.path, 'backups'));
+    final backupFiles = await backups
+        .list()
+        .where((entity) => entity is File)
+        .toList();
+    expect(backupFiles, hasLength(1));
+    if (Platform.isWindows) {
+      expect(backupFiles.single.path.length, greaterThan(260));
+    }
   });
 
   test('runtime cache repair failure does not fail the scan', () async {
@@ -3235,7 +3253,14 @@ void main() {
     ),
     (
       const CollectorDisconnectedException('raw pipe error'),
-      'Refresh stopped because session collection restarted. Select Refresh to try again.',
+      'Refresh stopped because the session collection connection was interrupted. Select Refresh to try again.',
+    ),
+    (
+      const CollectorRequestException(
+        'protocol_error',
+        'raw protocol frame exceeds limit',
+      ),
+      'Refresh stopped because session collection sent an invalid response. Select Refresh to try again. If this keeps happening, restart Codex Sessions Viewer.',
     ),
     (
       const CollectorRequestException('busy'),
@@ -3444,6 +3469,133 @@ void main() {
       },
     );
   }
+
+  test('omitted summary diagnostics retain totals in logs and status', () async {
+    final root = await Directory.systemTemp.createTemp('cxv194-omissions-');
+    final database = File(p.join(root.path, 'viewer.sqlite'));
+    final settings = File(p.join(root.path, 'settings.toml'));
+    await SettingsRepository(settings).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(windowsCodexPath: root.path, wslCodexUncPath: ''),
+        logging: _testLogging(root),
+      ),
+    );
+    expect((await _migrateCollectorFixture(database)).canStartNormalUi, isTrue);
+    final bridge = ScriptedBridge();
+    bridge.onRequest = (request) {
+      if (request['op'] != 'scan') return;
+      bridge.emit({
+        'id': request['id'],
+        'event': 'finished',
+        'command': 'codex scan',
+        'files_failed': 200,
+        'all_configured_roots_reachable': false,
+        'errors_omitted': 100,
+        'unreachable_paths_omitted': 100,
+        'errors': List.generate(
+          100,
+          (i) => {
+            'path': 'missing-$i',
+            'status': 'missing',
+            'message': 'Missing file.',
+          },
+        ),
+        'cache_repair': {
+          'status': 'completed',
+          'reason_code': '',
+          'deleted_rows': 0,
+          'prune_failures': List.generate(100, (i) => 'locked-$i.sqlite'),
+          'prune_failures_omitted': 100,
+          'pruned_backups': List.generate(
+            100,
+            (i) => {'path': 'old-$i.sqlite', 'bytes': 1},
+          ),
+          'pruned_backups_omitted': 100,
+        },
+      });
+      bridge.emit({'id': request['id'], 'event': 'done', 'cancelled': false});
+    };
+    final client = ResidentCollectorClient(
+      databaseFile: database,
+      settingsFile: settings,
+      start: (_, _) async {
+        bridge.emit({'event': 'bridge', 'state': 'connected'});
+        return bridge;
+      },
+    );
+    try {
+      final result = await RuntimeSessionController(
+        databaseFile: database,
+        settingsFile: settings,
+        collectorClient: client,
+      ).refresh();
+      final db = openFileBackedDatabase(database);
+      try {
+        final entries = db.select('select message, details, level from logs');
+        for (final key in [
+          'prune_failures_omitted',
+          'pruned_backups_omitted',
+          'errors_omitted',
+          'unreachable_paths_omitted',
+        ]) {
+          expect(
+            entries.any(
+              (row) =>
+                  (jsonDecode(row['details'] as String)
+                      as Map<String, dynamic>)[key] ==
+                  100,
+            ),
+            isTrue,
+            reason: key,
+          );
+        }
+        final warning = entries.singleWhere(
+          (row) =>
+              row['message'] ==
+              '100 additional old database backups could not be deleted; their details were omitted.',
+        );
+        expect(warning['level'], 'warning');
+        expect(
+          (jsonDecode(warning['details'] as String) as Map)['total_count'],
+          200,
+        );
+        expect(
+          entries.where(
+            (row) =>
+                row['message'] ==
+                'An old database backup could not be deleted; it may be open in another program.',
+          ),
+          hasLength(100),
+        );
+      } finally {
+        db.close();
+      }
+      expect(
+        result.statusMessage,
+        contains('100 additional session collection errors omitted.'),
+      );
+      expect(
+        result.statusMessage,
+        contains('100 additional unreachable paths omitted.'),
+      );
+      expect(
+        result.statusMessage,
+        contains(
+          'Session root is unreachable. Check your Windows and WSL Codex paths in Settings, then run Refresh.',
+        ),
+      );
+      expect(
+        result.statusMessage,
+        allOf(
+          contains('100 more repair problems were not listed; see the log.'),
+          contains('100 more deleted backups were not listed; see the log.'),
+        ),
+      );
+    } finally {
+      await client.dispose();
+      await deleteCollectorFixture(root);
+    }
+  });
 
   test('runtime refresh does not show root errors as session rows', () async {
     final temp = await Directory.systemTemp.createTemp(

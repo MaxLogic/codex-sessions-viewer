@@ -86,6 +86,227 @@ fn scan_request_streams_progress_before_finished_and_done() {
 }
 
 #[test]
+fn large_scan_report_stays_bounded_through_the_real_bridge() {
+    let _fixture_load = ordinary_fixture_lane();
+    let mut fixture = Fixture::new();
+    let root = fixture.root.join("codex");
+    std::fs::create_dir(&root).unwrap();
+    // A compact database fixture for the same failure shape as a large cache:
+    // missing cached files become one error per session in the finished report.
+    let count = 1100;
+    let long_parent = root.join("component/".repeat(1640));
+    let mut conn = rusqlite::Connection::open(&fixture.db).unwrap();
+    let tx = conn.transaction().unwrap();
+    for index in 0..count {
+        let path = long_parent
+            .join(format!("missing-{index}.jsonl"))
+            .to_string_lossy()
+            .into_owned();
+        tx.execute("insert into sessions(id,harness,source_type,source_file_path,display_path,platform_path,created_at_utc,updated_at_utc) values (?1,'codex','windows',?2,?2,?2,'2026-10-24T00:00:00Z','2026-10-24T00:00:00Z')",rusqlite::params![format!("large-{index}"),path]).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    let output = fixture
+        .command()
+        .args(["codex", "scan", "--db"])
+        .arg(&fixture.db)
+        .arg("--windows-root")
+        .arg(&root)
+        .args([
+            "--wsl-root",
+            "",
+            "--wsl-unc-root",
+            "",
+            "--no-wsl-projects",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.len() > protocol::MAX_EVENT_BYTES,
+        "fixture must exceed the frame limit"
+    );
+    let full: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(full["errors"].as_array().unwrap().len(), count);
+    eprintln!(
+        "large_scan_report uncapped_bytes={} errors={count}",
+        output.stdout.len()
+    );
+    fixture.start("resident");
+    let pid = fixture.ready()["pid"].clone();
+    let mut bridge = fixture
+        .command()
+        .args(["client", "--db"])
+        .arg(&fixture.db)
+        .arg("--windows-root")
+        .arg(&root)
+        .args([
+            "--wsl-root",
+            "",
+            "--wsl-unc-root",
+            "",
+            "--claude-root",
+            "",
+            "--no-wsl-projects",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = bridge.stdin.take().unwrap();
+    let output = bridge.stdout.take().unwrap();
+    fixture.children.push(bridge);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let line = line.unwrap();
+            if sender
+                .send((
+                    line.len() + 1,
+                    serde_json::from_str::<Value>(&line).unwrap(),
+                ))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    protocol::send(
+        &mut input,
+        &serde_json::json!({"v":1,"id":"large","op":"scan","harnesses":["codex"]}),
+    )
+    .unwrap();
+    let mut saw_finished = false;
+    loop {
+        let (bytes, event) = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("bridge did not finish large scan");
+        assert!(bytes <= protocol::MAX_EVENT_BYTES);
+        if event["id"] != "large" {
+            continue;
+        }
+        if event["event"] == "error" {
+            assert_eq!(fixture.ready()["pid"], pid, "resident must stay alive");
+            panic!("large report disconnected while resident stayed alive: {event}");
+        }
+        if event["event"] == "finished" {
+            saw_finished = true;
+            assert_eq!(event["sessions_missing"], count);
+            let kept = event["errors"].as_array().unwrap().len();
+            assert!(kept <= 100);
+            assert_eq!(
+                kept + event["errors_omitted"].as_u64().unwrap() as usize,
+                count
+            );
+            assert_eq!(event["all_configured_roots_reachable"], true);
+            eprintln!("large_scan_report bounded_bytes={bytes} retained_errors={kept}");
+        }
+        if event["event"] == "done" {
+            assert!(saw_finished);
+            break;
+        }
+    }
+    assert_eq!(fixture.ready()["pid"], pid);
+    drop(input);
+    assert!(fixture.cli("stop").status.success());
+    fixture.wait_all(Duration::from_secs(4));
+    reader.join().unwrap();
+}
+
+#[test]
+fn large_scan_report_protocol_frame_error_is_not_a_disconnect() {
+    let _fixture_load = ordinary_fixture_lane();
+    for malformed_json in [false, true] {
+        let mut fixture = Fixture::new();
+        let key = instance::database_key(&fixture.db).unwrap();
+        let lock = instance::InstanceLock::try_acquire(&fixture.db)
+            .unwrap()
+            .unwrap();
+        let mut listener = endpoint::Listener::bind(&key).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let mut hello_count = 0;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let stream = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(e) => panic!("protocol peer accept: {e}"),
+                };
+                let mut wire = BufReader::new(stream);
+                assert_eq!(next_event(&mut wire)["op"], "hello");
+                protocol::send(wire.get_mut(),&serde_json::json!({"v":1,"id":"bridge-hello","event":"hello",
+                "database_key":key,"protocol":1,"viewer_protocol":1,
+                "capabilities":[protocol::BOUNDED_FINISHED_REPORT],"collector_version":env!("CARGO_PKG_VERSION"),
+                "schema":codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION,
+                "contract":codex_sessions_collector::contract::CONTRACT_VERSION,
+                "parsers":{"codex":codex_sessions_collector::codex::parser::PARSER_VERSION,
+                    "claude":codex_sessions_collector::claude::parser::CLAUDE_PARSER_VERSION},"state":"ready"})).unwrap();
+                hello_count += 1;
+                if hello_count == 1 {
+                    assert_eq!(next_event(&mut wire)["op"], "scan");
+                    // A peer violates framing. The bridge must retain this cause.
+                    let bytes = if malformed_json {
+                        b"{invalid JSON}\n".to_vec()
+                    } else {
+                        vec![b'x'; protocol::MAX_EVENT_BYTES + 1]
+                    };
+                    let _ = wire.get_mut().write_all(&bytes);
+                } else {
+                    let _ = released.recv_timeout(Duration::from_secs(5));
+                    break;
+                }
+            }
+            drop(listener);
+            drop(lock);
+        });
+        let mut bridge = fixture
+            .command()
+            .args(["client", "--db"])
+            .arg(&fixture.db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = bridge.stdin.take().unwrap();
+        let mut output = BufReader::new(bridge.stdout.take().unwrap());
+        fixture.children.push(bridge);
+        assert_eq!(next_event(&mut output)["state"], "connected");
+        protocol::send(
+            &mut input,
+            &serde_json::json!({"v":1,"id":"bad-frame","op":"scan","harnesses":["codex"]}),
+        )
+        .unwrap();
+        let error = next_event(&mut output);
+        // Always stop owned processes/peer before asserting the diagnostic.
+        drop(input);
+        let _ = release.send(());
+        fixture.wait_all(Duration::from_secs(4));
+        peer.join().unwrap();
+        assert_eq!(error["id"], "bad-frame");
+        assert_eq!(error["code"], "protocol_error", "{error}");
+        assert!(error["message"].as_str().unwrap().contains("frame"));
+    }
+}
+
+#[test]
 fn scan_request_refuses_missing_relative_or_foreign_context() {
     let _fixture_load = ordinary_fixture_lane();
     let mut fixture = Fixture::new();
@@ -1118,19 +1339,30 @@ fn bridge_reports_inflight_disconnect_and_reconnects_without_replaying() {
 #[cfg(windows)]
 #[test]
 fn bridge_replaces_only_a_positively_incompatible_resident() {
-    let _fixture_load = ordinary_fixture_lane();
-    for scenario in [
+    bridge_compatibility_scenarios(&[
         "disconnect",
         "malformed",
         "build",
         "version",
         "viewer-protocol",
         "lost-shutdown-reply",
-    ] {
+    ]);
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_replaces_old_identity_resident() {
+    bridge_compatibility_scenarios(&["old-identity"]);
+}
+
+#[cfg(windows)]
+fn bridge_compatibility_scenarios(scenarios: &[&'static str]) {
+    let _fixture_load = ordinary_fixture_lane();
+    for &scenario in scenarios {
         eprintln!("bridge compatibility scenario={scenario}");
         let incompatible = matches!(
             scenario,
-            "build" | "version" | "viewer-protocol" | "lost-shutdown-reply"
+            "build" | "version" | "viewer-protocol" | "lost-shutdown-reply" | "old-identity"
         );
         let fixture = Fixture::new();
         let key = instance::database_key(&fixture.db).unwrap();
@@ -1171,7 +1403,8 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
                 } else {
                     let mut hello = serde_json::json!({"v":1,"id":"bridge-hello","event":"hello",
                         "database_key":key,"protocol":1,"collector_version":"older-build","schema":30,"contract":2,
-                        "parsers":{"codex":1,"claude":1},"state":"ready"});
+                        "parsers":{"codex":1,"claude":1},"state":"ready",
+                        "capabilities":[protocol::BOUNDED_FINISHED_REPORT]});
                     if scenario == "viewer-protocol" {
                         hello["collector_version"] = env!("CARGO_PKG_VERSION").into();
                         hello["schema"] =
@@ -1184,9 +1417,36 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
                         hello["parsers"]["claude"] =
                             codex_sessions_collector::claude::parser::CLAUDE_PARSER_VERSION.into();
                     }
+                    if scenario == "old-identity" {
+                        // Exact advertised identity from b7b59d8, before bounded reports.
+                        hello = serde_json::json!({"v":1,"id":"bridge-hello","event":"hello",
+                            "database_key":key,"protocol":1,"viewer_protocol":1,
+                            "collector_version":"0.1.0","schema":30,"contract":2,
+                            "parsers":{"codex":5,"claude":1},"state":"ready"});
+                    }
                     protocol::send(wire.get_mut(), &hello).unwrap();
                 }
-                let shutdown = next_event(&mut wire);
+                let shutdown = if scenario == "old-identity" {
+                    let mut line = Vec::new();
+                    loop {
+                        match protocol::read_frame(&mut wire, &mut line, protocol::MAX_EVENT_BYTES)
+                        {
+                            Ok(protocol::Frame::Eof) => return false,
+                            Ok(protocol::Frame::Complete) => break,
+                            Ok(protocol::Frame::Partial) => (),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                ) => {}
+                            Err(error) => panic!("old fixture read: {error}"),
+                        }
+                        assert!(Instant::now() < deadline, "old fixture shutdown deadline");
+                    }
+                    serde_json::from_slice(&line).unwrap()
+                } else {
+                    next_event(&mut wire)
+                };
                 assert_eq!(shutdown["op"], "shutdown");
                 if scenario != "lost-shutdown-reply" {
                     protocol::send(
@@ -1200,6 +1460,7 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
             drop(wire);
             drop(listener);
             drop(lock);
+            true
         });
         let mut bridge = fixture
             .command()
@@ -1224,7 +1485,10 @@ fn bridge_replaces_only_a_positively_incompatible_resident() {
         }
         drop(input);
         let output = bridge.wait_with_output().unwrap();
-        fake.join().unwrap();
+        assert!(
+            fake.join().unwrap(),
+            "old b7b59d8 identity was accepted without replacement"
+        );
         if incompatible {
             assert!(
                 output.status.success(),
@@ -1334,32 +1598,44 @@ fn replacement_started_after_its_shared_deadline_does_not_become_a_resident() {
 #[test]
 fn bridge_replacement_allows_a_slow_shutdown() {
     let _fixture_load = ordinary_fixture_lane();
-    slow_bridge_replacement(6500, false);
+    slow_bridge_replacement(ShutdownRelease::AfterMillis(6500), false);
 }
 
 #[cfg(windows)]
 #[test]
-fn bridge_replacement_allows_shutdown_near_its_deadline() {
+fn bridge_replacement_waits_for_an_explicit_lock_release() {
     let _fixture_load = ordinary_fixture_lane();
-    slow_bridge_replacement(9500, false);
+    // Native process startup/serving complements the controlled-clock test of
+    // attach, transferred replacement deadline and lock handoff in
+    // bridge::deadline_tests::replacement_obeys_the_shared_deadline_through_handoff.
+    slow_bridge_replacement(ShutdownRelease::Signalled, false);
 }
 
 #[cfg(windows)]
 #[test]
 fn bridge_replacement_survives_the_viewer_connection_deadline() {
     let _fixture_load = ordinary_fixture_lane();
-    slow_bridge_replacement(6500, true);
+    slow_bridge_replacement(ShutdownRelease::AfterMillis(6500), true);
 }
 
 #[cfg(windows)]
 #[test]
 fn bridge_replacement_stops_at_the_shutdown_deadline_without_an_orphan() {
     let _fixture_load = ordinary_fixture_lane();
-    slow_bridge_replacement(10500, false);
+    slow_bridge_replacement(ShutdownRelease::AfterMillis(10500), false);
 }
 
 #[cfg(windows)]
-fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
+#[derive(Clone, Copy)]
+enum ShutdownRelease {
+    AfterMillis(u64),
+    Signalled,
+}
+
+#[cfg(windows)]
+fn slow_bridge_replacement(release: ShutdownRelease, abandon: bool) {
+    let beyond_deadline = matches!(release, ShutdownRelease::AfterMillis(ms) if ms > 10000);
+    let (release_sent, release_received) = std::sync::mpsc::channel();
     let mut fixture = Fixture::new();
     let key = instance::database_key(&fixture.db).unwrap();
     let lock = instance::InstanceLock::try_acquire(&fixture.db)
@@ -1391,7 +1667,12 @@ fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
         shutdown_sent.send(()).unwrap();
         drop(wire); // Deliberately lose the shutdown reply.
         drop(listener);
-        std::thread::sleep(Duration::from_millis(delay_ms));
+        match release {
+            ShutdownRelease::AfterMillis(ms) => std::thread::sleep(Duration::from_millis(ms)),
+            ShutdownRelease::Signalled => release_received
+                .recv_timeout(Duration::from_secs(16))
+                .expect("fixture lock-release signal"),
+        }
         drop(lock);
     });
     let start = Instant::now();
@@ -1418,6 +1699,24 @@ fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
     shutdown_received
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
+    if matches!(release, ShutdownRelease::Signalled) {
+        assert!(
+            instance::InstanceLock::try_acquire(&fixture.db)
+                .unwrap()
+                .is_none(),
+            "old owner released before the explicit signal"
+        );
+        assert!(
+            matches!(
+                received.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "bridge announced replacement or exited while the old owner held the lock"
+        );
+        // Release before the process census: WMI latency must not consume the
+        // shutdown budget while this deterministic fixture deliberately waits.
+        release_sent.send(()).unwrap();
+    }
     let workers = DetachedWorkers::for_hook(&HookIdentity::capture(&bridge));
     if abandon {
         std::thread::sleep(
@@ -1458,7 +1757,7 @@ fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
             let event = received
                 .recv_timeout(Duration::from_secs(16).saturating_sub(start.elapsed()))
                 .unwrap();
-            if delay_ms > 10000 {
+            if beyond_deadline {
                 assert_ne!(event["state"], "replaced");
                 assert_ne!(event["state"], "connected");
                 if event["state"] == "failed" {
@@ -1485,7 +1784,7 @@ fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
         }
         drop(input);
         fixture.children.push(bridge);
-        if delay_ms > 10000 {
+        if beyond_deadline {
             let until = Instant::now() + Duration::from_secs(3);
             while fixture.children[0].try_wait().unwrap().is_none() {
                 assert!(Instant::now() < until);
@@ -1501,7 +1800,7 @@ fn slow_bridge_replacement(delay_ms: u64, abandon: bool) {
         start.elapsed() < Duration::from_secs(16),
         "replacement exceeded its total bound"
     );
-    if delay_ms > 10000 {
+    if beyond_deadline {
         assert!(
             !fixture.cli("status").status.success(),
             "late successor escaped the shutdown deadline"
@@ -3556,6 +3855,16 @@ fn bridge_protocol_wire_version_and_validation() {
     assert!(hello["parsers"]["codex"].as_i64().unwrap() > 0);
     assert!(hello["parsers"]["claude"].as_i64().unwrap() > 0);
     assert_eq!(hello["collector_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        hello["capabilities"],
+        serde_json::json!([protocol::BOUNDED_FINISHED_REPORT])
+    );
+    // b7b59d8 bridge::compatible ignores additive fields. Keep its advertised
+    // inputs stable, so an old bridge accepts a new bounded-report resident.
+    assert_eq!(hello["viewer_protocol"], 1);
+    assert_eq!(hello["collector_version"], "0.1.0");
+    assert_eq!(hello["parsers"]["codex"], 5);
+    assert_eq!(hello["parsers"]["claude"], 1);
     assert_eq!(hello["lifetime"], "viewer");
     let unknown = exchange(
         &mut wire,

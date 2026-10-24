@@ -267,7 +267,7 @@ void main() {
         expect(node.label, isNot(contains(fixture.backups.single.path)));
         expect(find.byKey(const Key('background-backup-path')), findsOneWidget);
         expect(
-          RegExp('installed but turned off').allMatches(node.label).length,
+          RegExp('Installed but turned off').allMatches(node.label).length,
           disabled ? 1 : 0,
         );
         debugPrint(
@@ -382,10 +382,7 @@ void main() {
       schedule: const ScheduledScanState(installed: true, enabled: false),
     );
     final announcer = await _show(tester, collection);
-    expect(
-      find.text('Background collection is installed but turned off.'),
-      findsOneWidget,
-    );
+    expect(find.text('Installed but turned off.'), findsOneWidget);
     await tester.tap(find.text('Turn on'));
     await tester.pumpAndSettle();
     expect(collection.calls, ['enable']);

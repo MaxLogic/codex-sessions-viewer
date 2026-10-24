@@ -39,7 +39,9 @@ String collectionRefreshError(Object error) => switch (error) {
   CollectorUnavailableException() =>
     CollectorUnavailableException.recoveryMessage,
   CollectorDisconnectedException() =>
-    'Refresh stopped because session collection restarted. Select Refresh to try again.',
+    'Refresh stopped because the session collection connection was interrupted. Select Refresh to try again.',
+  CollectorRequestException(code: 'protocol_error') =>
+    'Refresh stopped because session collection sent an invalid response. Select Refresh to try again. If this keeps happening, restart Codex Sessions Viewer.',
   CollectorRequestException(
     code: 'busy' || 'refused' || 'queue_full' || 'unavailable',
   ) =>
@@ -281,8 +283,13 @@ class ResidentCollectorClient extends ChangeNotifier {
                 (line) {
                   if (identical(_process, process)) _event(line);
                 },
-                onError: (Object error) =>
-                    _disconnect(error.toString(), source: process),
+                onError: (Object error) => _disconnect(
+                  'Session collection response could not be read.',
+                  source: process,
+                  error: error is FormatException
+                      ? const CollectorRequestException('protocol_error')
+                      : null,
+                ),
                 onDone: () => _disconnect(
                   'Session collection connection closed.',
                   source: process,
@@ -364,7 +371,14 @@ class ResidentCollectorClient extends ChangeNotifier {
         } else {
           _setState(state);
         }
-        if (state == 'failed') _disconnect('Collector unavailable.');
+        if (state == 'failed') {
+          _disconnect(
+            'Collector unavailable.',
+            error: event['code'] == 'protocol_error'
+                ? const CollectorRequestException('protocol_error')
+                : null,
+          );
+        }
         return;
       }
       final controller = _pending[event['id']];
@@ -375,8 +389,11 @@ class ResidentCollectorClient extends ChangeNotifier {
         _cancelTimers.remove(event['id'])?.cancel();
         unawaited(controller.close());
       }
-    } on Object catch (error) {
-      _disconnect('Invalid collector response: $error');
+    } on Object {
+      _disconnect(
+        'Invalid collector response.',
+        error: const CollectorRequestException('protocol_error'),
+      );
     }
   }
 
@@ -433,7 +450,9 @@ class ResidentCollectorClient extends ChangeNotifier {
     for (final controller in _pending.values) {
       controller.add({
         'event': 'error',
-        'code': 'disconnected',
+        'code': error is CollectorRequestException
+            ? error.code
+            : 'disconnected',
         'message': reason,
       });
       unawaited(controller.close());
@@ -681,10 +700,19 @@ class ResidentCollectorClient extends ChangeNotifier {
     return SessionScanResult(
       progress: finished,
       cancelled: cancelled,
-      allConfiguredRootsReachable: !errors.any(
-        (e) => e.status == SessionFileStatus.pathUnreachable,
-      ),
+      allConfiguredRootsReachable:
+          reports.values.every(
+            (report) => report['all_configured_roots_reachable'] != false,
+          ) &&
+          !errors.any((e) => e.status == SessionFileStatus.pathUnreachable),
       errors: errors,
+      errorsOmitted: _sum(reports.values, 'errors_omitted'),
+      unreachablePathsOmitted: _sum(
+        reports.values,
+        'unreachable_paths_omitted',
+      ),
+      pruneFailuresOmitted: cacheRepair?['prune_failures_omitted'] as int? ?? 0,
+      prunedBackupsOmitted: cacheRepair?['pruned_backups_omitted'] as int? ?? 0,
     );
   }
 

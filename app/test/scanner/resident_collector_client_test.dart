@@ -3,7 +3,13 @@ import '../support/test_environment.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:convert';
 
+import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/database/database_connection.dart';
+import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
+import 'package:codex_sessions_viewer/src/scanner/collector_process.dart';
 import 'package:codex_sessions_viewer/src/scanner/resident_collector_client.dart';
 import 'package:codex_sessions_viewer/src/scanner/scan_types.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -380,6 +386,208 @@ void main(List<String> args) {
         throwsA(isA<CollectorRequestException>()),
       );
       expect(attempts, 1);
+    },
+  );
+
+  test(
+    'large finished report native summary survives an oversized CLI report',
+    () async {
+      await client.dispose();
+      final root = await Directory.systemTemp.createTemp(
+        'cxv194-native-summary-',
+      );
+      addTearDown(() async {
+        await client.dispose();
+        await deleteCollectorFixture(root);
+      });
+      final database = File(p.join(root.path, 'viewer.sqlite'));
+      final settings = File(p.join(root.path, 'settings.toml'));
+      final sessions = await Directory(p.join(root.path, 'sessions')).create();
+      await SettingsRepository(settings).save(
+        AppSettings.defaults().copyWith(
+          paths: PathSettings(
+            windowsCodexPath: sessions.path,
+            wslCodexUncPath: '',
+          ),
+        ),
+      );
+      final startup = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(database, deferUsageMigration: true);
+      expect(startup.canStartNormalUi, isTrue);
+      final migration = await startPendingDatabaseMigration(
+        database,
+        sqlRoot: Directory('../sql'),
+      );
+      if (migration != null) {
+        final result = await migration.result;
+        expect(result.succeeded, isTrue, reason: result.errorMessage);
+      }
+      final db = openFileBackedDatabase(database);
+      try {
+        final parent = p.joinAll([
+          sessions.path,
+          ...List.filled(1640, 'component'),
+        ]);
+        db.execute('begin');
+        for (var i = 0; i < 1100; i++) {
+          final path = p.join(parent, 'missing-$i.jsonl');
+          db.execute(
+            "insert into sessions(id,harness,source_type,source_file_path,display_path,platform_path,created_at_utc,updated_at_utc) values (?,'codex','windows',?,?,?,'2026-10-24T00:00:00Z','2026-10-24T00:00:00Z')",
+            ['large-$i', path, path, path],
+          );
+        }
+        db.execute('commit');
+      } finally {
+        db.close();
+      }
+      client = ResidentCollectorClient(
+        databaseFile: database,
+        settingsFile: settings,
+      );
+      try {
+        final process =
+            await startCollectorProcess(CollectorProcess.defaultExecutable(), [
+              'codex',
+              'scan',
+              '--db',
+              database.path,
+              '--windows-root',
+              sessions.path,
+              '--wsl-root',
+              '',
+              '--wsl-unc-root',
+              '',
+              '--no-wsl-projects',
+              '--json',
+            ]);
+        final bytes = process.stdout.fold<int>(
+          0,
+          (count, chunk) => count + chunk.length,
+        );
+        final errors = process.stderr.transform(utf8.decoder).join();
+        await process.stdin.close();
+        expect(await process.exitCode, 0, reason: await errors);
+        final reportBytes = await bytes;
+        expect(reportBytes, greaterThan(16 * 1024 * 1024));
+        final result = await client.scan(
+          cancellation: ScanCancellationController().token,
+          onProgress: (_, _) {},
+        );
+        expect(result.progress.sessionsMissing, 1100);
+        expect(result.errors, hasLength(100));
+        expect(result.errorsOmitted, 1000);
+        expect(result.allConfiguredRootsReachable, isTrue);
+        // ignore: avoid_print
+        print(
+          'native_large_summary uncapped_bytes=$reportBytes retained=${result.errors.length} omitted=${result.errorsOmitted}',
+        );
+      } finally {
+        await client.dispose();
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  test('large finished report protocol error never claims a restart', () async {
+    bridge.onRequest = (request) {
+      bridge.emit({
+        'id': request['id'],
+        'event': 'error',
+        'code': 'protocol_error',
+        'message': 'protocol frame exceeds limit',
+      });
+    };
+    Object? failure;
+    try {
+      await client.scan(
+        cancellation: ScanCancellationController().token,
+        onProgress: (_, _) {},
+      );
+    } on Object catch (error) {
+      failure = error;
+    }
+    expect(failure, isA<CollectorRequestException>());
+    expect(
+      collectionRefreshError(failure!),
+      'Refresh stopped because session collection sent an invalid response. Select Refresh to try again. If this keeps happening, restart Codex Sessions Viewer.',
+    );
+    expect(bridge.killed, isFalse);
+    expect(
+      collectionRefreshError(const CollectorDisconnectedException()),
+      isNot(contains('restarted')),
+    );
+  });
+
+  test(
+    'large finished report malformed response preserves protocol failure',
+    () async {
+      bridge.onRequest = (_) => bridge.emit({'event': 'bridge', 'state': 42});
+      Object? failure;
+      try {
+        await client.scan(
+          cancellation: ScanCancellationController().token,
+          onProgress: (_, _) {},
+        );
+      } on Object catch (error) {
+        failure = error;
+      }
+      expect(
+        failure,
+        isA<CollectorRequestException>().having(
+          (e) => e.code,
+          'code',
+          'protocol_error',
+        ),
+      );
+      expect(collectionRefreshError(failure!), contains('invalid response'));
+    },
+  );
+
+  test('large finished report invalid UTF-8 is a protocol error', () async {
+    bridge.onRequest = (_) => bridge.emitBytes([0xff, 10]);
+    await expectLater(
+      client.scan(
+        cancellation: ScanCancellationController().token,
+        onProgress: (_, _) {},
+      ),
+      throwsA(
+        isA<CollectorRequestException>().having(
+          (e) => e.code,
+          'code',
+          'protocol_error',
+        ),
+      ),
+    );
+  });
+
+  test(
+    'large finished report handshake protocol error keeps its cause',
+    () async {
+      await client.dispose();
+      client = ResidentCollectorClient(
+        databaseFile: File('fixture.sqlite'),
+        settingsFile: File('fixture.toml'),
+        start: (_, _) async {
+          bridge.emit({
+            'event': 'bridge',
+            'state': 'failed',
+            'code': 'protocol_error',
+            'detail': 'invalid resident hello',
+          });
+          return bridge;
+        },
+      );
+      await expectLater(
+        client.connect(),
+        throwsA(
+          isA<CollectorRequestException>().having(
+            (e) => e.code,
+            'code',
+            'protocol_error',
+          ),
+        ),
+      );
     },
   );
 

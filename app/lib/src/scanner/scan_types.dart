@@ -68,12 +68,24 @@ class SessionScanResult {
     this.cancelled = false,
     required this.allConfiguredRootsReachable,
     required this.errors,
+    this.errorsOmitted = 0,
+    this.unreachablePathsOmitted = 0,
+    this.pruneFailuresOmitted = 0,
+    this.prunedBackupsOmitted = 0,
   });
 
   final ScanProgress progress;
   final bool cancelled;
   final bool allConfiguredRootsReachable;
   final List<ScanFileError> errors;
+
+  /// Additional file diagnostics omitted from the bounded resident summary.
+  final int errorsOmitted;
+  final int unreachablePathsOmitted;
+
+  /// Additional cache repair details omitted from the resident summary.
+  final int pruneFailuresOmitted;
+  final int prunedBackupsOmitted;
 }
 
 class ScanCancellationController {

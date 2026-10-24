@@ -350,10 +350,13 @@ fn repair(
     // the GUI slot. Failure here precedes backup creation and any deletion.
     leases.acquire_for_backup()?;
     let backup = backup_directory.join(backup_name(database, &audit.id));
-    if let Err(_error) = create_verified_backup(conn, database, &backup, &audit) {
-        discard_backup(&backup);
-        return Ok(RepairReport::postponed("backup_failed", Some(&audit)));
-    }
+    let backup = match create_verified_backup(conn, database, &backup, &audit) {
+        Ok(backup) => backup,
+        Err(_error) => {
+            discard_backup(&backup);
+            return Ok(RepairReport::postponed("backup_failed", Some(&audit)));
+        }
+    };
     if cancelled() {
         discard_backup(&backup);
         return Ok(RepairReport::postponed("cancelled", Some(&audit)));
@@ -735,7 +738,7 @@ fn create_verified_backup(
     database: &Path,
     backup: &Path,
     audit: &Audit,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let same = |left: &Path, right: &Path| {
         std::path::absolute(left)
             .ok()
@@ -750,10 +753,29 @@ fn create_verified_backup(
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    // SQLite's ordinary Windows VFS can open the source database but refuse
+    // its longer adjacent backup (including the journal suffix). Canonicalize
+    // the existing parent to obtain Windows extended path syntax before the
+    // backup exists, and retain that path for both verification passes.
+    #[cfg(windows)]
+    let backup = {
+        let parent = backup
+            .parent()
+            .ok_or("the repair backup has no parent directory")?;
+        let name = backup
+            .file_name()
+            .ok_or("the repair backup has no file name")?;
+        std::fs::canonicalize(parent)
+            .map_err(|error| error.to_string())?
+            .join(name)
+    };
+    #[cfg(not(windows))]
+    let backup = backup.to_path_buf();
     conn.execute("vacuum into ?", [backup.to_string_lossy().into_owned()])
         .map_err(|error| error.to_string())?;
     let expected_schema = last_applied_version(conn).map_err(|error| error.to_string())?;
-    verify_backup(backup, audit, expected_schema).map_err(|error| error.to_string())
+    verify_backup(&backup, audit, expected_schema).map_err(|error| error.to_string())?;
+    Ok(backup)
 }
 
 /// The copy must be a readable SQLite database holding this audit. A
