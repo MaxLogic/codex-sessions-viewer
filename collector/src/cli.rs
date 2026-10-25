@@ -479,7 +479,7 @@ fn hub_backfill(options: &Options, out: &mut impl Write) -> Result<(), CliError>
     enabled_hub_url(&store)?;
     let report = crate::hub_backfill::backfill(std::path::Path::new(&store.path), store.mode)
         .map_err(CliError::Failed)?;
-    writeln!(out, "{}", json!({"command":"hub backfill","candidates":report.candidates,"queued":report.queued,"pending":report.pending}))
+    writeln!(out, "{}", json!({"command":"hub backfill","candidates":report.candidates,"still_present":report.still_present,"queued":report.queued,"pending":report.pending}))
         .map_err(|error| CliError::Failed(error.to_string()))
 }
 

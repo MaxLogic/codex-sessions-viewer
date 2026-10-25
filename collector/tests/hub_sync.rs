@@ -1392,6 +1392,18 @@ fn backfill_delivers_a_stored_session_whose_file_is_gone() {
     assert_eq!(refused.status.code(), Some(3), "not paired yet");
 
     hub_client::enable_for_collection(&db, OwnerMode::Standalone, &hub.url).unwrap();
+    // A compressed copy on disk is left to the next scan.
+    let compressed = support::day_folder(&home).join("rich_session.jsonl.zst");
+    std::fs::write(&compressed, b"not read by backfill").unwrap();
+    let skipped = json_output(&hub_command(&db, "backfill", MACHINE_A_TOKEN));
+    assert_eq!(
+        (
+            skipped["still_present"].as_i64(),
+            skipped["queued"].as_i64()
+        ),
+        (Some(1), Some(0))
+    );
+    std::fs::remove_file(&compressed).unwrap();
     let report = json_output(&hub_command(&db, "backfill", MACHINE_A_TOKEN));
     assert_eq!(
         (report["candidates"].as_i64(), report["queued"].as_i64()),

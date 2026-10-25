@@ -170,7 +170,9 @@ A forced collection queues only sessions whose source files still exist. A
 session collected before pairing whose file was deleted since exists only in
 the local database. `hub backfill` rebuilds each such session (source recorded
 missing, parse available) from its stored rows, queues it with an explicit
-missing status, and leaves the upload to the next `hub sync`:
+missing status, and leaves the upload to the next `hub sync`. A session whose
+file, or a `.zst` copy of it, is on disk again is skipped (`still_present`):
+the next scan sends it parsed.
 
 ```powershell
 codex-sessions-collector.exe hub backfill --db C:\Path\codex_sessions_viewer.sqlite

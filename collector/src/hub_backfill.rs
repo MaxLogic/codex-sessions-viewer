@@ -30,6 +30,8 @@ const CHUNK: usize = 32;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackfillReport {
     pub candidates: usize,
+    /// Recorded missing, but the file (or its `.zst`) is on disk again.
+    pub still_present: usize,
     pub queued: usize,
     pub pending: i64,
 }
@@ -48,19 +50,33 @@ fn run(conn: &Connection) -> StoreResult<BackfillReport> {
             "hub delivery is not enabled; run hub enable first".to_owned(),
         ));
     }
-    let ids: Vec<String> = conn
+    let recorded: Vec<(String, Option<String>, Option<String>)> = conn
         .prepare(
-            "select id from sessions
+            "select id, source_file_path, source_file_unc_path from sessions
              where scan_status = 'missing' and parse_status = 'available'
                and message_count > 0
              order by coalesce(last_message_at_utc, started_at_utc), id",
         )?
-        .query_map([], |row| row.get(0))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
     let mut report = BackfillReport {
-        candidates: ids.len(),
+        candidates: recorded.len(),
         ..BackfillReport::default()
     };
+    // A file that still exists, or that Codex compressed in place, is sent
+    // parsed by the next scan; the stored rows would only be a weaker copy.
+    let ids: Vec<String> = recorded
+        .into_iter()
+        .filter(|(_, path, unc)| {
+            let present = [path, unc]
+                .into_iter()
+                .flatten()
+                .any(|path| Path::new(path).exists() || Path::new(&format!("{path}.zst")).exists());
+            report.still_present += usize::from(present);
+            !present
+        })
+        .map(|(id, _, _)| id)
+        .collect();
     for chunk in ids.chunks(CHUNK) {
         let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
         let _phase = crate::store::write_budget::write_phase("hub");
