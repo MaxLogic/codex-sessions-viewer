@@ -410,13 +410,13 @@ void main() {
     await _show(tester, _FakeCollection());
     expect(find.text('Background collection is off.'), findsOneWidget);
     final explanation = _text(tester, 'background-explanation');
-    expect(explanation, contains('apply immediately'));
+    expect(explanation, contains('saved immediately'));
     expect(explanation, contains('not part of Save settings'));
-    expect(explanation, contains('Codex config.toml'));
+    expect(explanation, contains('Codex hooks.json'));
     expect(explanation, contains('Claude Code settings.json'));
-    expect(explanation, contains('backup is kept'));
-    expect(explanation, contains('chained'));
-    expect(explanation, contains('restored'));
+    expect(explanation, contains('backups beside changed files'));
+    expect(explanation, contains('migrates supported legacy notify chains'));
+    expect(explanation, contains('/hooks'));
     expect(explanation, contains('scheduled task'));
     expect(_text(tester, 'background-codex-state'), 'Not installed');
     expect(_text(tester, 'background-schedule-state'), 'Not scheduled');
@@ -432,14 +432,15 @@ void main() {
     await tester.pump();
     expect(
       _text(tester, 'background-message'),
-      'Installing Codex notify hook…',
+      'Installing Codex lifecycle hooks…',
     );
-    expect(announcer.messages.last, 'Installing Codex notify hook…');
+    expect(announcer.messages.last, 'Installing Codex lifecycle hooks…');
     collection.gate!.complete();
     await tester.pumpAndSettle();
     expect(announcer.messages, [
-      'Installing Codex notify hook…',
-      'Codex notify hook installed.',
+      'Installing Codex lifecycle hooks…',
+      'Codex lifecycle hooks installed. Review them in Codex '
+          '/hooks and restart the session to activate them.',
     ]);
     expect(_text(tester, 'background-codex-state'), 'Installed');
     expect(
@@ -464,7 +465,7 @@ void main() {
     expect(_text(tester, 'background-codex-state'), 'Not installed');
     expect(
       announcer.messages.last,
-      'Codex notify hook removed. The previous hook configuration was restored.',
+      'Codex lifecycle hooks removed. The previous hook configuration was restored.',
     );
     expect(_focusedButton(), const Key('background-codex-install'));
     collection.restores = false;
@@ -472,7 +473,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('background-codex-remove')));
     await tester.pumpAndSettle();
-    expect(announcer.messages.last, 'Codex notify hook removed.');
+    expect(announcer.messages.last, 'Codex lifecycle hooks removed.');
   });
 
   testWidgets('focus survives the schedule row and refresh', (tester) async {
@@ -612,7 +613,7 @@ void main() {
       _text(tester, 'background-codex-state'),
       'Out of date. Update to fix.',
     );
-    expect(find.text('Update Codex notify hook'), findsOneWidget);
+    expect(find.text('Update Codex lifecycle hooks'), findsOneWidget);
     await tester.tap(find.byKey(const Key('background-claude-copy-path')));
     await tester.pumpAndSettle();
     expect(copied, [r'C:\Users\a\.claude\settings.json']);
@@ -772,7 +773,7 @@ void main() {
       final remove = tester.getSemantics(
         find.byKey(const Key('background-codex-remove')),
       );
-      expect(remove.label, contains('Remove Codex notify hook'));
+      expect(remove.label, contains('Remove Codex lifecycle hooks'));
       expect(remove.flagsCollection.isButton, isTrue);
       expect(remove.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
       final install = tester.getSemantics(

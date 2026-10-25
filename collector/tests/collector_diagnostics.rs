@@ -41,6 +41,13 @@ impl Fixture {
             .env_remove("CODEX_SESSIONS_HUB_MACHINE_TOKEN");
         cmd
     }
+    fn hooks_config(&self) -> std::path::PathBuf {
+        if self.harness == "codex" {
+            self.config.with_file_name("hooks.json")
+        } else {
+            self.config.clone()
+        }
+    }
     fn setup(&self) {
         let out = self.command("setup").arg("--apply").output().unwrap();
         assert!(
@@ -298,11 +305,11 @@ fn hook_registration_preserves_root_kinds_and_rejects_ambiguous_codex_roots() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let config: toml::Table = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
-    let args = config["notify"].as_array().unwrap();
-    assert!(args.iter().any(|v| v.as_str() == Some("--windows-root")));
-    assert!(args.iter().any(|v| v.as_str() == Some("--wsl-root")));
-    let before = std::fs::read(&f.config).unwrap();
+    let command = claude_commands(&f.hooks_config(), "Stop").remove(0);
+    assert!(command.contains("--windows-root"));
+    assert!(command.contains("--wsl-root"));
+    assert!(!f.config.exists());
+    let before = std::fs::read(f.hooks_config()).unwrap();
     let out = f
         .command("setup")
         .arg("--root")
@@ -311,7 +318,7 @@ fn hook_registration_preserves_root_kinds_and_rejects_ambiguous_codex_roots() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert_eq!(std::fs::read(&f.config).unwrap(), before);
+    assert_eq!(std::fs::read(f.hooks_config()).unwrap(), before);
 }
 
 #[test]
@@ -321,37 +328,13 @@ fn generated_hooks_execute_and_queue_synthetic_events_on_windows() {
     for harness in ["codex", "claude"] {
         let f = Fixture::new(harness);
         f.setup();
-        let contents = std::fs::read_to_string(&f.config).unwrap();
-        let mut cmd = if harness == "codex" {
-            let config: toml::Table = contents.parse().unwrap();
-            let args: Vec<_> = config["notify"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_owned())
-                .collect();
-            let mut cmd = support::test_command(&args[0]);
-            cmd.args(&args[1..])
-                .arg("--no-drain")
-                .arg(r#"{"type":"agent-turn-complete","thread-id":"synthetic-hook"}"#);
-            cmd
-        } else {
-            let config: Value = serde_json::from_str(&contents).unwrap();
-            let command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap();
-            let mut cmd = support::test_command("cmd.exe");
-            cmd.args(["/D", "/S", "/C"])
-                .raw_arg(format!("\"{command} --no-drain\""));
-            cmd
-        };
-        let input = if harness == "claude" {
-            serde_json::json!({"session_id":"synthetic-hook", "hook_event_name":"Stop",
-                "transcript_path":f.root.join("transcript.jsonl")})
-            .to_string()
-        } else {
-            String::new()
-        };
+        let command = claude_commands(&f.hooks_config(), "Stop").remove(0);
+        let mut cmd = support::test_command("cmd.exe");
+        cmd.args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command} --no-drain\""));
+        let input = serde_json::json!({"session_id":"synthetic-hook", "hook_event_name":"Stop", "cwd":f.root,
+            "transcript_path":f.root.join("transcript.jsonl")})
+        .to_string();
         let child = cmd
             .env("CODEX_SESSIONS_COLLECTOR_QUEUE", &f.queue)
             .stdout(Stdio::piped())
@@ -381,11 +364,14 @@ fn setup_preview_apply_repeat_preserves_configuration_for_both_harnesses() {
             "settings.json"
         });
         let original = if harness == "codex" {
-            "# keep this comment\napi_key = 'private-test-secret'\nnotify = ['previous-command', 'private-hook-secret']\n[other]\nvalue = 42\n"
+            "# keep this comment\napi_key = 'private-test-secret'\n[other]\nvalue = 42\n"
         } else {
             r#"{"api_key":"private-test-secret","hooks":{"Stop":[{"hooks":[{"type":"command","command":"old-hook private-hook-secret"}]}]},"other":{"value":42}}"#
         };
         std::fs::write(&config, original).unwrap();
+        if harness == "codex" {
+            std::fs::write(config.with_file_name("hooks.json"), r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"old-hook private-hook-secret"}]}]}}"#).unwrap();
+        }
         let run = |apply: bool| {
             let mut cmd = collector();
             cmd.args([harness, "setup", "--json", "--root"])
@@ -413,7 +399,13 @@ fn setup_preview_apply_repeat_preserves_configuration_for_both_harnesses() {
         assert_eq!(preview["planned_sha256"], applied["planned_sha256"]);
         let changed = std::fs::read_to_string(&config).unwrap();
         assert!(changed.contains("private-test-secret"));
-        assert!(changed.contains("private-hook-secret"));
+        assert!(if harness == "codex" {
+            std::fs::read_to_string(config.with_file_name("hooks.json"))
+                .unwrap()
+                .contains("private-hook-secret")
+        } else {
+            changed.contains("private-hook-secret")
+        });
         if harness == "codex" {
             assert!(changed.contains("# keep this comment"));
         }
@@ -449,53 +441,62 @@ fn claude_commands(config: &std::path::Path, event: &str) -> Vec<String> {
 }
 
 #[test]
-fn codex_setup_replaces_moved_managed_notify_and_keeps_its_inner_previous_notify() {
-    let previous = r#"["previous-command","private-hook-secret"]"#;
+fn codex_setup_migrates_nested_collector_only_notify_without_duplicates() {
     let moved = serde_json::json!([
         r"C:\Old Place\CODEX-SESSIONS-COLLECTOR.EXE",
         "codex",
         "notify",
         "--db",
-        r"C:\old.sqlite",
-        "--previous-notify",
-        previous
-    ])
-    .to_string();
-    // A chain produced by earlier setups that wrapped their own notify.
+        "old.sqlite"
+    ]);
     let nested = serde_json::json!([
-        "/opt/other/codex-sessions-collector",
+        "/opt/codex-sessions-collector",
         "codex",
         "notify",
         "--previous-notify",
-        moved
-    ])
-    .to_string();
-    for existing in [moved.clone(), nested] {
+        moved.to_string()
+    ]);
+    for existing in [moved, nested] {
         let f = Fixture::new("codex");
-        let array: Vec<String> = serde_json::from_str(&existing).unwrap();
-        let mut notify = toml_edit::Array::new();
-        for arg in &array {
-            notify.push(arg.as_str());
-        }
-        std::fs::write(&f.config, format!("model = 'x'\nnotify = {notify}\n")).unwrap();
-        f.setup();
-        let args = notify_args(&f.config);
-        assert!(
-            !args[0].contains("Old Place") && !args[0].starts_with("/opt"),
-            "{args:?}"
+        write_notify(
+            &f.config,
+            &serde_json::from_value::<Vec<String>>(existing).unwrap(),
         );
         assert_eq!(
-            args.iter().filter(|a| *a == "--previous-notify").count(),
-            1,
-            "{args:?}"
+            f.run("status", &[], 1)["configuration"]["hook_state"],
+            "different_arguments"
         );
-        assert_eq!(args.last().unwrap(), previous, "{args:?}");
+        let applied = f.run("setup", &["--apply"], 0);
+        assert!(applied["config_changed"].as_bool().unwrap());
+        assert!(
+            !std::fs::read_to_string(&f.config)
+                .unwrap()
+                .contains("notify")
+        );
+        for event in ["Stop", "Interrupt"] {
+            let commands = claude_commands(&f.hooks_config(), event);
+            assert_eq!(commands.len(), 1);
+            assert!(commands[0].contains("hook"));
+            assert!(!commands[0].contains("notify"));
+        }
         assert_eq!(f.run("setup", &[], 0)["changed"], false);
         assert_eq!(
             f.run("status", &[], 0)["configuration"]["hook_state"],
             "registered"
         );
     }
+}
+
+fn write_notify(config: &std::path::Path, args: &[String]) {
+    let mut array = toml_edit::Array::new();
+    for arg in args {
+        array.push(arg.as_str());
+    }
+    std::fs::write(
+        config,
+        format!("# retained comment\nmodel = 'x'\nnotify = {array}\n"),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -584,17 +585,13 @@ fn setup_backs_up_an_existing_configuration_before_replacing_it() {
         let f = Fixture::new(harness);
         let applied = f.run("setup", &["--apply"], 0);
         assert!(applied["backup"].is_null(), "{applied}");
-        let original = if harness == "codex" {
-            "api_key = 'private-test-secret'\n".to_owned()
-        } else {
-            r#"{"api_key":"private-test-secret"}"#.to_owned()
-        };
-        std::fs::write(&f.config, &original).unwrap();
+        let original = r#"{"api_key":"private-test-secret"}"#.to_owned();
+        std::fs::write(f.hooks_config(), &original).unwrap();
         let applied = f.run("setup", &["--apply"], 0);
         let backup = std::path::PathBuf::from(applied["backup"].as_str().unwrap());
-        assert_eq!(backup.parent(), f.config.parent());
+        assert_eq!(backup.parent(), f.hooks_config().parent());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
-        assert_ne!(std::fs::read_to_string(&f.config).unwrap(), original);
+        assert_ne!(std::fs::read_to_string(f.hooks_config()).unwrap(), original);
         assert!(!applied.to_string().contains("private-test-secret"));
         // An unchanged repeat writes neither the file nor another backup.
         assert!(f.run("setup", &["--apply"], 0)["backup"].is_null());
@@ -608,16 +605,20 @@ fn setup_keeps_a_secret_configurations_mode_and_owner_on_unix() {
     for harness in ["codex", "claude"] {
         let f = Fixture::new(harness);
         let original = if harness == "codex" {
-            "api_key = 'private-test-secret'\n".to_owned()
+            r#"{"api_key":"private-test-secret"}"#.to_owned()
         } else {
             r#"{"api_key":"private-test-secret"}"#.to_owned()
         };
-        std::fs::write(&f.config, &original).unwrap();
-        std::fs::set_permissions(&f.config, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let before = std::fs::metadata(&f.config).unwrap();
+        std::fs::write(&f.hooks_config(), &original).unwrap();
+        std::fs::set_permissions(&f.hooks_config(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let before = std::fs::metadata(&f.hooks_config()).unwrap();
         let applied = f.run("setup", &["--apply"], 0);
-        let after = std::fs::metadata(&f.config).unwrap();
-        assert_ne!(std::fs::read_to_string(&f.config).unwrap(), original);
+        let after = std::fs::metadata(&f.hooks_config()).unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&f.hooks_config()).unwrap(),
+            original
+        );
         assert_eq!(after.permissions().mode() & 0o7777, 0o600, "{harness}");
         assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
         let backup = std::path::PathBuf::from(applied["backup"].as_str().unwrap());
@@ -625,10 +626,11 @@ fn setup_keeps_a_secret_configurations_mode_and_owner_on_unix() {
         assert_eq!(backup.permissions().mode() & 0o7777, 0o600, "{harness}");
 
         // A group-readable file keeps its wider mode; setup does not guess.
-        std::fs::set_permissions(&f.config, std::fs::Permissions::from_mode(0o640)).unwrap();
-        std::fs::write(&f.config, &original).unwrap();
+        std::fs::set_permissions(&f.hooks_config(), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        std::fs::write(&f.hooks_config(), &original).unwrap();
         f.setup();
-        let after = std::fs::metadata(&f.config).unwrap();
+        let after = std::fs::metadata(&f.hooks_config()).unwrap();
         assert_eq!(after.permissions().mode() & 0o7777, 0o640, "{harness}");
     }
 }
@@ -647,7 +649,8 @@ fn setup_accepts_and_preserves_a_utf8_byte_order_mark() {
         let written = std::fs::read_to_string(&f.config).unwrap();
         assert!(written.starts_with('\u{feff}'), "{written}");
         if harness == "codex" {
-            assert!(notify_args(&f.config).len() > 3);
+            assert_eq!(claude_commands(&f.hooks_config(), "Stop").len(), 1);
+            assert_eq!(written, format!("\u{feff}{body}"));
         } else {
             assert_eq!(claude_commands(&f.config, "Stop").len(), 1);
         }
@@ -725,31 +728,34 @@ fn setup_run(
 }
 
 #[test]
-fn codex_remove_restores_the_previous_notify_and_keeps_other_settings() {
-    let original = "# keep this comment\napi_key = 'private-test-secret'\nnotify = ['previous-command', 'private-hook-secret']\n[other]\nvalue = 42\n";
-    let (_temp, root, config) = removal_fixture("codex", original);
-    setup_run("codex", &root, &config, &["--apply"]);
-    assert_eq!(notify_args(&config)[1], "codex");
-    let preview = setup_run("codex", &root, &config, &["--remove"]);
+fn codex_remove_restores_unknown_previous_notify_without_migrating_it() {
+    let f = Fixture::new("codex");
+    let previous = serde_json::json!(["previous-command", "private-hook-secret"]).to_string();
+    write_notify(
+        &f.config,
+        &[
+            "codex-sessions-collector".into(),
+            "codex".into(),
+            "notify".into(),
+            "--previous-notify".into(),
+            previous,
+        ],
+    );
+    let original = std::fs::read(&f.config).unwrap();
+    let preview = f.run("setup", &["--remove"], 0);
     assert_eq!(preview["changed"], true);
-    assert_eq!(preview["applied"], false);
-    assert_eq!(notify_args(&config)[1], "codex");
-    let applied = setup_run("codex", &root, &config, &["--remove", "--apply"]);
+    assert_eq!(std::fs::read(&f.config).unwrap(), original);
+    let applied = f.run("setup", &["--remove", "--apply"], 0);
     assert_eq!(preview["planned_sha256"], applied["planned_sha256"]);
-    assert_eq!(applied["hook_state_before"], "registered");
     assert_eq!(applied["preserves_existing_hook"], true);
-    assert!(applied["backup"].is_string());
     assert_eq!(
-        notify_args(&config),
+        notify_args(&f.config),
         ["previous-command", "private-hook-secret"]
     );
-    let restored = std::fs::read_to_string(&config).unwrap();
-    assert!(restored.contains("# keep this comment"));
-    assert!(restored.contains("api_key = 'private-test-secret'"));
-    let again = setup_run("codex", &root, &config, &["--remove", "--apply"]);
-    assert_eq!(again["changed"], false);
-    assert_eq!(again["hook_state_before"], "absent");
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), restored);
+    assert_eq!(
+        f.run("setup", &["--remove", "--apply"], 0)["changed"],
+        false
+    );
 }
 
 #[test]
@@ -769,7 +775,9 @@ fn removal_works_when_session_folders_are_gone_and_never_touches_a_foreign_hook(
     let applied = setup_run("codex", &root, &config, &["--remove", "--apply"]);
     assert_eq!(applied["changed"], false);
     assert_eq!(std::fs::read_to_string(&config).unwrap(), foreign);
+    std::fs::write(&config, "model = 'x'\n").unwrap();
     setup_run("codex", &root, &config, &["--apply"]);
+    std::fs::write(&config, foreign).unwrap();
     std::fs::remove_dir(&root).unwrap();
     setup_run("codex", &root, &config, &["--remove", "--apply"]);
     assert_eq!(notify_args(&config), ["other-tool", "notify"]);
@@ -805,4 +813,513 @@ fn claude_remove_does_not_claim_a_restore_when_unrelated_hooks_merely_remain() {
     assert_eq!(applied["preserves_existing_hook"], false);
     let restored: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     assert_eq!(restored, serde_json::from_str::<Value>(original).unwrap());
+}
+
+fn collector_notify(previous: Option<&[String]>) -> Vec<String> {
+    let mut args = vec![
+        "codex-sessions-collector.exe".into(),
+        "codex".into(),
+        "notify".into(),
+    ];
+    if let Some(previous) = previous {
+        args.extend([
+            "--previous-notify".into(),
+            serde_json::to_string(previous).unwrap(),
+        ]);
+    }
+    args
+}
+
+fn computer_notify(previous: Option<&[String]>) -> Vec<String> {
+    let mut args = vec![
+        r"C:\discovered-version\codex-computer-use.exe".into(),
+        "turn-ended".into(),
+    ];
+    if let Some(previous) = previous {
+        args.extend([
+            "--previous-notify".into(),
+            serde_json::to_string(previous).unwrap(),
+        ]);
+    }
+    args
+}
+
+#[test]
+fn codex_native_repair_preserves_foreign_hooks_settings_and_positions() {
+    let f = Fixture::new("codex");
+    let stale = r#""D:\moved\codex-sessions-collector.exe" "codex" "hook" "--db" "old.sqlite""#;
+    let foreign_a = serde_json::json!({"type":"command", "command":"ActiveAppView private-hook-secret", "timeout":7});
+    let foreign_b = serde_json::json!({"type":"command", "command":"rtk rewrite", "async":true});
+    let stale_item = serde_json::json!({"type":"command","command":stale});
+    let original = serde_json::json!({"enabled":true, "other":{"private-test-secret":42}, "hooks":{
+        "Stop":[{"hooks":[foreign_a.clone(),stale_item.clone(),foreign_b.clone()]},
+            {"hooks":[stale_item]}, {"matcher":"x","hooks":[foreign_b.clone()]}],
+        "PreToolUse":[{"matcher":"Bash","hooks":[foreign_b.clone()]}]}});
+    std::fs::write(f.hooks_config(), original.to_string()).unwrap();
+    std::fs::write(
+        &f.config,
+        "# trust must stay unchanged\n[hooks.state]\nprivate_hash = true\n",
+    )
+    .unwrap();
+    let config_before = std::fs::read(&f.config).unwrap();
+    f.setup();
+    let updated: Value = serde_json::from_slice(&std::fs::read(f.hooks_config()).unwrap()).unwrap();
+    assert_eq!(updated["hooks"]["Stop"][0]["hooks"][0], foreign_a);
+    assert_eq!(updated["hooks"]["Stop"][0]["hooks"][2], foreign_b);
+    assert!(
+        updated["hooks"]["Stop"][0]["hooks"][1]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hook")
+    );
+    assert_eq!(updated["hooks"]["Stop"][2], original["hooks"]["Stop"][2]);
+    assert_eq!(
+        updated["hooks"]["PreToolUse"],
+        original["hooks"]["PreToolUse"]
+    );
+    assert_eq!(updated["other"], original["other"]);
+    assert_eq!(std::fs::read(&f.config).unwrap(), config_before);
+    let before = std::fs::read(f.hooks_config()).unwrap();
+    assert_eq!(f.run("setup", &["--apply"], 0)["changed"], false);
+    assert_eq!(std::fs::read(f.hooks_config()).unwrap(), before);
+    let rejected = f.run("setup", &["--remove", "--apply"], 1);
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap()
+            .contains("handler index")
+    );
+    assert_eq!(std::fs::read(f.hooks_config()).unwrap(), before);
+    assert_eq!(std::fs::read(&f.config).unwrap(), config_before);
+}
+
+fn assert_codex_mixed_handler_shift_refused(remove: bool, duplicate: bool, conditional: bool) {
+    let f = Fixture::new("codex");
+    let managed = serde_json::json!({"type":"command",
+        "command":r#""C:\old\codex-sessions-collector.exe" "codex" "hook""#});
+    let mut handlers = vec![managed.clone()];
+    if duplicate {
+        handlers.push(managed);
+    }
+    let foreign_index = handlers.len();
+    handlers.push(serde_json::json!({"type":"command", "command":"ActiveAppView rtk"}));
+    let mut group = serde_json::json!({"hooks":handlers});
+    if conditional {
+        group["matcher"] = serde_json::json!("conditional");
+    }
+    std::fs::write(
+        f.hooks_config(),
+        serde_json::json!({"hooks":{"Stop":[group]}}).to_string(),
+    )
+    .unwrap();
+    // Existing state is fixture data, not a newly computed trust decision.
+    let config = format!(
+        "# saved user hook decisions\n[hooks.state.\"stop:0:{foreign_index}\"]\nenabled = false\ntrusted_hash = 'sha256:preexisting-fixture'\n"
+    );
+    std::fs::write(&f.config, config).unwrap();
+    let config_before = std::fs::read(&f.config).unwrap();
+    let hooks_before = std::fs::read(f.hooks_config()).unwrap();
+    let applied_flags = if remove {
+        vec!["--remove", "--apply"]
+    } else {
+        vec!["--apply"]
+    };
+    let preview_flags = if remove { vec!["--remove"] } else { vec![] };
+    for flags in [applied_flags, preview_flags] {
+        let report = f.run("setup", &flags, 1);
+        let error = report["error"].as_str().unwrap();
+        assert!(
+            error.contains("handler index") && error.contains("/hooks"),
+            "{report}"
+        );
+        assert_eq!(std::fs::read(&f.config).unwrap(), config_before);
+        assert_eq!(std::fs::read(f.hooks_config()).unwrap(), hooks_before);
+        let entries: Vec<_> = std::fs::read_dir(f.temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!entries.iter().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("collector-backup")
+        }));
+    }
+}
+
+#[test]
+fn codex_mixed_handler_removal_refuses_foreign_trust_index_shift() {
+    assert_codex_mixed_handler_shift_refused(true, false, false);
+}
+
+#[test]
+fn codex_mixed_handler_duplicate_repair_refuses_foreign_trust_index_shift() {
+    assert_codex_mixed_handler_shift_refused(false, true, false);
+}
+
+#[test]
+fn codex_mixed_handler_conditional_repair_refuses_foreign_trust_index_shift() {
+    assert_codex_mixed_handler_shift_refused(false, false, true);
+}
+
+#[test]
+fn codex_setup_refuses_unknown_notify_even_inside_computer_use_without_writing() {
+    let unknown = vec!["unrelated-notifier".into(), "private-hook-secret".into()];
+    let helper = computer_notify(Some(&unknown));
+    for args in [
+        unknown.clone(),
+        collector_notify(Some(&unknown)),
+        helper.clone(),
+        computer_notify(Some(&collector_notify(Some(&unknown)))),
+        collector_notify(Some(&helper)),
+    ] {
+        let f = Fixture::new("codex");
+        write_notify(&f.config, &args);
+        let original = std::fs::read(&f.config).unwrap();
+        for flags in [&[][..], &["--apply"][..]] {
+            let report = f.run("setup", flags, 1);
+            assert!(
+                report["error"].as_str().unwrap().contains("full-content"),
+                "{report}"
+            );
+            assert!(!report.to_string().contains("private-hook-secret"));
+            assert_eq!(std::fs::read(&f.config).unwrap(), original);
+            assert!(!f.hooks_config().exists());
+            assert!(
+                !f.config
+                    .with_file_name("collector-computer-use.json")
+                    .exists()
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_computer_use_migration_keeps_discovered_helper_chain_and_cleanup_on_removal() {
+    let only_helper = computer_notify(None);
+    let nested_helper = computer_notify(Some(&only_helper));
+    for legacy in [
+        computer_notify(Some(&collector_notify(None))),
+        collector_notify(Some(&nested_helper)),
+        computer_notify(Some(&collector_notify(Some(&only_helper)))),
+    ] {
+        let f = Fixture::new("codex");
+        write_notify(&f.config, &legacy);
+        let before = std::fs::read(&f.config).unwrap();
+        let preview = f.run("setup", &[], 0);
+        assert_eq!(std::fs::read(&f.config).unwrap(), before);
+        assert!(
+            preview["vendor_notice"]
+                .as_str()
+                .unwrap()
+                .contains("reinstall")
+        );
+        let applied = f.run("setup", &["--apply"], 0);
+        assert_eq!(applied["planned_sha256"], preview["planned_sha256"]);
+        let saved = f.config.with_file_name("collector-computer-use.json");
+        let command: Vec<String> = serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap();
+        let expected = if legacy == computer_notify(Some(&collector_notify(None))) {
+            &only_helper
+        } else {
+            &nested_helper
+        };
+        assert_eq!(&command, expected);
+        assert!(
+            !std::fs::read_to_string(&f.config)
+                .unwrap()
+                .contains("notify")
+        );
+        for event in ["Stop", "Interrupt", "SubagentStop"] {
+            let commands = claude_commands(&f.hooks_config(), event);
+            assert_eq!(commands.len(), if event == "SubagentStop" { 1 } else { 2 });
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.contains("computer-use-hook"))
+                    .count(),
+                1
+            );
+        }
+        let native: Value =
+            serde_json::from_slice(&std::fs::read(f.hooks_config()).unwrap()).unwrap();
+        for group in native["hooks"]["Interrupt"].as_array().unwrap() {
+            for hook in group["hooks"].as_array().unwrap() {
+                assert_eq!(hook["timeout"], 3);
+            }
+        }
+        let stable = std::fs::read(f.hooks_config()).unwrap();
+        let saved_before = std::fs::read(&saved).unwrap();
+        assert_eq!(f.run("setup", &["--apply"], 0)["changed"], false);
+        assert_eq!(std::fs::read(f.hooks_config()).unwrap(), stable);
+        assert_eq!(
+            f.run("status", &[], 0)["configuration"]["hook_state"],
+            "registered"
+        );
+        // Vendor reinstatement is unhealthy even when the native entries stay.
+        write_notify(&f.config, &legacy);
+        assert_eq!(
+            f.run("status", &[], 1)["configuration"]["hook_state"],
+            "different_arguments"
+        );
+        f.setup();
+        // Collector removal leaves cleanup native, including its command file.
+        f.run("setup", &["--remove", "--apply"], 0);
+        for event in ["Stop", "Interrupt", "SubagentStop"] {
+            let commands = claude_commands(&f.hooks_config(), event);
+            assert_eq!(commands.len(), 1);
+            assert!(commands[0].contains("computer-use-hook"));
+        }
+        assert_eq!(std::fs::read(&saved).unwrap(), saved_before);
+        assert!(
+            !std::fs::read_to_string(&f.config)
+                .unwrap()
+                .contains("notify")
+        );
+        assert_eq!(
+            f.run("setup", &["--remove", "--apply"], 0)["changed"],
+            false
+        );
+    }
+    // Removal from an unmigrated legacy configuration also keeps cleanup
+    // native, instead of restoring the oversized computer-use notify entry.
+    let f = Fixture::new("codex");
+    let arm64 = vec![
+        r"C:\discovered-version\codex-computer-use-arm64.exe".into(),
+        "turn-ended".into(),
+    ];
+    write_notify(&f.config, &collector_notify(Some(&arm64)));
+    f.run("setup", &["--remove", "--apply"], 0);
+    assert!(
+        !std::fs::read_to_string(&f.config)
+            .unwrap()
+            .contains("notify")
+    );
+    for event in ["Stop", "Interrupt", "SubagentStop"] {
+        let commands = claude_commands(&f.hooks_config(), event);
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].contains("computer-use-hook"));
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn codex_failed_config_replacement_rolls_back_new_and_existing_hooks_and_sidecar() {
+    use std::os::windows::fs::OpenOptionsExt;
+    for existing in [false, true] {
+        let f = Fixture::new("codex");
+        write_notify(&f.config, &computer_notify(Some(&collector_notify(None))));
+        let before_config = std::fs::read(&f.config).unwrap();
+        let sidecar = f.config.with_file_name("collector-computer-use.json");
+        let original_hooks = "{\"other\":\"private-test-secret\"}\n";
+        let original_sidecar =
+            serde_json::to_string(&vec!["/old/codex-computer-use", "turn-ended"]).unwrap();
+        if existing {
+            std::fs::write(f.hooks_config(), original_hooks).unwrap();
+            std::fs::write(&sidecar, &original_sidecar).unwrap();
+        }
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&f.config)
+            .unwrap();
+        let report = f.run("setup", &["--apply"], 1);
+        drop(held);
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap()
+                .contains("rollback: completed"),
+            "{report}"
+        );
+        assert!(!report.to_string().contains("private-test-secret"));
+        assert_eq!(std::fs::read(&f.config).unwrap(), before_config);
+        if existing {
+            assert_eq!(
+                std::fs::read_to_string(f.hooks_config()).unwrap(),
+                original_hooks
+            );
+            assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), original_sidecar);
+            assert!(
+                std::fs::read_dir(f.temp.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with("collector-backup"))
+            );
+        } else {
+            assert!(!f.hooks_config().exists());
+            assert!(!sidecar.exists());
+        }
+    }
+}
+
+#[test]
+fn codex_invalid_native_hook_document_never_changes_legacy_configuration() {
+    for body in [
+        "{private-test-secret",
+        "[]",
+        r#"{"hooks":[]}"#,
+        r#"{"hooks":{"Stop":{}}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":{}}]}}"#,
+    ] {
+        let f = Fixture::new("codex");
+        write_notify(&f.config, &collector_notify(None));
+        std::fs::write(f.hooks_config(), body).unwrap();
+        let before = std::fs::read(&f.config).unwrap();
+        let report = f.run("setup", &["--apply"], 1);
+        assert!(!report.to_string().contains("private-test-secret"));
+        assert_eq!(std::fs::read(&f.config).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(f.hooks_config()).unwrap(), body);
+    }
+}
+
+#[test]
+#[cfg(any(windows, unix))]
+fn codex_shared_hook_symlink_is_preserved_and_reports_the_canonical_target() {
+    let f = Fixture::new("codex");
+    let canonical = f.temp.path().join("shared-hooks.json");
+    std::fs::write(&canonical, "{\"other\":42}").unwrap();
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_file(&canonical, f.hooks_config());
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(&canonical, f.hooks_config());
+    if let Err(error) = result {
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        eprintln!("symlink creation unavailable: {error}; symlink behavior not exercised");
+        return;
+    }
+    let report = f.run("setup", &["--apply"], 1);
+    let error = report["error"].as_str().unwrap();
+    assert!(
+        error.contains("symbolic link") && error.contains("canonical target"),
+        "{report}"
+    );
+    assert!(error.contains("shared-hooks.json"));
+    assert_eq!(
+        std::fs::read_to_string(&canonical).unwrap(),
+        "{\"other\":42}"
+    );
+    assert!(
+        std::fs::symlink_metadata(f.hooks_config())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    // Remove the link itself before the fixture's recursive cleanup.
+    std::fs::remove_file(f.hooks_config()).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn codex_replacement_preserves_explicit_windows_acl_owner_and_backup_permissions() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    fn security(path: &std::path::Path, protect: bool) -> String {
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let flags =
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut descriptor = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        // SAFETY: name and output pointers remain live for this synchronous call.
+        assert_eq!(
+            unsafe {
+                GetNamedSecurityInfoW(
+                    name.as_ptr(),
+                    SE_FILE_OBJECT,
+                    flags,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        if protect {
+            // SAFETY: dacl points into descriptor until LocalFree below.
+            assert_eq!(
+                unsafe {
+                    SetNamedSecurityInfoW(
+                        name.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        dacl,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+        }
+        let mut text = std::ptr::null_mut();
+        let mut length = 0;
+        // SAFETY: descriptor is initialized and conversion allocates text.
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    1,
+                    flags,
+                    &mut text,
+                    &mut length,
+                )
+            },
+            0
+        );
+        // SAFETY: length includes the terminating nul; both buffers are owned.
+        let result = unsafe {
+            let result =
+                String::from_utf16_lossy(std::slice::from_raw_parts(text, length as usize - 1));
+            LocalFree(text.cast());
+            LocalFree(descriptor.cast());
+            result
+        };
+        if protect {
+            security(path, false)
+        } else {
+            result
+        }
+    }
+    let f = Fixture::new("codex");
+    write_notify(&f.config, &computer_notify(Some(&collector_notify(None))));
+    let sidecar = f.config.with_file_name("collector-computer-use.json");
+    std::fs::write(
+        &sidecar,
+        serde_json::to_string(&computer_notify(None)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(f.hooks_config(), "{\"api_key\":\"private-test-secret\"}").unwrap();
+    let paths = [&f.config, &f.hooks_config(), &sidecar];
+    let before: Vec<_> = paths.iter().map(|path| security(path, true)).collect();
+    let applied = f.run("setup", &["--apply"], 0);
+    for (path, before) in paths.iter().zip(&before) {
+        assert_eq!(security(path, false), *before);
+        let backup = applied["backups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(std::path::PathBuf::from)
+            .find(|backup| {
+                backup
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{}.", path.file_name().unwrap().to_string_lossy()))
+            })
+            .unwrap();
+        assert_eq!(security(&backup, false), *before);
+    }
 }

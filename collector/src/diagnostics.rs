@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 
 use crate::store::OwnerMode;
 
+mod codex_hooks;
+
 struct Options {
     config: PathBuf,
     roots: Vec<PathBuf>,
@@ -186,7 +188,12 @@ fn emit(out: &mut impl Write, as_json: bool, report: &Value) {
 fn read_config(path: &Path) -> Result<String, String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            Err("configuration is a symbolic link; edit its target explicitly with --config".into())
+            let target = std::fs::canonicalize(path)
+                .map(|target| target.display().to_string())
+                .unwrap_or_else(|_| "unresolved target (repair the link first)".into());
+            Err(format!(
+                "configuration is a symbolic link; canonical target: {target}; pass --config pointing to config.toml alongside that canonical hooks.json target (or the canonical config.toml itself)"
+            ))
         }
         Ok(_) => std::fs::read_to_string(path).map_err(|_| {
             "configuration is not readable UTF-8; check --config and permissions".into()
@@ -201,7 +208,7 @@ fn hook_args(harness: &str, o: &Options) -> Result<Vec<String>, String> {
     let mut args = vec![
         exe.to_string_lossy().into_owned(),
         harness.into(),
-        if harness == "codex" { "notify" } else { "hook" }.into(),
+        "hook".into(),
     ];
     if let Some(db) = &o.db {
         args.extend([
@@ -308,166 +315,96 @@ fn plan(harness: &str, original: &str, args: &[String]) -> Result<Plan, String> 
     }
 }
 
-/// Unwraps `--previous-notify` values that are themselves managed notify
-/// commands, left behind when an older setup chained to its own hook.
-fn previous_notify(managed: &[String]) -> Result<Option<String>, String> {
-    let Some(index) = managed.iter().position(|arg| arg == "--previous-notify") else {
-        return Ok(None);
-    };
-    let value = managed
-        .get(index + 1)
-        .ok_or("existing managed notify chain is incomplete")?;
-    match serde_json::from_str::<Vec<String>>(value) {
-        Ok(inner) if is_managed(&inner, "codex", "notify") => previous_notify(&inner),
-        _ => Ok(Some(value.clone())),
-    }
-}
-
-fn plan_body(harness: &str, original: &str, args: &[String]) -> Result<Plan, String> {
-    if harness == "codex" {
-        let mut doc = original
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|_| "invalid Codex TOML; repair configuration before setup")?;
-        let previous = match doc.get("notify") {
-            None => Vec::new(),
-            Some(item) => item
-                .as_array()
-                .ok_or("Codex notify must be an array of strings")?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_owned)
-                        .ok_or("Codex notify must be an array of strings")
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        let managed = is_managed(&previous, "codex", "notify");
-        let mut desired = args.to_vec();
-        if managed {
-            if let Some(value) = previous_notify(&previous)? {
-                desired.extend(["--previous-notify".into(), value]);
-            }
-        } else if !previous.is_empty() {
-            desired.extend([
-                "--previous-notify".into(),
-                serde_json::to_string(&previous).unwrap(),
-            ]);
-        }
-        let registered = desired == previous;
-        let state = if registered {
-            HookState::Registered
-        } else if managed {
-            HookState::DifferentArguments
-        } else {
-            HookState::Absent
-        };
-        if !registered {
-            let mut array = toml_edit::Array::new();
-            for arg in &desired {
-                array.push(arg.as_str());
-            }
-            doc["notify"] = toml_edit::value(array);
-        }
-        Ok(Plan {
-            contents: if registered {
-                original.into()
-            } else {
-                doc.to_string()
-            },
-            state,
-            preserves_previous: desired.iter().any(|arg| arg == "--previous-notify"),
-        })
+fn plan_body(_harness: &str, original: &str, args: &[String]) -> Result<Plan, String> {
+    let mut doc: Value = if original.trim().is_empty() {
+        json!({})
     } else {
-        let mut doc: Value = if original.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(original)
-                .map_err(|_| "invalid Claude JSON; repair configuration before setup")?
-        };
-        let object = doc
-            .as_object_mut()
-            .ok_or("Claude settings must be a JSON object")?;
-        let hooks = object
-            .entry("hooks")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or("Claude hooks must be an object")?;
-        let command = shell_command(args)?;
-        let (mut all_registered, mut any_managed) = (true, false);
-        let preserves_previous = !hooks.is_empty();
-        let is_ours = |item: &Value| {
-            item["type"] == "command"
-                && item["command"]
-                    .as_str()
-                    .is_some_and(|c| is_managed(&command_tokens(c, 3), "claude", "hook"))
-        };
-        for event in ["Stop", "SessionEnd"] {
-            let entries = hooks
-                .entry(event)
-                .or_insert_with(|| json!([]))
-                .as_array_mut()
-                .ok_or("Claude hook events must be arrays")?;
-            let managed: Vec<&str> = entries
-                .iter()
-                .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
-                .flatten()
-                .filter(|item| is_ours(item))
-                .filter_map(|item| item["command"].as_str())
-                .collect();
-            any_managed |= !managed.is_empty();
-            if managed == [command.as_str()] {
+        serde_json::from_str(original)
+            .map_err(|_| "invalid Claude JSON; repair configuration before setup")?
+    };
+    let object = doc
+        .as_object_mut()
+        .ok_or("Claude settings must be a JSON object")?;
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("Claude hooks must be an object")?;
+    let command = shell_command(args)?;
+    let (mut all_registered, mut any_managed) = (true, false);
+    let preserves_previous = !hooks.is_empty();
+    let is_ours = |item: &Value| {
+        item["type"] == "command"
+            && item["command"]
+                .as_str()
+                .is_some_and(|c| is_managed(&command_tokens(c, 3), "claude", "hook"))
+    };
+    for event in ["Stop", "SessionEnd"] {
+        let entries = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or("Claude hook events must be arrays")?;
+        let managed: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .filter(|item| is_ours(item))
+            .filter_map(|item| item["command"].as_str())
+            .collect();
+        any_managed |= !managed.is_empty();
+        if managed == [command.as_str()] {
+            continue;
+        }
+        all_registered = false;
+        // Replace the first managed hook in place and drop any others, so
+        // a moved executable or changed options never leave duplicates.
+        let mut replaced = false;
+        let mut emptied = Vec::new();
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let Some(items) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
                 continue;
-            }
-            all_registered = false;
-            // Replace the first managed hook in place and drop any others, so
-            // a moved executable or changed options never leave duplicates.
-            let mut replaced = false;
-            let mut emptied = Vec::new();
-            for (index, entry) in entries.iter_mut().enumerate() {
-                let Some(items) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
-                    continue;
-                };
-                let before = items.len();
-                items.retain_mut(|item| {
-                    if !is_ours(item) {
-                        return true;
-                    }
-                    if replaced {
-                        return false;
-                    }
-                    replaced = true;
-                    item["command"] = json!(command);
-                    true
-                });
-                if before > 0 && items.is_empty() {
-                    emptied.push(index);
+            };
+            let before = items.len();
+            items.retain_mut(|item| {
+                if !is_ours(item) {
+                    return true;
                 }
-            }
-            for index in emptied.into_iter().rev() {
-                entries.remove(index);
-            }
-            if !replaced {
-                entries.push(json!({"hooks":[{"type":"command","command":command}]}));
+                if replaced {
+                    return false;
+                }
+                replaced = true;
+                item["command"] = json!(command);
+                true
+            });
+            if before > 0 && items.is_empty() {
+                emptied.push(index);
             }
         }
-        let registered = all_registered;
-        let state = if registered {
-            HookState::Registered
-        } else if any_managed {
-            HookState::DifferentArguments
-        } else {
-            HookState::Absent
-        };
-        Ok(Plan {
-            contents: if registered {
-                original.into()
-            } else {
-                format!("{}\n", serde_json::to_string_pretty(&doc).unwrap())
-            },
-            state,
-            preserves_previous,
-        })
+        for index in emptied.into_iter().rev() {
+            entries.remove(index);
+        }
+        if !replaced {
+            entries.push(json!({"hooks":[{"type":"command","command":command}]}));
+        }
     }
+    let registered = all_registered;
+    let state = if registered {
+        HookState::Registered
+    } else if any_managed {
+        HookState::DifferentArguments
+    } else {
+        HookState::Absent
+    };
+    Ok(Plan {
+        contents: if registered {
+            original.into()
+        } else {
+            format!("{}\n", serde_json::to_string_pretty(&doc).unwrap())
+        },
+        state,
+        preserves_previous,
+    })
 }
 
 /// Plans removing this collector's managed hooks and restoring the hook they
@@ -482,117 +419,72 @@ fn plan_removal(harness: &str, original: &str) -> Result<Plan, String> {
     }
 }
 
-fn plan_removal_body(harness: &str, original: &str) -> Result<Plan, String> {
+fn plan_removal_body(_harness: &str, original: &str) -> Result<Plan, String> {
     let unchanged = |state| Plan {
         contents: original.into(),
         state,
         preserves_previous: false,
     };
-    if harness == "codex" {
-        let mut doc = original
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|_| "invalid Codex TOML; repair configuration before setup")?;
-        let previous = match doc.get("notify") {
-            None => return Ok(unchanged(HookState::Absent)),
-            Some(item) => item
-                .as_array()
-                .ok_or("Codex notify must be an array of strings")?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_owned)
-                        .ok_or("Codex notify must be an array of strings")
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+    if original.trim().is_empty() {
+        return Ok(unchanged(HookState::Absent));
+    }
+    let mut doc: Value = serde_json::from_str(original)
+        .map_err(|_| "invalid Claude JSON; repair configuration before setup")?;
+    let object = doc
+        .as_object_mut()
+        .ok_or("Claude settings must be a JSON object")?;
+    let Some(hooks) = object.get_mut("hooks") else {
+        return Ok(unchanged(HookState::Absent));
+    };
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or("Claude hooks must be an object")?;
+    let is_ours = |item: &Value| {
+        item["type"] == "command"
+            && item["command"]
+                .as_str()
+                .is_some_and(|c| is_managed(&command_tokens(c, 3), "claude", "hook"))
+    };
+    let mut removed = false;
+    for event in ["Stop", "SessionEnd"] {
+        let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
         };
-        if !is_managed(&previous, "codex", "notify") {
-            return Ok(unchanged(HookState::Absent));
-        }
-        let restored = match previous_notify(&previous)? {
-            Some(value) => Some(serde_json::from_str::<Vec<String>>(&value).map_err(|_| {
-                "the notify command this hook replaced is unreadable; edit the configuration by hand"
-            })?),
-            None => None,
-        };
-        match &restored {
-            Some(command) => {
-                let mut array = toml_edit::Array::new();
-                for arg in command {
-                    array.push(arg.as_str());
-                }
-                doc["notify"] = toml_edit::value(array);
-            }
-            None => {
-                doc.remove("notify");
-            }
-        }
-        Ok(Plan {
-            contents: doc.to_string(),
-            state: HookState::Registered,
-            preserves_previous: restored.is_some(),
-        })
-    } else {
-        if original.trim().is_empty() {
-            return Ok(unchanged(HookState::Absent));
-        }
-        let mut doc: Value = serde_json::from_str(original)
-            .map_err(|_| "invalid Claude JSON; repair configuration before setup")?;
-        let object = doc
-            .as_object_mut()
-            .ok_or("Claude settings must be a JSON object")?;
-        let Some(hooks) = object.get_mut("hooks") else {
-            return Ok(unchanged(HookState::Absent));
-        };
-        let hooks = hooks
-            .as_object_mut()
-            .ok_or("Claude hooks must be an object")?;
-        let is_ours = |item: &Value| {
-            item["type"] == "command"
-                && item["command"]
-                    .as_str()
-                    .is_some_and(|c| is_managed(&command_tokens(c, 3), "claude", "hook"))
-        };
-        let mut removed = false;
-        for event in ["Stop", "SessionEnd"] {
-            let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+        let mut touched = false;
+        for entry in entries.iter_mut() {
+            let Some(items) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
                 continue;
             };
-            let mut touched = false;
-            for entry in entries.iter_mut() {
-                let Some(items) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
-                    continue;
-                };
-                let before = items.len();
-                items.retain(|item| !is_ours(item));
-                touched |= items.len() != before;
-            }
-            if touched {
-                removed = true;
-                entries.retain(|entry| {
-                    entry
-                        .get("hooks")
-                        .and_then(Value::as_array)
-                        .is_none_or(|items| !items.is_empty())
-                });
-                if entries.is_empty() {
-                    hooks.remove(event);
-                }
+            let before = items.len();
+            items.retain(|item| !is_ours(item));
+            touched |= items.len() != before;
+        }
+        if touched {
+            removed = true;
+            entries.retain(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_none_or(|items| !items.is_empty())
+            });
+            if entries.is_empty() {
+                hooks.remove(event);
             }
         }
-        if !removed {
-            return Ok(unchanged(HookState::Absent));
-        }
-        if hooks.is_empty() {
-            object.remove("hooks");
-        }
-        Ok(Plan {
-            contents: format!("{}\n", serde_json::to_string_pretty(&doc).unwrap()),
-            state: HookState::Registered,
-            // Claude hooks are only added on install, never chained, so
-            // nothing is restored; other hooks merely stay.
-            preserves_previous: false,
-        })
     }
+    if !removed {
+        return Ok(unchanged(HookState::Absent));
+    }
+    if hooks.is_empty() {
+        object.remove("hooks");
+    }
+    Ok(Plan {
+        contents: format!("{}\n", serde_json::to_string_pretty(&doc).unwrap()),
+        state: HookState::Registered,
+        // Claude hooks are only added on install, never chained, so
+        // nothing is restored; other hooks merely stay.
+        preserves_previous: false,
+    })
 }
 
 fn roots(o: &Options) -> (Vec<Value>, bool) {
@@ -605,6 +497,9 @@ fn roots(o: &Options) -> (Vec<Value>, bool) {
 }
 
 fn setup(harness: &str, o: &Options) -> Result<Value, String> {
+    if harness == "codex" {
+        return codex_hooks::setup(o);
+    }
     let original = read_config(&o.config)?;
     let args = hook_args(harness, o)?;
     let plan = if o.remove {
@@ -826,11 +721,20 @@ fn nonce() -> u128 {
 
 fn diagnose(harness: &str, action: &str, o: &Options) -> Result<Value, String> {
     let (roots, roots_ok) = roots(o);
-    let config = read_config(&o.config)
-        .and_then(|original| plan(harness, &original, &hook_args(harness, o)?));
+    let config = if harness == "codex" {
+        codex_hooks::detection(o)
+    } else {
+        read_config(&o.config)
+            .and_then(|original| plan(harness, &original, &hook_args(harness, o)?))
+    };
     let (state, config_error) = match config {
         Ok(plan) => (Some(plan.state), None),
         Err(error) => (None, Some(error)),
+    };
+    let state = if harness == "codex" && codex_hooks::has_legacy_notify(o) {
+        Some(HookState::DifferentArguments)
+    } else {
+        state
     };
     let registered = state == Some(HookState::Registered);
     let hook_action = match state {
@@ -866,7 +770,7 @@ fn diagnose(harness: &str, action: &str, o: &Options) -> Result<Value, String> {
     // URLs can contain credentials or query secrets. They are input only.
     database.as_object_mut().unwrap().remove("hub_url");
     Ok(
-        json!({"command":action,"harness":harness,"ok":ok,"detected":roots_ok,"roots":roots,"configuration":{"ok":configuration_ok,"config":o.config,"hook_registered":registered,"hook_state":state.map(HookState::name),"error":config_error,"action":hook_action},"local_ok":local_ok,"database":database,"queue":queue,"local_ingestion_proof":local,"hub":hub}),
+        json!({"command":action,"harness":harness,"ok":ok,"detected":roots_ok,"roots":roots,"configuration":{"ok":configuration_ok,"config":o.config,"hook_registered":registered,"hook_state":state.map(HookState::name),"error":config_error,"action":hook_action},"hooks_config":if harness == "codex" { Some(codex_hooks::hooks_path(o)) } else { None },"trust_notice":if harness == "codex" { Some(codex_hooks::TRUST_NOTICE) } else { None },"vendor_notice":if harness == "codex" { Some(codex_hooks::VENDOR_NOTICE) } else { None },"local_ok":local_ok,"database":database,"queue":queue,"local_ingestion_proof":local,"hub":hub}),
     )
 }
 

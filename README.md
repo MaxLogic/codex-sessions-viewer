@@ -85,6 +85,27 @@ per-user task starts the resident at login, with a five-minute watchdog, no
 execution time limit and one task instance at a time. Rescan timing uses Scan
 interval (seconds) in Settings, independently of the watchdog.
 
+Codex collection uses lifecycle hooks with JSON on stdin, avoiding Windows
+command-line limits for long conversations. Setup manages `Stop` and `Interrupt`
+entries in `hooks.json` and backs up changed configuration files. After installing
+or changing a hook, review it with Codex `/hooks` and restart the session.
+Unreviewed hooks do not run. Existing hooks remain in place.
+Setup refuses edits that would shift an unrelated handler's saved trust or enabled
+state within a mixed hook group. Restructure and review that group in `/hooks`
+before retrying; setup never creates trust hashes.
+For a supported legacy computer-use chain, setup saves the discovered helper
+command in `collector-computer-use.json` and installs a separate metadata adapter.
+Removing collection leaves that cleanup adapter installed. Unknown notification
+commands require explicit migration because they may depend on conversation text.
+The Codex Windows app can reinstall its legacy notify wrapper when computer-use
+starts or its helper changes; recheck collector status after those events.
+If legacy notify returns, long conversations can again fail with Windows error
+206 before either handler runs. Restart stability and active computer-use
+cleanup/reacquisition still require verification; successful manual hook delivery
+alone does not establish them. Review hooks in each active Windows and WSL account
+context. WSL setup adds collection hooks without introducing a legacy notify
+command where none exists.
+
 On first viewer start after an upgrade, an installed outdated task is updated
 automatically. The old XML is saved with a timestamp under the app data folder
 in `logs/task-backups` before replacement. A disabled task stays disabled. The

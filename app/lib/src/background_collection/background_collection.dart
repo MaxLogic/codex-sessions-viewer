@@ -7,7 +7,7 @@ import 'package:path/path.dart' as p;
 import 'collector_autostart.dart';
 
 enum CollectionHarness {
-  codex('codex', 'Codex notify hook'),
+  codex('codex', 'Codex lifecycle hooks'),
   claude('claude', 'Claude Code hooks');
 
   const CollectionHarness(this.id, this.label);

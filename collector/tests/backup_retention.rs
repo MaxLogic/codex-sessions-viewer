@@ -277,6 +277,8 @@ fn setup_apply_prunes_old_configuration_backups() {
     std::fs::create_dir(&root).unwrap();
     let config = write(&temp.path().join("config.toml"), 0);
     std::fs::write(&config, "model = \"x\"\n").unwrap();
+    let hooks = temp.path().join("hooks.json");
+    std::fs::write(&hooks, "{}").unwrap();
     let old = write(
         &temp
             .path()
@@ -309,6 +311,8 @@ fn setup_apply_prunes_old_configuration_backups() {
     assert_eq!(report["pruned_backups"][0]["bytes"], 2);
     let fresh = report["backup"].as_str().expect("setup made a new backup");
     assert!(Path::new(fresh).exists(), "the new backup is kept");
+    assert_eq!(std::fs::read_to_string(fresh).unwrap(), "{}");
+    assert_eq!(std::fs::read_to_string(config).unwrap(), "model = \"x\"\n");
 }
 
 #[test]

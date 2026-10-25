@@ -131,11 +131,13 @@ function Invoke-TestEnvironment {
     Assert-TestEnvironment $Context
     $saved = [Environment]::GetEnvironmentVariables('Process')
     try {
-        foreach ($key in @([Environment]::GetEnvironmentVariables('Process').Keys)) { [Environment]::SetEnvironmentVariable($key, $null, 'Process') }
+        # PowerShell coerces $null to an empty string for this .NET string
+        # parameter. NullString passes a real null so excluded keys are absent.
+        foreach ($key in @([Environment]::GetEnvironmentVariables('Process').Keys)) { [Environment]::SetEnvironmentVariable($key, [NullString]::Value, 'Process') }
         foreach ($key in $Context.Variables.Keys) { [Environment]::SetEnvironmentVariable($key, $Context.Variables[$key], 'Process') }
         & $Body
     } finally {
-        foreach ($key in @([Environment]::GetEnvironmentVariables('Process').Keys)) { [Environment]::SetEnvironmentVariable($key, $null, 'Process') }
+        foreach ($key in @([Environment]::GetEnvironmentVariables('Process').Keys)) { [Environment]::SetEnvironmentVariable($key, [NullString]::Value, 'Process') }
         foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key], 'Process') }
     }
 }

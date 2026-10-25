@@ -33,6 +33,9 @@
 - Removed remaining production no-op UI handlers and added unavailable reasons for disabled session filters.
 
 ### Changed
+- Moved Codex collection to `Stop` and `Interrupt` lifecycle hooks receiving JSON through stdin, avoiding oversized Windows notification arguments while preserving durable queues and resident/fallback collection. Supported legacy computer-use chains migrate to a separate bounded metadata adapter for `Stop`, `Interrupt`, and `SubagentStop`; removing collection retains cleanup.
+- Updated Codex hook setup, detection, repair, and removal together, with configuration backups, rollback, idempotent installation, and preservation of unrelated hooks, account links, permissions, and trust state. Unsafe mixed-group edits and unknown notification contracts are refused. New or changed hooks require `/hooks` review in each active Windows/WSL account context and a session restart. The Codex app can reinstall legacy notify at computer-use startup/helper refresh; restart stability and active cleanup/reacquisition remain unverified.
+- Fixed Windows test-environment restoration so absent environment variables remain absent instead of becoming empty strings, preventing an unintended Pub cache in the app directory. Normalized Rust test sandbox paths to preserve Windows fixture ownership checks with mixed path separators.
 - The Show icons and Show text on buttons settings now apply to the app's buttons; an icon-only button keeps its label as tooltip and accessible name.
 - Add/remove tags works again; its dialog was opened from above the navigator and failed.
 - Apply the theme, UI density, and font size settings; they were saved but ignored.

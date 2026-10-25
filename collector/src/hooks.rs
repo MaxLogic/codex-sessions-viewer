@@ -35,6 +35,8 @@ pub struct WorkItem {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
     pub transcript_path: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -206,6 +208,7 @@ pub fn codex_work_item(payload: &str) -> WorkItem {
         harness: "codex".to_owned(),
         event: text("type").unwrap_or_else(|| "notify".to_owned()),
         session_id: text("thread-id").or_else(|| text("thread_id")),
+        turn_id: text("turn-id").or_else(|| text("turn_id")),
         transcript_path: None,
         cwd: text("cwd"),
         received_utc: DartDateTime::now().to_iso8601(),
@@ -225,12 +228,227 @@ pub fn claude_work_item(input: &str) -> WorkItem {
         harness: "claude".to_owned(),
         event: text("hook_event_name").unwrap_or_else(|| "hook".to_owned()),
         session_id: text("session_id"),
+        turn_id: None,
         transcript_path: text("transcript_path"),
         cwd: text("cwd"),
         received_utc: DartDateTime::now().to_iso8601(),
         attempts: 0,
         not_before_utc: None,
         last_error: None,
+    }
+}
+
+/// Native Codex lifecycle hooks carry metadata on stdin. Do not retain any
+/// conversation content or treat a continued Stop as a request to continue.
+pub fn codex_hook_work_item(input: &str) -> Result<WorkItem, String> {
+    #[derive(Deserialize)]
+    struct Event {
+        session_id: String,
+        #[serde(default)]
+        turn_id: Option<String>,
+        cwd: String,
+        #[serde(default)]
+        transcript_path: Option<String>,
+        hook_event_name: String,
+    }
+    let event: Event = serde_json::from_str(input).map_err(|error| {
+        // Serde's type errors can quote input values. Keep conversation text
+        // out of stderr and the queue's error log even for malformed events.
+        format!(
+            "invalid Codex hook input at line {}, column {} (expected lifecycle metadata)",
+            error.line(),
+            error.column()
+        )
+    })?;
+    for (name, value) in [
+        ("session_id", event.session_id.as_str()),
+        ("cwd", event.cwd.as_str()),
+        ("hook_event_name", event.hook_event_name.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("Codex hook requires nonempty {name}"));
+        }
+    }
+    if event
+        .turn_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err("Codex hook turn_id must be nonempty when provided".into());
+    }
+    if !matches!(event.hook_event_name.as_str(), "Stop" | "Interrupt") {
+        return Err("Codex hook supports only Stop and Interrupt".into());
+    }
+    Ok(WorkItem {
+        database_key: None,
+        harness: "codex".into(),
+        event: event.hook_event_name,
+        session_id: Some(event.session_id),
+        turn_id: event.turn_id,
+        transcript_path: event.transcript_path,
+        cwd: Some(event.cwd),
+        received_utc: DartDateTime::now().to_iso8601(),
+        attempts: 0,
+        not_before_utc: None,
+        last_error: None,
+    })
+}
+
+/// Bound the read and retained input; reject overflow and invalid UTF-8.
+/// On overflow the caller exits and closes stdin rather than waiting for an
+/// unbounded producer to finish writing.
+pub fn read_codex_hook_input() -> Result<String, String> {
+    let mut stdin = std::io::stdin().lock();
+    let mut input = Vec::new();
+    (&mut stdin)
+        .take(MAX_HOOK_INPUT_BYTES + 1)
+        .read_to_end(&mut input)
+        .map_err(|error| format!("could not read Codex hook stdin: {error}"))?;
+    if input.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        return Err(format!(
+            "Codex hook input exceeds {MAX_HOOK_INPUT_BYTES} bytes"
+        ));
+    }
+    String::from_utf8(input).map_err(|_| "Codex hook input is not UTF-8".into())
+}
+
+const MAX_COMPUTER_USE_COMMAND_UTF16: usize = 24_000;
+const COMPUTER_USE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Only the vendor's identity-based cleanup contract may receive projected
+/// metadata. Unknown previous notifiers may require content and must fail closed.
+fn validate_computer_use_command(argv: &[String], depth: usize) -> Result<(), String> {
+    if depth >= 16 {
+        return Err("computer-use helper nesting exceeds 16 wrappers".into());
+    }
+    let valid_name = argv
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "codex-computer-use"
+                    | "codex-computer-use.exe"
+                    | "codex-computer-use-arm64"
+                    | "codex-computer-use-arm64.exe"
+            )
+        });
+    if !valid_name || argv.get(1).map(String::as_str) != Some("turn-ended") {
+        return Err("command file must contain only known computer-use turn-ended helpers".into());
+    }
+    match &argv[2..] {
+        [] => Ok(()),
+        [flag, previous] if flag == "--previous-notify" => {
+            let nested: Vec<String> = serde_json::from_str(previous).map_err(|_| {
+                "computer-use previous notify must be a JSON command array".to_owned()
+            })?;
+            validate_computer_use_command(&nested, depth + 1)
+        }
+        _ => Err("unsupported arguments in computer-use helper chain".into()),
+    }
+}
+
+fn computer_use_metadata(input: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Event {
+        session_id: String,
+        turn_id: String,
+        cwd: String,
+        hook_event_name: String,
+        #[serde(default)]
+        agent_id: Option<String>,
+    }
+    let event: Event = serde_json::from_str(input)
+        .map_err(|_| "invalid computer-use lifecycle metadata".to_owned())?;
+    for (field, value) in [
+        ("session_id", &event.session_id),
+        ("turn_id", &event.turn_id),
+        ("cwd", &event.cwd),
+    ] {
+        if value.trim().is_empty() || value.contains('\0') {
+            return Err(format!(
+                "computer-use hook requires nonempty {field} without NUL"
+            ));
+        }
+    }
+    let session = match event.hook_event_name.as_str() {
+        "Stop" | "Interrupt" => &event.session_id,
+        "SubagentStop" => event
+            .agent_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty() && !id.contains('\0'))
+            .ok_or_else(|| "SubagentStop requires nonempty agent_id without NUL".to_owned())?,
+        _ => return Err("computer-use hook supports only Stop, Interrupt and SubagentStop".into()),
+    };
+    Ok(serde_json::json!({
+        "type": "agent-turn-complete", "thread-id": session,
+        "turn-id": event.turn_id, "cwd": event.cwd,
+        "hook_event_name": event.hook_event_name,
+        "session_id": session, "turn_id": event.turn_id,
+    })
+    .to_string())
+}
+
+pub fn run_computer_use_hook(command_file: &Path, input: &str) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(command_file)
+        .and_then(|file| file.take(MAX_HOOK_INPUT_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|error| format!("could not read computer-use command file: {error}"))?;
+    if bytes.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        return Err("computer-use command file exceeds 1048576 bytes".into());
+    }
+    let argv: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|_| "computer-use command file must be a JSON string array".to_owned())?;
+    validate_computer_use_command(&argv, 0)?;
+    let payload = computer_use_metadata(input)?;
+    // Windows quoting can double every backslash/quote. Count this worst case
+    // for every argument, including executable, separators and the final NUL.
+    let budget = argv
+        .iter()
+        .map(String::as_str)
+        .chain([payload.as_str()])
+        .try_fold(1usize, |count, arg| {
+            if arg.contains('\0') {
+                return None;
+            }
+            count.checked_add(arg.encode_utf16().count().checked_mul(2)?.checked_add(3)?)
+        });
+    if !budget.is_some_and(|count| count < MAX_COMPUTER_USE_COMMAND_UTF16) {
+        return Err("computer-use metadata and command exceed conservative 24000 UTF-16 limit or contain NUL".into());
+    }
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .arg(payload)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not launch computer-use helper: {error}"))?;
+    let deadline = std::time::Instant::now() + COMPUTER_USE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("computer-use helper failed: {status}")),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(error) => format!("could not wait for computer-use helper: {error}"),
+                    _ => "computer-use helper timed out after 2 seconds".into(),
+                });
+            }
+        }
     }
 }
 

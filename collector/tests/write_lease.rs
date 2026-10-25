@@ -547,6 +547,7 @@ fn l5_drain_lease_timeout_releases_claim_without_attempting() {
         harness: "codex".into(),
         event: "turn".into(),
         session_id: Some("a".into()),
+        turn_id: None,
         transcript_path: None,
         cwd: None,
         received_utc: "fixed".into(),

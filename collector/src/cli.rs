@@ -32,6 +32,9 @@ USAGE:
   codex-sessions-collector codex parse  [OPTIONS] <FILE>  Print one file as contract records
   codex-sessions-collector codex notify [--previous-notify <JSON>] <PAYLOAD>
                                                           Codex notify hook: queue the turn's session
+  codex-sessions-collector codex hook [OPTIONS]            Codex Stop/Interrupt hook (JSON on stdin)
+  codex-sessions-collector codex computer-use-hook --command-file <FILE>
+                                                          Dispatch metadata-only computer-use cleanup
   codex-sessions-collector claude scan   [OPTIONS]        Scan Claude Code transcripts (SCAN and CLAUDE OPTIONS)
   codex-sessions-collector claude ingest [OPTIONS] <FILE> Ingest one transcript and its subagents
   codex-sessions-collector claude parse  <FILE>           Print one transcript as contract records
@@ -81,7 +84,9 @@ HOOK OPTIONS:
   --previous-notify <JSON>  The notify command this one replaced, as a JSON array; it still runs
   --no-drain                Queue the work without waking or starting the resident
   --no-wait                 Drain due work once without waiting for retries
-Hooks exit 0 even when they fail; problems go to errors.log in the queue folder
+Legacy notify and Claude hooks exit 0 even when they fail; problems go to errors.log.
+Native Codex hooks return {} on success and exit 1 with stderr on failure.
+Queue folder:
 (CODEX_SESSIONS_COLLECTOR_QUEUE, default: platform user cache folder).
 Hub sync reads CODEX_SESSIONS_HUB_MACHINE_TOKEN from the environment. Schedule it
 separately; local collection never waits for network delivery.
@@ -326,6 +331,8 @@ pub fn run(args: &[String]) -> i32 {
             codex_notify(&args[2..]);
             Ok(())
         }
+        ["codex", "hook", ..] => codex_hook(&args[2..], &mut stdout),
+        ["codex", "computer-use-hook", ..] => computer_use_hook(&args[2..], &mut stdout),
         ["claude", "hook", ..] => {
             claude_hook(&args[2..]);
             Ok(())
@@ -1071,24 +1078,62 @@ fn drain_arguments(args: &[String]) -> std::io::Result<Vec<String>> {
     Ok(forwarded)
 }
 
-fn start_hook_worker(args: &[String], resident: bool) {
+fn start_hook_worker(args: &[String], resident: bool) -> Result<(), String> {
     let queue = crate::hooks::queue_dir();
-    match std::env::current_exe() {
-        Ok(exe) => {
-            let result = drain_arguments(args).and_then(|mut forwarded| {
-                if resident {
-                    forwarded[0] = "serve".into();
-                }
-                crate::hooks::spawn_detached_with_queue(&exe, &forwarded, &queue)
-            });
-            if let Err(error) = result {
-                crate::hooks::log_error(&queue, &format!("could not start hook worker: {error}"));
+    std::env::current_exe()
+        .and_then(|exe| {
+            let mut forwarded = drain_arguments(args)?;
+            if resident {
+                forwarded[0] = "serve".into();
             }
-        }
-        Err(error) => {
-            crate::hooks::log_error(&queue, &format!("could not start hook worker: {error}"))
-        }
+            crate::hooks::spawn_detached_with_queue(&exe, &forwarded, &queue)
+        })
+        .map_err(|error| format!("could not start hook worker (work remains queued): {error}"))
+}
+
+/// Native hook errors must not use Codex's blocking/continuation exit code 2.
+fn computer_use_hook(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let input = crate::hooks::read_codex_hook_input().map_err(CliError::Failed)?;
+    let [option, file] = args else {
+        return Err(CliError::Failed(
+            "computer-use-hook needs --command-file FILE".into(),
+        ));
+    };
+    if option != "--command-file" || file.is_empty() {
+        return Err(CliError::Failed(
+            "computer-use-hook needs --command-file FILE".into(),
+        ));
     }
+    crate::hooks::run_computer_use_hook(Path::new(file), &input).map_err(CliError::Failed)?;
+    writeln!(out, "{{}}").map_err(|error| CliError::Failed(error.to_string()))
+}
+
+/// Native hook errors must not use Codex's blocking/continuation exit code 2.
+fn codex_hook(args: &[String], out: &mut impl Write) -> Result<(), CliError> {
+    let result = (|| {
+        let input = crate::hooks::read_codex_hook_input()?;
+        let options = parse_options(args).map_err(|error| match error {
+            CliError::Usage(message) | CliError::Failed(message) | CliError::Refused(message) => {
+                message
+            }
+        })?;
+        if !options.positional.is_empty() || options.previous_notify.is_some() {
+            return Err(
+                "codex hook accepts metadata on stdin, not notify payloads or --previous-notify"
+                    .into(),
+            );
+        }
+        let item = crate::hooks::codex_hook_work_item(&input)?;
+        handoff_checked(item, &options, args)
+    })();
+    if let Err(message) = result {
+        crate::hooks::log_error(
+            &crate::hooks::queue_dir(),
+            &format!("codex hook: {message}"),
+        );
+        return Err(CliError::Failed(message));
+    }
+    writeln!(out, "{{}}").map_err(|error| CliError::Failed(error.to_string()))
 }
 
 /// Codex calls its `notify` program with the event JSON as the last argument.
@@ -1110,7 +1155,17 @@ fn codex_notify(args: &[String]) {
     handoff(crate::hooks::codex_work_item(&payload), &options, args);
 }
 
-fn handoff(mut item: crate::hooks::WorkItem, options: &Options, args: &[String]) {
+fn handoff(item: crate::hooks::WorkItem, options: &Options, args: &[String]) {
+    if let Err(message) = handoff_checked(item, options, args) {
+        crate::hooks::log_error(&crate::hooks::queue_dir(), &message);
+    }
+}
+
+fn handoff_checked(
+    mut item: crate::hooks::WorkItem,
+    options: &Options,
+    args: &[String],
+) -> Result<(), String> {
     let mut timings = crate::timing::Phases::start();
     let queue = crate::hooks::queue_dir();
     let database = options
@@ -1119,26 +1174,23 @@ fn handoff(mut item: crate::hooks::WorkItem, options: &Options, args: &[String])
         .or_else(|| options.standalone.clone())
         .or_else(default_viewer_database);
     let Some(database) = database else {
-        crate::hooks::log_error(&queue, "hook: database location unavailable");
-        return;
+        return Err("hook: database location unavailable".into());
     };
     let key = match crate::resident::instance::database_key(&database) {
         Ok(key) => key,
         Err(error) => {
-            crate::hooks::log_error(&queue, &format!("hook database identity: {error}"));
-            return;
+            return Err(format!("hook database identity: {error}"));
         }
     };
     item.database_key = Some(key.clone());
     let entry = match crate::hooks::enqueue(&queue, &item) {
         Ok(entry) => entry,
         Err(error) => {
-            crate::hooks::log_error(&queue, &format!("hook could not queue: {error}"));
-            return;
+            return Err(format!("hook could not queue: {error}"));
         }
     };
     if options.no_drain {
-        return;
+        return Ok(());
     }
     timings.mark("hook queue persistence");
     let notification =
@@ -1146,10 +1198,11 @@ fn handoff(mut item: crate::hooks::WorkItem, options: &Options, args: &[String])
     timings.mark("hook resident notification");
     match notification {
         crate::resident::HookNotify::Handled => (),
-        crate::resident::HookNotify::OtherQueue => start_hook_worker(args, false),
-        crate::resident::HookNotify::Unavailable => start_hook_worker(args, true),
+        crate::resident::HookNotify::OtherQueue => start_hook_worker(args, false)?,
+        crate::resident::HookNotify::Unavailable => start_hook_worker(args, true)?,
     }
     timings.mark("hook worker startup");
+    Ok(())
 }
 
 /// Claude Code passes the hook event as JSON on stdin.

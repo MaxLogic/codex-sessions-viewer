@@ -171,6 +171,10 @@ fn make_environment(original: BTreeMap<OsString, OsString>) -> Environment {
             .unwrap()
             .as_nanos()
     ));
+    // Native absolute spelling keeps fixture paths consistent with collector
+    // output and prevents cmd builtins interpreting mixed '/' separators as
+    // switches. Physical ownership/reparse checks remain in guard below.
+    let root = std::path::absolute(root).expect("test sandbox root must resolve absolutely");
     std::fs::create_dir(&root).unwrap();
     let mut variables: BTreeMap<OsString, OsString> = original
         .into_iter()
@@ -516,6 +520,8 @@ impl TestCommand {
                     "CODEX_SESSIONS_HUB_OWNER_TOKEN",
                     "CSV_TEST_LEASE_CHILD",
                     "CXV_HANDLE_CHECK_CHILD",
+                    "CSV_COMPUTER_USE_TEST_SINK",
+                    "CSV_COMPUTER_USE_TEST_MODE",
                 ]
                 .contains(&name.as_ref())
             {
@@ -528,6 +534,14 @@ impl TestCommand {
             }
             if name == "CSV_TEST_LEASE_CHILD" {
                 env.guard(Path::new(value), &cwd)?;
+            }
+            if name == "CSV_COMPUTER_USE_TEST_SINK" {
+                env.guard(Path::new(value), &cwd)?;
+            }
+            if name == "CSV_COMPUTER_USE_TEST_MODE"
+                && ![OsStr::new(""), OsStr::new("fail"), OsStr::new("timeout")].contains(value)
+            {
+                return Err(denied("invalid computer-use fixture mode"));
             }
         }
         let mut profile_paths = std::collections::BTreeSet::new();
@@ -582,6 +596,7 @@ impl TestCommand {
             "--output",
             "--config",
             "--data-dir",
+            "--command-file",
         ];
         let mut index = 0;
         while index < args.len() {
@@ -766,6 +781,44 @@ fn admit_executable(command: &Command, raw: Option<&str>, cwd: &Path) -> io::Res
         .get_args()
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
+    let compiler_name = if cfg!(windows) { "rustc.exe" } else { "rustc" };
+    if program.file_name() == Some(OsStr::new(compiler_name)) {
+        let rustup = std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                    .map(|home| PathBuf::from(home).join(".rustup"))
+            })
+            .ok_or_else(|| denied("no original Rust toolchain home"))?;
+        let toolchains = physical(&rustup.join("toolchains"))?;
+        let valid_location = program.parent().is_some_and(|bin| {
+            bin.file_name() == Some(OsStr::new("bin"))
+                && bin.parent().and_then(Path::parent) == Some(toolchains.as_path())
+        });
+        if !valid_location || raw.is_some() || args.len() != 3 || args[1] != "-o" {
+            return Err(denied("unlisted compiler location or arguments"));
+        }
+        let source = Path::new(&args[0]);
+        let output = Path::new(&args[2]);
+        environment().guard(source, cwd)?;
+        environment().guard(output, cwd)?;
+        let source = physical(&absolute(source, cwd))?;
+        let output = physical(&absolute(output, cwd))?;
+        let helper_name = if cfg!(windows) {
+            "codex-computer-use.exe"
+        } else {
+            "codex-computer-use"
+        };
+        if source.file_name() != Some(OsStr::new("computer_use_fixture.rs"))
+            || output.file_name() != Some(OsStr::new(helper_name))
+            || source.parent() != output.parent()
+        {
+            return Err(denied(
+                "compiler requires sibling computer-use fixture source and output",
+            ));
+        }
+        return Ok(());
+    }
     if native
         .iter()
         .any(|p| Path::new(p) == Path::new(command.get_program()))
@@ -827,7 +880,7 @@ fn admit_executable(command: &Command, raw: Option<&str>, cwd: &Path) -> io::Res
                 && args[..3] == ["/D", "/S", "/C"]
                 && let Some(raw) = raw
             {
-                // Only the generated managed Claude hook is permitted through cmd.
+                // Only generated managed lifecycle hooks are permitted through cmd.
                 if raw.contains(['&', '|', '<', '>', '%', '^', '\n', '\r']) {
                     return Err(denied("shell metacharacter"));
                 }
@@ -840,7 +893,12 @@ fn admit_executable(command: &Command, raw: Option<&str>, cwd: &Path) -> io::Res
                     return Err(denied("invalid managed hook"));
                 }
                 let exe = tool(OsStr::new(&words[0]))?;
-                if exe != std::fs::canonicalize(native[0])? || words[1..3] != ["claude", "hook"] {
+                if exe != std::fs::canonicalize(native[0])?
+                    || !matches!(
+                        (words[1].as_str(), words[2].as_str()),
+                        ("claude" | "codex", "hook")
+                    )
+                {
                     return Err(denied("unmanaged hook"));
                 }
                 return admit_native_args(&words[1..], cwd);
@@ -930,7 +988,15 @@ fn admit_native_args(args: &[String], cwd: &Path) -> io::Result<()> {
         if ["codex", "claude"].contains(&first.as_str())
             && !args.get(1).is_some_and(|s| {
                 [
-                    "setup", "verify", "status", "scan", "ingest", "parse", "notify", "hook",
+                    "setup",
+                    "verify",
+                    "status",
+                    "scan",
+                    "ingest",
+                    "parse",
+                    "notify",
+                    "hook",
+                    "computer-use-hook",
                 ]
                 .contains(&s.as_str())
             })
@@ -961,6 +1027,7 @@ fn admit_native_args(args: &[String], cwd: &Path) -> io::Result<()> {
         "--log",
         "--output",
         "--data-dir",
+        "--command-file",
     ];
     let values = [
         "--replacement-deadline-ms",

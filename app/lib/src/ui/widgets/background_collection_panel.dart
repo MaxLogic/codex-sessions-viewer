@@ -208,11 +208,12 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
         ),
         const SizedBox(height: 4),
         Text(
-          'Changes here apply immediately. They are not part of Save '
-          'settings. Hooks edit your Codex config.toml and Claude Code '
-          'settings.json: a backup is kept beside each file, and an existing '
-          'Codex notify command is chained, then restored when you remove the '
-          'hook. Start at sign-in uses a per-user scheduled task.',
+          'Changes here are saved immediately. They are not part of Save '
+          'settings. Hooks edit your Codex hooks.json and Claude Code '
+          'settings.json, with backups beside changed files. Codex setup also '
+          'migrates supported legacy notify chains in config.toml. Review new '
+          'Codex hooks in /hooks and restart the session to activate them. '
+          'Start at sign-in uses a per-user scheduled task.',
           key: const Key('background-explanation'),
           style: muted,
         ),
@@ -360,7 +361,10 @@ class _BackgroundCollectionPanelState extends State<BackgroundCollectionPanel> {
                     focusOnFail: '$id-install',
                     action: () async {
                       await widget.collection.installHook(harness);
-                      return '${harness.label} installed.';
+                      return harness == CollectionHarness.codex
+                          ? '${harness.label} installed. Review them in Codex '
+                                '/hooks and restart the session to activate them.'
+                          : '${harness.label} installed.';
                     },
                   ),
             icon: const AppSvgIcon(AppIcons.play),

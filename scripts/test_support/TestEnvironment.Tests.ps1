@@ -3,6 +3,54 @@ BeforeAll {
     $script:context = New-TestEnvironment
 }
 Describe 'Shared PowerShell test profile boundary' {
+    It 'roundtrips absent and empty environment entries after <Mode>' -ForEach @(
+        @{ Mode = 'success' }, @{ Mode = 'exception' }, @{ Mode = 'native nonzero exit' }
+    ) {
+        $keys = @('PUB_CACHE', 'HOME', 'INCLUDE', 'CXV_TEST_INHERITED_SENTINEL')
+        $saved = [Environment]::GetEnvironmentVariables('Process')
+        $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+        $probe = 'import os,json; print(json.dumps({k:os.environ.get(k) for k in ["PUB_CACHE","HOME","INCLUDE","CXV_TEST_INHERITED_SENTINEL"]}))'
+        try {
+            foreach ($key in @('PUB_CACHE', 'HOME')) { [Environment]::SetEnvironmentVariable($key, [NullString]::Value, 'Process') }
+            [Environment]::SetEnvironmentVariable('INCLUDE', '', 'Process')
+            [Environment]::SetEnvironmentVariable('CXV_TEST_INHERITED_SENTINEL', 'inherited', 'Process')
+            $isolated = New-TestEnvironment
+            $operation = {
+                Invoke-TestEnvironment $isolated {
+                    $native = (& $python -I -c $probe) | ConvertFrom-Json
+                    $null -eq $native.CXV_TEST_INHERITED_SENTINEL | Should -BeTrue
+                    [Environment]::GetEnvironmentVariables('Process').Contains('CXV_TEST_INHERITED_SENTINEL') | Should -BeFalse
+                    $native.HOME | Should -Be $isolated.Variables['HOME']
+                    $native.PUB_CACHE | Should -Be $isolated.Variables['PUB_CACHE']
+                    $native.INCLUDE | Should -BeExactly ''
+                    $null -eq $native.INCLUDE | Should -BeFalse
+                    if ($Mode -eq 'exception') { throw 'environment roundtrip probe' }
+                }
+            }
+            if ($Mode -eq 'exception') {
+                $operation | Should -Throw '*environment roundtrip probe*'
+            } elseif ($Mode -eq 'native nonzero exit') {
+                Invoke-TestProcess $isolated $env:ComSpec @('/d', '/c', 'exit 7')
+                $LASTEXITCODE | Should -Be 7
+            } else { & $operation }
+            $restored = [Environment]::GetEnvironmentVariables('Process')
+            foreach ($key in @('PUB_CACHE', 'HOME')) { $restored.Contains($key) | Should -BeFalse }
+            $restored.Contains('INCLUDE') | Should -BeTrue
+            $restored['INCLUDE'] | Should -BeExactly ''
+            $restored['CXV_TEST_INHERITED_SENTINEL'] | Should -BeExactly 'inherited'
+            $native = (& $python -I -c $probe) | ConvertFrom-Json
+            $null -eq $native.PUB_CACHE | Should -BeTrue
+            $null -eq $native.HOME | Should -BeTrue
+            $native.INCLUDE | Should -BeExactly ''
+            $null -eq $native.INCLUDE | Should -BeFalse
+            $native.CXV_TEST_INHERITED_SENTINEL | Should -BeExactly 'inherited'
+        } finally {
+            foreach ($key in $keys) {
+                $value = if ($saved.Contains($key)) { $saved[$key] } else { [NullString]::Value }
+                [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+            }
+        }
+    }
     It 'admits both exact NoProfile sampler child forms under strict mode' {
         Set-StrictMode -Version Latest
         $hostPath = 'C:\Program Files\PowerShell\7\pwsh.exe'
