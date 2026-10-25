@@ -10,6 +10,7 @@ pub mod dart;
 pub mod diagnostics;
 pub mod hooks;
 pub mod hub_annotations;
+pub mod hub_backfill;
 pub mod hub_client;
 pub mod hub_server;
 pub mod path_mapping;

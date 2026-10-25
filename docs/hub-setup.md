@@ -164,6 +164,25 @@ records. The pairing and last acknowledged sequence remain, so `hub enable`
 with the same URL continues the same hub history; collect again with `--force`
 to queue existing sessions.
 
+### Sessions whose files are gone
+
+A forced collection queues only sessions whose source files still exist. A
+session collected before pairing whose file was deleted since exists only in
+the local database. `hub backfill` rebuilds each such session (source recorded
+missing, parse available) from its stored rows, queues it with an explicit
+missing status, and leaves the upload to the next `hub sync`:
+
+```powershell
+codex-sessions-collector.exe hub backfill --db C:\Path\codex_sessions_viewer.sqlite
+codex-sessions-collector.exe hub sync --db C:\Path\codex_sessions_viewer.sqlite
+```
+
+The rebuilt snapshot is the stored state, not the source: per-message
+reasoning and cache-write tokens are absent. A hub that already holds a parsed
+copy of the session keeps it, because a missing source ranks below an
+available one. Each run queues every qualifying session again; run it once
+after pairing, or after restoring an older hub backup.
+
 ### Reconcile after restoring a backup
 
 Back up the local database while preserving its hub state and outbox.

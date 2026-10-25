@@ -1351,3 +1351,80 @@ fn malformed_header_syntax_is_rejected() {
         );
     }
 }
+
+/// A session collected before pairing whose file was deleted reaches the hub
+/// through `hub backfill`, rebuilt from the local rows, and is marked missing.
+#[test]
+fn backfill_delivers_a_stored_session_whose_file_is_gone() {
+    let temp = TempDir::new("hub_backfill");
+    let hub = start(&temp);
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let db = temp.path().join("local.sqlite");
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .conn
+            .execute(
+                "update app_metadata set value = 'machine-a' where key = 'machine_id'",
+                [],
+            )
+            .unwrap();
+    }
+    let scan = || {
+        let output = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
+            .args(["codex", "scan", "--no-wsl-projects", "--standalone"])
+            .arg(&db)
+            .arg("--windows-root")
+            .arg(&home)
+            .args(["--wsl-root", ""])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    scan();
+    std::fs::remove_file(support::day_folder(&home).join("rich_session.jsonl")).unwrap();
+    scan();
+    let refused = hub_command(&db, "backfill", MACHINE_A_TOKEN);
+    assert_eq!(refused.status.code(), Some(3), "not paired yet");
+
+    hub_client::enable_for_collection(&db, OwnerMode::Standalone, &hub.url).unwrap();
+    let report = json_output(&hub_command(&db, "backfill", MACHINE_A_TOKEN));
+    assert_eq!(
+        (report["candidates"].as_i64(), report["queued"].as_i64()),
+        (Some(1), Some(1))
+    );
+    json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+
+    let id = "session:parity-rich-001";
+    let local = rusqlite::Connection::open(&db).unwrap();
+    let digest = |conn: &rusqlite::Connection, sql: &str| -> String {
+        conn.query_row(sql, [id], |row| row.get(0)).unwrap()
+    };
+    let messages = "select group_concat(message_index || '|' || author_type || '|' || content_plain || '|' || coalesce(token_total, ''), char(10)) from (select * from messages where session_id = ? order by message_index)";
+    let tools = "select coalesce(group_concat(t.tool_index || '|' || t.tool_name || '|' || coalesce(m.message_index, ''), char(10)), '') from (select * from tool_calls where session_id = ?1 order by tool_index) t left join messages m on m.id = t.message_id";
+    let usage = "select group_concat(source_record_ordinal || '|' || coalesce(total_tokens, '') || '|' || event_fingerprint, char(10)) from (select * from usage_events where session_row_id = ? order by source_record_ordinal)";
+    let session = "select title || '|' || coalesce(working_directory_display, '') || '|' || models_used || '|' || coalesce(total_tokens, '') from sessions where id = ?";
+    let remote = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
+    for sql in [messages, tools, usage, session] {
+        assert_eq!(digest(&remote, sql), digest(&local, sql), "{sql}");
+    }
+    assert_eq!(
+        hub_rows(
+            &temp,
+            "select count(*) from messages where session_id = 'session:parity-rich-001'"
+        ),
+        12
+    );
+    let status: String = remote
+        .query_row(
+            "select scan_status from sessions where id = ?",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "missing");
+}

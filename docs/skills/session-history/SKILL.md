@@ -40,11 +40,11 @@ read from the Windows user environment.
   when the hub is unreachable; local history covers this machine only and may
   be missing WSL Claude sessions.
 - The hub has only what machines delivered: uploads run every few minutes, so
-  the newest turns of a running session may be absent. A machine can deliver
-  only sessions whose files still existed when it was paired; older history
-  of deleted files, and single sessions above 48 MiB, remain only in that
-  machine's local database. When the hub has no match for an older period,
-  search again with `--local` on the machine concerned before concluding.
+  the newest turns of a running session may be absent. Sessions whose files
+  were deleted reach the hub only after `hub backfill` on their machine, and
+  single sessions above 48 MiB never do; both remain in that machine's local
+  database. When the hub has no match for an older period, search again with
+  `--local` on the machine concerned before concluding.
 
 Windows:
 

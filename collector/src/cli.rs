@@ -46,6 +46,7 @@ USAGE:
   codex-sessions-collector hub sync [DATABASE OPTIONS]    Deliver queued records
   codex-sessions-collector hub status [DATABASE OPTIONS]  Show delivery state and rejected records
   codex-sessions-collector hub resync [DATABASE OPTIONS]  Continue from the hub's last accepted sequence
+  codex-sessions-collector hub backfill [DATABASE OPTIONS] Queue stored sessions whose files are gone
   codex-sessions-collector hub disable [DATABASE OPTIONS] Stop queuing and clear the outbox
   codex-sessions-collector version
   codex-sessions-collector serve [OPTIONS] [--lifetime resident|viewer]
@@ -360,6 +361,9 @@ pub fn run(args: &[String]) -> i32 {
         ["hub", "disable", ..] => {
             parse_options(&args[2..]).and_then(|o| hub_disable(&o, &mut stdout))
         }
+        ["hub", "backfill", ..] => {
+            parse_options(&args[2..]).and_then(|o| hub_backfill(&o, &mut stdout))
+        }
         ["version", ..] | ["--version", ..] => {
             let _ = writeln!(
                 stdout,
@@ -468,6 +472,15 @@ fn hub_disable(options: &Options, out: &mut impl Write) -> Result<(), CliError> 
         json!({"command":"hub disable","enabled":false,"cleared":cleared})
     )
     .map_err(|error| CliError::Failed(error.to_string()))
+}
+
+fn hub_backfill(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
+    let store = open_store(options)?;
+    enabled_hub_url(&store)?;
+    let report = crate::hub_backfill::backfill(std::path::Path::new(&store.path), store.mode)
+        .map_err(CliError::Failed)?;
+    writeln!(out, "{}", json!({"command":"hub backfill","candidates":report.candidates,"queued":report.queued,"pending":report.pending}))
+        .map_err(|error| CliError::Failed(error.to_string()))
 }
 
 fn hub_sync(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
