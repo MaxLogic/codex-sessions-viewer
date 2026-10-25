@@ -13,7 +13,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use sha2::{Digest, Sha256};
 
-use crate::codex::parser::{AuthorType, SourceType, Usage};
+use crate::codex::parser::{AuthorType, SourceType, Usage, is_compressed_jsonl};
 use crate::contract::{
     MessageRecord, ProjectHint, ProjectHints, Record, SessionRef, SessionSnapshot, SourceStatus,
     ThreadName, ToolCallRecord, UsageRecord, parse_time,
@@ -115,7 +115,15 @@ fn compare_candidates(left: &Evidence, right: &Evidence) -> Ordering {
         .cmp(&right.is_valid_parse)
         .then_with(|| compare_nullable(left.last_evidence_utc, right.last_evidence_utc))
         .then_with(|| compare_nullable(left.modified_utc, right.modified_utc))
-        .then_with(|| left.file_size.cmp(&right.file_size))
+        .then_with(|| {
+            // A compressed rollout is smaller than the same content plain;
+            // only sizes of the same encoding say which copy is longer.
+            if is_compressed_jsonl(&left.source_path) == is_compressed_jsonl(&right.source_path) {
+                left.file_size.cmp(&right.file_size)
+            } else {
+                Ordering::Equal
+            }
+        })
         .then_with(|| {
             lifecycle_preference(&left.source_state).cmp(&lifecycle_preference(&right.source_state))
         })
@@ -1781,6 +1789,14 @@ fn apply_identity_merge(
         )?;
     }
     refresh_session_search_row(conn, canonical_id)?;
+    // With immediate enforcement every statement above already failed on a
+    // violation. The full check reads every table: about ten seconds per
+    // merge on a large database, which held the write lock that long.
+    let enforced = conn.query_row("pragma foreign_keys", [], |row| row.get::<_, i64>(0))? == 1
+        && conn.query_row("pragma defer_foreign_keys", [], |row| row.get::<_, i64>(0))? == 0;
+    if enforced {
+        return Ok(());
+    }
     let violations: i64 =
         conn.query_row("select count(*) from pragma_foreign_key_check", [], |row| {
             row.get(0)

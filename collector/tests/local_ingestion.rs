@@ -1021,6 +1021,105 @@ fn appended_rollout_updates_messages_and_usage_in_place() {
     );
 }
 
+/// Codex compresses older rollouts in place: `x.jsonl` becomes `x.jsonl.zst`.
+/// The rescan reads the compressed copy and keeps one complete session.
+#[test]
+fn a_rollout_compressed_by_codex_is_read_and_stays_one_session() {
+    let temp = TempDir::new("zstd");
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let db = viewer_database(&temp);
+    assert!(support::scan(&db, &home, &[]).status.success());
+    let snapshot = |conn: &Connection| {
+        (
+            count(conn, "select count(*) from sessions"),
+            count(
+                conn,
+                "select count(*) from messages where session_id = 'session:parity-rich-001'",
+            ),
+            count(
+                conn,
+                "select count(*) from usage_events where session_row_id = 'session:parity-rich-001'",
+            ),
+        )
+    };
+    let before = snapshot(&open(&db));
+    assert_eq!(before, (1, 12, 9));
+
+    // As Codex does it: the compressed copy keeps the modification time and
+    // is smaller. A scan between deleting and compressing (or one that runs
+    // before this collector can read `.zst`) records the session missing.
+    let plain = support::day_folder(&home).join("rich_session.jsonl");
+    let bytes = std::fs::read(&plain).unwrap();
+    let modified = std::fs::metadata(&plain).unwrap().modified().unwrap();
+    std::fs::remove_file(&plain).unwrap();
+    assert!(support::scan(&db, &home, &[]).status.success());
+    let compressed_path = plain.with_extension("jsonl.zst");
+    std::fs::write(
+        &compressed_path,
+        zstd::stream::encode_all(&bytes[..], 3).unwrap(),
+    )
+    .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&compressed_path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+
+    let output = support::scan(&db, &home, &["--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["files_parsed"], 1, "{report}");
+    let conn = open(&db);
+    assert_eq!(snapshot(&conn), before);
+    let (status, path): (String, String) = conn
+        .query_row(
+            "select scan_status, source_file_path from sessions where id = 'session:parity-rich-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "available");
+    assert!(path.ends_with("rich_session.jsonl.zst"), "{path}");
+    assert_eq!(
+        count(
+            &conn,
+            "select count(*) from sessions where scan_status = 'unsupported_format'"
+        ),
+        0
+    );
+    drop(conn);
+    // An unchanged compressed file is skipped like a plain one.
+    let again: Value =
+        serde_json::from_slice(&support::scan(&db, &home, &["--json"]).stdout).unwrap();
+    assert_eq!(again["files_parsed"], 0, "{again}");
+}
+
+#[test]
+fn a_damaged_compressed_rollout_is_a_parse_error() {
+    let temp = TempDir::new("zstd-damaged");
+    let home = support::codex_home(&temp, &[]);
+    std::fs::create_dir_all(support::day_folder(&home)).unwrap();
+    std::fs::write(
+        support::day_folder(&home).join("damaged.jsonl.zst"),
+        b"\x28\xb5\x2f\xfdnot zstd",
+    )
+    .unwrap();
+    let db = viewer_database(&temp);
+    assert!(support::scan(&db, &home, &[]).status.success());
+    assert_eq!(
+        count(
+            &open(&db),
+            "select count(*) from sessions where scan_status = 'parse_error'"
+        ),
+        1
+    );
+}
+
 #[test]
 fn malformed_and_unreadable_sources_are_recorded_without_stopping_the_scan() {
     let temp = TempDir::new("malformed");

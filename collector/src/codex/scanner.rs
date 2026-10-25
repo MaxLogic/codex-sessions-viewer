@@ -555,7 +555,10 @@ fn list_directory(
         if !file_type.is_file() {
             continue;
         }
-        if !(path.ends_with(".json") || path.ends_with(".jsonl")) {
+        if !(path.ends_with(".json")
+            || path.ends_with(".jsonl")
+            || crate::codex::parser::is_compressed_jsonl(&path))
+        {
             walked.unsupported.push(status(
                 &path,
                 "unsupported_format",

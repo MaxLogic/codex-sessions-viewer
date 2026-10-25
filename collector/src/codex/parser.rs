@@ -511,7 +511,7 @@ fn parse_file_inner(path: &str, options: ParserOptions) -> Result<ParseSuccess, 
     let size = metadata.len();
     let modified = file_modified_utc(&metadata)?;
     let parser = Parser { path, options };
-    if path.to_lowercase().ends_with(".jsonl") {
+    if path.to_lowercase().ends_with(".jsonl") || is_compressed_jsonl(path) {
         return parser.parse_jsonl_snapshot(size, modified);
     }
     let probe_end = size.min(JSON_FORMAT_PROBE_BYTES);
@@ -560,6 +560,12 @@ fn parse_file_inner(path: &str, options: ParserOptions) -> Result<ParseSuccess, 
         snapshot_modified_utc: modified,
         changed_during_parse: after.len() != size || file_modified_utc(&after)? != modified,
     })
+}
+
+/// Codex compresses older rollouts in place to `<name>.jsonl.zst` (one zstd
+/// stream of the original JSONL). Such a file is read through a decoder.
+pub fn is_compressed_jsonl(path: &str) -> bool {
+    path.to_lowercase().ends_with(".jsonl.zst")
 }
 
 fn read_prefix(path: &str, end: u64) -> Result<Vec<u8>, Failure> {
@@ -1190,14 +1196,36 @@ impl Parser<'_> {
 
     fn parse_jsonl_session(&self, size: u64) -> Result<ParsedSession, Failure> {
         let file = File::open(self.path)?;
-        let mut reader = BufReader::with_capacity(256 * 1024, file.take(size));
+        // `size` counts compressed bytes for a `.zst` file, so the decoder
+        // reads the whole stream; the metadata check after parsing still
+        // detects a file that changed meanwhile.
+        let compressed = is_compressed_jsonl(self.path);
+        let mut reader: Box<dyn BufRead> = if compressed {
+            let decoder = zstd::stream::read::Decoder::new(file.take(size)).map_err(|error| {
+                ParseError::new(self.path, ParseErrorKind::MalformedJson, error.to_string())
+            })?;
+            Box::new(BufReader::with_capacity(256 * 1024, decoder))
+        } else {
+            Box::new(BufReader::with_capacity(256 * 1024, file.take(size)))
+        };
         let mut state = JsonlState::new(self.path);
         let mut line_number = 0u64;
         let mut bytes_read = 0u64;
         let mut segment = Vec::new();
         loop {
             segment.clear();
-            let read = reader.read_until(b'\n', &mut segment)?;
+            let read = reader
+                .read_until(b'\n', &mut segment)
+                .map_err(|error| -> Failure {
+                    // The decoder reports corrupt data as `Other`; that is a
+                    // damaged file, not an unreachable one.
+                    if compressed && error.kind() == std::io::ErrorKind::Other {
+                        ParseError::new(self.path, ParseErrorKind::MalformedJson, error.to_string())
+                            .into()
+                    } else {
+                        error.into()
+                    }
+                })?;
             if read == 0 {
                 break;
             }
@@ -1242,7 +1270,7 @@ impl Parser<'_> {
                 state.record(&record, self);
             }
         }
-        if bytes_read != size {
+        if !compressed && bytes_read != size {
             return Err(ParseError::new(
                 self.path,
                 ParseErrorKind::Io,

@@ -170,7 +170,7 @@ fn compressed_noop_preserves_placeholder_metadata_journal_and_hub_queue() {
     };
     let temp = support::TempDir::new("compressed_metadata");
     let home = support::codex_home(&temp, &[]);
-    let path = support::day_folder(&home).join("unsupported.jsonl.zst");
+    let path = support::day_folder(&home).join("unsupported.jsonl.gz");
     std::fs::write(&path, b"compressed").unwrap();
     let store = Store::open(&temp.path().join("fixture.sqlite"), OwnerMode::Standalone).unwrap();
     let options = ScanOptions {
@@ -235,7 +235,7 @@ fn steady_state_full_scan_with_compressed_sources_has_zero_write_transactions() 
     let temp = support::TempDir::new("steady_compressed");
     let home = support::codex_home(&temp, &["rich_session.jsonl"]);
     std::fs::write(
-        support::day_folder(&home).join("unsupported.jsonl.zst"),
+        support::day_folder(&home).join("unsupported.jsonl.gz"),
         b"compressed",
     )
     .unwrap();
@@ -298,7 +298,7 @@ fn chunking_preserves_complete_table_contents_at_session_boundaries() {
     let temp = support::TempDir::new("chunk_equivalence");
     let home = support::codex_home(&temp, &["rich_session.jsonl"]);
     std::fs::write(
-        support::day_folder(&home).join("unsupported.jsonl.zst"),
+        support::day_folder(&home).join("unsupported.jsonl.gz"),
         b"compressed",
     )
     .unwrap();
