@@ -28,6 +28,8 @@ const SHRINK_AFTER_FAILURES: i64 = 2;
 const INFLIGHT_FAILURES_KEY: &str = "hub.inflight_transport_failures";
 /// Upper bound of batches per `hub sync` run.
 const MAX_BATCHES_PER_RUN: usize = 1000;
+/// How long delivery waits for the collector write lease; scans use the same.
+pub(crate) const LEASE_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncReport {
@@ -627,6 +629,10 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
     if token.trim().is_empty() {
         return Err("hub credential is missing".to_owned());
     }
+    // Wait as long as a scan does: a long scan holds the lease for each of its
+    // batches and releases it only briefly, so the busy timeout alone refused
+    // every sync until the scan ended.
+    let _wait = crate::store::write_lease::LeaseWait::enter(LEASE_WAIT);
     let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
     let machine = local_machine(&store)?;
     let mut sequence = enable(&store, &url, &machine)?;

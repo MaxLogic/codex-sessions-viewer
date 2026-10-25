@@ -37,6 +37,7 @@ pub struct BackfillReport {
 /// Queues every available-parse session whose source is recorded missing.
 /// Refuses when hub delivery is not enabled: nothing would be queued.
 pub fn backfill(db_path: &Path, mode: OwnerMode) -> Result<BackfillReport, String> {
+    let _wait = crate::store::write_lease::LeaseWait::enter(crate::hub_client::LEASE_WAIT);
     let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
     run(&store.conn).map_err(|error| error.to_string())
 }
