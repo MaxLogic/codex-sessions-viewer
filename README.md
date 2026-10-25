@@ -125,6 +125,8 @@ viewer creates it from the packaged `settings.sample.toml` and fills blank sessi
 roots from the current user. An existing Windows
 `settings.toml` beside the executable remains supported. Configure paths for
 each machine after installation; keep the local runtime file out of packages.
+The repository tracks only `settings.sample.toml`; a local `settings.toml`
+in a checkout is ignored by Git.
 
 Windows Codex sessions:
 

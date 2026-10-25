@@ -23,3 +23,6 @@ __pycache__/
 
 # Local reference material; never published
 /references/
+
+# Local runtime settings; settings.sample.toml is the tracked template
+/settings.toml
