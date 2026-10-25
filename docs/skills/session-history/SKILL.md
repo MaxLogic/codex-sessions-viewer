@@ -1,9 +1,9 @@
 ---
 name: session-history
-description: Search indexed coding-session history to recall project decisions, prior work, fixes, and unfinished tasks. Use for questions such as what did we do on this project or where did we discuss this. Reads the local Codex Session Viewer database read-only; does not replace source-code or Git verification.
+description: Search indexed coding-session history to recall project decisions, prior work, fixes, and unfinished tasks. Use for questions such as what did we do on this project or where did we discuss this. Reads the personal sessions hub (every machine) when configured, otherwise the local Codex Session Viewer database, read-only; does not replace source-code or Git verification.
 metadata:
   author: Pawel Piotrowski
-  version: "2.0.0"
+  version: "2.1.0"
 ---
 
 # Session History
@@ -18,9 +18,29 @@ Resolve deployment links before locating bundled scripts.
 read-only query contract (`codex-sessions-collector.exe query`, contract
 `codex-sessions-viewer.query` version 2). The executable opens the existing
 database read-only with `query_only`; nothing scans or imports sessions,
-migrates schemas, starts the app, or contacts a server or model. The launcher
-finds the executable through `--exe PATH`, `CODEX_SESSIONS_COLLECTOR`, the
-repository's `release/windows` folder, or `PATH`.
+migrates schemas, starts the app, or contacts a model. The launcher finds the
+executable through `--exe PATH`, `CODEX_SESSIONS_COLLECTOR`, the repository's
+`release/windows` folder, or `PATH`.
+
+## Hub or local database
+
+When `CODEX_SESSIONS_HUB_URL` is set, queries go to that personal hub, which
+holds every paired machine's history. The owner token comes from
+`CODEX_SESSIONS_HUB_OWNER_TOKEN` or from the `KEY=VALUE` file named by
+`CODEX_SESSIONS_HUB_ENV_FILE`; never print either. In WSL, unset values are
+read from the Windows user environment.
+
+- Without `--hub-machine`, a command runs once per hub machine and returns
+  `{"hub", "machines": [{"machine", "name", "exit_code", "result" | "error"}]}`.
+  `name` comes from `CODEX_SESSIONS_HUB_MACHINE_ID_<NAME>=<id>` lines in the
+  token file. A failed machine makes the exit code 1; report it, keep the others.
+- `--hub-machine <name or id>` queries one machine and returns its plain
+  result. Use it for paging: a `next_cursor` belongs to one machine.
+- `--local`, or an explicit `--db`, reads the local database instead. Use it
+  when the hub is unreachable; local history covers this machine only and may
+  be missing WSL Claude sessions.
+- The hub has only what machines delivered: uploads run every few minutes, so
+  the newest turns of a running session may be absent.
 
 Windows:
 
@@ -43,8 +63,8 @@ database is Windows-owned: never open it through Linux SQLite, even when it is
 reachable under `/mnt/c`. If Windows interop is unavailable, report that
 prerequisite; do not fall back to Linux database access.
 
-The default database is `%APPDATA%/CodexSessionViewer/codex_sessions_viewer.sqlite`,
-matching the app. Use `--db <path>` for another instance or fixture. A missing
+The default local database is
+`%APPDATA%/CodexSessionViewer/codex_sessions_viewer.sqlite`, matching the app. Use `--db <path>` for another instance or fixture. A missing
 database is an error, not empty history. Do not search drives for alternative
 databases or print settings files that may contain credentials.
 

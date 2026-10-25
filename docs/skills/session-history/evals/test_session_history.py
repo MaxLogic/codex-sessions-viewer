@@ -1,7 +1,9 @@
 """Retained native-Windows regressions for the session-history launcher, using
 only owned temporary databases built by the collector."""
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -160,15 +162,32 @@ def to_wsl(path):
     return f'/mnt/{drive}{rest}'
 
 
+HUB_VARIABLES = ('CODEX_SESSIONS_HUB_URL', 'CODEX_SESSIONS_HUB_OWNER_TOKEN', 'CODEX_SESSIONS_HUB_ENV_FILE')
+
+
+def load_launcher(test):
+    """In-process launcher with no inherited or Windows-side hub configuration."""
+    environment = mock.patch.dict('os.environ')
+    environment.start()
+    test.addCleanup(environment.stop)
+    for name in HUB_VARIABLES:
+        os.environ.pop(name, None)
+    spec = importlib.util.spec_from_file_location('history_launcher', SCRIPT)
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    lookup = mock.patch.object(launcher, 'windows_variable', return_value=None)
+    lookup.start()
+    test.addCleanup(lookup.stop)
+    return launcher
+
+
 class WslLauncherTests(unittest.TestCase):
     """Exercise WSL routing with the default-profile lookup mocked, never WSL."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='wsl-', dir=test_environment.ROOT)
         self.addCleanup(self.temp.cleanup)
         self.db = fixture.build(Path(self.temp.name) / 'wsl.sqlite', EXE)
-        spec = importlib.util.spec_from_file_location('history_launcher', SCRIPT)
-        self.launcher = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.launcher)
+        self.launcher = load_launcher(self)
 
     def test_wsl_paths_reach_the_windows_database(self):
         with mock.patch.object(self.launcher, 'in_wsl', return_value=True), \
@@ -196,6 +215,96 @@ class WslLauncherTests(unittest.TestCase):
     def test_default_profile_database_is_rejected_by_native_boundary(self):
         with self.assertRaisesRegex(RuntimeError, 'explicit fixture database'):
             test_environment.run([str(EXE), 'query', 'status'])
+
+
+class HubLauncherTests(unittest.TestCase):
+    """Hub routing with the machine list and collector process mocked; no network."""
+    URL = 'https://hub.example.test'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='hub-', dir=test_environment.ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.launcher = load_launcher(self)
+        self.env_file = Path(self.temp.name) / 'hub.env'
+        self.env_file.write_text('# comment\nCODEX_SESSIONS_HUB_OWNER_TOKEN=owner-secret-value\n'
+                                 'CODEX_SESSIONS_HUB_MACHINE_ID_ALPHA=machine-a\n'
+                                 'CODEX_SESSIONS_HUB_MACHINE_ID_BETA=machine-b\n', encoding='utf-8')
+        os.environ['CODEX_SESSIONS_HUB_URL'] = self.URL
+        os.environ['CODEX_SESSIONS_HUB_ENV_FILE'] = str(self.env_file)
+
+    def run_main(self, *args, machines=('machine-a', 'machine-b'), outputs=None):
+        outputs = outputs or {}
+        def spawn(command, **kwargs):
+            if '--hub-machine' not in command:
+                return subprocess.CompletedProcess(command, 0, '', '')
+            machine = command[command.index('--hub-machine') + 1]
+            code, stdout, stderr = outputs.get(machine, (0, json.dumps({'machine': machine}), ''))
+            return subprocess.CompletedProcess(command, code, stdout, stderr)
+        stdout = mock.patch('sys.stdout', new_callable=io.StringIO)
+        with mock.patch.object(self.launcher, 'in_wsl', return_value=False), \
+             mock.patch.object(self.launcher.os, 'name', 'nt'), \
+             mock.patch.object(self.launcher, 'find_exe', return_value=str(EXE)), \
+             mock.patch.object(self.launcher, 'hub_machines', return_value=list(machines)) as listed, \
+             mock.patch.object(self.launcher.subprocess, 'run', side_effect=spawn) as process, \
+             stdout as printed:
+            code = self.launcher.main(list(args))
+        return code, printed.getvalue(), process, listed
+
+    def test_configured_hub_queries_every_machine_with_token_in_environment(self):
+        code, printed, process, listed = self.run_main('search', '--query', 'shutdown queue')
+        self.assertEqual(code, 0)
+        listed.assert_called_once_with(self.URL, 'owner-secret-value')
+        self.assertEqual(process.call_count, 2)
+        for call, machine in zip(process.call_args_list, ('machine-a', 'machine-b')):
+            command = call.args[0]
+            self.assertEqual(command[:5], [str(EXE), 'query', 'search', '--query', 'shutdown queue'])
+            self.assertEqual(command[-4:], ['--hub', self.URL, '--hub-machine', machine])
+            self.assertNotIn('owner-secret-value', command)
+            self.assertEqual(call.kwargs['env']['CODEX_SESSIONS_HUB_OWNER_TOKEN'], 'owner-secret-value')
+        merged = json.loads(printed)
+        self.assertEqual([(m['machine'], m['name']) for m in merged['machines']],
+                         [('machine-a', 'ALPHA'), ('machine-b', 'BETA')])
+        self.assertNotIn('owner-secret-value', printed)
+
+    def test_machine_name_selects_one_machine_and_passes_output_through(self):
+        code, printed, process, listed = self.run_main('status', '--hub-machine', 'BETA')
+        self.assertEqual(code, 0)
+        listed.assert_not_called()
+        self.assertEqual(process.call_args.args[0][-1], 'machine-b')
+        self.assertEqual(json.loads(printed), {'machine': 'machine-b'})
+
+    def test_one_failing_machine_is_reported_and_fails_the_run(self):
+        error = json.dumps({'error': 'unknown machine'})
+        code, printed, _, _ = self.run_main('status', outputs={'machine-b': (1, '', error)})
+        self.assertEqual(code, 1)
+        merged = json.loads(printed)['machines']
+        self.assertEqual(merged[0]['result'], {'machine': 'machine-a'})
+        self.assertEqual(merged[1]['error'], {'error': 'unknown machine'})
+
+    def test_local_and_db_options_bypass_the_hub(self):
+        for args in (['--local', 'status'], ['--db', str(Path(self.temp.name) / 'local.sqlite'), 'status']):
+            code, _, process, listed = self.run_main(*args)
+            self.assertEqual(code, 0)
+            listed.assert_not_called()
+            self.assertNotIn('--hub', process.call_args.args[0])
+
+    def test_hub_machine_without_a_hub_is_refused_instead_of_reading_local_history(self):
+        del os.environ['CODEX_SESSIONS_HUB_URL']
+        with mock.patch('sys.stderr', new_callable=io.StringIO) as printed:
+            code, _, process, _ = self.run_main('status', '--hub-machine', 'ALPHA')
+        self.assertEqual(code, 2)
+        self.assertIn('--hub-machine needs a hub', printed.getvalue())
+        process.assert_not_called()
+
+    def test_missing_owner_token_is_an_error_before_any_request(self):
+        self.env_file.write_text('CODEX_SESSIONS_HUB_MACHINE_ID_ALPHA=machine-a\n', encoding='utf-8')
+        stderr = mock.patch('sys.stderr', new_callable=io.StringIO)
+        with stderr as printed:
+            code, _, process, listed = self.run_main('status')
+        self.assertEqual(code, 2)
+        self.assertIn('CODEX_SESSIONS_HUB_OWNER_TOKEN', printed.getvalue())
+        listed.assert_not_called()
+        process.assert_not_called()
 
 
 class LaunchBoundaryTests(unittest.TestCase):
