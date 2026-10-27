@@ -589,6 +589,842 @@ fn hub_rows(temp: &TempDir, sql: &str) -> i64 {
         .unwrap()
 }
 
+fn large_snapshot(session: &str) -> Envelope {
+    let mut snapshot = sample_snapshot(session);
+    let tool = snapshot.tool_calls[0].clone();
+    snapshot.tool_calls = (0..12_544)
+        .map(|index| {
+            let mut tool = tool.clone();
+            tool.tool_index = index;
+            tool.output_preview = format!("tool {index}: {}", "x".repeat(4096));
+            tool
+        })
+        .collect();
+    let envelope = Envelope::new(Record::SessionSnapshot(Box::new(snapshot)));
+    let bytes = serde_json::to_vec(&envelope).unwrap().len();
+    assert!(bytes > 48 * 1024 * 1024 && bytes < 56 * 1024 * 1024);
+    envelope
+}
+
+fn move_to_dead_letter(conn: &rusqlite::Connection, key: &str, status: Option<u16>) {
+    conn.execute(
+        "insert into collector_upload_dead_letters(outbox_id, record_key, record_json,
+         created_at_utc, failed_at_utc, http_status, error)
+         select id, record_key, record_json, created_at_utc, 'now', ?,
+         'record exceeds the hub upload size limit and was not sent'
+         from collector_upload_outbox where record_key = ?",
+        rusqlite::params![status, key],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.execute(
+            "delete from collector_upload_outbox where record_key = ?",
+            [key]
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn records_above_the_old_48_mib_limit_are_delivered_and_their_dead_letters_cleared() {
+    let temp = TempDir::new("large_delivery");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    store.apply(vec![large_snapshot("large-a")]).unwrap();
+    move_to_dead_letter(&store.conn, "session:session:large-a", None);
+    store.apply(vec![large_snapshot("large-b")]).unwrap();
+    let local_counts: (i64, i64, i64) = store
+        .conn
+        .query_row(
+            "select count(*), sum(message_count), sum(tool_call_count) from sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let local_bytes: i64 = store
+        .conn
+        .query_row(
+            "select sum(length(cast(output_preview as blob))) from tool_calls",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        local_bytes > 48 * 1024 * 1024,
+        "tool previews must survive local apply"
+    );
+    drop(store);
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(report["requeued_dead_letters"], 1, "{report}");
+    assert_eq!(report["dead_lettered"], 0);
+    assert!(report["sent"].as_u64().unwrap() >= local_counts.0 as u64);
+    assert_eq!(report["pending"], 0);
+    assert_eq!(
+        json_output(&hub_command(&db, "status", ""))["dead_letters"],
+        0
+    );
+    assert_eq!(
+        hub_rows(&temp, "select count(*) from sessions"),
+        local_counts.0
+    );
+    assert_eq!(
+        hub_rows(&temp, "select sum(message_count) from sessions"),
+        local_counts.1
+    );
+    assert_eq!(
+        hub_rows(&temp, "select sum(tool_call_count) from sessions"),
+        local_counts.2
+    );
+    assert_eq!(
+        hub_rows(
+            &temp,
+            "select sum(length(cast(output_preview as blob))) from tool_calls"
+        ),
+        local_bytes
+    );
+}
+
+#[test]
+fn dead_letter_reconciliation_preserves_current_state_across_event_permutations() {
+    const SEED: u64 = 0x201_2026;
+    let temp = TempDir::new("replay_class");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let mut cases = Vec::new();
+    for clock in [-1, 0, 1] {
+        for status_key in [false, true] {
+            for reverse_parse in [false, true] {
+                for dead_b in [false, true] {
+                    for delivered in [false, true] {
+                        for deleted in [false, true] {
+                            for missing in [false, true] {
+                                cases.push((
+                                    clock,
+                                    status_key,
+                                    reverse_parse,
+                                    dead_b,
+                                    delivered,
+                                    deleted,
+                                    missing,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut random = SEED;
+    for index in (1..cases.len()).rev() {
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+        cases.swap(index, random as usize % (index + 1));
+    }
+    eprintln!(
+        "replay class seed={SEED:#x}, cases={}, clocks=-1/0/+1 second; snapshot/status keys; A/B parse order; dead A/B; deliver/no-deliver; delete/keep; active/missing",
+        cases.len()
+    );
+    let mut sequence = 0;
+    let mut expected = Vec::new();
+    for (index, &(clock, status_key, reverse_parse, dead_b, delivered, deleted, missing)) in
+        cases.iter().enumerate()
+    {
+        let session = format!("class-{index}");
+        let mut a = sample_snapshot(&session);
+        a.messages[0].content_plain = format!("A-{index}");
+        let mut b = a.clone();
+        b.messages[0].content_plain = format!("B-{index}");
+        let (first, newest) = if reverse_parse {
+            (b.clone(), a.clone())
+        } else {
+            (a.clone(), b.clone())
+        };
+        store
+            .apply(vec![
+                Envelope::new(Record::SessionSnapshot(Box::new(first))),
+                Envelope::new(Record::SessionSnapshot(Box::new(newest.clone()))),
+            ])
+            .unwrap();
+        // Apply separately as real independent parse commits, without relying on a clock ordering.
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                newest.clone(),
+            )))])
+            .unwrap();
+        let path = newest.source.path.clone();
+        let current_status = status_record(&path, if missing { "missing" } else { "available" });
+        store.apply(vec![current_status.clone()]).unwrap();
+        if delivered {
+            sequence += 1;
+            upload(
+                &hub,
+                MACHINE_A_TOKEN,
+                sequence,
+                &format!("class-delivery-{index}"),
+                vec![
+                    serde_json::to_value(Envelope::new(Record::SessionSnapshot(Box::new(
+                        newest.clone(),
+                    ))))
+                    .unwrap(),
+                    serde_json::to_value(current_status).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+        let key = format!("session:session:{session}");
+        let status = format!(
+            "status:codex:{}",
+            codex_sessions_collector::store::writer::source_status_id(&path)
+        );
+        store
+            .conn
+            .execute(
+                "delete from collector_upload_outbox where record_key in (?, ?)",
+                rusqlite::params![key, status],
+            )
+            .unwrap();
+        let payload = if status_key {
+            // A historical lifecycle event opposite to the latest authoritative path state.
+            status_record(&path, if missing { "available" } else { "missing" })
+        } else {
+            Envelope::new(Record::SessionSnapshot(Box::new(if dead_b {
+                b
+            } else {
+                a
+            })))
+        };
+        store.conn.execute("insert into collector_upload_dead_letters(outbox_id,record_key,record_json,created_at_utc,failed_at_utc,http_status,error)
+            values (1,?,?, '2026-10-27T12:00:00Z','now',null,'synthetic local size refusal')",
+            rusqlite::params![if status_key { &status } else { &key }, serde_json::to_string(&payload).unwrap()]).unwrap();
+        let parsed = format!(
+            "2026-10-27T{}Z",
+            match clock {
+                -1 => "11:59:59",
+                0 => "12:00:00",
+                _ => "12:00:01",
+            }
+        );
+        store
+            .conn
+            .execute(
+                "update sessions set last_parsed_utc=? where id=?",
+                rusqlite::params![parsed, format!("session:{session}")],
+            )
+            .unwrap();
+        if deleted {
+            store
+                .conn
+                .execute(
+                    "delete from sessions where id=?",
+                    [format!("session:{session}")],
+                )
+                .unwrap();
+        }
+        // Deleted local paths have no new state to send; the protocol retains
+        // previously delivered history rather than deleting it remotely.
+        let state = if !deleted || delivered {
+            Some((
+                newest.messages[0].content_plain.clone(),
+                if missing { "missing" } else { "available" }.to_owned(),
+                if missing { "missing" } else { "active" }.to_owned(),
+            ))
+        } else {
+            None
+        };
+        expected.push((session, state));
+    }
+    store
+        .conn
+        .execute(
+            "update collector_hub_state set last_sequence=? where id=1",
+            [sequence],
+        )
+        .unwrap();
+    drop(store);
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    let remote = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
+    let mut failures = Vec::new();
+    use rusqlite::OptionalExtension;
+    for (index, (session, state)) in expected.iter().enumerate() {
+        let actual: Option<(String,String,String)> = remote.query_row(
+            "select m.content_plain,s.scan_status,s.source_state from sessions s left join messages m on m.session_id=s.id where s.id=?",
+            [format!("session:{session}")], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().unwrap();
+        if &actual != state {
+            failures.push(format!(
+                "case {index} {:?}: expected {state:?}, got {actual:?}",
+                cases[index]
+            ));
+        }
+    }
+    let remaining = json_output(&hub_command(&db, "status", ""))["dead_letters"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        failures.is_empty() && remaining == 0,
+        "seed={SEED:#x}, remaining={remaining}, report={report}, failures={}\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn reconciliation_preserves_retained_parse_error_history_and_status_only_paths() {
+    let temp = TempDir::new("rebuild_entity");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let snapshot = sample_snapshot("retained-error");
+    let path = snapshot.source.path.clone();
+    let expected = snapshot.messages[0].content_plain.clone();
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            snapshot,
+        )))])
+        .unwrap();
+    move_to_dead_letter(&store.conn, "session:session:retained-error", None);
+    store
+        .apply(vec![status_record(&path, "parse_error")])
+        .unwrap();
+    let placeholder = r"C:\synthetic\never-parsed.jsonl";
+    store
+        .apply(vec![status_record(placeholder, "parse_error")])
+        .unwrap();
+    let status_key = format!(
+        "status:codex:{}",
+        codex_sessions_collector::store::writer::source_status_id(placeholder)
+    );
+    move_to_dead_letter(&store.conn, &status_key, None);
+    store
+        .conn
+        .execute("delete from collector_upload_outbox", [])
+        .unwrap();
+    drop(store);
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(report["dead_lettered"], 0, "{report}");
+    assert_eq!(
+        hub_rows(&temp, "select count(*) from messages"),
+        1,
+        "retained parsed history must reach the hub"
+    );
+    let remote = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
+    let actual:(String,String)=remote.query_row("select content_plain,scan_status from messages join sessions on sessions.id=messages.session_id where sessions.id='session:retained-error'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(actual, (expected, "parse_error".to_owned()));
+    assert_eq!(
+        hub_rows(&temp, "select count(*) from sessions"),
+        2,
+        "one parsed session and one status-only placeholder"
+    );
+    assert_eq!(
+        json_output(&hub_command(&db, "status", ""))["dead_letters"],
+        0
+    );
+}
+
+#[test]
+fn an_already_delivered_newer_snapshot_is_not_overwritten_by_an_old_dead_letter() {
+    let temp = TempDir::new("delivered_newer");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let old = sample_snapshot("already-newer");
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            old.clone(),
+        )))])
+        .unwrap();
+    move_to_dead_letter(&store.conn, "session:session:already-newer", None);
+    // Same file revision and row counts: only the committed content changes.
+    // An old collector retained A when acknowledging B and removing its outbox row.
+    let mut newer = old;
+    newer.messages[0].content_plain = "NEW".to_owned();
+    let envelope = Envelope::new(Record::SessionSnapshot(Box::new(newer)));
+    store.apply(vec![envelope.clone()]).unwrap();
+    upload(
+        &hub,
+        MACHINE_A_TOKEN,
+        1,
+        "old-collector-delivered-b",
+        vec![serde_json::to_value(envelope).unwrap()],
+    )
+    .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "delete from collector_upload_outbox;
+        update collector_hub_state set last_sequence = 1 where id = 1",
+        )
+        .unwrap();
+    // Equal commit clocks must not hide stale replay.
+    store.conn.execute("update sessions set last_parsed_utc=(select created_at_utc from collector_upload_dead_letters limit 1)", []).unwrap();
+    assert_eq!(
+        hub_rows(
+            &temp,
+            "select count(*) from messages where content_plain = 'NEW'"
+        ),
+        1
+    );
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(
+        hub_rows(
+            &temp,
+            "select count(*) from messages where content_plain = 'NEW'"
+        ),
+        1
+    );
+    assert_eq!(report["requeued_dead_letters"], 1, "{report}");
+    assert_eq!(report["pruned_dead_letters"], 0);
+    assert_eq!(report["sent"], 2);
+    assert_eq!(
+        local_count(
+            &db,
+            "select count(*) from messages where content_plain = 'NEW'"
+        ),
+        1
+    );
+    assert_eq!(
+        json_output(&hub_command(&db, "status", ""))["dead_letters"],
+        0
+    );
+}
+
+#[test]
+fn stale_orphaned_and_delivered_dead_letters_are_pruned() {
+    let temp = TempDir::new("prune_delivery");
+    let hub = start(&temp);
+    let local_db = temp.path().join("local.sqlite");
+    let real_url = hub.url.clone();
+    let fake = fake_hub(Box::new(move |body| {
+        let ack: Value = ureq::post(format!("{real_url}/v1/ingest"))
+            .header("Authorization", format!("Bearer {MACHINE_A_TOKEN}"))
+            .send_json(body)
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+        // Introduce a refusal after start-of-sync pruning, before the ack:
+        // only acknowledgement reconciliation can remove this one.
+        let conn = rusqlite::Connection::open(&local_db).unwrap();
+        assert_eq!(
+            conn.execute(
+                "insert into collector_upload_dead_letters(outbox_id, record_key, record_json,
+             created_at_utc, failed_at_utc, http_status, error)
+             select id, record_key, record_json, created_at_utc, 'now', 409, 'synthetic refusal'
+             from collector_upload_outbox where record_key = 'session:session:delivered'",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        Some((200, ack.to_string()))
+    }));
+    let db = paired_database(&temp, &fake.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    for name in ["stale", "delivered", "gone", "refused"] {
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot(name),
+            )))])
+            .unwrap();
+        if name != "delivered" {
+            move_to_dead_letter(&store.conn, &format!("session:session:{name}"), Some(409));
+        }
+    }
+    store
+        .conn
+        .execute("delete from sessions where id = 'session:gone'", [])
+        .unwrap();
+    for name in ["stale", "delivered"] {
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot(name),
+            )))])
+            .unwrap();
+    }
+    drop(store);
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(report["pruned_dead_letters"], 3, "{report}");
+    assert_eq!(report["requeued_dead_letters"], 0);
+    assert_eq!(report["sent"], 2);
+    let status = json_output(&hub_command(&db, "status", ""));
+    assert_eq!(status["dead_letters"], 1);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let kept: String = conn
+        .query_row(
+            "select record_key from collector_upload_dead_letters",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, "session:session:refused");
+}
+
+#[test]
+fn an_old_hub_without_ingest_capability_gets_plain_bodies_and_the_old_limit() {
+    let temp = TempDir::new("old_hub_limit");
+    let fake = fake_hub(Box::new(|body| {
+        Some((200, json!({
+        "protocol":1,"sequence":body["sequence"],"batch_id":body["batch_id"],"duplicate":false
+    }).to_string()))
+    }));
+    let db = paired_database(&temp, &fake.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            sample_snapshot("small"),
+        )))])
+        .unwrap();
+    let name = ThreadName {
+        harness: "codex".to_owned(),
+        session_id: "large-name".to_owned(),
+        thread_name: "x".repeat(49 * 1024 * 1024),
+    };
+    // Keep the large payload outside session apply and its FTS indexing.
+    hub_client::enqueue(&store.conn, Record::ThreadName(name), "now").unwrap();
+    drop(store);
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(report["sent"], 1);
+    assert_eq!(report["dead_lettered"], 1);
+    let bodies = fake.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert!(bodies[0].is_object(), "old hub must receive plain JSON");
+    drop(bodies);
+    let wire = fake.wire.lock().unwrap();
+    assert_eq!(wire.len(), 1);
+    assert_eq!(
+        wire[0].content_encoding, None,
+        "old hub must not receive Content-Encoding"
+    );
+    assert!(
+        wire[0].plain_json,
+        "old hub must receive raw JSON bytes, not zstd"
+    );
+    drop(wire);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "select count(*) from collector_upload_dead_letters where http_status is null",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let repeat = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(repeat["requeued_dead_letters"], 0, "{repeat}");
+}
+
+#[test]
+fn hub_decodes_zstd_ingest_within_its_decoded_limit() {
+    let temp = TempDir::new("zstd_ingest");
+    let hub = start(&temp);
+    let verify: Value = ureq::get(format!("{}/v1/verify", hub.url))
+        .header("Authorization", format!("Bearer {MACHINE_A_TOKEN}"))
+        .call()
+        .unwrap()
+        .body_mut()
+        .read_json()
+        .unwrap();
+    assert_eq!(verify["protocol"], 1);
+    assert_eq!(verify["contract_version"], 2);
+    assert_eq!(verify["ingest"]["content_encodings"], json!(["zstd"]));
+    let limit = verify["ingest"]["max_decoded_bytes"].as_u64().unwrap() as usize;
+    let body =
+        json!({"protocol":1,"sequence":1,"batch_id":"compressed","records":[record("compressed")]})
+            .to_string();
+    let payload = zstd::bulk::compress(body.as_bytes(), 3).unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    for duplicate in [false, true] {
+        let mut response = agent
+            .post(format!("{}/v1/ingest", hub.url))
+            .header("Authorization", format!("Bearer {MACHINE_A_TOKEN}"))
+            .header("Content-Encoding", "ZsTd")
+            .send(payload.as_slice())
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.body_mut().read_json::<Value>().unwrap()["duplicate"],
+            duplicate
+        );
+    }
+    let before = hub_rows(&temp, "select count(*) from hub_received_batches");
+    for (encoding, bytes, status, code) in [
+        (
+            "zstd",
+            {
+                let mut bomb = zstd::bulk::compress(&vec![0; limit + 1], 3).unwrap();
+                // A bounded decoder must stop at limit + 1. Reading to EOF
+                // encounters this invalid next frame and returns 400 instead.
+                bomb.extend_from_slice(b"invalid trailing zstd frame");
+                bomb
+            },
+            413,
+            "record_rejected",
+        ),
+        ("zstd", b"corrupt frame".to_vec(), 400, "invalid_batch"),
+        ("gzip", b"{}".to_vec(), 415, "request"),
+    ] {
+        let mut response = agent
+            .post(format!("{}/v1/ingest", hub.url))
+            .header("Authorization", format!("Bearer {MACHINE_A_TOKEN}"))
+            .header("Content-Encoding", encoding)
+            .send(bytes.as_slice())
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.body_mut().read_json::<Value>().unwrap()["code"],
+            code
+        );
+        assert_eq!(
+            hub_rows(&temp, "select count(*) from hub_received_batches"),
+            before
+        );
+        assert!(ureq::get(format!("{}/v1/health", hub.url)).call().is_ok());
+    }
+    // A protocol-1 plain upload is the old collector's exact wire format.
+    assert_eq!(
+        upload(&hub, MACHINE_A_TOKEN, 2, "plain", vec![record("plain")]).unwrap()["duplicate"],
+        false
+    );
+}
+
+// The first proxy connection holds the hub's ingest gate before forwarding
+// its body. The second event proves another real sync reached that gate.
+#[test]
+fn overlapping_sync_runs_wait_before_sending_large_bodies() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    let temp = TempDir::new("overlap_sync");
+    let other = TempDir::new("overlap_sync_b");
+    let hub = start(&temp);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    let address = hub.url.trim_start_matches("http://").to_owned();
+    let (events, arrived) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let released = Arc::new(std::sync::Mutex::new(released));
+    let count = Arc::new(AtomicUsize::new(0));
+    let proxy = thread::spawn(move || {
+        let mut workers = Vec::new();
+        // Each sync performs one verify and one ingest; the hub closes responses.
+        for _ in 0..4 {
+            let (socket, _) = listener.accept().unwrap();
+            let address = address.clone();
+            let events = events.clone();
+            let released = released.clone();
+            let count = count.clone();
+            workers.push(thread::spawn(move || {
+                let mut client = BufReader::new(socket);
+                client
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    client.read_line(&mut line).unwrap();
+                    head.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let ingest = head.starts_with("POST /v1/ingest ");
+                let expecting = head.to_ascii_lowercase().contains("expect: 100-continue");
+                if ingest && !expecting {
+                    head.truncate(head.len() - 2);
+                    head.push_str("Expect: 100-continue\r\n\r\n");
+                }
+                let length: u64 = head
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut upstream = BufReader::new(std::net::TcpStream::connect(address).unwrap());
+                upstream
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                upstream.get_mut().write_all(head.as_bytes()).unwrap();
+                if ingest {
+                    let index = count.fetch_add(1, Ordering::SeqCst);
+                    if index == 1 {
+                        events.send(1).unwrap();
+                    }
+                    let mut interim = String::new();
+                    loop {
+                        let mut line = String::new();
+                        upstream.read_line(&mut line).unwrap();
+                        interim.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    if interim.starts_with("HTTP/1.1 100") {
+                        if expecting {
+                            client.get_mut().write_all(interim.as_bytes()).unwrap();
+                        }
+                        if index == 0 {
+                            events.send(0).unwrap();
+                            released
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10))
+                                .unwrap();
+                        }
+                        std::io::copy(&mut client.by_ref().take(length), upstream.get_mut())
+                            .unwrap();
+                    } else {
+                        client.get_mut().write_all(interim.as_bytes()).unwrap();
+                    }
+                }
+                std::io::copy(&mut upstream, client.get_mut()).ok();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let db_a = paired_database(&temp, &proxy_url);
+    let db_b = other.path().join("local.sqlite");
+    {
+        let store = Store::open(&db_b, OwnerMode::Standalone).unwrap();
+        store
+            .conn
+            .execute(
+                "update app_metadata set value='machine-b' where key='machine_id'",
+                [],
+            )
+            .unwrap();
+    }
+    hub_client::enable_for_collection(&db_b, OwnerMode::Standalone, &proxy_url).unwrap();
+    let mut large = sample_snapshot("overlap-large");
+    let mut random = 0x201u64;
+    large.tool_calls[0].output_preview = (0..12 * 1024 * 1024)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            char::from(b'!' + (random % 90) as u8)
+        })
+        .collect();
+    let expected_bytes = large.tool_calls[0].output_preview.len() as i64;
+    Store::open(&db_a, OwnerMode::Standalone)
+        .unwrap()
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            large,
+        )))])
+        .unwrap();
+    Store::open(&db_b, OwnerMode::Standalone)
+        .unwrap()
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            sample_snapshot("overlap-small"),
+        )))])
+        .unwrap();
+    let first_db = db_a.clone();
+    let first = thread::spawn(move || hub_command(&first_db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(arrived.recv_timeout(Duration::from_secs(20)).unwrap(), 0);
+    let second_db = db_b.clone();
+    let second = thread::spawn(move || hub_command(&second_db, "sync", MACHINE_B_TOKEN));
+    assert_eq!(arrived.recv_timeout(Duration::from_secs(20)).unwrap(), 1);
+    // Leave the first admitted while the hub handles the second request head.
+    thread::sleep(Duration::from_millis(250));
+    let started = Instant::now();
+    assert!(ureq::get(format!("{}/v1/health", hub.url)).call().is_ok());
+    assert_eq!(session_count(&hub, "machine-b"), 0);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    release.send(()).unwrap();
+    let a = first.join().unwrap();
+    let b = second.join().unwrap();
+    proxy.join().unwrap();
+    assert_eq!(json_output(&a)["pending"], 0);
+    assert_eq!(json_output(&b)["pending"], 0);
+    assert_eq!(
+        hub_rows(
+            &temp,
+            "select length(cast(output_preview as blob)) from tool_calls"
+        ),
+        expected_bytes
+    );
+    assert_eq!(session_count(&hub, "machine-b"), 1);
+    for db in [&db_a, &db_b] {
+        assert_eq!(
+            local_count(
+                db,
+                "select count(*) from app_metadata where key='hub.inflight_transport_failures'"
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+fn an_in_progress_ingest_refuses_another_body_without_starving_queries() {
+    use std::io::{BufRead, BufReader, Write};
+    let temp = TempDir::new("ingest_admission");
+    let hub = start_with(&temp, json!({"request_timeout_seconds":1}));
+    let address = hub.url.trim_start_matches("http://");
+    let connect = |size| {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(stream, "POST /v1/ingest HTTP/1.1\r\nHost: hub\r\nAuthorization: Bearer {MACHINE_A_TOKEN}\r\nContent-Length: {size}\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        BufReader::new(stream)
+    };
+    let mut first = connect(10);
+    let mut line = String::new();
+    first.read_line(&mut line).unwrap();
+    assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+    line.clear();
+    first.read_line(&mut line).unwrap();
+    assert_eq!(line, "\r\n");
+    let mut producer = first.get_ref().try_clone().unwrap();
+    let progress = thread::spawn(move || {
+        for _ in 0..6 {
+            producer.write_all(b" ").unwrap();
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+    // The body is progressing, but remains incomplete. The gate must already cover its allocation/read.
+    // A second 64 MiB declaration gets 503 before 100 Continue or buffering.
+    let waiting = Instant::now();
+    let mut second = connect(64 * 1024 * 1024);
+    line.clear();
+    second.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 503"), "{line}");
+    assert!(waiting.elapsed() >= Duration::from_secs(2));
+    let started = Instant::now();
+    assert!(ureq::get(format!("{}/v1/health", hub.url)).call().is_ok());
+    assert_eq!(session_count(&hub, "machine-a"), 0);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    progress.join().unwrap();
+    line.clear();
+    first.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+    // A stalled accepted body still times out and releases admission.
+    assert!(
+        upload(
+            &hub,
+            MACHINE_A_TOKEN,
+            1,
+            "after-timeout",
+            vec![record("after-timeout")]
+        )
+        .is_ok()
+    );
+}
+
 fn status_record(path: &str, status: &str) -> Envelope {
     Envelope::new(Record::SourceStatus(SourceStatus {
         harness: "codex".to_owned(),
@@ -999,6 +1835,12 @@ type IngestReply = Box<dyn FnMut(&Value) -> Option<(u16, String)> + Send>;
 struct FakeHub {
     url: String,
     bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    wire: std::sync::Arc<std::sync::Mutex<Vec<CapturedUpload>>>,
+}
+
+struct CapturedUpload {
+    content_encoding: Option<String>,
+    plain_json: bool,
 }
 
 fn fake_hub(reply: IngestReply) -> FakeHub {
@@ -1011,6 +1853,8 @@ fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = bodies.clone();
+    let wire = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_wire = wire.clone();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -1021,6 +1865,8 @@ fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
             }
             let path = request_line.split(' ').nth(1).unwrap_or("").to_owned();
             let mut length = 0usize;
+            let mut encoding = None;
+            let mut expect_continue = false;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -1030,11 +1876,18 @@ fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
                 if line.is_empty() {
                     break;
                 }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse().unwrap();
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    } else if name.eq_ignore_ascii_case("expect") {
+                        expect_continue = value.trim().eq_ignore_ascii_case("100-continue");
+                    } else if name.eq_ignore_ascii_case("content-encoding") {
+                        encoding = Some(value.trim().to_owned());
+                    }
                 }
+            }
+            if expect_continue {
+                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
             }
             let mut body = vec![0u8; length];
             let _ = reader.read_exact(&mut body);
@@ -1053,10 +1906,20 @@ fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
                 )
             } else {
                 let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let plain_json = body.first() == Some(&b'{') && value.is_object();
+                seen_wire.lock().unwrap().push(CapturedUpload {
+                    content_encoding: encoding.clone(),
+                    plain_json,
+                });
                 seen.lock().unwrap().push(value.clone());
-                match reply(&value) {
-                    Some(answer) => answer,
-                    None => continue,
+                if encoding.is_some() || !plain_json {
+                    // This old peer neither advertises nor accepts compression.
+                    (415, json!({"code":"request","error":"old hub requires plain JSON without Content-Encoding"}).to_string())
+                } else {
+                    match reply(&value) {
+                        Some(answer) => answer,
+                        None => continue,
+                    }
                 }
             };
             let _ = write!(
@@ -1066,7 +1929,7 @@ fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
             );
         }
     });
-    FakeHub { url, bodies }
+    FakeHub { url, bodies, wire }
 }
 
 #[test]
@@ -1238,6 +2101,39 @@ fn a_restored_local_database_cannot_acknowledge_a_batch_the_hub_never_stored() {
         hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
     assert_eq!(delivered.sent, 1);
     assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 2);
+}
+
+#[test]
+fn busy_uploads_retry_the_same_batch_without_transport_failure_or_halving() {
+    let temp = TempDir::new("busy_retry");
+    let mut attempts = 0;
+    let fake = fake_hub(Box::new(move |body| {
+        attempts += 1;
+        if attempts <= 2 {
+            Some((
+                503,
+                json!({"code":"busy","error":"synthetic admission wait exhausted"}).to_string(),
+            ))
+        } else {
+            Some(acknowledge(body))
+        }
+    }));
+    let db = paired_database(&temp, &fake.url);
+    queue_sessions(&db, &["busy-a", "busy-b", "busy-c", "busy-d"]);
+    let result = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN);
+    assert!(result.is_ok(), "{result:?}");
+    let report = result.unwrap();
+    assert_eq!((report.sent, report.batches, report.pending), (4, 1, 0));
+    let bodies = fake.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.iter().all(|body| body == &bodies[0]));
+    assert_eq!(
+        local_count(
+            &db,
+            "select count(*) from app_metadata where key='hub.inflight_transport_failures'"
+        ),
+        0
+    );
 }
 
 #[test]

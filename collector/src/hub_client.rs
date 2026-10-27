@@ -2,7 +2,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -18,10 +18,9 @@ use crate::store::{OwnerMode, Store};
 /// Byte budget of one batch. Small enough that a batch finishes on a slow
 /// uplink within its upload timeout. A larger single record is sent alone.
 pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
-/// A single record stays below the hub's 64 MiB request limit, with headroom
-/// for the envelope. A record above this size can never be delivered and
-/// moves to the dead-letter table without contacting the hub.
-pub const MAX_RECORD_BYTES: usize = 48 * 1024 * 1024;
+/// Per-record limit for hubs that do not advertise compressed ingestion.
+pub const LEGACY_MAX_RECORD_BYTES: usize = 48 * 1024 * 1024;
+const BATCH_ENVELOPE_HEADROOM: usize = 64 * 1024;
 /// After this many consecutive transport failures (for example timeouts) of
 /// one in-flight batch, the batch is halved before the next attempt.
 const SHRINK_AFTER_FAILURES: i64 = 2;
@@ -36,6 +35,8 @@ pub struct SyncReport {
     pub sent: usize,
     pub batches: usize,
     pub dead_lettered: usize,
+    pub requeued: usize,
+    pub pruned: usize,
     pub pending: i64,
     pub last_sequence: i64,
 }
@@ -381,6 +382,8 @@ fn error_text(response: &mut ureq::http::Response<ureq::Body>, token: &str) -> (
 struct Verified {
     machine: String,
     high_water: i64,
+    compress: bool,
+    max_record_bytes: usize,
 }
 
 fn verify(agent: &ureq::Agent, url: &str, token: &str, machine: &str) -> Result<Verified, String> {
@@ -408,9 +411,21 @@ fn verify(agent: &ureq::Agent, url: &str, token: &str, machine: &str) -> Result<
     {
         return Err("hub protocol, schema, contract, or machine identity differs from this collector release".to_owned());
     }
+    let decoded_limit = server["ingest"]["max_decoded_bytes"].as_u64();
+    let compress = server["ingest"]["content_encodings"]
+        .as_array()
+        .is_some_and(|encodings| encodings.iter().any(|value| value.as_str() == Some("zstd")))
+        && decoded_limit.is_some_and(|limit| limit >= LEGACY_MAX_RECORD_BYTES as u64);
     Ok(Verified {
         machine: machine.to_owned(),
         high_water: server["high_water"].as_i64().unwrap_or(0),
+        compress,
+        max_record_bytes: if compress {
+            decoded_limit.unwrap_or_default().min(1024 * 1024 * 1024) as usize
+                - BATCH_ENVELOPE_HEADROOM
+        } else {
+            LEGACY_MAX_RECORD_BYTES
+        },
     })
 }
 
@@ -432,6 +447,8 @@ fn now_utc() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
+// NULL status means exactly a local size refusal that was never sent.
+// Only next_batch may pass None; hub refusals always retain their HTTP status.
 fn dead_letter(conn: &Connection, id: i64, status: Option<u16>, error: &str) -> StoreResult<()> {
     conn.execute(
             "insert into collector_upload_dead_letters(outbox_id, record_key, record_json, created_at_utc, failed_at_utc, http_status, error)
@@ -446,6 +463,96 @@ fn dead_letter(conn: &Connection, id: i64, status: Option<u16>, error: &str) -> 
     Ok(())
 }
 
+fn reconcile_dead_letters(
+    conn: &Connection,
+    max_record_bytes: usize,
+) -> StoreResult<(usize, usize)> {
+    let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
+    let _phase = crate::store::write_budget::write_phase("hub");
+    begin_write(conn)?;
+    let result = (|| -> StoreResult<(usize, usize)> {
+        let mut pruned = conn.execute(
+            "delete from collector_upload_dead_letters as dead
+             where record_key is not null and (
+                 exists(select 1 from collector_upload_outbox where record_key=dead.record_key)
+                 or exists(select 1 from collector_upload_dead_letters newer
+                           where newer.record_key=dead.record_key and newer.id>dead.id))
+             or (record_key like 'session:%' and not exists(
+                 select 1 from sessions where id=substr(dead.record_key,9)))",
+            [],
+        )?;
+        // Read keys, never payloads. Wall clocks and delivery history cannot
+        // establish replay safety. The lease AND transaction cover discovery,
+        // authoritative reconstruction, deletion and enqueue as one operation.
+        let letters: Vec<(i64, String)> = conn
+            .prepare(
+                "select id, record_key from collector_upload_dead_letters
+             where http_status is null and record_key is not null
+             and length(cast(record_json as blob)) <= ? order by id",
+            )?
+            .query_map([max_record_bytes as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut requeued = 0;
+        for (id, key) in letters {
+            let ids = if let Some(session) = key.strip_prefix("session:") {
+                vec![session.to_owned()]
+            } else if key.starts_with("status:") {
+                // Use the same canonical path identity as enqueue, including
+                // UNC aliases. No state or locator is read from record_json.
+                conn.prepare("select id,coalesce(harness,'codex'),source_file_path,source_file_unc_path from sessions")?
+                    .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,Option<String>>(2)?, row.get::<_,Option<String>>(3)?)))?
+                    .collect::<Result<Vec<_>,_>>()?.into_iter()
+                    .filter(|(_,harness,path,unc)| [path,unc].into_iter().flatten()
+                        .any(|path| format!("status:{harness}:{}",source_status_id(path)) == key))
+                    .map(|(id,_,_,_)| id).collect()
+            } else {
+                // Non-session metadata has no authoritative snapshot here.
+                // Retain it for diagnosis; never replay its historical payload.
+                continue;
+            };
+            conn.execute("delete from collector_upload_dead_letters where id=?", [id])?;
+            let mut queued = false;
+            for session in ids {
+                let snapshot_key = format!("session:{session}");
+                let pending: bool = conn.query_row(
+                    "select exists(select 1 from collector_upload_outbox where record_key=?)",
+                    [&snapshot_key],
+                    |row| row.get(0),
+                )?;
+                if pending {
+                    continue;
+                }
+                let now = now_utc();
+                // Queue the current snapshot before its current lifecycle status
+                // so a missing source cannot be inadvertently restored to active.
+                if let Some((snapshot, status)) =
+                    crate::hub_backfill::rebuild_current(conn, &session)?
+                {
+                    enqueue(conn, Record::SessionSnapshot(Box::new(snapshot)), &now)?;
+                    enqueue(conn, Record::SourceStatus(status), &now)?;
+                    queued = true;
+                } else if let Some(status) = crate::hub_backfill::current_status(conn, &session)? {
+                    conn.execute(
+                        "delete from collector_hub_record_state where record_key=?",
+                        [&key],
+                    )?;
+                    enqueue(conn, Record::SourceStatus(status), &now)?;
+                    queued = true;
+                }
+            }
+            if queued {
+                requeued += 1;
+            } else {
+                pruned += 1;
+            }
+        }
+        Ok((requeued, pruned))
+    })();
+    finish(conn, result)
+}
+
 /// Returns the persisted in-flight batch, or builds and persists the next one.
 /// `isolate_until` sends records one at a time so a rejected batch reveals
 /// which record is refused.
@@ -454,6 +561,7 @@ fn next_batch(
     machine: &str,
     sequence: i64,
     isolate_until: Option<i64>,
+    max_record_bytes: usize,
     dead_lettered: &mut usize,
 ) -> StoreResult<Option<Batch>> {
     let inflight: Option<(Option<String>, Option<i64>)> = conn
@@ -497,9 +605,9 @@ fn next_batch(
                 .collect::<Result<Vec<_>, _>>()?;
             for (id, size) in candidates {
                 let size = usize::try_from(size).unwrap_or(usize::MAX);
-                if size > MAX_RECORD_BYTES {
+                if size > max_record_bytes {
                     if rows.is_empty() {
-                        oversized = Some(id);
+                        oversized = Some((id, size));
                     }
                     break;
                 }
@@ -516,12 +624,14 @@ fn next_batch(
                 rows.push((id, json));
             }
         }
-        if let Some(id) = oversized {
+        if let Some((id, size)) = oversized {
             dead_letter(
                 conn,
                 id,
                 None,
-                "record exceeds the hub upload size limit and was not sent",
+                &format!(
+                    "record of {size} bytes exceeds the hub's {max_record_bytes}-byte record limit and was not sent"
+                ),
             )?;
             *dead_lettered += 1;
             continue;
@@ -642,11 +752,15 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
         sent: 0,
         batches: 0,
         dead_lettered: 0,
+        requeued: 0,
+        pruned: 0,
         pending: 0,
         last_sequence: sequence,
     };
     let mut isolate_until: Option<i64> = None;
     let conn = &store.conn;
+    (report.requeued, report.pruned) = reconcile_dead_letters(conn, verified.max_record_bytes)
+        .map_err(|error| error.to_string())?;
     while report.batches < MAX_BATCHES_PER_RUN {
         let lease = crate::store::write_lease::WriteLease::acquire(conn)
             .map_err(|error| error.to_string())?;
@@ -668,6 +782,7 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
             &verified.machine,
             sequence + 1,
             isolate_until,
+            verified.max_record_bytes,
             &mut dead,
         );
         let batch = finish(conn, batch).map_err(|error| error.to_string())?;
@@ -678,28 +793,62 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
         };
         let expected = sequence + 1;
         let body = batch_body(expected, &batch);
-        let sent = agent
-            .post(format!("{url}/v1/ingest"))
-            .config()
-            .timeout_global(Some(upload_timeout(body.len())))
-            .build()
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json")
-            .send(body);
-        let mut response = match sent {
-            Ok(response) => response,
-            Err(error) => {
-                let shrunk =
-                    record_transport_failure(conn, &batch).map_err(|error| error.to_string())?;
-                let next = if shrunk {
-                    "; the next attempt sends a smaller batch"
-                } else {
-                    ""
-                };
+        let body_len = body.len();
+        let payload = if verified.compress {
+            zstd::bulk::compress(body.as_bytes(), 3).map_err(|error| {
+                format!("cannot compress hub upload; local records remain queued: {error}")
+            })?
+        } else {
+            body.into_bytes()
+        };
+        // Busy is an admission response, not a failed transport. Keep the
+        // persisted batch and sequence through up to three bounded retries.
+        let deadline = Instant::now() + upload_timeout(body_len);
+        let mut busy_retries = 0;
+        let mut response = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut request = agent
+                .post(format!("{url}/v1/ingest"))
+                .config()
+                .timeout_global(Some(remaining))
+                .timeout_await_100(Some(Duration::from_secs(35).min(remaining)))
+                .build()
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .header("Expect", "100-continue");
+            if verified.compress {
+                request = request.header("Content-Encoding", "zstd");
+            }
+            let mut response = match request.send(payload.as_slice()) {
+                Ok(response) => response,
+                Err(error) => {
+                    let shrunk = record_transport_failure(conn, &batch)
+                        .map_err(|error| error.to_string())?;
+                    let next = if shrunk {
+                        "; the next attempt sends a smaller batch"
+                    } else {
+                        ""
+                    };
+                    return Err(format!(
+                        "hub upload failed; local records remain queued{next}: {error}"
+                    ));
+                }
+            };
+            if response.status().as_u16() != 503 {
+                break response;
+            }
+            let (code, message) = error_text(&mut response, token);
+            if code != "busy" || busy_retries == 3 {
                 return Err(format!(
-                    "hub upload failed; local records remain queued{next}: {error}"
+                    "hub upload failed (HTTP 503): {message}. Local records remain queued"
                 ));
             }
+            let backoff = Duration::from_millis(100 << busy_retries);
+            if deadline.saturating_duration_since(Instant::now()) <= backoff {
+                return Err("hub remains busy; local records remain queued".to_owned());
+            }
+            std::thread::sleep(backoff);
+            busy_retries += 1;
         };
         let status = response.status().as_u16();
         if status != 200 {
@@ -753,7 +902,13 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
             .map_err(|error| error.to_string())?;
         let _phase = crate::store::write_budget::write_phase("hub");
         begin_write(conn).map_err(|error| error.to_string())?;
-        let result = (|| -> StoreResult<()> {
+        let result = (|| -> StoreResult<usize> {
+            let pruned = conn.execute(
+                "delete from collector_upload_dead_letters
+                 where record_key in (select record_key from collector_upload_outbox
+                                      where id <= ? and record_key is not null)",
+                [batch.last_id],
+            )?;
             conn.execute(
                 "delete from collector_upload_outbox where id <= ?",
                 [batch.last_id],
@@ -762,9 +917,9 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
                 "update collector_hub_state set last_sequence = ?, inflight_batch_id = null, inflight_last_id = null where id = 1",
                 [expected],
             )?;
-            Ok(())
+            Ok(pruned)
         })();
-        finish(conn, result).map_err(|error| error.to_string())?;
+        report.pruned += finish(conn, result).map_err(|error| error.to_string())?;
         sequence = expected;
         report.sent += batch.rows.len();
         report.batches += 1;
@@ -848,8 +1003,8 @@ mod tests {
         assert!(upload_timeout(MAX_BATCH_BYTES).as_secs() > transfer);
         // A single large record gets proportionally more time.
         assert!(
-            upload_timeout(MAX_RECORD_BYTES).as_secs()
-                > MAX_RECORD_BYTES as u64 / SLOW_UPLINK_BYTES_PER_SECOND
+            upload_timeout(crate::hub_server::MAX_INGEST_DECODED_BYTES).as_secs()
+                > crate::hub_server::MAX_INGEST_DECODED_BYTES as u64 / SLOW_UPLINK_BYTES_PER_SECOND
         );
         const _: () = assert!(MAX_BATCH_BYTES <= 8 * 1024 * 1024);
     }

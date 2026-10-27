@@ -124,6 +124,22 @@ pub(crate) fn rebuild(
     conn: &Connection,
     id: &str,
 ) -> StoreResult<Option<(SessionSnapshot, SourceStatus)>> {
+    let qualifies: bool = conn.query_row(
+        "select exists(select 1 from sessions where id=? and scan_status='missing' and parse_status='available' and message_count>0)",
+        [id], |row| row.get(0),
+    )?;
+    if !qualifies {
+        return Ok(None);
+    }
+    rebuild_current(conn, id)
+}
+
+/// Rebuild only from authoritative stored rows, never from a dead-letter payload.
+/// Both local and hub writers retain the same content columns.
+pub(crate) fn rebuild_current(
+    conn: &Connection,
+    id: &str,
+) -> StoreResult<Option<(SessionSnapshot, SourceStatus)>> {
     let found = conn
         .prepare_cached(
             "select session_id, harness, source_type, source_file_path, source_file_unc_path,
@@ -138,7 +154,7 @@ pub(crate) fn rebuild(
                     models_used, input_tokens, output_tokens, cached_input_tokens, total_tokens,
                     coalesce(parser_version, 0), detected_project_id
              from sessions
-             where id = ? and scan_status = 'missing' and parse_status = 'available'",
+             where id = ?",
         )?
         .query_row([id], |row| {
             let source = Row {
@@ -194,13 +210,20 @@ pub(crate) fn rebuild(
     let Some((source, session, project_id)) = found else {
         return Ok(None);
     };
-    if source.source_file_path.is_empty() {
+    // Parsed session identities and status-only placeholder identities are
+    // disjoint in the writer. Rebuild every parsed entity's stored history,
+    // including after a later parse error, without relying on a clock or a
+    // current parse-status eligibility rule. Placeholders only send status.
+    if crate::store::writer::session_row_id(
+        &source.harness,
+        source.session_id.as_deref(),
+        &source.source_file_path,
+    ) != id
+        || source.source_file_path.is_empty()
+    {
         return Ok(None);
     }
     let messages = messages(conn, id)?;
-    if messages.is_empty() {
-        return Ok(None);
-    }
     let project_hints = match (&session.working_directory_display, project_id) {
         (Some(directory), Some(project)) => conn
             .prepare_cached("select name from projects where id = ?")?
@@ -229,16 +252,7 @@ pub(crate) fn rebuild(
         state @ ("active" | "codex_archived" | "missing") => state.to_owned(),
         _ => "missing".to_owned(),
     };
-    let status = SourceStatus {
-        harness: source.harness.clone(),
-        path: source.source_file_path.clone(),
-        environment: Some(source.source_type.clone()),
-        status: "missing".to_owned(),
-        state: state.clone(),
-        message: Some(
-            "Source file was removed; history rebuilt from the collecting database.".to_owned(),
-        ),
-    };
+    let status = current_status(conn, id)?.expect("session exists in the caller's transaction");
     let snapshot = SessionSnapshot {
         harness: source.harness,
         machine_id: None,
@@ -246,6 +260,8 @@ pub(crate) fn rebuild(
             path: source.source_file_path.clone(),
             environment: source.source_type,
             state,
+            // The snapshot describes retained parsed history. The separate
+            // status record below carries the current lifecycle (including missing).
             status: "available".to_owned(),
             size: source.file_size.unwrap_or(0).max(0) as u64,
             modified_utc: source
@@ -383,4 +399,25 @@ fn usage_events(conn: &Connection, id: &str) -> StoreResult<Vec<UsageEventRecord
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Status-only rows can exist without a valid parsed snapshot.
+pub(crate) fn current_status(conn: &Connection, id: &str) -> StoreResult<Option<SourceStatus>> {
+    Ok(conn
+        .query_row(
+            "select coalesce(harness,'codex'), source_file_path, source_type, scan_status,
+                coalesce(source_state,'active'), parse_error from sessions where id=?",
+            [id],
+            |row| {
+                Ok(SourceStatus {
+                    harness: row.get(0)?,
+                    path: row.get(1)?,
+                    environment: row.get(2)?,
+                    status: row.get(3)?,
+                    state: row.get(4)?,
+                    message: row.get(5)?,
+                })
+            },
+        )
+        .optional()?)
 }

@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Hub uploads negotiate zstd compression to deliver larger session snapshots; sync requeues local size refusals that now fit and clears superseded, orphaned and delivered dead letters.
 - The collector reads Codex rollouts that Codex compressed to `.jsonl.zst`. They were reported as unsupported files, so their sessions showed as missing and never reached a hub; the next scan collects them again. A compressed copy now replaces the stored row of its deleted plain file instead of losing to it on file size, and merging the old placeholder row no longer runs a full foreign-key check of the database, which took about ten seconds per session on a large database.
 - Added `hub backfill`, which queues stored sessions whose source files are gone, rebuilt from the local database, so a hub receives history collected before pairing.
 - Added a Projects screen: a searchable project list sorted by name or last activity in either direction, and for the selected project its folder rules (with how many sessions each places and which more specific rules take sessions from it), the folders it was detected from, and its sessions moved by hand. Add, change, move, or remove folder rules, merge a detected folder or a whole project into another project, or reset manual moves; every change offers Undo. Open it from the rail, from a session's menus, or from Manage folder rules… in the Move to project dialog.

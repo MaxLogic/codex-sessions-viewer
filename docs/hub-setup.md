@@ -72,8 +72,14 @@ certificates, not the Windows certificate store. A hub behind a certificate
 from a private or corporate CA is therefore refused by the collector even when
 Windows trusts it; use a publicly trusted certificate for the proxy.
 
-The server accepts up to 128 records and 64 MiB per upload and refuses a
-larger declared body before reading it. Credentials are checked before a body
+The server accepts up to 128 records and 64 MiB of wire bytes per upload and
+refuses a larger declared body before reading it. It advertises zstd support
+and a 96 MiB decoded limit in `/v1/verify`, enforcing that limit while decoding.
+Plain uploads remain supported. One upload at a time is read, decoded and applied
+across all machines. Other uploads wait for bounded admission before their bodies
+are read; an exhausted admission wait returns transient HTTP 503.
+Queries and health requests do not take that gate.
+Credentials are checked before a body
 is read. Each connection is served on its own thread, up to 32 at once; further
 clients receive HTTP 503 at once. Every socket read and write must progress
 within `request_timeout_seconds` (default 30), the request head must arrive
@@ -125,7 +131,11 @@ Only changes are queued. A scan that finds a source or thread name unchanged
 queues nothing, and a newer state of a source replaces its older unsent state,
 so an unreachable hub does not grow the outbox with repeated scans. The sync
 command sends batches of up to 128 records and 8 MiB of UTF-8 until the
-outbox is empty; a single larger record (up to 48 MiB) is sent alone. Each
+outbox is empty; a single larger record is sent alone. When the authenticated
+hub advertises zstd ingestion, uploads are compressed at level 3 and the record
+limit is the advertised decoded limit minus 64 KiB of envelope headroom.
+Hubs without that capability receive plain JSON with the existing 48 MiB
+record limit. Each
 upload may take a minute plus one second per 64 KiB. A batch, its sequence and
 a batch ID with a random part are recorded before sending, so a lost
 acknowledgment is retried with the same sequence and batch ID and the hub
@@ -137,15 +147,33 @@ applies idempotently.
 
 ### Dead letters
 
-Only the hub's own refusal moves records aside: a response whose JSON `code`
+A hub refusal moves records aside when the response's JSON `code`
 is `record_rejected` (a record the hub cannot store, a batch above its size
 limit, or a record for another machine) or `invalid_batch` (an upload the hub
 cannot parse). The hub applies a batch atomically, so a refused batch of
 several records is resent one record at a time to find the refused record.
-That record, or one above 48 MiB that is never sent, moves to the
+That record, or one above the negotiated record limit that is never sent, moves to the
 `collector_upload_dead_letters` table with the HTTP status, the time and the
 hub's reason (the credential is never echoed), and no longer blocks the
-records behind it. Dead letters are not retried; `hub disable` discards them.
+records behind it. Hub refusals are never retried automatically. Local size
+refusals have a NULL HTTP status. When they fit the negotiated limit,
+`hub sync` removes them and rebuilds the current session snapshot and path
+status from local database rows under the collector lease and transaction.
+It never resends a dead letter's stored payload or uses wall-clock ordering.
+Deleted sessions and paths enqueue nothing; current queued records take priority.
+Non-session metadata without an authoritative snapshot stays in dead letters.
+The hub waits for ingest admission before reading an upload body. That wait
+is bounded by twice `request_timeout_seconds`, capped at 30 seconds, and by
+the whole-request deadline with one socket timeout reserved for the body.
+Health and query requests use their existing independent connection slots.
+Collectors use `Expect: 100-continue` and wait up to 35 seconds for admission.
+An explicit hub busy response gets up to three retries with 100/200/400 ms
+backoff within the original upload timeout, preserving the same batch and
+sequence and leaving transport-failure counters unchanged.
+
+An acknowledged delivery clears dead letters for
+the delivered keys. The sync result includes `requeued_dead_letters` and
+`pruned_dead_letters`. `hub disable` discards all dead letters.
 
 Every other failure is transient and leaves the queue untouched for the next
 run: network errors and timeouts, HTTP 408 and 5xx, a rejected credential, a

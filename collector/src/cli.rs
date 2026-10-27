@@ -490,7 +490,7 @@ fn hub_sync(options: &Options, out: &mut impl Write) -> Result<(), CliError> {
     let report =
         crate::hub_client::sync(std::path::Path::new(&store.path), store.mode, &url, &token)
             .map_err(CliError::Failed)?;
-    writeln!(out, "{}", json!({"command":"hub sync","sent":report.sent,"batches":report.batches,"dead_lettered":report.dead_lettered,"pending":report.pending,"last_sequence":report.last_sequence}))
+    writeln!(out, "{}", json!({"command":"hub sync","sent":report.sent,"batches":report.batches,"dead_lettered":report.dead_lettered,"requeued_dead_letters":report.requeued,"pruned_dead_letters":report.pruned,"pending":report.pending,"last_sequence":report.last_sequence}))
         .map_err(|error| CliError::Failed(error.to_string()))
 }
 

@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{OpenFlags, OptionalExtension};
@@ -25,8 +25,11 @@ use crate::query;
 use crate::store::schema::{StoreError, in_write_transaction};
 use crate::store::{OwnerMode, Store};
 
-/// Upload bodies above this size are refused before they are read.
+/// Upload wire bodies above this size are refused before they are read.
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Hard bound enforced while decoding compressed uploads.
+pub const MAX_INGEST_DECODED_BYTES: usize = 96 * 1024 * 1024;
+static INGEST_GATE: Mutex<()> = Mutex::new(());
 /// Every other request carries a small JSON document.
 const MAX_SMALL_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -76,11 +79,12 @@ fn default_request_timeout() -> u64 {
 }
 
 #[derive(Deserialize)]
-struct Upload {
+struct Upload<'a> {
     protocol: u64,
     sequence: i64,
     batch_id: String,
-    records: Vec<Box<RawValue>>,
+    #[serde(borrow)]
+    records: Vec<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -215,6 +219,7 @@ fn reason(status: u16) -> &'static str {
         408 => "Request Timeout",
         409 => "Conflict",
         413 => "Content Too Large",
+        415 => "Unsupported Media Type",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
@@ -329,6 +334,7 @@ struct Head {
     path: String,
     authorization: String,
     content_length: Option<usize>,
+    content_encoding: Option<String>,
     chunked: bool,
     expect_continue: bool,
 }
@@ -350,6 +356,7 @@ fn read_head(reader: &mut Connection) -> Result<Head, HttpError> {
         path: path.to_owned(),
         authorization: String::new(),
         content_length: None,
+        content_encoding: None,
         chunked: false,
         expect_continue: false,
     };
@@ -369,6 +376,15 @@ fn read_head(reader: &mut Connection) -> Result<Head, HttpError> {
         let value = value.trim_matches([' ', '\t']);
         match name.to_ascii_lowercase().as_str() {
             "authorization" => head.authorization = value.to_owned(),
+            "content-encoding" => {
+                // Multiple encodings form a list, which this server does not support.
+                if let Some(previous) = &mut head.content_encoding {
+                    previous.push(',');
+                    previous.push_str(value);
+                } else {
+                    head.content_encoding = Some(value.to_owned());
+                }
+            }
             "content-length" => {
                 // Digits only: `+5` is not a valid length.
                 let length = Some(value)
@@ -817,6 +833,16 @@ fn handle(
 ) -> (u16, Value) {
     let method = head.method.as_str();
     let path = head.path.as_str();
+    let encoding = head.content_encoding.as_deref().unwrap_or("identity");
+    let compressed = encoding.eq_ignore_ascii_case("zstd");
+    if !encoding.eq_ignore_ascii_case("identity")
+        && !(method == "POST" && path == "/v1/ingest" && compressed)
+    {
+        return (
+            415,
+            json!({"error":"unsupported Content-Encoding","code":"request"}),
+        );
+    }
     if method == "GET" && path == "/v1/health" {
         return (200, json!({"protocol": HUB_PROTOCOL_VERSION}));
     }
@@ -849,6 +875,35 @@ fn handle(
     if owner_route && !owner {
         return (401, json!({"error":"invalid owner credential"}));
     }
+    // Wait before allocating a body or sending 100 Continue. Queued
+    // connections retain only the bounded header prefetch and socket buffers.
+    // Admission uses at most two socket timeouts (capped at 30s), and leaves
+    // one socket timeout within the existing whole-request deadline for a body.
+    // Health and queries never acquire this gate; the connection slot remains
+    // held by serve_connection's caller until this response is written.
+    let _ingest_gate = if method == "POST" && path == "/v1/ingest" {
+        let timeout = Duration::from_secs(config.request_timeout_seconds);
+        let admission_deadline = (Instant::now() + (timeout * 2).min(Duration::from_secs(30)))
+            .min(reader.get_ref().deadline - timeout);
+        Some(loop {
+            match INGEST_GATE.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = admission_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return (
+                            503,
+                            json!({"error":"hub ingestion is busy; retry later","code":"busy"}),
+                        );
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+            }
+        })
+    } else {
+        None
+    };
     let limit = if path == "/v1/ingest" {
         MAX_BODY_BYTES
     } else {
@@ -898,14 +953,30 @@ fn handle(
                     "contract": crate::contract::CONTRACT_NAME,
                     "contract_version": crate::contract::CONTRACT_VERSION,
                     "machine_id": machine,
-                    "high_water": high_water
+                    "high_water": high_water,
+                    "ingest": {"content_encodings":["zstd"], "max_decoded_bytes": MAX_INGEST_DECODED_BYTES}
                 }),
             )
         }
-        ("POST", "/v1/ingest") => match ingest(data_root, machine.unwrap_or_default(), &body) {
-            Ok(value) => (200, value),
-            Err((status, code, message)) => (status, json!({"error": message, "code": code})),
-        },
+        ("POST", "/v1/ingest") => {
+            let body = if compressed {
+                match decode_upload(&body) {
+                    Ok(decoded) => {
+                        drop(body);
+                        decoded
+                    }
+                    Err((status, code, message)) => {
+                        return (status, json!({"error":message,"code":code}));
+                    }
+                }
+            } else {
+                body
+            };
+            match ingest(data_root, machine.unwrap_or_default(), &body) {
+                Ok(value) => (200, value),
+                Err((status, code, message)) => (status, json!({"error": message, "code": code})),
+            }
+        }
         ("POST", "/v1/query") => {
             reply(parse_json(&body).and_then(|value| remote_query(data_root, config, value)))
         }
@@ -921,6 +992,29 @@ fn handle(
         }
         _ => (404, json!({"error":"unknown route"})),
     }
+}
+
+fn decode_upload(body: &[u8]) -> Result<Vec<u8>, IngestError> {
+    let invalid = |_| (400, "invalid_batch", "invalid compressed upload".to_owned());
+    let mut decoder = zstd::stream::read::Decoder::new(body).map_err(invalid)?;
+    // Bound the frame's declared history window as well as its output.
+    decoder.window_log_max(27).map_err(invalid)?;
+    let mut decoded = Vec::new();
+    decoder
+        .take(MAX_INGEST_DECODED_BYTES as u64 + 1)
+        .read_to_end(&mut decoded)
+        .map_err(invalid)?;
+    if decoded.len() > MAX_INGEST_DECODED_BYTES {
+        return Err((
+            413,
+            "record_rejected",
+            format!(
+                "decoded upload exceeds {} MiB",
+                MAX_INGEST_DECODED_BYTES / (1024 * 1024)
+            ),
+        ));
+    }
+    Ok(decoded)
 }
 
 #[cfg(test)]
