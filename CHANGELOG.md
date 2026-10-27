@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Bulk collection groups small sessions into bounded transactions while retaining the 150 ms viewer-write gap; large sessions and identity merges remain isolated.
+
 ### Added
 - Hub uploads negotiate zstd compression to deliver larger session snapshots; sync requeues local size refusals that now fit and clears superseded, orphaned and delivered dead letters.
 - The collector reads Codex rollouts that Codex compressed to `.jsonl.zst`. They were reported as unsupported files, so their sessions showed as missing and never reached a hub; the next scan collects them again. A compressed copy now replaces the stored row of its deleted plain file instead of losing to it on file size, and merging the old placeholder row no longer runs a full foreign-key check of the database, which took about ten seconds per session on a large database.

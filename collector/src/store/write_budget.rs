@@ -73,7 +73,7 @@ impl Drop for WriteChunkScope {
     }
 }
 
-/// Optional diagnostics, computed from the immutable snapshot outside the lock.
+/// Immutable session shape, computed outside the lock for admission and diagnostics.
 #[derive(Clone, Copy)]
 pub(crate) struct SessionWriteShape {
     pub messages: usize,
@@ -83,7 +83,33 @@ pub(crate) struct SessionWriteShape {
 }
 
 pub(crate) fn record_session_shape(shape: Option<SessionWriteShape>) {
-    SESSION_SHAPE.with(|current| current.set(shape));
+    SESSION_SHAPE.with(|current| {
+        if let Some(shape) = shape {
+            let sum = match current.get() {
+                Some(previous) => SessionWriteShape {
+                    messages: previous.messages.saturating_add(shape.messages),
+                    tool_calls: previous.tool_calls.saturating_add(shape.tool_calls),
+                    source_bytes: previous.source_bytes.saturating_add(shape.source_bytes),
+                    content_bytes: previous.content_bytes.saturating_add(shape.content_bytes),
+                },
+                None => shape,
+            };
+            current.set(Some(sum));
+        }
+    });
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum UnitCost {
+    Small { bytes: u64 },
+    Isolated,
+}
+pub const ADMIT_MAX_UNITS: usize = 32;
+pub const ADMIT_MAX_BYTES: u64 = 1 << 20;
+
+enum ChunkPolicy<'a, U> {
+    Bounded(usize),
+    Admitted(&'a dyn Fn(&U) -> UnitCost),
 }
 /// Library-only override for deterministic chunking proof; never an environment knob.
 pub struct WriteBudgetScope(WriteBudget, std::marker::PhantomData<Rc<()>>);
@@ -109,12 +135,56 @@ pub fn write_chunked<U, S>(
     budget: WriteBudget,
     max_units: usize,
     units: impl IntoIterator<Item = U>,
+    setup: impl FnMut() -> StoreResult<S>,
+    apply: impl FnMut(&mut S, U) -> StoreResult<()>,
+) -> StoreResult<()> {
+    write_chunks(
+        conn,
+        phase,
+        budget,
+        ChunkPolicy::Bounded(max_units),
+        units,
+        setup,
+        apply,
+    )
+}
+
+/// Apply shape-classed units with per-unit savepoints. Callers own the collector
+/// lease. Large/merging units stand alone; small units join only below half-soft,
+/// 32 units and 1 MiB. A slow prediction disables admission for this call.
+pub fn write_admitted<U>(
+    conn: &Connection,
+    phase: &'static str,
+    budget: WriteBudget,
+    units: impl IntoIterator<Item = U>,
+    cost: impl Fn(&U) -> UnitCost,
+    mut apply: impl FnMut(U) -> StoreResult<()>,
+) -> StoreResult<()> {
+    write_chunks(
+        conn,
+        phase,
+        budget,
+        ChunkPolicy::Admitted(&cost),
+        units,
+        || Ok(()),
+        |_, unit| apply(unit),
+    )
+}
+
+fn write_chunks<U, S>(
+    conn: &Connection,
+    phase: &'static str,
+    budget: WriteBudget,
+    policy: ChunkPolicy<'_, U>,
+    units: impl IntoIterator<Item = U>,
     mut setup: impl FnMut() -> StoreResult<S>,
     mut apply: impl FnMut(&mut S, U) -> StoreResult<()>,
 ) -> StoreResult<()> {
     let _budget = WriteBudgetScope::enter(budget);
     let _phase = write_phase(phase);
     let mut units = units.into_iter().peekable();
+    let admitted = matches!(policy, ChunkPolicy::Admitted(_));
+    let mut fallback = false;
     while units.peek().is_some() {
         SESSION_SHAPE.with(|current| current.set(None));
         begin_write(conn)?;
@@ -129,7 +199,10 @@ pub fn write_chunked<U, S>(
             })
         });
         let start = Instant::now();
+        let hold_start = owner_started.unwrap_or(start);
         let mut count = 0;
+        let mut bytes = 0u64;
+        let mut first_small = false;
         let mut largest = Duration::ZERO;
         let mut setup_time = Duration::ZERO;
         let mut apply_time = Duration::ZERO;
@@ -137,21 +210,82 @@ pub fn write_chunked<U, S>(
             let setup_start = Instant::now();
             let mut state = setup()?;
             setup_time = setup_start.elapsed();
-            for _ in 0..max_units.max(1) {
-                let Some(unit) = units.next() else { break };
+            while let Some(next) = units.peek() {
+                let cost = match policy {
+                    ChunkPolicy::Bounded(_) => UnitCost::Isolated,
+                    ChunkPolicy::Admitted(cost) => cost(next),
+                };
+                if count > 0 {
+                    let joins = match policy {
+                        ChunkPolicy::Bounded(max_units) => {
+                            count < max_units.max(1) && start.elapsed() < budget.soft
+                        }
+                        ChunkPolicy::Admitted(_) => {
+                            first_small
+                                && !fallback
+                                && count < ADMIT_MAX_UNITS
+                                && matches!(cost, UnitCost::Small { bytes: next_bytes }
+                                if bytes.checked_add(next_bytes).is_some_and(|total| total <= ADMIT_MAX_BYTES))
+                                && hold_start.elapsed() < budget.soft / 2
+                                && check_control().is_ok()
+                        }
+                    };
+                    if !joins {
+                        break;
+                    }
+                }
+                if let UnitCost::Small { bytes: unit_bytes } = cost {
+                    if count == 0 {
+                        first_small = true;
+                    }
+                    bytes = bytes.saturating_add(unit_bytes);
+                }
+                let unit = units.next().expect("peeked unit");
+                if admitted {
+                    conn.execute_batch("savepoint admitted_unit")?;
+                }
                 let unit_start = Instant::now();
-                apply(&mut state, unit)?;
+                let result = apply(&mut state, unit).and_then(|()| {
+                    if admitted {
+                        conn.execute_batch("release admitted_unit")?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    if admitted {
+                        // SQLite may already have rolled the transaction back.
+                        // Keep the unit's first error, including if cleanup fails.
+                        let _ =
+                            conn.execute_batch("rollback to admitted_unit; release admitted_unit");
+                    }
+                    return Err(error);
+                }
                 let elapsed = unit_start.elapsed();
                 largest = largest.max(elapsed);
                 apply_time += elapsed;
                 count += 1;
-                if start.elapsed() >= budget.soft {
-                    break;
-                }
             }
             Ok(())
         })();
-        finish(conn, result)?;
+        let pre_commit = hold_start.elapsed();
+        if let Err(error) = result {
+            if admitted && count > 0 && !conn.is_autocommit() {
+                // Outside an outer transaction this preserves the successful
+                // prefix. Inside hub receive it releases nested_write; the
+                // propagated error then rolls back the outer transaction.
+                let _ = finish(conn, Ok(()));
+                return Err(error);
+            }
+            return finish(conn, Err(error));
+        }
+        finish(conn, Ok(()))?;
+        if admitted && count > 1 && pre_commit > budget.soft {
+            fallback = true;
+            eprintln!(
+                "collector write admission fell back: phase={phase} units={count} pre_commit_ms={:.3}",
+                pre_commit.as_secs_f64() * 1000.0
+            );
+        }
         if crate::timing::enabled() {
             eprintln!(
                 "write_chunk phase={phase} units={count} largest_unit_ms={:.3} elapsed_ms={:.3}",
@@ -160,7 +294,7 @@ pub fn write_chunked<U, S>(
             );
             let shape = SESSION_SHAPE.with(std::cell::Cell::get);
             eprintln!(
-                "write_detail phase={phase} setup_ms={:.6} apply_ms={:.6} commit_ms={:.6} gap_ms={:.6} required_gap_ms={:.6} messages={} tool_calls={} source_bytes={} content_bytes={}",
+                "write_detail phase={phase} units={count} setup_ms={:.6} apply_ms={:.6} commit_ms={:.6} gap_ms={:.6} required_gap_ms={:.6} messages={} tool_calls={} source_bytes={} content_bytes={}",
                 (validation_time + setup_time).as_secs_f64() * 1000.0,
                 apply_time.as_secs_f64() * 1000.0,
                 COMPLETION_TIME.with(std::cell::Cell::get).as_secs_f64() * 1000.0,
@@ -216,6 +350,22 @@ pub(crate) fn write_planned<U>(
         || Ok(()),
         |_, unit| apply(unit),
     )
+}
+
+/// Plan once inside the collector lease and outside SQLite's write lock. Only
+/// viewer V-set edits may interleave; apply must read/guard their values in its
+/// own statements, never copy them from the plan. Model earlier own units when
+/// planning ordered inputs. Admission changes only transaction boundaries.
+pub(crate) fn write_planned_admitted<U>(
+    conn: &Connection,
+    phase: &'static str,
+    plan: impl FnOnce() -> StoreResult<Vec<U>>,
+    cost: impl Fn(&U) -> UnitCost,
+    apply: impl FnMut(U) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
+    let units = plan()?;
+    write_admitted(conn, phase, current_budget(), units, cost, apply)
 }
 
 #[cfg(debug_assertions)]

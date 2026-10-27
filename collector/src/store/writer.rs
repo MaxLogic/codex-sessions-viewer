@@ -172,6 +172,25 @@ pub fn apply_session_batch(
     apply_session_batch_versioned(conn, snapshots, None)
 }
 
+const SMALL_SESSION_ITEMS: usize = 256;
+const SMALL_SESSION_CONTENT_BYTES: usize = 256 * 1024;
+
+fn session_unit_cost(
+    shape: super::write_budget::SessionWriteShape,
+    merges: bool,
+) -> super::write_budget::UnitCost {
+    if merges
+        || shape.messages.saturating_add(shape.tool_calls) > SMALL_SESSION_ITEMS
+        || shape.content_bytes > SMALL_SESSION_CONTENT_BYTES
+    {
+        super::write_budget::UnitCost::Isolated
+    } else {
+        super::write_budget::UnitCost::Small {
+            bytes: shape.content_bytes as u64,
+        }
+    }
+}
+
 pub(crate) fn apply_session_batch_versioned(
     conn: &Connection,
     snapshots: Vec<SessionSnapshot>,
@@ -201,13 +220,11 @@ pub(crate) fn apply_session_batch_versioned(
     let canonical = canonical_snapshots(snapshots);
     let count = canonical.len();
     let now = DartDateTime::now().to_iso8601();
-    super::write_budget::write_planned(
+    super::write_budget::write_planned_admitted(
         conn,
         "sessions",
-        // A session's cost is unknown before applying its indexed merges and
-        // projections. Isolate it so one large indivisible unit cannot carry
-        // earlier units past the soft target (CXV-180 live-copy witness).
-        1,
+        // CXV-200: immutable shape admission isolates large/merging sessions;
+        // small sessions join only while the physical hold is below half-soft.
         || {
             let lookup = IdentityLookup::for_batch(conn)?;
             let mut units = Vec::new();
@@ -216,22 +233,23 @@ pub(crate) fn apply_session_batch_versioned(
                     .map(|merge| merge.alternate_ids)
                     .unwrap_or_default();
                 candidates.push(id.clone());
-                let shape =
-                    crate::timing::enabled().then(|| super::write_budget::SessionWriteShape {
-                        messages: snapshot.messages.len(),
-                        tool_calls: snapshot.tool_calls.len(),
-                        source_bytes: snapshot.source.size,
-                        content_bytes: snapshot
-                            .messages
-                            .iter()
-                            .map(|message| message.content_plain.len())
-                            .sum(),
-                    });
-                units.push((id, snapshot, candidates, shape));
+                let shape = super::write_budget::SessionWriteShape {
+                    messages: snapshot.messages.len(),
+                    tool_calls: snapshot.tool_calls.len(),
+                    source_bytes: snapshot.source.size,
+                    content_bytes: snapshot
+                        .messages
+                        .iter()
+                        .map(|message| message.content_plain.len())
+                        .sum(),
+                };
+                let cost = session_unit_cost(shape, candidates.len() > 1);
+                units.push((id, snapshot, candidates, shape, cost));
             }
             Ok(units)
         },
-        |(id, snapshot, candidates, shape)| {
+        |(_, _, _, _, cost)| *cost,
+        |(id, snapshot, candidates, shape, _)| {
             let start = std::time::Instant::now();
             {
                 check_parser_version(conn, &snapshot.harness)?;
@@ -261,7 +279,7 @@ pub(crate) fn apply_session_batch_versioned(
                 )?;
             }
             super::write_budget::record_session_unit(start.elapsed());
-            super::write_budget::record_session_shape(shape);
+            super::write_budget::record_session_shape(Some(shape));
             Ok(())
         },
     )?;

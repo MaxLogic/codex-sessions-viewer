@@ -8,6 +8,330 @@ use codex_sessions_collector::store::{
 };
 use rusqlite::Connection;
 
+fn admission_chunks(
+    costs: Vec<codex_sessions_collector::store::write_budget::UnitCost>,
+    sleeps: &[Duration],
+    soft: Duration,
+) -> Vec<usize> {
+    use codex_sessions_collector::store::{
+        write_budget::{WriteBudget, WriteChunkScope, write_admitted},
+        write_lease::WriteLease,
+    };
+    use std::{cell::RefCell, rc::Rc};
+    let conn = Rc::new(padded_status_store(1));
+    conn.execute_batch("create table admission_units(unit integer primary key)")
+        .unwrap();
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let chunks = observed.clone();
+    let observer_conn = conn.clone();
+    let mut previous = 0usize;
+    let _observer = WriteChunkScope::observe(move |phase| {
+        if phase == "admission_test" {
+            let count: usize = observer_conn
+                .query_row("select count(*) from admission_units", [], |row| {
+                    row.get::<_, i64>(0).map(|n| n as usize)
+                })
+                .unwrap();
+            chunks.borrow_mut().push(count - previous);
+            previous = count;
+        }
+    });
+    let _lease = WriteLease::acquire(&conn).unwrap();
+    write_admitted(
+        &conn,
+        "admission_test",
+        WriteBudget {
+            soft,
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        },
+        costs.into_iter().enumerate(),
+        |(_, cost)| *cost,
+        |(index, _)| {
+            conn.execute("insert into admission_units values (?)", [index as i64])?;
+            std::thread::sleep(sleeps.get(index).copied().unwrap_or_default());
+            Ok(())
+        },
+    )
+    .unwrap();
+    observed.borrow().clone()
+}
+
+#[test]
+fn admission_composition_follows_class_count_and_byte_caps() {
+    use codex_sessions_collector::store::write_budget::UnitCost::{Isolated, Small};
+    let small = Small { bytes: 1024 };
+    let big = Small { bytes: 600 * 1024 };
+    let mut input = vec![small, small, small, Isolated, small, small, Isolated];
+    input.extend(std::iter::repeat_n(small, 40));
+    input.extend([big, big, big]);
+    assert_eq!(
+        admission_chunks(input, &[], Duration::from_secs(3600)),
+        [3, 1, 2, 1, 32, 9, 1, 1]
+    );
+    assert_eq!(
+        admission_chunks(vec![Isolated, small, small], &[], Duration::from_secs(3600)),
+        [1, 2]
+    );
+    assert!(admission_chunks(vec![], &[], Duration::from_secs(3600)).is_empty());
+}
+
+#[test]
+fn admission_stops_at_half_soft_and_falls_back_after_a_slow_small_unit() {
+    use codex_sessions_collector::store::write_budget::UnitCost::Small;
+    let small = Small { bytes: 1 };
+    let soft = Duration::from_millis(400);
+    let half_soft_chunks = admission_chunks(vec![small; 6], &[Duration::from_millis(120); 6], soft);
+    assert_eq!(half_soft_chunks.iter().sum::<usize>(), 6);
+    // Two completed units cost at least 240 ms, beyond half-soft (200 ms).
+    // Oversleep may close a chunk after one unit, but can never admit a third.
+    assert!(half_soft_chunks.iter().all(|count| (1..=2).contains(count)));
+    let slow_chunks = admission_chunks(
+        vec![small; 8],
+        &[Duration::ZERO, Duration::ZERO, Duration::from_millis(450)],
+        soft,
+    );
+    assert_eq!(slow_chunks.iter().sum::<usize>(), 8);
+    let mut written = 0;
+    let slow_chunk = slow_chunks
+        .iter()
+        .position(|count| {
+            written += count;
+            written >= 3
+        })
+        .unwrap();
+    assert_eq!(written, 3, "the slow unit must end its transaction");
+    // Fallback requires a slow *multi-unit* transaction. If scheduling already
+    // isolated the slow unit, a later multi-unit transaction remains valid.
+    if slow_chunks[slow_chunk] > 1 {
+        assert!(
+            slow_chunks[slow_chunk + 1..]
+                .iter()
+                .all(|count| *count == 1)
+        );
+    }
+    eprintln!("half-soft chunks={half_soft_chunks:?}; slow chunks={slow_chunks:?}");
+    // Fallback belongs to one call, not to the worker thread.
+    assert_eq!(admission_chunks(vec![small; 3], &[], Duration::MAX), [3]);
+}
+
+#[test]
+fn soft_zero_isolates_every_unit() {
+    use codex_sessions_collector::store::write_budget::UnitCost::{Isolated, Small};
+    assert_eq!(
+        admission_chunks(
+            vec![
+                Small { bytes: 1 },
+                Small { bytes: 1 },
+                Isolated,
+                Small { bytes: 2 }
+            ],
+            &[],
+            Duration::ZERO
+        ),
+        [1, 1, 1, 1]
+    );
+}
+
+#[test]
+fn admission_failures_preserve_the_first_error_and_transaction_semantics() {
+    use codex_sessions_collector::store::{
+        write_budget::{UnitCost, WriteBudget, in_write_transaction, write_admitted},
+        write_lease::WriteLease,
+    };
+    // (failing unit, SQLite auto-rollback, outer hub transaction, prefix commit fails)
+    for (fail_at, auto_rollback, nested, commit_failure) in [
+        (2, false, false, false),
+        (0, false, false, false),
+        (2, true, false, false),
+        (2, false, true, false),
+        (2, true, true, false),
+        (2, false, false, true),
+    ] {
+        let conn = padded_status_store(1);
+        conn.execute_batch("pragma foreign_keys=on; create table parent(id integer primary key);
+            create table admission_units(unit integer primary key, parent integer references parent(id) deferrable initially deferred)")
+            .unwrap();
+        let _lease = WriteLease::acquire(&conn).unwrap();
+        let scope = WriteHoldScope::start();
+        let mut called = Vec::new();
+        let mut write = || {
+            write_admitted(
+                &conn,
+                "admission_failure",
+                WriteBudget {
+                    gap: Duration::ZERO,
+                    ..WriteBudget::default()
+                },
+                0..4,
+                |_| UnitCost::Small { bytes: 1 },
+                |unit| {
+                    called.push(unit);
+                    conn.execute(
+                        "insert into admission_units values (?, ?)",
+                        rusqlite::params![unit as i64, commit_failure.then_some(99)],
+                    )?;
+                    if unit == fail_at {
+                        if auto_rollback {
+                            conn.execute_batch("rollback")?;
+                        }
+                        return Err(StoreError::Refused("unit failure witness".into()));
+                    }
+                    Ok(())
+                },
+            )
+        };
+        let result = if nested {
+            in_write_transaction(&conn, &mut write)
+        } else {
+            write()
+        };
+        assert!(
+            matches!(result, Err(StoreError::Refused(ref message)) if message == "unit failure witness")
+        );
+        assert_eq!(called, (0..=fail_at).collect::<Vec<_>>());
+        let rows = conn
+            .prepare("select unit from admission_units order by unit")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0).map(|n| n as usize))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            if !nested && !auto_rollback && !commit_failure {
+                (0..fail_at).collect()
+            } else {
+                vec![]
+            }
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            scope.report().transactions,
+            1,
+            "one physical hold, even after rollback or failed commit"
+        );
+    }
+}
+
+#[test]
+fn admission_savepoint_release_failure_never_reports_success() {
+    use codex_sessions_collector::store::{
+        write_budget::{UnitCost, WriteBudget, write_admitted},
+        write_lease::WriteLease,
+    };
+    let conn = padded_status_store(1);
+    let _lease = WriteLease::acquire(&conn).unwrap();
+    let scope = WriteHoldScope::start();
+    let mut called = Vec::new();
+    let result = write_admitted(
+        &conn,
+        "admission_failure",
+        WriteBudget {
+            soft: Duration::MAX,
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        },
+        0..2,
+        |_| UnitCost::Small { bytes: 0 },
+        |unit| {
+            called.push(unit);
+            if unit == 0 {
+                conn.execute_batch("rollback")?;
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        matches!(result, Err(StoreError::Sql(rusqlite::Error::SqliteFailure(_, Some(ref message))))
+            if message == "no such savepoint: admitted_unit"),
+        "the per-unit RELEASE must detect the lost savepoint: {result:?}"
+    );
+    assert_eq!(
+        called,
+        [0],
+        "RELEASE failure must stop before the next unit"
+    );
+    assert!(conn.is_autocommit());
+    assert_eq!(scope.report().transactions, 1);
+}
+
+#[test]
+fn session_admission_isolates_large_and_merging_sessions() {
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        write_budget::{WriteBudget, WriteBudgetScope, WriteChunkScope},
+        writer,
+    };
+    use std::{cell::RefCell, rc::Rc};
+    assert!(
+        std::env::var_os("CODEX_SESSIONS_COLLECTOR_TIMINGS").is_none(),
+        "exercise classification without diagnostic timing"
+    );
+    for large_content in [false, true] {
+        let temp = support::TempDir::new("session_admission_classes");
+        let mut outputs = Vec::new();
+        for soft in [Duration::ZERO, WriteBudget::default().soft] {
+            let path = temp.path().join(format!("{}.sqlite", soft.as_millis()));
+            let store = Store::open(&path, OwnerMode::Standalone).unwrap();
+            store.conn.execute("insert into sessions(id,session_id,harness,source_type,source_file_path,display_path,platform_path,scan_status,source_state,parse_status,created_at_utc,updated_at_utc,last_scanned_utc)
+                values('source-status:c:/synthetic/d-merge.jsonl',null,'codex','windows','C:/synthetic/d-merge.jsonl','C:/synthetic/d-merge.jsonl','C:/synthetic/d-merge.jsonl','available','active','available','now','now','now')", []).unwrap();
+            let _budget = WriteBudgetScope::enter(WriteBudget {
+                soft,
+                gap: Duration::ZERO,
+                ..WriteBudget::default()
+            });
+            let input = ["a", "b", "c-large", "d-merge", "e"].map(|id| {
+                let mut snapshot = support::sample_snapshot(id);
+                if id == "c-large" {
+                    if large_content {
+                        snapshot.messages[0].content_plain = "x".repeat(256 * 1024 + 1);
+                    } else {
+                        snapshot.messages = (0..300)
+                            .map(|index| {
+                                let mut message = snapshot.messages[0].clone();
+                                message.index = index;
+                                message
+                            })
+                            .collect();
+                    }
+                }
+                snapshot
+            });
+            let chunk_sizes = Rc::new(RefCell::new(Vec::new()));
+            let chunks = chunk_sizes.clone();
+            let view = Connection::open(&path).unwrap();
+            let mut previous = 0usize;
+            let observer = WriteChunkScope::observe(move |phase| {
+                if phase == "sessions" {
+                    let count: usize = view
+                        .query_row(
+                            "select count(*) from sessions where id like 'session:%'",
+                            [],
+                            |row| row.get::<_, i64>(0).map(|n| n as usize),
+                        )
+                        .unwrap();
+                    chunks.borrow_mut().push(count - previous);
+                    previous = count;
+                }
+            });
+            writer::apply_session_batch(&store.conn, input.to_vec()).unwrap();
+            drop(observer);
+            assert_eq!(
+                *chunk_sizes.borrow(),
+                if soft.is_zero() {
+                    vec![1; 5]
+                } else {
+                    vec![2, 1, 1, 1]
+                }
+            );
+            drop(store);
+            outputs.push(support::content_snapshot(&path));
+        }
+        assert_eq!(outputs[0], outputs[1]);
+    }
+}
+
 /// Count actual SQLite VM instructions only while a physical transaction is
 /// open. Stop a quadratic regression promptly rather than hanging the suite.
 fn locked_steps(conn: &Connection) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
@@ -326,8 +650,8 @@ fn chunking_preserves_complete_table_contents_at_session_boundaries() {
             .unwrap();
         assert_eq!(
             sessions.report().transactions,
-            4,
-            "session units stay isolated so a large unit never inherits earlier work"
+            if soft.is_zero() { 4 } else { 1 },
+            "small sessions share a transaction; soft=0 isolates each"
         );
         let mut records: Vec<_> = snapshots
             .iter()
