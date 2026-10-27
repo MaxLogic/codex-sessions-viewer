@@ -1272,7 +1272,24 @@ fn overlapping_sync_runs_wait_before_sending_large_bodies() {
                     }
                     if interim.starts_with("HTTP/1.1 100") {
                         if expecting {
-                            client.get_mut().write_all(interim.as_bytes()).unwrap();
+                            // Caddy can forward a second 100 with its Server header after
+                            // its own bare interim response. Both remain informational.
+                            client
+                                .get_mut()
+                                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                                .unwrap();
+                            let decorated =
+                                interim.replacen("\r\n\r\n", "\r\nServer: Caddy\r\n\r\n", 1);
+                            // Split inside the header to exercise socket fragmentation.
+                            let split = decorated.find("Caddy").unwrap() + 2;
+                            client
+                                .get_mut()
+                                .write_all(&decorated.as_bytes()[..split])
+                                .unwrap();
+                            client
+                                .get_mut()
+                                .write_all(&decorated.as_bytes()[split..])
+                                .unwrap();
                         }
                         if index == 0 {
                             events.send(0).unwrap();

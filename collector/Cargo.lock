@@ -111,6 +111,7 @@ name = "codex-sessions-collector"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "httparse",
  "libc",
  "rusqlite",
  "serde",

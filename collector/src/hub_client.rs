@@ -1,5 +1,7 @@
 //! Durable, optional upload of locally committed contract records.
 
+mod continue_transport;
+
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -341,12 +343,12 @@ fn upload_timeout(bytes: usize) -> Duration {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(120)))
         .max_redirects(0)
         .http_status_as_error(false)
-        .build()
-        .new_agent()
+        .build();
+    continue_transport::agent(config)
 }
 
 /// The hub's error text, limited and with the credential removed.
