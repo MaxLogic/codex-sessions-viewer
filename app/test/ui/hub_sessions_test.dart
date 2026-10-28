@@ -394,8 +394,12 @@ void main() {
         () => tester.tap(find.text('Save hub annotations')),
       );
       await settleNetwork();
-      expect(requests.last['notes'], 'Owner note');
-      expect(requests.last['path'], '/v1/annotations/edit');
+      // The 1-second poll can append a query after the save under load.
+      final saves = requests
+          .where((r) => r['path'] == '/v1/annotations/edit')
+          .toList();
+      expect(saves, hasLength(1));
+      expect(saves.single['notes'], 'Owner note');
       fail = true;
       await tester.runAsync(
         () => tester.tap(find.text('Search / refresh hub')),
