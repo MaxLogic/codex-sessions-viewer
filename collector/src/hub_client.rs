@@ -98,13 +98,16 @@ pub fn enqueue(conn: &Connection, record: Record, now: &str) -> StoreResult<()> 
     let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
     // A legacy status has no provenance to add. Keep it in v1 rather than
     // inventing an environment while moving it to a new outbox row.
-    let version = if matches!(&record, Record::SourceStatus(status) if status.environment.is_none())
-    {
+    let version = record_version(&record);
+    enqueue_versioned(conn, record, now, version)
+}
+
+fn record_version(record: &Record) -> u32 {
+    if matches!(record, Record::SourceStatus(status) if status.environment.is_none()) {
         1
     } else {
-        crate::contract::CONTRACT_VERSION
-    };
-    enqueue_versioned(conn, record, now, version)
+        CONTRACT_VERSION
+    }
 }
 
 pub(crate) fn plan_delivery(
@@ -226,49 +229,93 @@ pub(crate) fn enqueue_versioned(
         let json = session_envelope_json(snapshot, Some(version))?;
         return enqueue_prepared(conn, snapshot, &json, now);
     }
-    let key = record_key(&record);
-    let envelope = serde_json::to_string(&Envelope {
-        contract: crate::contract::CONTRACT_NAME.to_owned(),
-        version,
-        record,
-    })
-    .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
-    let Some((key, deduplicate)) = key else {
-        conn.execute(
-            "insert into collector_upload_outbox(record_json, created_at_utc) values (?, ?)",
-            params![envelope, now],
-        )?;
-        return Ok(());
-    };
-    if deduplicate {
-        let hash = crate::dart::sha256_hex(envelope.as_bytes());
-        let previous: Option<String> = conn
-            .query_row(
-                "select record_hash from collector_hub_record_state where record_key = ?",
-                [&key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if previous.as_deref() == Some(hash.as_str()) {
+    PreparedRecord::new(record, version)?.enqueue(conn, now)
+}
+
+/// Serialized before taking SQLite's write lock during authoritative rebuilds.
+/// The collector lease still protects every stored input until enqueue commits.
+struct PreparedRecord {
+    key: Option<(String, bool)>,
+    envelope: String,
+    hash: Option<String>,
+    reset_status: Option<String>,
+}
+
+impl PreparedRecord {
+    fn current(record: Record) -> StoreResult<Self> {
+        let version = record_version(&record);
+        Self::new(record, version)
+    }
+
+    fn new(record: Record, version: u32) -> StoreResult<Self> {
+        let key = record_key(&record);
+        let reset_status = if let Record::SessionSnapshot(snapshot) = &record {
+            Some(format!(
+                "status:{}:{}",
+                snapshot.harness,
+                source_status_id(&snapshot.source.path)
+            ))
+        } else {
+            None
+        };
+        let envelope = serde_json::to_string(&Envelope {
+            contract: CONTRACT_NAME.to_owned(),
+            version,
+            record,
+        })
+        .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
+        let hash = key
+            .as_ref()
+            .filter(|(_, deduplicate)| *deduplicate)
+            .map(|_| crate::dart::sha256_hex(envelope.as_bytes()));
+        Ok(Self {
+            key,
+            envelope,
+            hash,
+            reset_status,
+        })
+    }
+
+    fn enqueue(&self, conn: &Connection, now: &str) -> StoreResult<()> {
+        // A snapshot restores availability, so its current status must follow it.
+        if let Some(key) = &self.reset_status {
+            conn.execute(
+                "delete from collector_hub_record_state where record_key=?",
+                [key],
+            )?;
+        }
+        let Some((key, _)) = &self.key else {
+            conn.execute(
+                "insert into collector_upload_outbox(record_json,created_at_utc) values (?,?)",
+                params![self.envelope, now],
+            )?;
             return Ok(());
+        };
+        if let Some(hash) = &self.hash {
+            let previous: Option<String> = conn
+                .query_row(
+                    "select record_hash from collector_hub_record_state where record_key=?",
+                    [key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous.as_ref() == Some(hash) {
+                return Ok(());
+            }
+            conn.execute(
+                "insert into collector_hub_record_state(record_key,record_hash) values (?,?)
+                on conflict(record_key) do update set record_hash=excluded.record_hash",
+                params![key, hash],
+            )?;
         }
         conn.execute(
-            "insert into collector_hub_record_state(record_key, record_hash) values (?, ?)
-             on conflict(record_key) do update set record_hash = excluded.record_hash",
-            params![key, hash],
+            "delete from collector_upload_outbox where record_key=?",
+            [key],
         )?;
+        conn.execute("insert into collector_upload_outbox(record_json,created_at_utc,record_key) values (?,?,?)",
+            params![self.envelope,now,key])?;
+        Ok(())
     }
-    // The newest state of a source replaces any unsent older state. It is
-    // appended so that delivery order still follows local commit order.
-    conn.execute(
-        "delete from collector_upload_outbox where record_key = ?",
-        [&key],
-    )?;
-    conn.execute(
-        "insert into collector_upload_outbox(record_json, created_at_utc, record_key) values (?, ?, ?)",
-        params![envelope, now, key],
-    )?;
-    Ok(())
 }
 
 /// Accepts HTTPS, or plain HTTP only on a literal loopback address. A host
@@ -516,90 +563,132 @@ fn reconcile_dead_letters(
     conn: &Connection,
     max_record_bytes: usize,
 ) -> StoreResult<(usize, usize)> {
+    use crate::store::write_budget::{current_budget, write_chunked};
     let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
-    let _phase = crate::store::write_budget::write_phase("hub");
-    begin_write(conn)?;
-    let result = (|| -> StoreResult<(usize, usize)> {
-        let mut pruned = conn.execute(
-            "delete from collector_upload_dead_letters as dead
-             where record_key is not null and (
-                 exists(select 1 from collector_upload_outbox where record_key=dead.record_key)
-                 or exists(select 1 from collector_upload_dead_letters newer
-                           where newer.record_key=dead.record_key and newer.id>dead.id))
-             or (record_key like 'session:%' and not exists(
-                 select 1 from sessions where id=substr(dead.record_key,9)))",
-            [],
-        )?;
-        // Read keys, never payloads. Wall clocks and delivery history cannot
-        // establish replay safety. The lease AND transaction cover discovery,
-        // authoritative reconstruction, deletion and enqueue as one operation.
-        let letters: Vec<(i64, String)> = conn
-            .prepare(
-                "select id, record_key from collector_upload_dead_letters
-             where http_status is null and record_key is not null
-             and length(cast(record_json as blob)) <= ? order by id",
-            )?
-            .query_map([max_record_bytes as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        let mut requeued = 0;
-        for (id, key) in letters {
-            let ids = if let Some(session) = key.strip_prefix("session:") {
-                vec![session.to_owned()]
-            } else if key.starts_with("status:") {
-                // Use the same canonical path identity as enqueue, including
-                // UNC aliases. No state or locator is read from record_json.
-                conn.prepare("select id,coalesce(harness,'codex'),source_file_path,source_file_unc_path from sessions")?
-                    .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,Option<String>>(2)?, row.get::<_,Option<String>>(3)?)))?
-                    .collect::<Result<Vec<_>,_>>()?.into_iter()
-                    .filter(|(_,harness,path,unc)| [path,unc].into_iter().flatten()
-                        .any(|path| format!("status:{harness}:{}",source_status_id(path)) == key))
-                    .map(|(id,_,_,_)| id).collect()
-            } else {
-                // Non-session metadata has no authoritative snapshot here.
-                // Retain it for diagnosis; never replay its historical payload.
+    // Collector-owned inputs cannot change under this lease. Discovery, table
+    // scans, reconstruction and serialization stay OUTSIDE SQLite write holds.
+    // Viewer-owned annotations are never copied into the upload contract.
+    // A queued record with the same key proves a letter obsolete, except for a
+    // reconstructable status letter: its key can cover several current
+    // sessions, and an interruption after the first pair leaves that pair's
+    // status queued while later identities still need rebuilding. Those
+    // letters go through reconstruction, which skips already-queued sessions.
+    let obsolete: Vec<i64> = conn
+        .prepare(
+            "select dead.id from collector_upload_dead_letters dead
+         where record_key is not null and (
+             (exists(select 1 from collector_upload_outbox where record_key=dead.record_key)
+              and not (record_key like 'status:%' and http_status is null
+                       and length(cast(record_json as blob))<=?1))
+             or exists(select 1 from collector_upload_dead_letters newer
+                       where newer.record_key=dead.record_key and newer.id>dead.id))
+         or (record_key like 'session:%' and not exists(
+             select 1 from sessions where id=substr(dead.record_key,9)))",
+        )?
+        .query_map([max_record_bytes as i64], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut pruned = 0;
+    write_chunked(
+        conn,
+        "hub_reconcile",
+        current_budget(),
+        1,
+        obsolete,
+        || Ok(()),
+        |_, id| {
+            pruned += conn.execute("delete from collector_upload_dead_letters where id=?", [id])?;
+            Ok(())
+        },
+    )?;
+    // Read keys, never historical payloads. Clocks and delivery history cannot
+    // establish replay safety; rebuild the current authoritative entity instead.
+    let letters: Vec<(i64, String)> = conn
+        .prepare(
+            "select id,record_key from collector_upload_dead_letters
+         where http_status is null and record_key is not null
+         and length(cast(record_json as blob))<=? order by id",
+        )?
+        .query_map([max_record_bytes as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut requeued = 0;
+    for (id, key) in letters {
+        let ids = if let Some(session) = key.strip_prefix("session:") {
+            vec![session.to_owned()]
+        } else if key.starts_with("status:") {
+            // Includes UNC aliases, with exactly enqueue's canonical identity.
+            conn.prepare("select id,coalesce(harness,'codex'),source_file_path,source_file_unc_path from sessions")?
+                .query_map([],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?)))?
+                .collect::<Result<Vec<_>,_>>()?.into_iter()
+                .filter(|(_,harness,path,unc)| [path,unc].into_iter().flatten()
+                    .any(|path| format!("status:{harness}:{}",source_status_id(path))==key))
+                .map(|(id,_,_,_)| id).collect()
+        } else {
+            // No authoritative snapshot for this metadata: retain for diagnosis.
+            continue;
+        };
+        let mut records = Vec::new();
+        let mut clear_status = false;
+        for session in ids {
+            let pending: bool = conn.query_row(
+                "select exists(select 1 from collector_upload_outbox where record_key=?)",
+                [format!("session:{session}")],
+                |row| row.get(0),
+            )?;
+            if pending {
                 continue;
-            };
-            conn.execute("delete from collector_upload_dead_letters where id=?", [id])?;
-            let mut queued = false;
-            for session in ids {
-                let snapshot_key = format!("session:{session}");
-                let pending: bool = conn.query_row(
-                    "select exists(select 1 from collector_upload_outbox where record_key=?)",
-                    [&snapshot_key],
-                    |row| row.get(0),
-                )?;
-                if pending {
-                    continue;
-                }
-                let now = now_utc();
-                // Queue the current snapshot before its current lifecycle status
-                // so a missing source cannot be inadvertently restored to active.
-                if let Some((snapshot, status)) =
-                    crate::hub_backfill::rebuild_current(conn, &session)?
-                {
-                    enqueue(conn, Record::SessionSnapshot(Box::new(snapshot)), &now)?;
-                    enqueue(conn, Record::SourceStatus(status), &now)?;
-                    queued = true;
-                } else if let Some(status) = crate::hub_backfill::current_status(conn, &session)? {
-                    conn.execute(
-                        "delete from collector_hub_record_state where record_key=?",
-                        [&key],
-                    )?;
-                    enqueue(conn, Record::SourceStatus(status), &now)?;
-                    queued = true;
-                }
             }
-            if queued {
-                requeued += 1;
-            } else {
-                pruned += 1;
+            if let Some((snapshot, status)) = crate::hub_backfill::rebuild_current(conn, &session)?
+            {
+                records.push(vec![
+                    PreparedRecord::current(Record::SessionSnapshot(Box::new(snapshot)))?,
+                    PreparedRecord::current(Record::SourceStatus(status))?,
+                ]);
+            } else if let Some(status) = crate::hub_backfill::current_status(conn, &session)? {
+                clear_status = true;
+                records.push(vec![PreparedRecord::current(Record::SourceStatus(status))?]);
             }
         }
-        Ok((requeued, pruned))
-    })();
-    finish(conn, result)
+        let queued = !records.is_empty();
+        // Each current snapshot + lifecycle status commits atomically BEFORE
+        // deleting the historical blob in a separate chunk. A crash between
+        // them leaves an outbox pair; the next sync's existing prune rule then
+        // removes the letter. Never combine two large blob writes in one hold.
+        // Multiple current identities for a status key also get separate units.
+        write_chunked(
+            conn,
+            "hub_reconcile",
+            current_budget(),
+            1,
+            records.iter().map(Some).chain(std::iter::once(None)),
+            || Ok(()),
+            |_, group| {
+                if let Some(records) = group {
+                    if clear_status {
+                        conn.execute(
+                            "delete from collector_hub_record_state where record_key=?",
+                            [&key],
+                        )?;
+                        clear_status = false;
+                    }
+                    let now = now_utc();
+                    for record in records {
+                        record.enqueue(conn, &now)?;
+                    }
+                } else {
+                    conn.execute("delete from collector_upload_dead_letters where id=?", [id])?;
+                }
+                Ok(())
+            },
+        )?;
+        if queued {
+            requeued += 1;
+        } else {
+            pruned += 1;
+        }
+    }
+    Ok((requeued, pruned))
 }
 
 /// Returns the persisted in-flight batch, or builds and persists the next one.

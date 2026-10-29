@@ -158,7 +158,11 @@ hub's reason (the credential is never echoed), and no longer blocks the
 records behind it. Hub refusals are never retried automatically. Local size
 refusals have a NULL HTTP status. When they fit the negotiated limit,
 `hub sync` removes them and rebuilds the current session snapshot and path
-status from local database rows under the collector lease and transaction.
+status from local database rows under the collector lease. Discovery, reconstruction and JSON
+serialization run outside SQLite's write lock. Each current snapshot and lifecycle status commit together, followed by deletion
+of their historical letter in a separate chunk using the existing 250 ms soft / 1,000 ms hard
+write budget and 150 ms gap. A single large SQLite write/COMMIT can exceed the
+targets; it cannot be interrupted safely halfway through.
 It never resends a dead letter's stored payload or uses wall-clock ordering.
 Deleted sessions and paths enqueue nothing; current queued records take priority.
 Non-session metadata without an authoritative snapshot stays in dead letters.
@@ -268,3 +272,54 @@ another machine. The
 hub stores normalized content, paths, and usage inputs; treat its database and
 backups as private session data. Pricing history reconciliation is a separate
 feature and is not implied by the usage totals returned here.
+
+
+### Local Caddy regression
+
+This opt-in test uses only loopback endpoints, synthetic credentials and a new
+scratch database. It never uses the installed app's database or the NAS hub.
+Prerequisites: Python 3.9+, native Caddy (tested with 2.11.7), and both Rust
+binaries built in this checkout's `collector/target/debug`:
+
+```powershell
+cargo build --manifest-path collector/Cargo.toml --bins
+python scripts/test_hub_caddy.py --caddy <absolute-path-to-caddy> --output-root <existing-scratch-parent>
+```
+
+Use `--profile release` for binaries built with `--release`. Each run creates a
+unique `caddy-busy-*` directory with logs, `result.json`, isolated Caddy settings
+and synthetic databases; retain the result and logs, then remove its disposable
+fixtures after both child processes have stopped. The script stops its own
+children even on failure. It needs no Docker or installed Caddy service.
+
+The 56 MiB decoded upload is deliberately compressible. A progressing direct
+request holds the local hub's ingest gate while sync exhausts four busy attempts
+through Caddy. Assertions cover HTTP 503 reporting, retained queue and batch
+identity, bounded completion and unchanged transport-failure counters. Releasing
+the gate must deliver that same persisted batch successfully.
+
+For the additional wire-pressure case, add `--noise-mib 9`. This places seeded
+high-entropy bytes inside the same record. On Windows with Caddy 2.11.7's default
+HTTP transport, this currently exposes a separate limitation: Caddy sends an
+early 100 and later records the hub's 503, but closes while the collector is
+still uploading; the collector sees a connection reset and counts a transport
+failure. The script intentionally fails its response/counter assertions in that
+case and retains the observation. A proxy/transport fix remains required before
+claiming busy-response preservation for large, poorly compressible wire bodies.
+Header-bearing 103 responses before 100 also retain ureq-proto 0.6.4's Await100
+limitation; the deterministic filter tests prove byte preservation, not support
+for that sequence in ureq itself.
+
+The separate large dead-letter measurement uses three synthetic 56 MiB records
+and a scratch database copy, without reading a live database:
+
+```powershell
+$env:CODEX_SESSIONS_COLLECTOR_TIMINGS = '1'
+cargo test --manifest-path collector/Cargo.toml --test hub_sync three_56_mib_dead_letters_rebuild_within_the_write_hold_budget -- --ignored --exact --nocapture
+```
+
+This test asserts the 1,000 ms hard hold limit and deliberately fails if a
+single SQLite blob insert/COMMIT exceeds it. The chunk helper bounds work units
+and supplies gaps; it cannot guarantee a deadline for an indivisible SQLite
+operation. Do not treat a passing ordinary suite (which ignores this expensive
+measurement) as proof of the large-record hold limit.

@@ -686,6 +686,87 @@ fn records_above_the_old_48_mib_limit_are_delivered_and_their_dead_letters_clear
     );
 }
 
+// Compare retained contract fields through SQL, independently of rebuild_current.
+// Database-generated row IDs, clocks and viewer-only annotations are excluded.
+fn retained_replay_state(conn: &rusqlite::Connection, session: &str) -> Value {
+    let id = format!("session:{session}");
+    let queries = [
+        "select session_id,thread_name,thread_source,parent_thread_id,forked_from_id,history_base_thread_id,history_base_end_ordinal,history_base_end_byte_offset,subagent_history_start_ordinal,usage_projection_status,agent_nickname,agent_role,subagent_depth,title,summary,working_directory_display,working_directory_platform,working_directory_unc,models_used,input_tokens,output_tokens,cached_input_tokens,total_tokens,parser_version,source_file_path,source_file_unc_path,display_path,platform_path,file_size,modified_utc from sessions where id='$id'",
+        "select message_index,author_type,raw_type,created_at_utc,first_line,content_plain,content_preview,content_truncated,token_input,token_output,token_cached,token_total,model,has_tool_calls,has_error from messages where session_id='$id' order by message_index",
+        "select t.tool_index,m.message_index,t.tool_name,t.status,t.started_at_utc,t.finished_at_utc,t.input_preview,t.output_preview,t.output_truncated,t.error_message from tool_calls t left join messages m on m.id=t.message_id where t.session_id='$id' order by t.tool_index",
+        "select source_record_ordinal,rollout_ordinal,turn_ordinal,epoch,occurred_at_utc,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,derivation,branch_scope,event_fingerprint from usage_events where session_row_id='$id' order by source_record_ordinal",
+        "select source_record_ordinal,provider,request_input_tokens,model_context_window,billable_units_json from usage_event_inputs where session_row_id='$id' order by source_record_ordinal",
+        "select e.source_record_ordinal,c.display_path_raw,c.unc_path_raw from usage_events e left join usage_path_contexts c on c.id=e.path_context_id where e.session_row_id='$id' order by e.source_record_ordinal",
+        "select extra_json from session_source_extras where session_row_id='$id'",
+        "select path_key from session_path_keys where session_id='$id' order by path_key",
+    ];
+    Value::Array(
+        queries
+            .into_iter()
+            .map(|sql| json!(support::rows(conn, &sql.replace("$id", &id))))
+            .collect(),
+    )
+}
+
+fn enrich_replay_snapshot(
+    snapshot: &mut codex_sessions_collector::contract::SessionSnapshot,
+    label: &str,
+) {
+    use codex_sessions_collector::contract::UsageRecord;
+    snapshot.session.thread_name = Some(format!("parsed-{label}"));
+    snapshot.session.thread_source = Some("subagent".into());
+    snapshot.session.parent_thread_id = Some(format!("parent-{label}"));
+    snapshot.session.forked_from_id = Some(format!("fork-{label}"));
+    snapshot.session.history_base_thread_id = Some(format!("base-{label}"));
+    snapshot.session.history_base_end_ordinal_exclusive = Some(3);
+    snapshot.session.history_base_end_byte_offset = Some(128);
+    snapshot.session.subagent_history_start_ordinal = Some(4);
+    snapshot.session.agent_nickname = Some(format!("agent-{label}"));
+    snapshot.session.agent_role = Some("worker".into());
+    snapshot.session.subagent_depth = Some(2);
+    snapshot.session.title = Some(format!("title-{label}"));
+    snapshot.session.summary = Some(format!("summary-{label}"));
+    snapshot.session.working_directory_unc = Some(r"\\synthetic\share\project".into());
+    snapshot.session.models = vec!["model-a".into(), format!("model-{label}")];
+    snapshot.extra = Some(json!({"label":label,"nested":{"retained":true}}));
+    let message = &mut snapshot.messages[0];
+    message.first_line = format!("first-{label}");
+    message.content_preview = format!("preview-{label}");
+    message.content_plain = format!("content-{label}");
+    message.content_truncated = true;
+    message.has_tool_calls = true;
+    message.has_error = true;
+    message.model = Some(format!("model-{label}"));
+    message.usage = UsageRecord {
+        input_tokens: Some(123),
+        output_tokens: Some(13),
+        cached_input_tokens: Some(23),
+        total_tokens: Some(136),
+        ..UsageRecord::default()
+    };
+    let tool = &mut snapshot.tool_calls[0];
+    tool.input_preview = format!("input-{label}");
+    tool.output_preview = format!("output-{label}");
+    tool.output_truncated = true;
+    tool.status = "error".into();
+    tool.error_message = Some(format!("error-{label}"));
+    tool.started_at_utc = Some("2026-09-10T10:00:02Z".into());
+    tool.finished_at_utc = Some("2026-09-10T10:00:03Z".into());
+    for event in &mut snapshot.usage_events {
+        event.rollout_ordinal = Some(event.source_record_ordinal + 2);
+        event.provider = Some("openai".into());
+        event.request_input_tokens = Some(111);
+        event.model_context_window = Some(128_000);
+        event.billable_units = Some(json!({"web_search_calls":5}).as_object().unwrap().clone());
+        event.usage.cached_input_tokens = Some(23);
+        event.usage.cache_write_input_tokens = Some(7);
+        event.usage.reasoning_output_tokens = Some(3);
+        event.branch_scope = "ambiguous".into();
+        event.working_directory_unc = Some(r"\\synthetic\share\project".into());
+        event.model = Some(format!("model-{label}"));
+    }
+}
+
 #[test]
 fn dead_letter_reconciliation_preserves_current_state_across_event_permutations() {
     const SEED: u64 = 0x201_2026;
@@ -693,6 +774,13 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
     let hub = start(&temp);
     let db = paired_database(&temp, &hub.url);
     let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    // Fixture construction does not exercise fairness; the sync below uses
+    // the production budget. The separate chunk test proves real 150 ms gaps.
+    use codex_sessions_collector::store::write_budget::{WriteBudget, WriteBudgetScope};
+    let fixture_budget = WriteBudgetScope::enter(WriteBudget {
+        gap: Duration::ZERO,
+        ..WriteBudget::default()
+    });
     let mut cases = Vec::new();
     for clock in [-1, 0, 1] {
         for status_key in [false, true] {
@@ -723,7 +811,7 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
         cases.swap(index, random as usize % (index + 1));
     }
     eprintln!(
-        "replay class seed={SEED:#x}, cases={}, clocks=-1/0/+1 second; snapshot/status keys; A/B parse order; dead A/B; deliver/no-deliver; delete/keep; active/missing",
+        "replay class seed={SEED:#x}, cases={}, clocks=-1/0/+1 second; snapshot/status keys; A/B parse order; dead A/B; deliver/no-deliver; delete/keep; active/missing; separate thread names; merged/path identities; rich retained fields",
         cases.len()
     );
     let mut sequence = 0;
@@ -733,13 +821,33 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
     {
         let session = format!("class-{index}");
         let mut a = sample_snapshot(&session);
-        a.messages[0].content_plain = format!("A-{index}");
+        enrich_replay_snapshot(&mut a, &format!("A-{index}"));
         let mut b = a.clone();
-        b.messages[0].content_plain = format!("B-{index}");
+        enrich_replay_snapshot(&mut b, &format!("B-{index}"));
         let (first, newest) = if reverse_parse {
             (b.clone(), a.clone())
         } else {
             (a.clone(), b.clone())
+        };
+        // Exercise a path-derived identity becoming a stable session identity.
+        // Its old dead letter must never resurrect the merged fallback row.
+        let fallback = if index % 2 == 0 {
+            let mut provisional = first.clone();
+            provisional.session.session_id = None;
+            let id = codex_sessions_collector::store::writer::session_row_id(
+                "codex",
+                None,
+                &provisional.source.path,
+            );
+            store
+                .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                    provisional,
+                )))])
+                .unwrap();
+            move_to_dead_letter(&store.conn, &format!("session:{id}"), None);
+            Some(id)
+        } else {
+            None
         };
         store
             .apply(vec![
@@ -753,6 +861,20 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
                 newest.clone(),
             )))])
             .unwrap();
+        let old_name = thread_name(&session, &format!("old-name-{index}"));
+        let current_name = thread_name(&session, &format!("current-name-{index}"));
+        store.apply(vec![old_name, current_name.clone()]).unwrap();
+        if let Some(id) = &fallback {
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("select count(*) from sessions where id=?", [id], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let rich = retained_replay_state(&store.conn, &session);
         let path = newest.source.path.clone();
         let current_status = status_record(&path, if missing { "missing" } else { "available" });
         store.apply(vec![current_status.clone()]).unwrap();
@@ -769,6 +891,7 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
                     ))))
                     .unwrap(),
                     serde_json::to_value(current_status).unwrap(),
+                    serde_json::to_value(current_name).unwrap(),
                 ],
             )
             .unwrap();
@@ -833,7 +956,16 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
         } else {
             None
         };
-        expected.push((session, state));
+        // Independent thread-name events have been delivered with the reference
+        // state above; clear local pending names so reconstruction must carry it.
+        store
+            .conn
+            .execute(
+                "delete from collector_upload_outbox where record_key=?",
+                [format!("thread:codex:{session}")],
+            )
+            .unwrap();
+        expected.push((session, state, rich, fallback));
     }
     store
         .conn
@@ -842,15 +974,34 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
             [sequence],
         )
         .unwrap();
+    drop(fixture_budget);
     drop(store);
     let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
     let remote = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
     let mut failures = Vec::new();
     use rusqlite::OptionalExtension;
-    for (index, (session, state)) in expected.iter().enumerate() {
+    for (index, (session, state, rich, fallback)) in expected.iter().enumerate() {
         let actual: Option<(String,String,String)> = remote.query_row(
             "select m.content_plain,s.scan_status,s.source_state from sessions s left join messages m on m.session_id=s.id where s.id=?",
             [format!("session:{session}")], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().unwrap();
+        if state.is_some() {
+            let actual_rich = retained_replay_state(&remote, session);
+            if &actual_rich != rich {
+                failures.push(format!(
+                    "case {index}: retained fields differ: expected {rich}, got {actual_rich}"
+                ));
+            }
+        }
+        if let Some(id) = fallback {
+            assert_eq!(
+                remote
+                    .query_row("select count(*) from sessions where id=?", [id], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "merged identity resurrected in case {index}"
+            );
+        }
         if &actual != state {
             failures.push(format!(
                 "case {index} {:?}: expected {state:?}, got {actual:?}",
@@ -2151,6 +2302,328 @@ fn busy_uploads_retry_the_same_batch_without_transport_failure_or_halving() {
         ),
         0
     );
+}
+
+#[test]
+fn busy_exhaustion_retains_queue_identity_size_and_transport_failure_count() {
+    let temp = TempDir::new("busy_exhaust");
+    let mut first = true;
+    let fake = fake_hub(Box::new(move |_| {
+        if first {
+            first = false;
+            return None;
+        }
+        Some((
+            503,
+            json!({"code":"busy","error":"synthetic busy exhaustion"}).to_string(),
+        ))
+    }));
+    let db = paired_database(&temp, &fake.url);
+    queue_sessions(&db, &["busy-a", "busy-b", "busy-c", "busy-d"]);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    // Establish an in-flight batch and one real transport failure first.
+    // Misclassifying the following busy response would shrink that batch.
+    assert!(hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).is_err());
+    fake.bodies.lock().unwrap().clear();
+    let before: Vec<(i64, String)> = conn
+        .prepare("select id,record_json from collector_upload_outbox order by id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for _ in 0..2 {
+        let started = Instant::now();
+        let error =
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap_err();
+        assert!(
+            error.contains("HTTP 503")
+                && error.contains("synthetic busy exhaustion")
+                && error.contains("remain queued"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let after: Vec<(i64, String)> = conn
+            .prepare("select id,record_json from collector_upload_outbox order by id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(before, after);
+        let failures: String = conn
+            .query_row(
+                "select value from app_metadata where key='hub.inflight_transport_failures'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, "1");
+        let last: i64 = conn
+            .query_row(
+                "select inflight_last_id from collector_hub_state where id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, before.last().unwrap().0);
+    }
+    let bodies = fake.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 8, "four attempts per sync, then stop");
+    assert!(bodies.iter().all(|body| body == &bodies[0]));
+    assert_eq!(bodies[0]["records"].as_array().unwrap().len(), before.len());
+    assert_eq!(
+        local_count(&db, "select last_sequence from collector_hub_state"),
+        0
+    );
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_dead_letters"),
+        0
+    );
+}
+
+/// Synthetic only: ~56 MiB of retained tool output per session, never a live DB.
+#[test]
+#[ignore = "large synthetic hold-budget measurement; run serially with timings enabled"]
+fn three_56_mib_dead_letters_rebuild_within_the_write_hold_budget() {
+    use codex_sessions_collector::store::write_budget::WriteHoldScope;
+    let temp = TempDir::new("rebuild_56mib");
+    let hub = start(&temp);
+    let original = paired_database(&temp, &hub.url);
+    let store = Store::open(&original, OwnerMode::Standalone).unwrap();
+    for name in ["large-a", "large-b", "large-c"] {
+        let mut snapshot = sample_snapshot(name);
+        let tool = snapshot.tool_calls[0].clone();
+        snapshot.tool_calls = (0..13_600)
+            .map(|index| {
+                let mut tool = tool.clone();
+                tool.tool_index = index;
+                tool.output_preview = format!("tool {index}: {}", "x".repeat(4096));
+                tool
+            })
+            .collect();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                snapshot,
+            )))])
+            .unwrap();
+        move_to_dead_letter(&store.conn, &format!("session:session:{name}"), None);
+    }
+    let sizes: Vec<i64>=store.conn.prepare("select length(cast(record_json as blob)) from collector_upload_dead_letters order by id").unwrap()
+        .query_map([],|r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(sizes.len(), 3);
+    assert!(
+        sizes
+            .iter()
+            .all(|s| (55 * 1024 * 1024..58 * 1024 * 1024).contains(s)),
+        "{sizes:?}"
+    );
+    let copy = temp.path().join("scratch-copy.sqlite");
+    store
+        .conn
+        .execute("vacuum into ?", [copy.to_str().unwrap()])
+        .unwrap();
+    drop(store);
+    let holds = WriteHoldScope::for_phase("hub_reconcile");
+    let report = hub_client::sync(&copy, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    let hold = holds.report();
+    eprintln!(
+        "synthetic_reconciliation sizes={sizes:?} holds={}",
+        serde_json::to_string(&hold).unwrap()
+    );
+    assert_eq!((report.requeued, report.pending), (3, 0));
+    assert!(hold.transactions >= sizes.len() as u64);
+    assert_eq!(hold.over_budget, 0, "{hold:?}");
+    assert!(hold.max_ms <= 1000.0, "{hold:?}");
+    assert_eq!(
+        hub_rows(&temp, "select sum(tool_call_count) from sessions"),
+        40_800
+    );
+    assert_eq!(
+        local_count(&copy, "select count(*) from collector_upload_dead_letters"),
+        0
+    );
+}
+
+#[test]
+fn interrupted_reconstruction_retains_the_letter_until_the_current_pair_is_durable() {
+    use codex_sessions_collector::store::write_budget::WriteChunkScope;
+    let temp = TempDir::new("rebuild_crash");
+    let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+    let db = paired_database(&temp, &fake.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let mut snapshot = sample_snapshot("interrupted");
+    snapshot.messages[0].content_plain = "CURRENT".into();
+    let path = snapshot.source.path.clone();
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            snapshot,
+        )))])
+        .unwrap();
+    move_to_dead_letter(&store.conn, "session:session:interrupted", None);
+    store.apply(vec![status_record(&path, "missing")]).unwrap();
+    {
+        let _observer = WriteChunkScope::observe(|phase| {
+            if phase == "hub_reconcile" {
+                panic!("synthetic interruption after first durable queue chunk");
+            }
+        });
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN)
+        }));
+        assert!(interrupted.is_err());
+    }
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_dead_letters"),
+        1
+    );
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_outbox"),
+        2
+    );
+    // Crash recovery prunes the letter whose authoritative pair is already
+    // queued, without rebuilding or ever sending its old payload.
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(
+        (report.pruned, report.requeued, report.sent, report.pending),
+        (1, 0, 2, 0)
+    );
+    let bodies = fake.bodies.lock().unwrap();
+    let records = bodies[0]["records"].as_array().unwrap();
+    assert_eq!(
+        records[0]["record"]["messages"][0]["content_plain"],
+        "CURRENT"
+    );
+    assert_eq!(records[1]["kind"], "source_status");
+    assert_eq!(records[1]["record"]["status"], "missing");
+}
+
+#[test]
+fn interrupted_status_letter_reconstruction_rebuilds_every_identity_on_restart() {
+    use codex_sessions_collector::store::write_budget::WriteChunkScope;
+    let temp = TempDir::new("multi_crash");
+    let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+    let db = paired_database(&temp, &fake.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    // Two current sessions share one source path, so one status key covers both.
+    let a = sample_snapshot("same-path-a");
+    let mut b = sample_snapshot("same-path-b");
+    b.source = a.source.clone();
+    let path = a.source.path.clone();
+    store
+        .apply(vec![
+            Envelope::new(Record::SessionSnapshot(Box::new(a))),
+            Envelope::new(Record::SessionSnapshot(Box::new(b))),
+        ])
+        .unwrap();
+    assert_eq!(local_count(&db, "select count(*) from sessions"), 2);
+    store.apply(vec![status_record(&path, "missing")]).unwrap();
+    let status_key = format!(
+        "status:codex:{}",
+        codex_sessions_collector::store::writer::source_status_id(&path)
+    );
+    move_to_dead_letter(&store.conn, &status_key, None);
+    store
+        .conn
+        .execute("delete from collector_upload_outbox", [])
+        .unwrap();
+    {
+        let _observer = WriteChunkScope::observe(|phase| {
+            if phase == "hub_reconcile" {
+                panic!("synthetic interruption after the first pair");
+            }
+        });
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN)
+        }));
+        assert!(interrupted.is_err());
+    }
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_dead_letters"),
+        1,
+        "the letter stays until every identity is queued"
+    );
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.pending, report.dead_lettered), (0, 0), "{report:?}");
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_dead_letters"),
+        0
+    );
+    let bodies = fake.bodies.lock().unwrap();
+    let mut snapshots: Vec<String> = bodies
+        .iter()
+        .flat_map(|body| body["records"].as_array().unwrap())
+        .filter(|record| record["kind"] == "session_snapshot")
+        .map(|record| {
+            record["record"]["session"]["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    snapshots.sort();
+    snapshots.dedup();
+    assert_eq!(snapshots.len(), 2, "restart rebuilt only {snapshots:?}");
+}
+
+#[test]
+fn dead_letter_reconstruction_yields_between_independent_letters() {
+    use codex_sessions_collector::store::write_budget::{
+        WriteBudget, WriteBudgetScope, WriteChunkScope,
+    };
+    let temp = TempDir::new("rebuild_gaps");
+    let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+    let db = paired_database(&temp, &fake.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    for name in ["gap-a", "gap-b", "gap-c"] {
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot(name),
+            )))])
+            .unwrap();
+        move_to_dead_letter(&store.conn, &format!("session:session:{name}"), None);
+    }
+    let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let capture = observed.clone();
+    let db_copy = db.clone();
+    let mut remaining_letters = 3;
+    let _observer = WriteChunkScope::observe(move |phase| {
+        if phase == "hub_reconcile" {
+            // A viewer can acquire SQLite's write lock at every boundary.
+            let viewer = rusqlite::Connection::open(&db_copy).unwrap();
+            viewer.busy_timeout(Duration::ZERO).unwrap();
+            viewer.execute_batch("begin immediate; rollback").unwrap();
+            let remaining: i64 = viewer
+                .query_row(
+                    "select count(*) from collector_upload_dead_letters",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            // Internal-unit observers run after the helper's wait, whereas
+            // final-unit observers run immediately after COMMIT. Compare only
+            // completed letters so callback placement cannot fake a short gap.
+            if remaining < remaining_letters {
+                capture.borrow_mut().push(Instant::now());
+            }
+            remaining_letters = remaining;
+        }
+    });
+    let _budget = WriteBudgetScope::enter(WriteBudget {
+        soft: Duration::ZERO,
+        ..WriteBudget::default()
+    });
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.requeued, report.pending), (3, 0));
+    let observed = observed.borrow();
+    assert!(
+        observed.len() >= 3,
+        "expected separate reconstruction chunks, got {}",
+        observed.len()
+    );
+    for pair in observed.windows(2) {
+        assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(150));
+    }
 }
 
 #[test]

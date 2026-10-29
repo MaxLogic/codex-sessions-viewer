@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Full rescans prepare session rows, content hashes and hub envelopes before taking the database write lock, and group unchanged sessions by predicted write cost, including large sessions. Transactions retain the 150 ms viewer-write gap; changed large sessions and identity merges remain isolated.
+- Hub sync reconstructs size-refused dead letters under the collector lease before taking SQLite's write lock, then commits each current snapshot/status pair and deletes its old letter in separate chunks with the existing 150 ms viewer-write gap. Historical payloads are never replayed.
 
 ### Added
 - Hub uploads negotiate zstd compression to deliver larger session snapshots; sync requeues local size refusals that now fit and clears superseded, orphaned and delivered dead letters.
