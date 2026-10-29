@@ -21,7 +21,8 @@ class PackageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cxv native ; fixture ")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Packaging resolves its output; macOS /var and Windows 8.3 temp paths are aliases.
+        self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         self.built = self.root / "built"
         self.bins = self.root / "bins"
@@ -337,7 +338,7 @@ class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cxv runner ")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
 
     def test_native_error_status_logs_and_environment_unchanged(self):
         runner = release.Runner(self.root / "logs", "fixture-hash", deadline=10)
