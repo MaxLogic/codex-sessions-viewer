@@ -68,14 +68,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: macOS native release gates and ZIP (ad-hoc signing)
         if: matrix.target == 'macos'
-        # Hosted checkouts sit inside HOME, which test isolation refuses.
+        # Hosted checkouts sit inside HOME, which test isolation refuses. A short
+        # parent keeps test socket paths under the 104-byte Unix limit.
         env:
-          CXV_TEST_SANDBOX_PARENT: /tmp/cxv-test-sandboxes
+          CXV_TEST_SANDBOX_PARENT: /tmp/cx
         run: bash scripts/build_macos.sh
       - name: Linux native release gates and tarball
         if: matrix.target == 'linux'
         env:
-          CXV_TEST_SANDBOX_PARENT: /tmp/cxv-test-sandboxes
+          CXV_TEST_SANDBOX_PARENT: /tmp/cx
         # Integration tests start the GTK app, which needs a display.
         run: xvfb-run -a bash scripts/build_linux.sh
       - name: Retain gate logs

@@ -171,11 +171,13 @@ This writes the app to `release\windows` and the archive to
 output folder is kept and never packaged.
 
 Linux additionally needs Python 3.11, clang, CMake, Ninja, pkg-config and the
-GTK 3 development files. If the checkout is inside your home folder, point the
-test sandboxes elsewhere:
+GTK 3 development files. The tests refuse to create their sandboxes inside
+your home folder, so a checkout there needs a sandbox folder elsewhere. Keep
+its path short: the collector's test sockets must stay under the 104-byte
+limit for Unix socket paths.
 
 ```bash
-CXV_TEST_SANDBOX_PARENT=/tmp/cxv-test-sandboxes bash scripts/build_linux.sh
+CXV_TEST_SANDBOX_PARENT=/tmp/cx bash scripts/build_linux.sh
 ```
 
 The output is `release/linux` and `release/codex_sessions_viewer_linux.tar.gz`.

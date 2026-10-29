@@ -604,21 +604,13 @@ fn setup_keeps_a_secret_configurations_mode_and_owner_on_unix() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for harness in ["codex", "claude"] {
         let f = Fixture::new(harness);
-        let original = if harness == "codex" {
-            r#"{"api_key":"private-test-secret"}"#.to_owned()
-        } else {
-            r#"{"api_key":"private-test-secret"}"#.to_owned()
-        };
-        std::fs::write(&f.hooks_config(), &original).unwrap();
-        std::fs::set_permissions(&f.hooks_config(), std::fs::Permissions::from_mode(0o600))
-            .unwrap();
-        let before = std::fs::metadata(&f.hooks_config()).unwrap();
+        let original = r#"{"api_key":"private-test-secret"}"#.to_owned();
+        std::fs::write(f.hooks_config(), &original).unwrap();
+        std::fs::set_permissions(f.hooks_config(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(f.hooks_config()).unwrap();
         let applied = f.run("setup", &["--apply"], 0);
-        let after = std::fs::metadata(&f.hooks_config()).unwrap();
-        assert_ne!(
-            std::fs::read_to_string(&f.hooks_config()).unwrap(),
-            original
-        );
+        let after = std::fs::metadata(f.hooks_config()).unwrap();
+        assert_ne!(std::fs::read_to_string(f.hooks_config()).unwrap(), original);
         assert_eq!(after.permissions().mode() & 0o7777, 0o600, "{harness}");
         assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
         let backup = std::path::PathBuf::from(applied["backup"].as_str().unwrap());
@@ -626,11 +618,10 @@ fn setup_keeps_a_secret_configurations_mode_and_owner_on_unix() {
         assert_eq!(backup.permissions().mode() & 0o7777, 0o600, "{harness}");
 
         // A group-readable file keeps its wider mode; setup does not guess.
-        std::fs::set_permissions(&f.hooks_config(), std::fs::Permissions::from_mode(0o640))
-            .unwrap();
-        std::fs::write(&f.hooks_config(), &original).unwrap();
+        std::fs::set_permissions(f.hooks_config(), std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::write(f.hooks_config(), &original).unwrap();
         f.setup();
-        let after = std::fs::metadata(&f.hooks_config()).unwrap();
+        let after = std::fs::metadata(f.hooks_config()).unwrap();
         assert_eq!(after.permissions().mode() & 0o7777, 0o640, "{harness}");
     }
 }

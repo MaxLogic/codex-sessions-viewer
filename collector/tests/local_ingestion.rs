@@ -738,9 +738,11 @@ fn normalized_parser_output_matches_the_goldens() {
                 .unwrap_or_else(|error| panic!("{golden_path}: {error}")),
         )
         .unwrap();
-        // Goldens are recorded on Windows; a plain local file is the host's own source.
-        if golden["source_type"] == "windows" {
-            golden["source_type"] = json!(SourceType::native().wire_name());
+        // Goldens are recorded on Windows: a plain local file is the host's own
+        // source, while a file that records its platform keeps "windows".
+        let native = SourceType::native().wire_name();
+        if golden["source_type"] == "windows" && actual["source_type"] == native {
+            golden["source_type"] = json!(native);
         }
         if let Some(difference) = first_difference(name, &golden, &actual) {
             failures.push(difference);
