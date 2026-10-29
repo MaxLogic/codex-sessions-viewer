@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [1.0.0] - 2026-10-29
+
+First public release, with Windows and Linux x64 builds, under the MIT license. The collector now reports version 1.0.0, like the app; a resident started by an older collector is replaced when a 1.0.0 viewer connects.
 
 - Full rescans prepare session rows, content hashes and hub envelopes before taking the database write lock, and group unchanged sessions by predicted write cost, including large sessions. Transactions retain the 150 ms viewer-write gap; changed large sessions and identity merges remain isolated.
 - Hub sync reconstructs size-refused dead letters under the collector lease before taking SQLite's write lock, then commits each current snapshot/status pair and deletes its old letter in separate chunks with the existing 150 ms viewer-write gap. Historical payloads are never replayed.
