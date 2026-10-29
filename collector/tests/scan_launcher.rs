@@ -33,7 +33,9 @@ fn launcher_is_the_resident_and_killing_it_releases_ownership() {
     let mut child = Child(command.spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
+        // Unix endpoints live in the profile's runtime directory.
         let output = support::collector()
+            .profile(temp.path())
             .args(["resident", "status", "--db"])
             .arg(&db)
             .output()

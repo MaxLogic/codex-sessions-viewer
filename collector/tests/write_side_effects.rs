@@ -261,7 +261,12 @@ macro_rules! base_effects_test {
         }
     };
 }
-base_effects_test!(statuses_match_base_side_effects, "statuses");
+// The status fixtures use Windows paths, case-folded only by a Windows collector; the golden was captured on Windows.
+#[test]
+#[cfg_attr(not(windows), ignore = "Windows-captured status golden")]
+fn statuses_match_base_side_effects() {
+    assert_base_effects("statuses");
+}
 base_effects_test!(sessions_match_base_side_effects, "sessions");
 base_effects_test!(project_hints_match_base_side_effects, "project_hints");
 base_effects_test!(thread_names_match_base_side_effects, "thread_names");
@@ -360,6 +365,7 @@ fn capture_order_effects(phase: &str) -> Value {
 }
 
 #[test]
+#[cfg_attr(not(windows), ignore = "Windows-captured status golden")]
 fn statuses_preserve_base_journal_and_packet_order() {
     assert_base_order("statuses");
 }

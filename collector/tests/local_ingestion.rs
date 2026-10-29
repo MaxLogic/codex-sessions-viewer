@@ -190,9 +190,10 @@ fn t3_lineage_scan_reads_configured_state_after_cached_collection() {
     std::fs::write(
         &settings,
         format!(
-            "[paths]\nwindows_codex_path = {}\nt3_state_path = {}\nt3_source_type = 'windows'\n",
+            "[paths]\nwindows_codex_path = {}\nt3_state_path = {}\nt3_source_type = '{}'\n",
             json!(home.to_string_lossy()),
-            json!(state.to_string_lossy())
+            json!(state.to_string_lossy()),
+            SourceType::native().wire_name()
         ),
     )
     .unwrap();
@@ -2897,6 +2898,13 @@ fn scans_run_the_cache_repair_after_complete_discovery_and_report_it() {
     let fixture = RepairFixture::new("repair-scan");
     let plugin = fixture.file("plugins/legacy.json");
     fixture.insert(&format!("source:{plugin}"), None, &plugin, 1);
+    // A scan repairs rows of the host's own source type.
+    open(&fixture.db)
+        .execute(
+            "update sessions set source_type = ?",
+            [SourceType::native().wire_name()],
+        )
+        .unwrap();
     let malformed = fixture.home.join("sessions").join("gate.jsonl");
     std::fs::write(&malformed, "{ malformed").unwrap();
     let scan = |fixture: &RepairFixture| -> Value {

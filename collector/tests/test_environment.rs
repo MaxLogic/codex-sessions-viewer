@@ -72,13 +72,22 @@ fn all_profile_overrides_and_unknown_collector_paths_fail_closed() {
     }
 }
 
+/// An absolute path outside the sandbox: `C:/...` is relative on Unix.
+fn outside(name: &str) -> String {
+    if cfg!(windows) {
+        format!("C:\\synthetic-real-profile\\{name}")
+    } else {
+        format!("/synthetic-real-profile/{name}")
+    }
+}
+
 #[test]
 fn native_default_settings_probe_cannot_read_an_unowned_profile() {
     let owned = support::TempDir::new("settings-isolation");
     let settings = owned.path().join("settings.toml");
     std::fs::write(
         &settings,
-        "[paths]\nwindows_codex_path = 'C:\\synthetic-real-profile\\sessions'\n",
+        format!("[paths]\nwindows_codex_path = '{}'\n", outside("sessions")),
     )
     .unwrap();
     let result = support::collector()
@@ -160,8 +169,7 @@ fn a_default_settings_scan_does_not_inherit_profile_configuration() {
 
 #[test]
 fn hook_transcript_escape_is_rejected_before_spawn() {
-    let input = serde_json::json!({"transcript_path":"C:/synthetic-real-profile/transcript.jsonl"})
-        .to_string();
+    let input = serde_json::json!({"transcript_path": outside("transcript.jsonl")}).to_string();
     let result = support::collector()
         .args(["claude", "hook"])
         .spawn_with_input(&input);
@@ -179,7 +187,7 @@ fn hook_transcript_escape_is_rejected_before_spawn() {
 #[test]
 fn positional_ingest_input_is_guarded_before_spawn() {
     let result = support::collector()
-        .args(["codex", "ingest", "C:/synthetic-real-profile/input", "--db"])
+        .args(["codex", "ingest", &outside("input"), "--db"])
         .arg(support::test_root().join("owned.sqlite"))
         .output();
     assert_eq!(

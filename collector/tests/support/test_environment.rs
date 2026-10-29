@@ -322,6 +322,18 @@ impl TestCommand {
         self.command.env("CODEX_HOME", root.join("codex"));
         self.command
             .env("CODEX_SESSIONS_COLLECTOR_QUEUE", root.join("queue"));
+        // Unix socket paths are limited to 104 bytes, which nested fixture roots
+        // exceed. Every command for the same root gets the same short directory.
+        #[cfg(unix)]
+        {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            root.hash(&mut hasher);
+            let runtime = test_root()
+                .join("u")
+                .join(format!("{:08x}", hasher.finish() as u32));
+            self.command.env("XDG_RUNTIME_DIR", runtime);
+        }
         self
     }
     pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
@@ -919,6 +931,33 @@ fn admit_executable(command: &Command, raw: Option<&str>, cwd: &Path) -> io::Res
             {
                 return Ok(());
             }
+        }
+    }
+    #[cfg(unix)]
+    {
+        // The detached process-group test chains a marker writer through
+        // --previous-notify and then kills the hook's process group.
+        if raw.is_none()
+            && program == std::fs::canonicalize("/bin/sh")?
+            && args.len() == 3
+            && args[0] == "-c"
+            && args[2] == "sh"
+            && let Some(target) = args[1]
+                .strip_prefix("sleep 1; echo alive > '")
+                .and_then(|rest| rest.strip_suffix('\''))
+        {
+            environment().guard(Path::new(target), cwd)?;
+            return Ok(());
+        }
+        if raw.is_none()
+            && program == tool(OsStr::new("kill"))?
+            && args.len() == 3
+            && args[..2] == ["-KILL", "--"]
+            && args[2]
+                .strip_prefix('-')
+                .is_some_and(|group| group.parse::<u32>().is_ok())
+        {
+            return Ok(());
         }
     }
     // Independent example parser is the only Python entry point.

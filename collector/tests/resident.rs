@@ -219,7 +219,10 @@ fn large_scan_report_stays_bounded_through_the_real_bridge() {
     reader.join().unwrap();
 }
 
+// The in-process peer binds a pipe name on Windows; a Unix socket would sit in
+// this process's own runtime directory, outside the bridge's fixture profile.
 #[test]
+#[cfg(windows)]
 fn large_scan_report_protocol_frame_error_is_not_a_disconnect() {
     let _fixture_load = ordinary_fixture_lane();
     for malformed_json in [false, true] {
