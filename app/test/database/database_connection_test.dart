@@ -16,6 +16,19 @@ void main() {
   late Directory tempDir;
   late File dbFile;
 
+  // Plain `dart` loads native assets but never builds them. `dart run` builds
+  // sqlite3 once here; concurrent actors cannot share that build step, since
+  // Windows refuses to replace the library while another actor has it loaded.
+  setUpAll(() async {
+    final warmUp = await startTestProcess(_dartExecutable(), [
+      'run',
+      _actorHelper(),
+    ], workingDirectory: Directory.current.path);
+    unawaited(warmUp.stdout.drain<void>());
+    unawaited(warmUp.stderr.drain<void>());
+    await warmUp.exitCode.timeout(const Duration(minutes: 5));
+  });
+
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('csv_db_connection_test_');
     dbFile = File('${tempDir.path}${Platform.pathSeparator}viewer.sqlite');
@@ -313,22 +326,23 @@ Future<_ActorProcess> _startActor(
   String mode,
   String signalBase,
 ) async {
-  final helper = [
-    Directory.current.path,
-    'test',
-    'database',
-    'helpers',
-    'database_process_actor.dart',
-  ].join(Platform.pathSeparator);
   final process = await startTestProcess(_dartExecutable(), [
     '--packages=.dart_tool/package_config.json',
-    helper,
+    _actorHelper(),
     databaseFile.path,
     mode,
     signalBase,
   ], workingDirectory: Directory.current.path);
   return _ActorProcess(process);
 }
+
+String _actorHelper() => [
+  Directory.current.path,
+  'test',
+  'database',
+  'helpers',
+  'database_process_actor.dart',
+].join(Platform.pathSeparator);
 
 void _registerActorCleanup(_ActorProcess actor, String signalBase) {
   addTearDown(() async {

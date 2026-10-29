@@ -670,6 +670,8 @@ class TestEnvironment {
         }
         index++;
       }
+      // `dart run` additionally builds native assets such as sqlite3.
+      if (index < args.length && args[index] == 'run') index++;
       if (index >= args.length) reject();
       final script = args[index++];
       final helper = p.absolute(
