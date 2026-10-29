@@ -120,7 +120,8 @@ impl PlatformLocations {
             settings_file: settings,
             log_dir: logs,
             queue_dir: cache.join("collector").join("queue"),
-            runtime_dir: if platform == HostPlatform::Linux {
+            // macOS honours an explicit XDG_RUNTIME_DIR too; it is normally unset.
+            runtime_dir: if matches!(platform, HostPlatform::Linux | HostPlatform::Macos) {
                 non_empty("XDG_RUNTIME_DIR")
                     .map(|path| path.join("CodexSessionViewer"))
                     .unwrap_or_else(|| cache.join("run"))

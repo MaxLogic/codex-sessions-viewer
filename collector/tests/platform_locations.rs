@@ -83,6 +83,20 @@ fn macos_and_linux_defaults() {
         normalized(&mac.sql_dir),
         "/Applications/Viewer.app/Contents/Resources/sql"
     );
+    let mac_runtime = PlatformLocations::resolve(
+        HostPlatform::Macos,
+        |name| match name {
+            "HOME" => Some("/Users/tester".into()),
+            "XDG_RUNTIME_DIR" => Some("/tmp/runtime".into()),
+            _ => None,
+        },
+        Path::new("/Applications/Viewer.app/Contents/MacOS/viewer"),
+    )
+    .unwrap();
+    assert_eq!(
+        normalized(&mac_runtime.runtime_dir),
+        "/tmp/runtime/CodexSessionViewer"
+    );
 
     let linux = PlatformLocations::resolve(
         HostPlatform::Linux,
