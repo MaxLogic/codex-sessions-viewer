@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/config/default_session_folders.dart';
+import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
 import 'package:codex_sessions_viewer/src/platform/wsl_default_distro_detector.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -425,7 +426,13 @@ prompt = '0.5'
     expect(settings.voiceOver.events['copied']?.text, 'Copied item');
     expect(
       settings.voiceOver.events['copied']?.wav,
-      r'assets\voice\copied.wav',
+      p.join(
+        Platform.isWindows
+            ? 'assets'
+            : AppLocations.current().assetsDirectory.path,
+        'voice',
+        'copied.wav',
+      ),
     );
     expect(settings.voiceOver.events, contains('scan_started'));
     expect(settings.pricing.overrides['local/model']?.prompt, '0.5');
@@ -528,7 +535,23 @@ prompt = '0.5'
       expect(folders.wslLinuxRootUnc, isEmpty);
       expect(folders.wslCodexUncPath, isEmpty);
 
-      final settings = AppSettings.defaults(folders: folders);
+      // Asset and log defaults follow the install and profile folders, which
+      // are this checkout and the test sandbox here; use a neutral install.
+      final install = AppLocations.resolve(
+        platform: AppLocations.currentPlatform,
+        environment: {
+          'APPDATA': r'D:\Profiles\ada\AppData\Roaming',
+          'LOCALAPPDATA': r'D:\Profiles\ada\AppData\Local',
+          'HOME': '/home/ada',
+        },
+        executablePath: Platform.isWindows
+            ? r'C:\Program Files\Viewer\viewer.exe'
+            : '/opt/viewer/viewer',
+      );
+      final settings = AppLocations.scoped(
+        install,
+        () => AppSettings.defaults(folders: folders),
+      );
       expect(settings.paths.windowsCodexPath, r'D:\Profiles\ada\.codex');
       expect(settings.paths.wslCodexUncPath, isEmpty);
       expect(settings.wsl.distro, isEmpty);

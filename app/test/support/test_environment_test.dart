@@ -200,9 +200,11 @@ void main() {
     final settings = File(
       p.join(TestEnvironment.current.root.path, 'unsafe.toml'),
     );
-    await settings.writeAsString(
-      "[paths]\nwindows_codex_path = 'C:\\synthetic-real-profile\\sessions'",
-    );
+    // `C:\...` is relative on Unix and would resolve inside the owned root.
+    final escaped = Platform.isWindows
+        ? r'C:\synthetic-real-profile\sessions'
+        : '/synthetic-real-profile/sessions';
+    await settings.writeAsString("[paths]\nwindows_codex_path = '$escaped'");
     await expectLater(
       runTestProcess(
         TestEnvironment.current.environment['CODEX_SESSIONS_COLLECTOR_EXE']!,

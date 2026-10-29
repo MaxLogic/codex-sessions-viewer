@@ -245,6 +245,12 @@ class TestEnvironment {
       for (final key in profileKeys) key: p.join(fixture.path, key),
     };
     values['HOME'] = values['USERPROFILE']!;
+    if (!Platform.isWindows) {
+      // Resident sockets live here, named per database like Windows pipes.
+      // Sharing the run's folder keeps them reachable by fixture cleanup and
+      // within the 104-byte Unix socket limit that nested fixtures exceed.
+      values['XDG_RUNTIME_DIR'] = environment['XDG_RUNTIME_DIR']!;
+    }
     values['CODEX_SESSIONS_COLLECTOR_QUEUE'] =
         queue ?? p.join(fixture.path, 'queue');
     values['CODEX_HOME'] = codex ?? p.join(fixture.path, 'codex');

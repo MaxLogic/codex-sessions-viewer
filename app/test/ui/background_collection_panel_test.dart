@@ -16,6 +16,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
+
+// The collector reports configuration paths in the host's own form.
+final _home = Platform.isWindows ? r'C:\Users\a' : '/home/a';
+final _claudeSettings = p.join(_home, '.claude', 'settings.json');
 
 class _FakeCollection implements BackgroundCollection {
   _FakeCollection({
@@ -55,12 +60,12 @@ class _FakeCollection implements BackgroundCollection {
       hooks: {
         CollectionHarness.codex: HookStatus(
           hooks[CollectionHarness.codex]!,
-          configPath: r'C:\Users\a\.codex\config.toml',
+          configPath: p.join(_home, '.codex', 'config.toml'),
         ),
         CollectionHarness.claude: HookStatus(
           hooks[CollectionHarness.claude]!,
           detail: claudeDetail,
-          configPath: r'C:\Users\a\.claude\settings.json',
+          configPath: _claudeSettings,
         ),
       },
       schedule: schedule,
@@ -605,7 +610,7 @@ void main() {
     );
     expect(
       _text(tester, 'background-claude-path'),
-      r'Configuration file: C:\Users\a\.claude\settings.json',
+      'Configuration file: $_claudeSettings',
     );
     expect(find.byKey(const Key('background-claude-install')), findsNothing);
     expect(find.byKey(const Key('background-claude-remove')), findsNothing);
@@ -616,11 +621,11 @@ void main() {
     expect(find.text('Update Codex lifecycle hooks'), findsOneWidget);
     await tester.tap(find.byKey(const Key('background-claude-copy-path')));
     await tester.pumpAndSettle();
-    expect(copied, [r'C:\Users\a\.claude\settings.json']);
+    expect(copied, [_claudeSettings]);
     expect(announcer.messages.last, 'Path copied.');
     await tester.tap(find.byKey(const Key('background-claude-open-folder')));
     await tester.pumpAndSettle();
-    expect(opened, [r'C:\Users\a\.claude']);
+    expect(opened, [p.join(_home, '.claude')]);
   });
 
   testWidgets('an unsupported scheduler shows a plain statement', (

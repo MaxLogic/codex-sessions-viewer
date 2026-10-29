@@ -1,6 +1,10 @@
+import 'dart:io';
+
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
+import 'package:codex_sessions_viewer/src/platform/app_locations.dart';
 import 'package:codex_sessions_viewer/src/voice_over/voice_over_service.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 
 void main() {
   test('plays configured static WAV when enabled and available', () async {
@@ -15,7 +19,7 @@ void main() {
 
     await service.staticEvent(VoiceOverStaticEvent.copied);
 
-    expect(player.played, [r'assets\voice\copied.wav']);
+    expect(player.played, [_defaultWav('copied')]);
     expect(announcer.messages, isEmpty);
   });
 
@@ -31,7 +35,7 @@ void main() {
 
     await service.staticEvent(VoiceOverStaticEvent.exportFinished);
 
-    expect(player.played, [r'assets\voice\export_finished.wav']);
+    expect(player.played, [_defaultWav('export_finished')]);
     expect(announcer.messages, ['Export finished']);
   });
 
@@ -51,3 +55,11 @@ void main() {
     expect(announcer.messages, ['Refresh finished. 9 sessions visible.']);
   });
 }
+
+/// Windows defaults name the WAV relative to the app folder; other platforms
+/// use the bundled assets folder.
+String _defaultWav(String event) => p.join(
+  Platform.isWindows ? 'assets' : AppLocations.current().assetsDirectory.path,
+  'voice',
+  '$event.wav',
+);

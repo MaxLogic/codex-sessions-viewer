@@ -360,10 +360,8 @@ String _dartExecutable() {
   final separator = Platform.isWindows ? ';' : ':';
   final executableName = Platform.isWindows ? 'dart.exe' : 'dart';
   for (final entry in (Platform.environment['PATH'] ?? '').split(separator)) {
-    final direct = File([entry, executableName].join(Platform.pathSeparator));
-    if (direct.existsSync()) {
-      return direct.path;
-    }
+    // Flutter's bin folder also holds a `dart` launcher script on Linux and
+    // macOS; prefer the SDK binary behind it.
     final flutterSdk = File(
       [
         entry,
@@ -375,6 +373,10 @@ String _dartExecutable() {
     );
     if (flutterSdk.existsSync()) {
       return flutterSdk.path;
+    }
+    final direct = File([entry, executableName].join(Platform.pathSeparator));
+    if (direct.existsSync()) {
+      return direct.path;
     }
   }
   throw StateError('Unable to locate the Dart SDK executable.');

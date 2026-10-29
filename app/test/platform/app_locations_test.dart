@@ -58,6 +58,8 @@ void main() {
         p.join(root.path, 'Roaming', 'CodexSessionViewer', 'settings.toml'),
       );
     },
+    // The adjacent-settings probe needs Windows paths on a Windows disk.
+    skip: Platform.isWindows ? false : 'Windows locations need a Windows host.',
   );
 
   test('macOS uses user support, logs, caches and app resources', () {
@@ -144,14 +146,19 @@ void main() {
       final root = await Directory.systemTemp.createTemp('locations-sample-');
       addTearDown(() => root.delete(recursive: true));
       final locations = AppLocations.resolve(
-        platform: AppHostPlatform.windows,
+        platform: AppLocations.currentPlatform,
         environment: {
           'APPDATA': p.join(root.path, 'Roaming'),
           'LOCALAPPDATA': p.join(root.path, 'Local'),
+          'HOME': p.join(root.path, 'home'),
         },
-        executablePath: p.join(root.path, 'viewer.exe'),
+        executablePath: p.join(
+          root.path,
+          Platform.isWindows ? 'viewer.exe' : 'viewer',
+        ),
       );
-      final sample = File(p.join(root.path, 'settings.sample.toml'));
+      final sample = locations.sampleSettingsFile;
+      await sample.parent.create(recursive: true);
       await sample.writeAsString(
         '[app]\nfirst_run = true\n[paths]\nwindows_codex_path = ""\nwsl_codex_unc_path = ""\n[wsl]\ndistro = ""\nlinux_home = ""\nlinux_root_unc = ""\n',
       );

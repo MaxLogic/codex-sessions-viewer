@@ -1037,25 +1037,31 @@ void main() {
       );
     });
 
-    test('the schedule runs the launcher next to the collector', () async {
-      final collection = build();
-      await collection.installSchedule();
-      final request = scheduler.installed!;
-      expect(
-        request.launcherExecutable,
-        r'C:\Apps\codex-sessions-scan-launcher.exe',
-      );
-      expect(request.databaseFile, r'C:\db.sqlite');
-      expect(request.settingsFile, r'C:\settings.toml');
-      expect(request.enabled, isTrue);
-      scheduler.failure = const CollectorAutostartException('denied');
-      await expectLater(
-        collection.installSchedule(),
-        throwsA(isA<BackgroundCollectionException>()),
-      );
-      await collection.removeSchedule();
-      expect(scheduler.removed, 1);
-    });
+    test(
+      'the schedule runs the launcher next to the collector',
+      () async {
+        final collection = build();
+        await collection.installSchedule();
+        final request = scheduler.installed!;
+        expect(
+          request.launcherExecutable,
+          r'C:\Apps\codex-sessions-scan-launcher.exe',
+        );
+        expect(request.databaseFile, r'C:\db.sqlite');
+        expect(request.settingsFile, r'C:\settings.toml');
+        expect(request.enabled, isTrue);
+        scheduler.failure = const CollectorAutostartException('denied');
+        await expectLater(
+          collection.installSchedule(),
+          throwsA(isA<BackgroundCollectionException>()),
+        );
+        await collection.removeSchedule();
+        expect(scheduler.removed, 1);
+      },
+      skip: Platform.isWindows
+          ? false
+          : 'Only Windows Task Scheduler runs the scan launcher.',
+    );
 
     test(
       'a missing launcher stops the schedule with a clear message',

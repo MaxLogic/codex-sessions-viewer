@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:codex_sessions_viewer/src/benchmark/usage_projection_benchmark.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -82,5 +83,8 @@ void main() {
       );
       expect(mismatchErrors.toString(), contains('hash mismatch'));
     },
+    skip: Platform.isWindows
+        ? false
+        : 'The benchmark CLI refuses to run outside Windows.',
   );
 }

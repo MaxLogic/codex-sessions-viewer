@@ -5,6 +5,7 @@ import 'package:codex_sessions_viewer/src/commands/resume_command_generator.dart
 import 'package:codex_sessions_viewer/src/config/app_settings.dart';
 import 'package:codex_sessions_viewer/src/database/database_maintenance.dart';
 import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
+import 'package:codex_sessions_viewer/src/ui/models/session_label_formatter.dart';
 import 'package:codex_sessions_viewer/src/ui/screens/sessions_screen.dart';
 import 'package:codex_sessions_viewer/src/usage/usage_summary.dart';
 import 'package:flutter/material.dart';
@@ -71,9 +72,19 @@ void _main() {
       wslProjectResolver: const _NoWslProjects(),
     );
     final firstScan = await controller.refresh();
+    // The collector reads WSL roots only on Windows hosts; elsewhere the
+    // native root holds the host's own sessions.
+    final native = Platform.isWindows
+        ? SessionRowPlatform.windows
+        : Platform.isMacOS
+        ? SessionRowPlatform.macos
+        : SessionRowPlatform.linux;
+    final scanned = Platform.isWindows
+        ? [SessionRowPlatform.windows, SessionRowPlatform.wsl]
+        : [native];
     expect(
       firstScan.rows.map((row) => row.platform).toSet(),
-      containsAll([SessionRowPlatform.windows, SessionRowPlatform.wsl]),
+      containsAll(scanned),
     );
 
     final db = sqlite3.open(dbFile.path);
@@ -85,15 +96,15 @@ void _main() {
                 )
                 .single[column]
             as int;
-    expect(lastRun('files_parsed'), 2);
+    expect(lastRun('files_parsed'), scanned.length);
 
     final unchangedScan = await controller.refresh();
     expect(unchangedScan.rows, hasLength(firstScan.rows.length));
-    expect(lastRun('files_skipped'), 2);
+    expect(lastRun('files_skipped'), scanned.length);
     expect(lastRun('files_parsed'), 0);
 
     final windowsRow = firstScan.rows.firstWhere(
-      (row) => row.platform == SessionRowPlatform.windows,
+      (row) => row.platform == native,
     );
     final reloaded = await controller.reloadSessionDetailFromSource(
       windowsRow.id,
@@ -124,7 +135,11 @@ void _main() {
     expect(summary.totalSessions, firstScan.rows.length);
     expect(
       summary.byPlatform.map((row) => row.key),
-      containsAll(['Windows', 'WSL']),
+      containsAll(
+        Platform.isWindows
+            ? ['Windows', 'WSL']
+            : [SessionLabelFormatter.sourceType(native.name)],
+      ),
     );
   });
 

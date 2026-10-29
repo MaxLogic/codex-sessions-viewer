@@ -686,6 +686,8 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: SettingsScreen(
+          // The WSL section and UNC field are Windows layout.
+          hostPlatform: AppHostPlatform.windows,
           initialSettings: AppSettings.defaults(),
           announcer: announcer,
           onSave: (settings) async {
@@ -809,6 +811,7 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: SettingsScreen(
+          hostPlatform: AppHostPlatform.windows,
           initialSettings: AppSettings.defaults(),
           onReload: () async => reloaded,
         ),
