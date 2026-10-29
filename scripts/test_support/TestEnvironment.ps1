@@ -224,9 +224,11 @@ function Assert-TestExecutable {
     $resolved = (Get-Command $FilePath -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     if (-not $resolved -and (Test-Path -LiteralPath $FilePath -PathType Leaf)) { $resolved = [IO.Path]::GetFullPath($FilePath) }
     if (-not $resolved) { throw "Test profile isolation rejected unknown executable: $FilePath" }
+    # Compare normalized spellings: a PATH entry such as a CI FLUTTER_ROOT can use '/'.
+    $resolved = [IO.Path]::GetFullPath($resolved)
     # Rustup's installed cargo proxy is a known tool alias. Resolve that one
     # leaf link explicitly; every parent and every build-output reparse is denied.
-    $cargoProxy = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $cargoProxy = [IO.Path]::GetFullPath((Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
     $cursor = $resolved
     if ($resolved -eq $cargoProxy) {
         $item = Get-Item -LiteralPath $resolved -Force
@@ -242,7 +244,7 @@ function Assert-TestExecutable {
     }
     $native = @('debug','release') | ForEach-Object {
         $mode = $_
-        @('collector','hub','scan-launcher') | ForEach-Object { Join-Path $repo "collector/target/$mode/codex-sessions-$_.exe" }
+        @('collector','hub','scan-launcher') | ForEach-Object { [IO.Path]::GetFullPath((Join-Path $repo "collector/target/$mode/codex-sessions-$_.exe")) }
     }
     if ($resolved -in $native) {
         if ([IO.Path]::GetFileName($resolved) -eq 'codex-sessions-hub.exe') {
@@ -262,14 +264,14 @@ function Assert-TestExecutable {
         }
         return
     }
-    $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $python = [IO.Path]::GetFullPath((Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
     if ($resolved -eq $python -and $ArgumentList.Count -eq 3 -and $ArgumentList[0] -eq '-I' -and $ArgumentList[1] -eq (Join-Path $PSScriptRoot 'validate_settings.py')) {
         Assert-TestPath $Context $ArgumentList[2] -WorkingDirectory $WorkingDirectory
         return
     }
     # The build orchestrator has exactly two permitted test invocations.
-    $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-    $flutter = (Get-Command flutter -ErrorAction Stop | Select-Object -First 1).Source
+    $cargo = [IO.Path]::GetFullPath((Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
+    $flutter = [IO.Path]::GetFullPath((Get-Command flutter -ErrorAction Stop | Select-Object -First 1).Source)
     if ($resolved -eq $cargo -and ($ArgumentList -join '|') -eq 'test|--locked|--no-fail-fast' -and $WorkingDirectory -eq (Join-Path $repo 'collector')) { return }
     if ($resolved -eq $flutter -and ($ArgumentList -join '|') -in @('test','test|integration_test') -and $WorkingDirectory -eq (Join-Path $repo 'app')) { return }
     if ($resolved -eq $env:ComSpec -and ($ArgumentList -join '|') -eq '/d|/c|exit 7') { return }
