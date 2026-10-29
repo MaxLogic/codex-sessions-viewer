@@ -962,7 +962,7 @@ mod signals {
                 // handler is signal-safe and previous dispositions are retained for restoration.
                 unsafe {
                     let mut action: libc::sigaction = std::mem::zeroed();
-                    action.sa_sigaction = handler as usize;
+                    action.sa_sigaction = handler as *const () as usize;
                     libc::sigemptyset(&mut action.sa_mask);
                     let mut old_int = std::mem::zeroed();
                     let mut old_term = std::mem::zeroed();
@@ -973,7 +973,7 @@ mod signals {
                         libc::sigaction(libc::SIGINT, &old_int, std::ptr::null_mut());
                         return Err(io::Error::last_os_error());
                     }
-                    return Ok(Self { old_int, old_term });
+                    Ok(Self { old_int, old_term })
                 }
             }
             #[cfg(not(unix))]

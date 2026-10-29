@@ -381,6 +381,8 @@ def package(repo, native, binaries, output, target, run, identity=None, profile=
             shutil.copy2(readme, resources / "README.md")
         else:
             (resources / "README.md").write_text("# Codex Session Viewer\nSee docs/release-validation.md for native installation.\n")
+        if (repo / "LICENSE").is_file():
+            shutil.copy2(repo / "LICENSE", resources / "LICENSE")
         validate_tree(bundle)
         text = require_step(run, "collector-version", [str(exe_dir / BINARIES[0]), "version"], stage)
         if not re.search(r"^codex-sessions-collector " + re.escape(collector_version) + r"(?:\s|$)", text, re.MULTILINE):
@@ -507,8 +509,10 @@ def input_identity(repo):
 
 def ninja_shim(directory, ninja):
     shim = Path(directory) / "ninja"
-    shim.write_text("#!/usr/bin/env python3\nimport os,sys\nos.execv(" + repr(str(ninja))
-                    + ", [" + repr(str(ninja)) + "] + sys.argv[1:] + ['-j2'])\n")
+    # Subtools (-t restat, used by CMake) take their own arguments and build nothing.
+    shim.write_text("#!/usr/bin/env python3\nimport os,sys\nargs=sys.argv[1:]\n"
+                    "if '-t' not in args:\n    args += ['-j2']\n"
+                    "os.execv(" + repr(str(ninja)) + ", [" + repr(str(ninja)) + "] + args)\n")
     shim.chmod(0o755)
     return shim
 

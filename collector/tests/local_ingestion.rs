@@ -733,11 +733,15 @@ fn normalized_parser_output_matches_the_goldens() {
             std::fs::write(&golden_path, format!("{text}\n")).unwrap();
             continue;
         }
-        let golden: Value = serde_json::from_str(
+        let mut golden: Value = serde_json::from_str(
             &std::fs::read_to_string(&golden_path)
                 .unwrap_or_else(|error| panic!("{golden_path}: {error}")),
         )
         .unwrap();
+        // Goldens are recorded on Windows; a plain local file is the host's own source.
+        if golden["source_type"] == "windows" {
+            golden["source_type"] = json!(SourceType::native().wire_name());
+        }
         if let Some(difference) = first_difference(name, &golden, &actual) {
             failures.push(difference);
         }

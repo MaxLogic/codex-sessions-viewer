@@ -369,6 +369,9 @@ class RunnerTests(unittest.TestCase):
         code, output = runner("ninja-shim", [str(shim), "-j8", "path ; unchanged"], self.root)
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output), ["-j8", "path ; unchanged", "-j2"])
+        code, output = runner("ninja-tool", [str(shim), "-C", "scratch", "-t", "restat", "build.ninja"], self.root)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), ["-C", "scratch", "-t", "restat", "build.ninja"])
 
     @unittest.skipIf(os.name == "nt", "real POSIX executable shim")
     def test_xcrun_shim_bounds_xcode_projects_and_preserves_other_tools(self):
