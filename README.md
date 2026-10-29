@@ -48,6 +48,9 @@ folder and run `./codex_sessions_viewer` from it. The app needs GTK 3, which
 desktop distributions normally include. The release is built and tested on
 Ubuntu 24.04. To add it to your application menu, see
 [native releases](docs/release-validation.md#native-macos-and-linux-releases).
+On Linux, stopping a database maintenance job (optimize, index or migration)
+takes effect when its current step finishes, because the bundled SQLite
+cannot abort a running statement there.
 
 Each archive contains the viewer, the `codex-sessions-collector` that parses
 session files, the `codex-sessions-hub` server, and on Windows the windowless
