@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Hub sync reconstructs size-refused dead letters under the collector lease before taking SQLite's write lock, then commits each current snapshot/status pair and deletes its old letter in separate chunks with the existing 150 ms viewer-write gap. Historical payloads are never replayed.
+
 - Bulk collection groups small sessions into bounded transactions while retaining the 150 ms viewer-write gap; large sessions and identity merges remain isolated.
 
 ### Added

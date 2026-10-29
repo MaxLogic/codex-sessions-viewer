@@ -165,3 +165,206 @@ impl Transport for ContinueTransport {
         self.inner.is_tls()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct Input {
+        buffers: LazyBuffers,
+        chunks: VecDeque<Result<Vec<u8>, ureq::Timeout>>,
+        sent: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Transport for Input {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+        fn transmit_output(&mut self, amount: usize, _: NextTimeout) -> Result<(), ureq::Error> {
+            self.sent
+                .lock()
+                .unwrap()
+                .extend_from_slice(&self.buffers.output()[..amount]);
+            Ok(())
+        }
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            assert!(timeout.after <= Duration::from_secs(1).into());
+            match self.chunks.pop_front() {
+                Some(Ok(bytes)) => {
+                    self.buffers.input_append_buf()[..bytes.len()].copy_from_slice(&bytes);
+                    self.buffers.input_appended(bytes.len());
+                    Ok(true)
+                }
+                Some(Err(reason)) => Err(ureq::Error::Timeout(reason)),
+                None => Ok(false),
+            }
+        }
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+    use std::time::Duration;
+    fn transport(chunks: Vec<Result<Vec<u8>, ureq::Timeout>>) -> ContinueTransport {
+        ContinueTransport {
+            inner: Box::new(Input {
+                buffers: LazyBuffers::new(128 * 1024, 3),
+                chunks: chunks.into(),
+                sent: Arc::default(),
+            }),
+            buffers: LazyBuffers::new(2 * MAX_HEAD_BYTES, 16 * 1024),
+            head: Vec::new(),
+            interim_responses: 0,
+            final_response: false,
+        }
+    }
+    fn timeout() -> NextTimeout {
+        NextTimeout {
+            after: Duration::from_secs(1).into(),
+            reason: ureq::Timeout::RecvResponse,
+        }
+    }
+    fn drain(transport: &mut ContinueTransport) -> Result<Vec<u8>, ureq::Error> {
+        let mut bytes = Vec::new();
+        while transport.await_input(timeout())? {
+            let input = transport.buffers().input();
+            bytes.extend_from_slice(input);
+            let len = input.len();
+            transport.buffers().input_consume(len);
+        }
+        Ok(bytes)
+    }
+    #[test]
+    fn every_split_and_coalesced_heads_preserve_body_bytes() {
+        let wire=b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\nServer: Caddy\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n\0\xff\r\n100xyz";
+        let expected=b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n\0\xff\r\n100xyz";
+        for split in 0..=wire.len() {
+            let chunks = [&wire[..split], &wire[split..]]
+                .into_iter()
+                .filter(|b| !b.is_empty())
+                .map(|b| Ok(b.to_vec()))
+                .collect();
+            assert_eq!(
+                drain(&mut transport(chunks)).unwrap(),
+                expected,
+                "split={split}"
+            );
+        }
+        assert_eq!(
+            drain(&mut transport(
+                wire.chunks(1).map(|b| Ok(b.to_vec())).collect()
+            ))
+            .unwrap(),
+            expected
+        );
+    }
+    #[test]
+    fn no_continue_and_other_informational_responses_are_unchanged() {
+        for wire in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nyes".as_slice(),
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\n\r\nraw\0bytes",
+            b"HTTP/1.1 103 Early Hints\r\nLink: </test>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nyes",
+        ] {
+            for split in 0..=wire.len() {
+                let chunks=[&wire[..split],&wire[split..]].into_iter().filter(|b| !b.is_empty()).map(|b| Ok(b.to_vec())).collect();
+                assert_eq!(drain(&mut transport(chunks)).unwrap(),wire,"split={split}");
+            }
+        }
+        let mut filter=transport(vec![Ok(b"HTTP/1.1 103 Early Hints\r\nLink: </test>\r\n\r\nHTTP/1.1 100 Continue\r\nServer: Caddy\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n".to_vec())]);
+        assert_eq!(drain(&mut filter).unwrap(),b"HTTP/1.1 103 Early Hints\r\nLink: </test>\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n");
+    }
+    #[test]
+    fn sixteen_interims_are_allowed_and_seventeen_are_refused() {
+        for count in [16, 17] {
+            let mut wire = b"HTTP/1.1 100 Continue\r\nServer: Caddy\r\n\r\n".repeat(count);
+            wire.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+            let result = drain(&mut transport(vec![Ok(wire)]));
+            if count == 16 {
+                let mut expected = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(count);
+                expected.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+                assert_eq!(result.unwrap(), expected);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("too many informational responses")
+                );
+            }
+        }
+    }
+    #[test]
+    fn partial_head_timeout_retains_bytes_and_timeout_reason() {
+        let mut filter = transport(vec![
+            Ok(b"HTTP/1.1 100 Continue\r\nServer:".to_vec()),
+            Err(ureq::Timeout::Await100),
+            Ok(b" Caddy\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n".to_vec()),
+        ]);
+        assert!(matches!(
+            filter.await_input(NextTimeout {
+                reason: ureq::Timeout::Await100,
+                ..timeout()
+            }),
+            Err(ureq::Error::Timeout(ureq::Timeout::Await100))
+        ));
+        assert!(
+            filter.buffers().input().is_empty(),
+            "never emit a partial head"
+        );
+        assert_eq!(
+            drain(&mut filter).unwrap(),
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"
+        );
+        let mut expired = transport(vec![Ok(b"HTTP/1.1 100".to_vec())]);
+        assert!(matches!(
+            expired.await_input(NextTimeout {
+                after: Duration::ZERO.into(),
+                ..timeout()
+            }),
+            Err(ureq::Error::Timeout(ureq::Timeout::RecvResponse))
+        ));
+    }
+    #[test]
+    fn two_exchanges_reuse_one_pooled_connection() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            for body in [b"one", b"two"] {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                assert!(String::from_utf8_lossy(&head).starts_with("GET /"));
+                socket.write_all(b"HTTP/1.1 100 Continue\r\nServer: Caddy\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n").unwrap();
+                socket.write_all(body).unwrap();
+                socket.flush().unwrap();
+            }
+        });
+        let agent = agent(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(5)))
+                .build(),
+        );
+        for body in ["one", "two"] {
+            assert_eq!(
+                agent
+                    .get(format!("http://{address}/"))
+                    .call()
+                    .unwrap()
+                    .body_mut()
+                    .read_to_string()
+                    .unwrap(),
+                body
+            );
+        }
+        server.join().unwrap();
+    }
+}
