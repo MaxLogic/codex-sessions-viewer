@@ -44,7 +44,8 @@ collector at that path. The executables are not code-signed, so SmartScreen may
 ask for confirmation on first start.
 
 **Linux (x64):** extract `codex_sessions_viewer_linux.tar.gz` to a permanent
-folder and run `./codex_sessions_viewer` from it. The app needs GTK 3, which
+folder. It unpacks into a `linux` folder; run `./codex_sessions_viewer` from
+there. The app needs GTK 3, which
 desktop distributions normally include. The release is built and tested on
 Ubuntu 24.04. To add it to your application menu, see
 [native releases](docs/release-validation.md#native-macos-and-linux-releases).
