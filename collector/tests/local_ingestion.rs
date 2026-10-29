@@ -3736,3 +3736,46 @@ fn a_reparse_of_the_same_file_replaces_the_row_even_if_it_now_ends_earlier() {
     assert_eq!(rescanned, linked(&Connection::open(&reference_db).unwrap()));
     assert!(rescanned.iter().any(|(_, index)| index.is_some()));
 }
+#[test]
+fn prepared_envelope_matches_in_lock_serialization() {
+    use codex_sessions_collector::{
+        contract::{Envelope, Record},
+        store::{OwnerMode, Store, writer::SessionPreparationScope},
+    };
+    let temp = support::TempDir::new("prepared_json");
+    for version in [1, 2] {
+        let store = Store::open(
+            &temp.path().join(format!("{version}.sqlite")),
+            OwnerMode::Standalone,
+        )
+        .unwrap();
+        store
+            .conn
+            .execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','fixture')", [])
+            .unwrap();
+        let snapshot = support::sample_snapshot("envelope");
+        let envelope = Envelope {
+            contract: codex_sessions_collector::contract::CONTRACT_NAME.to_owned(),
+            version,
+            record: Record::SessionSnapshot(Box::new(snapshot)),
+        };
+        let expected = serde_json::to_string(&envelope).unwrap();
+        store.apply(vec![envelope.clone()]).unwrap();
+        let prepared: String = store
+            .conn
+            .query_row("select record_json from collector_upload_outbox", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(prepared, expected);
+        let _scope = SessionPreparationScope::enter(Some(0), |_| {});
+        store.apply(vec![envelope]).unwrap();
+        let in_lock: String = store
+            .conn
+            .query_row("select record_json from collector_upload_outbox", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(prepared, in_lock);
+    }
+}

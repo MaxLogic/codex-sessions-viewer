@@ -8,6 +8,331 @@ use codex_sessions_collector::store::{
 };
 use rusqlite::Connection;
 
+// These tests assert physical elapsed-time admission decisions. Concurrent
+// sibling schema bootstraps can consume the 125 ms join window even for a
+// four-session fixture. Serialize fixtures; tests retain their explicit
+// concurrent writer/viewer actors.
+fn budget_test() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[test]
+fn a_context_changed_between_plan_and_lock_falls_back() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        writer::{self, SessionPreparationScope},
+    };
+    let temp = support::TempDir::new("stale_context");
+    let store = Store::open(&temp.path().join("test.sqlite"), OwnerMode::Standalone).unwrap();
+    let snapshot = support::sample_snapshot("context");
+    writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
+    let old: i64 = store
+        .conn
+        .query_row(
+            "select path_context_id from usage_events limit 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scope = SessionPreparationScope::enter(None, |conn| {
+        assert!(conn.is_autocommit());
+        conn.execute_batch(
+            "pragma foreign_keys=off;
+            create temp table recreated_context as select * from usage_path_contexts;
+            update recreated_context set id=id+1000;
+            delete from usage_path_context_aliases; delete from usage_path_contexts;
+            insert into usage_path_contexts select * from recreated_context;
+            drop table recreated_context; pragma foreign_keys=on;",
+        )
+        .unwrap();
+    });
+    writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
+    assert_eq!(scope.fallbacks(), 1);
+    drop(scope);
+    let ids: Vec<i64> = store
+        .conn
+        .prepare("select path_context_id from usage_events")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![old + 1000; 2]);
+    let digest: String = store
+        .conn
+        .query_row("select content_hash from sessions", [], |r| r.get(0))
+        .unwrap();
+    // Force the ordinary in-lock build with the authoritative new context id.
+    let scope = SessionPreparationScope::enter(Some(0), |_| {});
+    writer::apply_session_batch(&store.conn, vec![snapshot]).unwrap();
+    assert_eq!(scope.fallbacks(), 0);
+    let fresh: String = store
+        .conn
+        .query_row("select content_hash from sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(digest, fresh);
+    let violations: i64 = store
+        .conn
+        .query_row("select count(*) from pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+}
+
+#[test]
+fn a_stored_digest_changed_between_plan_and_lock_rewrites_rows() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        writer::{self, SessionPreparationScope},
+    };
+    let temp = support::TempDir::new("stale_digest");
+    let store = Store::open(&temp.path().join("test.sqlite"), OwnerMode::Standalone).unwrap();
+    let snapshot = support::sample_snapshot("digest");
+    writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
+    let expected = support::content_snapshot(std::path::Path::new(&store.path));
+    let scope = SessionPreparationScope::enter(None, |conn| {
+        assert!(conn.is_autocommit());
+        conn.execute_batch("update sessions set content_hash='changed'; update messages set content_plain='stale';").unwrap();
+    });
+    writer::apply_session_batch(&store.conn, vec![snapshot]).unwrap();
+    assert_eq!(scope.fallbacks(), 1);
+    assert_eq!(
+        expected,
+        support::content_snapshot(std::path::Path::new(&store.path))
+    );
+}
+
+#[test]
+fn unknown_context_uses_the_in_lock_path() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        write_budget::{WriteBudget, WriteBudgetScope},
+        writer::{self, SessionPreparationScope},
+    };
+    let temp = support::TempDir::new("unknown_context");
+    let mut outputs = Vec::new();
+    for limit in [Some(0), None] {
+        let store = Store::open(
+            &temp.path().join(format!("{limit:?}.sqlite")),
+            OwnerMode::Standalone,
+        )
+        .unwrap();
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        });
+        let input: Vec<_> = ["a", "b"].map(support::sample_snapshot).into();
+        let scope = SessionPreparationScope::enter(limit, |conn| {
+            let count: i64 = conn
+                .query_row("select count(*) from usage_path_contexts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "planning must leave only the schema's unassigned context"
+            );
+        });
+        writer::apply_session_batch(&store.conn, input).unwrap();
+        assert_eq!(scope.fallbacks(), 0);
+        let contexts: i64 = store
+            .conn
+            .query_row("select count(*) from usage_path_contexts", [], |r| r.get(0))
+            .unwrap();
+        let aliases: i64 = store
+            .conn
+            .query_row("select count(*) from usage_path_context_aliases", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!((contexts, aliases), (2, 1));
+        outputs.push(support::content_snapshot(std::path::Path::new(&store.path)));
+    }
+    assert_eq!(outputs[0], outputs[1]);
+}
+
+#[test]
+fn prepare_budget_falls_back_beyond_64_mib() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        write_budget::{WriteBudget, WriteBudgetScope},
+        writer::{self, SessionPreparationScope},
+    };
+    let temp = support::TempDir::new("prepare_cap");
+    let mut outputs = Vec::new();
+    for limit in [Some(0), Some(400 * 1024), None] {
+        let store = Store::open(
+            &temp.path().join(format!("{limit:?}.sqlite")),
+            OwnerMode::Standalone,
+        )
+        .unwrap();
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        });
+        let mut input: Vec<_> = ["a", "b", "c"].map(support::sample_snapshot).into();
+        for s in &mut input {
+            s.messages[0].content_plain = "x".repeat(300 * 1024);
+        }
+        writer::apply_session_batch(&store.conn, input.clone()).unwrap();
+        let _scope = SessionPreparationScope::enter(limit, |_| {});
+        let holds = WriteHoldScope::start();
+        writer::apply_session_batch(&store.conn, input).unwrap();
+        assert_eq!(
+            holds.report().transactions,
+            if limit.is_none() { 1 } else { 3 }
+        );
+        outputs.push(support::content_snapshot(std::path::Path::new(&store.path)));
+    }
+    assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn identity_merges_stay_isolated_when_unchanged() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        write_budget::{WriteBudget, WriteBudgetScope},
+        writer,
+    };
+    let temp = support::TempDir::new("unchanged_merge");
+    let store = Store::open(&temp.path().join("test.sqlite"), OwnerMode::Standalone).unwrap();
+    let _budget = WriteBudgetScope::enter(WriteBudget {
+        gap: Duration::ZERO,
+        ..WriteBudget::default()
+    });
+    let input: Vec<_> = ["a", "b", "c"].map(support::sample_snapshot).into();
+    writer::apply_session_batch(&store.conn, input.clone()).unwrap();
+    store.conn.execute("insert into sessions(id,session_id,harness,source_type,source_file_path,display_path,platform_path,scan_status,source_state,parse_status,created_at_utc,updated_at_utc,last_scanned_utc) values('source-status:c:/synthetic/b.jsonl',null,'codex','windows','C:/synthetic/b.jsonl','C:/synthetic/b.jsonl','C:/synthetic/b.jsonl','available','active','available','now','now','now')",[]).unwrap();
+    let scope = WriteHoldScope::start();
+    writer::apply_session_batch(&store.conn, input).unwrap();
+    assert_eq!(scope.report().transactions, 3);
+    assert_eq!(
+        store
+            .conn
+            .query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn unchanged_large_sessions_share_a_transaction() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        write_budget::{WriteBudget, WriteBudgetScope},
+        writer,
+    };
+    let temp = support::TempDir::new("unchanged_large");
+    let store = Store::open(&temp.path().join("test.sqlite"), OwnerMode::Standalone).unwrap();
+    let _budget = WriteBudgetScope::enter(WriteBudget {
+        gap: Duration::ZERO,
+        ..WriteBudget::default()
+    });
+    let mut input: Vec<_> = ["a", "b", "c", "d"].map(support::sample_snapshot).into();
+    input[0].messages = (0..300)
+        .map(|index| {
+            let mut m = input[1].messages[0].clone();
+            m.index = index;
+            m
+        })
+        .collect();
+    input[2].tool_calls = (0..400)
+        .map(|index| {
+            let mut t = input[1].tool_calls[0].clone();
+            t.tool_index = index;
+            t
+        })
+        .collect();
+    let first = WriteHoldScope::start();
+    writer::apply_session_batch(&store.conn, input.clone()).unwrap();
+    assert_eq!(first.report().transactions, 4);
+    let second = WriteHoldScope::start();
+    writer::apply_session_batch(&store.conn, input).unwrap();
+    assert_eq!(
+        second.report().transactions,
+        1,
+        "unchanged large sessions must share the transaction"
+    );
+}
+
+#[test]
+fn unchanged_admission_respects_predicted_cost_and_write_bytes() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store,
+        write_budget::{WriteBudget, WriteBudgetScope},
+        writer,
+    };
+    let temp = support::TempDir::new("unchanged_bytes");
+    let mut results = Vec::new();
+    for soft in [Duration::ZERO, WriteBudget::default().soft] {
+        let store = Store::open(
+            &temp.path().join(format!("{}.sqlite", soft.as_millis())),
+            OwnerMode::Standalone,
+        )
+        .unwrap();
+        store
+            .conn
+            .execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','fixture')", [])
+            .unwrap();
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            soft,
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        });
+        let mut input: Vec<_> = ["a", "b", "c", "d"].map(support::sample_snapshot).into();
+        for s in &mut input[..3] {
+            s.messages[0].content_plain = "x".repeat(3 * 1024 * 1024);
+        }
+        input[3].tool_calls = (0..15000)
+            .map(|index| {
+                let mut t = input[3].tool_calls[0].clone();
+                t.tool_index = index;
+                t
+            })
+            .collect();
+        writer::apply_session_batch(&store.conn, input.clone()).unwrap();
+        let scope = WriteHoldScope::start();
+        writer::apply_session_batch(&store.conn, input).unwrap();
+        assert_eq!(
+            scope.report().transactions,
+            if soft.is_zero() { 4 } else { 3 },
+            "two 3 MiB envelopes join, third splits, costly unit isolates"
+        );
+        results.push(support::content_snapshot(std::path::Path::new(&store.path)));
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn digest_bytes_are_unchanged() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{OwnerMode, Store, writer};
+    let temp = support::TempDir::new("digest_golden");
+    let store = Store::open(&temp.path().join("test.sqlite"), OwnerMode::Standalone).unwrap();
+    let snapshot = support::sample_snapshot("digest-golden");
+    writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
+    // The first write has an unknown context. The second exercises the
+    // partial message/tool hasher completed with read-only planned usage ids.
+    writer::apply_session_batch(&store.conn, vec![snapshot]).unwrap();
+    let digest: String = store
+        .conn
+        .query_row("select content_hash from sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        digest,
+        "93ce84a5d2e4202f56346a4921766ec7f072642e29a049ad24c9149454652274"
+    );
+}
+
 fn admission_chunks(
     costs: Vec<codex_sessions_collector::store::write_budget::UnitCost>,
     sleeps: &[Duration],
@@ -59,9 +384,12 @@ fn admission_chunks(
 
 #[test]
 fn admission_composition_follows_class_count_and_byte_caps() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::UnitCost::{Isolated, Small};
     let small = Small { bytes: 1024 };
-    let big = Small { bytes: 600 * 1024 };
+    let big = Small {
+        bytes: 5 * 1024 * 1024,
+    };
     let mut input = vec![small, small, small, Isolated, small, small, Isolated];
     input.extend(std::iter::repeat_n(small, 40));
     input.extend([big, big, big]);
@@ -78,6 +406,7 @@ fn admission_composition_follows_class_count_and_byte_caps() {
 
 #[test]
 fn admission_stops_at_half_soft_and_falls_back_after_a_slow_small_unit() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::UnitCost::Small;
     let small = Small { bytes: 1 };
     let soft = Duration::from_millis(400);
@@ -117,6 +446,7 @@ fn admission_stops_at_half_soft_and_falls_back_after_a_slow_small_unit() {
 
 #[test]
 fn soft_zero_isolates_every_unit() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::UnitCost::{Isolated, Small};
     assert_eq!(
         admission_chunks(
@@ -135,6 +465,7 @@ fn soft_zero_isolates_every_unit() {
 
 #[test]
 fn admission_failures_preserve_the_first_error_and_transaction_semantics() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{
         write_budget::{UnitCost, WriteBudget, in_write_transaction, write_admitted},
         write_lease::WriteLease,
@@ -216,6 +547,7 @@ fn admission_failures_preserve_the_first_error_and_transaction_semantics() {
 
 #[test]
 fn admission_savepoint_release_failure_never_reports_success() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{
         write_budget::{UnitCost, WriteBudget, write_admitted},
         write_lease::WriteLease,
@@ -258,6 +590,7 @@ fn admission_savepoint_release_failure_never_reports_success() {
 
 #[test]
 fn session_admission_isolates_large_and_merging_sessions() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{
         OwnerMode, Store,
         write_budget::{WriteBudget, WriteBudgetScope, WriteChunkScope},
@@ -381,6 +714,7 @@ fn unsupported_status(path: &str) -> codex_sessions_collector::contract::SourceS
 
 #[test]
 fn status_lock_work_scales_with_changes_and_70k_unchanged_rows_do_not_write() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::writer;
     use std::sync::atomic::Ordering;
     let mut measured = Vec::new();
@@ -414,6 +748,7 @@ fn status_lock_work_scales_with_changes_and_70k_unchanged_rows_do_not_write() {
 
 #[test]
 fn status_full_input_t2_stays_below_reviewed_bound() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{
         write_budget::{WriteBudget, WriteBudgetScope, WriteChunkScope},
         writer,
@@ -483,6 +818,7 @@ fn status_full_input_t2_stays_below_reviewed_bound() {
 
 #[test]
 fn compressed_noop_preserves_placeholder_metadata_journal_and_hub_queue() {
+    let _serial = budget_test();
     use codex_sessions_collector::{
         codex::{
             self,
@@ -547,6 +883,7 @@ fn compressed_noop_preserves_placeholder_metadata_journal_and_hub_queue() {
 
 #[test]
 fn steady_state_full_scan_with_compressed_sources_has_zero_write_transactions() {
+    let _serial = budget_test();
     use codex_sessions_collector::{
         codex::{
             self,
@@ -587,6 +924,7 @@ fn steady_state_full_scan_with_compressed_sources_has_zero_write_transactions() 
 
 #[test]
 fn one_session_lock_work_is_independent_of_cached_table_size() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::writer;
     use std::sync::atomic::Ordering;
     let mut measured = Vec::new();
@@ -606,6 +944,7 @@ fn one_session_lock_work_is_independent_of_cached_table_size() {
 
 #[test]
 fn chunking_preserves_complete_table_contents_at_session_boundaries() {
+    let _serial = budget_test();
     use codex_sessions_collector::{
         codex::{
             self,
@@ -713,6 +1052,7 @@ fn chunking_preserves_complete_table_contents_at_session_boundaries() {
 
 #[test]
 fn chunk_gap_admits_a_waiting_viewer_between_consecutive_transactions() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{
         OwnerMode, Store,
         write_budget::{WriteBudget, write_chunked},
@@ -788,6 +1128,7 @@ fn chunk_gap_admits_a_waiting_viewer_between_consecutive_transactions() {
 
 #[test]
 fn rollback_journal_to_wal_has_a_measured_owner() {
+    let _serial = budget_test();
     let temp = support::TempDir::new("journal_mode_hold");
     let db = temp.path().join("rollback.sqlite");
     let conn = Connection::open(&db).unwrap();
@@ -806,6 +1147,7 @@ fn rollback_journal_to_wal_has_a_measured_owner() {
 #[cfg(debug_assertions)]
 #[test]
 fn completeness_open_bootstrap_and_migration() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{OwnerMode, Store, write_budget::audit::WriteAudit};
     let temp = support::TempDir::new("audit_bootstrap");
     let old = temp.path().join("old.sqlite");
@@ -846,6 +1188,7 @@ fn completeness_open_bootstrap_and_migration() {
 #[cfg(debug_assertions)]
 #[test]
 fn completeness_guard_detects_unowned_commit_and_special_pragma() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::audit::WriteAudit;
     let temp = support::TempDir::new("audit_negative");
     let conn = Connection::open(temp.path().join("fixture.sqlite")).unwrap();
@@ -873,6 +1216,7 @@ fn completeness_guard_detects_unowned_commit_and_special_pragma() {
 #[cfg(debug_assertions)]
 #[test]
 fn completeness_guard_rejects_missing_completion_after_already_wal_configure() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{OwnerMode, Store, write_budget::audit::WriteAudit};
     let temp = support::TempDir::new("audit_replaced_completion");
     let store = Store::open(&temp.path().join("fixture.sqlite"), OwnerMode::Standalone).unwrap();
@@ -907,6 +1251,7 @@ fn completeness_guard_rejects_missing_completion_after_already_wal_configure() {
 #[cfg(debug_assertions)]
 #[test]
 fn completeness_guard_detects_missing_completion() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::{OwnerMode, Store, write_budget::audit::WriteAudit};
     let temp = support::TempDir::new("audit_completion");
     let audit = WriteAudit::start();
@@ -931,6 +1276,7 @@ fn completeness_guard_detects_missing_completion() {
 #[cfg(debug_assertions)]
 #[test]
 fn completeness_codex_claude_and_price_history() {
+    let _serial = budget_test();
     use codex_sessions_collector::{
         claude::{self, ClaudeRoot, ClaudeScanOptions},
         codex::{
@@ -1001,6 +1347,7 @@ fn completeness_codex_claude_and_price_history() {
 
 #[test]
 fn hold_stats_distribution_and_max_phase() {
+    let _serial = budget_test();
     let mut stats = HoldStats::default();
     for ms in 1..=100 {
         stats.record(Duration::from_millis(ms), "sessions");
@@ -1015,6 +1362,7 @@ fn hold_stats_distribution_and_max_phase() {
 
 #[test]
 fn hold_stats_empty_and_submillisecond() {
+    let _serial = budget_test();
     let mut stats = HoldStats::default();
     let report = stats.report();
     assert_eq!(report.transactions, 0);
@@ -1029,6 +1377,7 @@ fn hold_stats_empty_and_submillisecond() {
 
 #[test]
 fn hold_stats_commit_rollback_nested_and_scope_restoration() {
+    let _serial = budget_test();
     let conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&conn, ":memory:").unwrap();
     let scope = WriteHoldScope::start();
@@ -1060,6 +1409,7 @@ fn hold_stats_commit_rollback_nested_and_scope_restoration() {
 
 #[test]
 fn hold_stats_refusal_and_panic_rollback_are_measured() {
+    let _serial = budget_test();
     let conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&conn, ":memory:").unwrap();
     let scope = WriteHoldScope::start();
@@ -1084,6 +1434,7 @@ fn hold_stats_refusal_and_panic_rollback_are_measured() {
 
 #[test]
 fn hold_stats_commit_failure_records_rollback() {
+    let _serial = budget_test();
     let conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&conn, ":memory:").unwrap();
     // A commit hook rejection exercises the real failed-COMMIT cleanup path.
@@ -1114,6 +1465,7 @@ fn hold_stats_commit_failure_records_rollback() {
 
 #[test]
 fn hold_stats_waiting_for_begin_is_not_a_hold() {
+    let _serial = budget_test();
     let temp = support::TempDir::new("hold_stats_busy");
     let db = support::viewer_database(&temp);
     let blocked = Connection::open(&db).unwrap();
@@ -1133,6 +1485,7 @@ fn hold_stats_waiting_for_begin_is_not_a_hold() {
 
 #[test]
 fn hold_stats_scan_reports_json_and_text() {
+    let _serial = budget_test();
     let temp = support::TempDir::new("hold_stats_reports");
     let home = support::codex_home(&temp, &["rich_session.jsonl"]);
     let db = support::viewer_database(&temp);
@@ -1182,6 +1535,7 @@ fn hold_stats_scan_reports_json_and_text() {
 
 #[test]
 fn autocommit_statements_are_measured_without_counting_outer_writes_twice() {
+    let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::execute_write;
     let conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&conn, ":memory:").unwrap();
@@ -1254,6 +1608,7 @@ fn autocommit_statements_are_measured_without_counting_outer_writes_twice() {
 
 #[test]
 fn hub_bootstrap_identity_and_each_ddl_statement_have_write_holds() {
+    let _serial = budget_test();
     use codex_sessions_collector::{hub_annotations, hub_server::HubConfig};
     let temp = support::TempDir::new("hub_bootstrap_holds");
     let config: HubConfig = serde_json::from_value(serde_json::json!({

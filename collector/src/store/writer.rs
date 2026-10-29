@@ -26,7 +26,9 @@ use crate::path_mapping::{
 };
 
 use super::projects::{
-    ProjectResolver, refresh_session_project, resolve_usage_path_context, upsert_auto_project,
+    ProjectMask, ProjectResolver, active_masks, lookup_project_id, lookup_usage_path_context,
+    refresh_session_project, refresh_session_project_with_masks, resolve_usage_path_context,
+    upsert_auto_project,
 };
 use super::schema::{
     StoreError, StoreResult, begin_write, check_parser_version, finish, parser_version_key,
@@ -175,20 +177,172 @@ pub fn apply_session_batch(
 const SMALL_SESSION_ITEMS: usize = 256;
 const SMALL_SESSION_CONTENT_BYTES: usize = 256 * 1024;
 
+const PREPARE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const UNCHANGED_ISOLATE_MS: f64 = 50.0;
+const PREDICT_UNIT_MS: f64 = 3.0;
+const PREDICT_ITEM_US: f64 = 3.3;
+const PREDICT_ENVELOPE_MS_PER_MIB: f64 = 3.6;
+
+type PlanHook = dyn FnMut(&Connection);
+thread_local! {
+    static PREPARE_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(PREPARE_MAX_BYTES) };
+    static PLAN_HOOK: std::cell::RefCell<Option<Box<PlanHook>>> = const { std::cell::RefCell::new(None) };
+    static PREPARED_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Library-only deterministic plan/lock interleaving and preparation-cap witness.
+/// The hook may issue raw fixture SQL, never collector API calls.
+#[doc(hidden)]
+pub struct SessionPreparationScope {
+    limit: usize,
+    hook: Option<Box<PlanHook>>,
+    fallbacks: usize,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl SessionPreparationScope {
+    pub fn enter(limit: Option<usize>, hook: impl FnMut(&Connection) + 'static) -> Self {
+        Self {
+            limit: PREPARE_LIMIT.with(|value| value.replace(limit.unwrap_or(PREPARE_MAX_BYTES))),
+            hook: PLAN_HOOK.with_borrow_mut(|value| value.replace(Box::new(hook))),
+            fallbacks: PREPARED_FALLBACKS.with(|value| value.replace(0)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+    pub fn fallbacks(&self) -> usize {
+        PREPARED_FALLBACKS.with(std::cell::Cell::get)
+    }
+}
+impl Drop for SessionPreparationScope {
+    fn drop(&mut self) {
+        PREPARE_LIMIT.with(|value| value.set(self.limit));
+        PLAN_HOOK.with_borrow_mut(|value| *value = self.hook.take());
+        PREPARED_FALLBACKS.with(|value| value.set(self.fallbacks));
+    }
+}
+
+struct PreparedSession {
+    id: String,
+    snapshot: SessionSnapshot,
+    shape: super::write_budget::SessionWriteShape,
+    content: Option<PreparedContent>,
+    envelope: Option<String>,
+    candidates: Vec<String>,
+    predicted_ms: f64,
+    write_bytes: u64,
+    cost: super::write_budget::UnitCost,
+}
+
+struct PreparedContent {
+    rows: Option<SessionContent>,
+    hasher: Sha256,
+    resolution: UsageResolution,
+    planned_ids: Vec<i64>,
+    digest: String,
+}
+
+fn row_bytes(rows: &[SessionRow]) -> usize {
+    rows.iter()
+        .flat_map(|(_, values)| values)
+        .map(|value| match value {
+            Value::Text(value) => value.len(),
+            Value::Blob(value) => value.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn session_shape(snapshot: &SessionSnapshot) -> super::write_budget::SessionWriteShape {
+    super::write_budget::SessionWriteShape {
+        messages: snapshot.messages.len(),
+        tool_calls: snapshot.tool_calls.len(),
+        source_bytes: snapshot.source.size,
+        content_bytes: snapshot
+            .messages
+            .iter()
+            .map(|message| message.content_plain.len())
+            .sum(),
+    }
+}
+
 fn session_unit_cost(
     shape: super::write_budget::SessionWriteShape,
     merges: bool,
+    unchanged: bool,
+    predicted_ms: f64,
+    write_bytes: u64,
 ) -> super::write_budget::UnitCost {
     if merges
-        || shape.messages.saturating_add(shape.tool_calls) > SMALL_SESSION_ITEMS
-        || shape.content_bytes > SMALL_SESSION_CONTENT_BYTES
+        || if unchanged {
+            predicted_ms > UNCHANGED_ISOLATE_MS
+        } else {
+            shape.messages.saturating_add(shape.tool_calls) > SMALL_SESSION_ITEMS
+                || shape.content_bytes > SMALL_SESSION_CONTENT_BYTES
+        }
     {
         super::write_budget::UnitCost::Isolated
     } else {
-        super::write_budget::UnitCost::Small {
-            bytes: shape.content_bytes as u64,
-        }
+        super::write_budget::UnitCost::Small { bytes: write_bytes }
     }
+}
+
+/// Snapshot-only work precedes the lease, overlapping its mandatory gap.
+fn prepare_sessions(
+    conn: &Connection,
+    snapshots: Vec<SessionSnapshot>,
+    version: Option<u32>,
+) -> StoreResult<Vec<PreparedSession>> {
+    let hub_predicted = hub_client::queue_enabled(conn)?;
+    let limit = PREPARE_LIMIT.with(std::cell::Cell::get);
+    let mut bytes = 0usize;
+    let mut stopped = false;
+    let mut units = Vec::new();
+    for (id, snapshot) in canonical_snapshots(snapshots) {
+        let shape = session_shape(&snapshot);
+        let mut content = None;
+        let mut envelope = None;
+        if !stopped {
+            let rows = SessionContent::snapshot_rows(&snapshot);
+            let json = hub_predicted
+                .then(|| hub_client::session_envelope_json(&snapshot, version))
+                .transpose()?;
+            let size = row_bytes(&rows.messages)
+                .saturating_add(row_bytes(&rows.tool_calls))
+                .saturating_add(json.as_ref().map_or(0, String::len));
+            if bytes.saturating_add(size) <= limit {
+                bytes += size;
+                let mut hasher = Sha256::new();
+                digest_tables(
+                    &mut hasher,
+                    &[
+                        ("messages", &rows.messages),
+                        ("tool_calls", &rows.tool_calls),
+                    ],
+                );
+                content = Some(PreparedContent {
+                    rows: Some(rows),
+                    hasher,
+                    resolution: UsageResolution::default(),
+                    planned_ids: Vec::new(),
+                    digest: String::new(),
+                });
+                envelope = json;
+            } else {
+                stopped = true;
+            }
+        }
+        units.push(PreparedSession {
+            id,
+            snapshot,
+            shape,
+            content,
+            envelope,
+            candidates: Vec::new(),
+            predicted_ms: 0.0,
+            write_bytes: 0,
+            cost: super::write_budget::UnitCost::Isolated,
+        });
+    }
+    Ok(units)
 }
 
 pub(crate) fn apply_session_batch_versioned(
@@ -197,6 +351,23 @@ pub(crate) fn apply_session_batch_versioned(
     version: Option<u32>,
 ) -> StoreResult<usize> {
     let _phase = super::write_budget::write_phase("sessions");
+    // Every original snapshot is validated: canonicalization in preparation
+    // drops superseded snapshots, which may come from another machine.
+    let machines: Vec<String> = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.machine_id.clone())
+        .collect();
+    let preparation_started = crate::timing::enabled().then(std::time::Instant::now);
+    let mut units = crate::timing::timed("write: prepare snapshots", || {
+        prepare_sessions(conn, snapshots, version)
+    })?;
+    if let Some(started) = preparation_started {
+        eprintln!(
+            "write_prepare phase=sessions units={} elapsed_ms={:.6}",
+            units.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let _lease = super::write_lease::WriteLease::acquire(conn)?;
     let own_machine: Option<String> = conn
         .query_row(
@@ -205,81 +376,186 @@ pub(crate) fn apply_session_batch_versioned(
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(foreign) = snapshots.iter().find_map(|snapshot| {
-        snapshot
-            .machine_id
-            .as_ref()
-            .filter(|machine| Some(*machine) != own_machine.as_ref())
-    }) {
+    if let Some(foreign) = machines
+        .iter()
+        .find(|machine| Some(*machine) != own_machine.as_ref())
+    {
         // Local session IDs are not namespaced by machine, so accepting the
         // record would relabel another machine's history as this one's.
         return Err(StoreError::Refused(format!(
             "The records come from another machine ({foreign}); this database only stores its own machine's sessions."
         )));
     }
-    let canonical = canonical_snapshots(snapshots);
-    let count = canonical.len();
+    let count = units.len();
     let now = DartDateTime::now().to_iso8601();
+    let mut transaction_masks = None;
     super::write_budget::write_planned_admitted(
         conn,
         "sessions",
-        // CXV-200: immutable shape admission isolates large/merging sessions;
-        // small sessions join only while the physical hold is below half-soft.
         || {
-            let lookup = IdentityLookup::for_batch(conn)?;
-            let mut units = Vec::new();
-            for (id, snapshot) in &canonical {
-                let mut candidates = capture_identity_merge(conn, id, snapshot, lookup)?
-                    .map(|merge| merge.alternate_ids)
-                    .unwrap_or_default();
-                candidates.push(id.clone());
-                let shape = super::write_budget::SessionWriteShape {
-                    messages: snapshot.messages.len(),
-                    tool_calls: snapshot.tool_calls.len(),
-                    source_bytes: snapshot.source.size,
-                    content_bytes: snapshot
-                        .messages
-                        .iter()
-                        .map(|message| message.content_plain.len())
-                        .sum(),
-                };
-                let cost = session_unit_cost(shape, candidates.len() > 1);
-                units.push((id, snapshot, candidates, shape, cost));
-            }
-            Ok(units)
+            crate::timing::timed("write: plan prepared", || {
+                let lookup = IdentityLookup::for_batch(conn)?;
+                let limit = PREPARE_LIMIT.with(std::cell::Cell::get);
+                let mut retained = units
+                    .iter()
+                    .map(|unit| {
+                        unit.envelope.as_ref().map_or(0, String::len)
+                            + unit
+                                .content
+                                .as_ref()
+                                .and_then(|content| content.rows.as_ref())
+                                .map_or(0, |rows| {
+                                    row_bytes(&rows.messages) + row_bytes(&rows.tool_calls)
+                                })
+                    })
+                    .sum::<usize>();
+                for unit in &mut units {
+                    let snapshot = &unit.snapshot;
+                    unit.candidates = capture_identity_merge(conn, &unit.id, snapshot, lookup)?
+                        .map(|merge| merge.alternate_ids)
+                        .unwrap_or_default();
+                    unit.candidates.push(unit.id.clone());
+                    let mut unchanged = false;
+                    if let Some(mut prepared) = unit.content.take() {
+                        let resolver = snapshot_resolver(snapshot);
+                        prepared.resolution =
+                            usage_resolution_steps(snapshot, &resolver, source_type(snapshot));
+                        let planned = if unit.candidates.len() == 1 {
+                            planned_usage_ids(conn, &prepared.resolution)?
+                        } else {
+                            None
+                        };
+                        if let Some(ids) = planned {
+                            let (events, inputs) =
+                                usage_rows_from(snapshot, &prepared.resolution, &ids);
+                            let usage_bytes = row_bytes(&events) + row_bytes(&inputs);
+                            if retained.saturating_add(usage_bytes) <= limit {
+                                retained += usage_bytes;
+                                digest_tables(
+                                    &mut prepared.hasher,
+                                    &[("usage_events", &events), ("usage_event_inputs", &inputs)],
+                                );
+                                prepared.digest = digest_hex(prepared.hasher.clone());
+                                prepared.planned_ids = ids;
+                                let stored: Option<String> = conn
+                                    .prepare_cached(
+                                        "select content_hash from sessions where id = ?",
+                                    )?
+                                    .query_row([&unit.id], |row| row.get(0))
+                                    .optional()?
+                                    .flatten();
+                                unchanged = stored.as_deref() == Some(prepared.digest.as_str());
+                                if unchanged {
+                                    let rows = prepared.rows.take().expect("phase A rows");
+                                    retained -= row_bytes(&rows.messages)
+                                        + row_bytes(&rows.tool_calls)
+                                        + usage_bytes;
+                                } else {
+                                    let rows = prepared.rows.as_mut().expect("phase A rows");
+                                    rows.usage_events = events;
+                                    rows.usage_inputs = inputs;
+                                    rows.digest = prepared.digest.clone();
+                                }
+                                unit.content = Some(prepared);
+                            } else if let Some(rows) = prepared.rows.take() {
+                                retained -= row_bytes(&rows.messages) + row_bytes(&rows.tool_calls);
+                            }
+                        } else if let Some(rows) = prepared.rows.take() {
+                            retained -= row_bytes(&rows.messages) + row_bytes(&rows.tool_calls);
+                        }
+                    }
+                    let envelope_bytes = unit.envelope.as_ref().map_or(0, String::len);
+                    unit.write_bytes = (if unchanged {
+                        0
+                    } else {
+                        unit.shape.content_bytes
+                    }) as u64
+                        + envelope_bytes as u64;
+                    unit.predicted_ms = if unchanged {
+                        PREDICT_UNIT_MS
+                            + PREDICT_ITEM_US * (unit.shape.messages + unit.shape.tool_calls) as f64
+                                / 1000.0
+                            + PREDICT_ENVELOPE_MS_PER_MIB * envelope_bytes as f64
+                                / (1024.0 * 1024.0)
+                    } else {
+                        0.0
+                    };
+                    unit.cost = session_unit_cost(
+                        unit.shape,
+                        unit.candidates.len() > 1,
+                        unchanged,
+                        unit.predicted_ms,
+                        unit.write_bytes,
+                    );
+                }
+                if let Some(mut hook) = PLAN_HOOK.with_borrow_mut(Option::take) {
+                    hook(conn);
+                    PLAN_HOOK.with_borrow_mut(|value| *value = Some(hook));
+                }
+                Ok(units)
+            })
         },
-        |(_, _, _, _, cost)| *cost,
-        |(id, snapshot, candidates, shape, _)| {
+        |unit| unit.cost,
+        |unit| {
             let start = std::time::Instant::now();
+            let transaction = super::write_budget::transaction_started(conn);
+            if transaction.is_none()
+                || transaction_masks
+                    .as_ref()
+                    .is_none_or(|(previous, _)| *previous != transaction)
             {
-                check_parser_version(conn, &snapshot.harness)?;
-                let resolver = ProjectResolver::new(
-                    snapshot
-                        .project_hints
-                        .iter()
-                        .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
-                );
-                crate::timing::timed("write: session total", || {
-                    upsert_session(
-                        conn,
-                        id,
-                        snapshot,
-                        &now,
-                        &resolver,
-                        IdentityLookup::Planned(&candidates),
-                    )
-                })?;
+                transaction_masks = Some((transaction, active_masks(conn)?));
             }
-            if hub_client::queue_enabled(conn)? {
-                enqueue_for_version(
+            let PreparedSession {
+                id,
+                snapshot,
+                shape,
+                content,
+                envelope,
+                candidates,
+                predicted_ms,
+                write_bytes,
+                ..
+            } = unit;
+            check_parser_version(conn, &snapshot.harness)?;
+            let resolver = snapshot_resolver(&snapshot);
+            crate::timing::timed("write: session total", || {
+                upsert_session(
                     conn,
-                    Record::SessionSnapshot(Box::new(snapshot.clone())),
+                    &id,
+                    &snapshot,
                     &now,
-                    version,
-                )?;
+                    &resolver,
+                    SessionApplyContext {
+                        lookup: IdentityLookup::Planned(&candidates),
+                        prepared: content,
+                        masks: &transaction_masks.as_ref().expect("transaction masks").1,
+                    },
+                )
+            })?;
+            if hub_client::queue_enabled(conn)? {
+                let json = match envelope {
+                    Some(json) => json,
+                    None => hub_client::session_envelope_json(&snapshot, version)?,
+                };
+                hub_client::enqueue_prepared(conn, &snapshot, &json, &now)?;
             }
-            super::write_budget::record_session_unit(start.elapsed());
+            let elapsed = start.elapsed();
+            super::write_budget::record_session_unit(elapsed);
             super::write_budget::record_session_shape(Some(shape));
+            super::write_budget::record_prepared_unit(predicted_ms, write_bytes);
+            if crate::timing::enabled() {
+                eprintln!(
+                    "write_unit phase=sessions predicted_ms={predicted_ms:.6} measured_ms={:.6} items={} envelope_bytes={}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    shape.messages + shape.tool_calls,
+                    write_bytes.saturating_sub(if predicted_ms > 0.0 {
+                        0
+                    } else {
+                        shape.content_bytes as u64
+                    })
+                );
+            }
             Ok(())
         },
     )?;
@@ -396,6 +672,12 @@ fn encode_membership(values: &[String]) -> String {
     }
 }
 
+struct SessionApplyContext<'a> {
+    lookup: IdentityLookup<'a>,
+    prepared: Option<PreparedContent>,
+    masks: &'a [ProjectMask],
+}
+
 /// `_upsertParsedSession`.
 fn upsert_session(
     conn: &Connection,
@@ -403,8 +685,13 @@ fn upsert_session(
     snapshot: &SessionSnapshot,
     now: &str,
     resolver: &ProjectResolver,
-    lookup: IdentityLookup<'_>,
+    context: SessionApplyContext<'_>,
 ) -> StoreResult<()> {
+    let SessionApplyContext {
+        lookup,
+        prepared,
+        masks,
+    } = context;
     let session = &snapshot.session;
     let identity_merge = crate::timing::timed("write: identity capture", || {
         capture_identity_merge(conn, id, snapshot, lookup)
@@ -436,8 +723,15 @@ fn upsert_session(
         .query_row([id], |row| row.get(0))
         .optional()?
         .flatten();
-    let content = crate::timing::timed("write: content rows", || {
-        SessionContent::build(conn, snapshot, now, resolver, source_type)
+    let content = crate::timing::timed("write: content rows", || match prepared {
+        Some(prepared) => prepared.apply(
+            conn,
+            snapshot,
+            now,
+            stored_digest.as_deref(),
+            identity_merge.is_some(),
+        ),
+        None => SessionContent::build(conn, snapshot, now, resolver, source_type),
     })?;
     let has_errors = snapshot.messages.iter().any(|message| message.has_error)
         || snapshot
@@ -585,7 +879,7 @@ fn upsert_session(
         apply_identity_merge(conn, id, &merge)?;
     }
     crate::timing::timed("write: project refresh", || {
-        refresh_session_project(conn, id)
+        refresh_session_project_with_masks(conn, id, masks)
     })?;
     let (affected, rescoped) = crate::timing::timed("write: legacy usage", || {
         reconcile_affected_legacy_usage(conn, &snapshot.harness, id, session.session_id.as_deref())
@@ -700,19 +994,6 @@ fn upsert_search_document(conn: &Connection, document: &SearchDocument<'_>) -> S
         now,
         now,
     ])?;
-    conn.prepare_cached("delete from session_path_keys where session_id = ?")?
-        .execute([document.id])?;
-    for path_key in document.normalized_path_keys.split(' ') {
-        // Dart trims with String.trim; keys never contain spaces themselves.
-        let key = trim(path_key);
-        if key.is_empty() {
-            continue;
-        }
-        conn.prepare_cached(
-            "insert or ignore into session_path_keys (session_id, path_key) values (?, ?)",
-        )?
-        .execute(params![document.id, key])?;
-    }
     let rowid: i64 = conn
         .prepare_cached("select rowid from sessions where id = ?")?
         .query_row([document.id], |row| row.get(0))?;
@@ -720,23 +1001,76 @@ fn upsert_search_document(conn: &Connection, document: &SearchDocument<'_>) -> S
         Some(project) => project.clone().unwrap_or_default(),
         None => document.project_name.to_owned(),
     };
-    let fts_tags = existing_tags.clone().unwrap_or_default().join(" ");
-    conn.prepare_cached("delete from session_search where rowid = ?")?
-        .execute([rowid])?;
-    conn.prepare_cached(
-        "insert into session_search (rowid, title, summary, tool_names, display_path,
-           normalized_path_keys, project_name, tags) values (?, ?, ?, ?, ?, ?, ?, ?)",
-    )?
-    .execute(params![
-        rowid,
-        document.title,
-        document.summary,
-        document.tool_names,
+    let fts_tags = existing_tags.unwrap_or_default().join(" ");
+    let desired_fts = [
+        document.title.as_str(),
+        document.summary.as_str(),
+        document.tool_names.as_str(),
         document.display_path,
-        document.normalized_path_keys,
-        fts_project,
-        fts_tags,
-    ])?;
+        document.normalized_path_keys.as_str(),
+        fts_project.as_str(),
+        fts_tags.as_str(),
+    ];
+    let stored_fts: Option<Vec<Option<String>>> = conn
+        .prepare_cached(
+            "select title, summary, tool_names, display_path, normalized_path_keys,
+                project_name, tags from session_search where rowid = ?",
+        )?
+        .query_row([rowid], |row| {
+            (0..desired_fts.len())
+                .map(|column| row.get(column))
+                .collect()
+        })
+        .optional()?;
+    let desired_keys: HashSet<&str> = document
+        .normalized_path_keys
+        .split(' ')
+        .map(trim)
+        .filter(|key| !key.is_empty())
+        .collect();
+    let stored_keys: HashSet<String> = conn
+        .prepare_cached("select path_key from session_path_keys where session_id = ?")?
+        .query_map([document.id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let search_equal = stored_fts.as_ref().is_some_and(|stored| {
+        stored
+            .iter()
+            .map(|value| value.as_deref())
+            .eq(desired_fts.iter().copied().map(Some))
+    });
+    let keys_equal = stored_keys.len() == desired_keys.len()
+        && desired_keys.iter().all(|key| stored_keys.contains(*key));
+    if !search_equal || !keys_equal {
+        conn.prepare_cached("delete from session_path_keys where session_id = ?")?
+            .execute([document.id])?;
+        // Preserve the original insertion order when a rewrite is required.
+        for path_key in document.normalized_path_keys.split(' ') {
+            let key = trim(path_key);
+            if key.is_empty() {
+                continue;
+            }
+            conn.prepare_cached(
+                "insert or ignore into session_path_keys (session_id, path_key) values (?, ?)",
+            )?
+            .execute(params![document.id, key])?;
+        }
+        conn.prepare_cached("delete from session_search where rowid = ?")?
+            .execute([rowid])?;
+        conn.prepare_cached(
+            "insert into session_search (rowid, title, summary, tool_names, display_path,
+               normalized_path_keys, project_name, tags) values (?, ?, ?, ?, ?, ?, ?, ?)",
+        )?
+        .execute(params![
+            rowid,
+            document.title,
+            document.summary,
+            document.tool_names,
+            document.display_path,
+            document.normalized_path_keys,
+            fts_project,
+            fts_tags,
+        ])?;
+    }
     if existing_project.is_none() {
         conn.prepare_cached("delete from session_tags where session_id = ?")?
             .execute([document.id])?;
@@ -1002,7 +1336,79 @@ struct SessionContent {
     digest: String,
 }
 
+fn snapshot_resolver(snapshot: &SessionSnapshot) -> ProjectResolver {
+    ProjectResolver::new(
+        snapshot
+            .project_hints
+            .iter()
+            .map(|hint| (hint.working_directory.clone(), hint.project_name.clone())),
+    )
+}
+
+impl PreparedContent {
+    fn apply(
+        self,
+        conn: &Connection,
+        snapshot: &SessionSnapshot,
+        now: &str,
+        stored: Option<&str>,
+        merges: bool,
+    ) -> StoreResult<SessionContent> {
+        let ids = resolve_usage_steps(conn, &self.resolution, now)?;
+        if ids == self.planned_ids && !merges {
+            if let Some(rows) = self.rows {
+                return Ok(rows);
+            }
+            if stored == Some(self.digest.as_str()) {
+                return Ok(SessionContent {
+                    digest: self.digest,
+                    ..SessionContent::snapshot_empty()
+                });
+            }
+        }
+        PREPARED_FALLBACKS.with(|value| value.set(value.get() + 1));
+        super::write_budget::record_prepared_fallback();
+        // Resolution already ran: rebuilding must not repeat its writes.
+        let mut rows = SessionContent::snapshot_rows(snapshot);
+        (rows.usage_events, rows.usage_inputs) = usage_rows_from(snapshot, &self.resolution, &ids);
+        rows.finish_digest();
+        Ok(rows)
+    }
+}
+
 impl SessionContent {
+    fn snapshot_empty() -> Self {
+        Self {
+            messages: Vec::new(),
+            tool_calls: Vec::new(),
+            usage_events: Vec::new(),
+            usage_inputs: Vec::new(),
+            digest: String::new(),
+        }
+    }
+    fn snapshot_rows(snapshot: &SessionSnapshot) -> Self {
+        Self {
+            messages: snapshot
+                .messages
+                .iter()
+                .map(|message| (message.index, message_values(message)))
+                .collect(),
+            tool_calls: snapshot
+                .tool_calls
+                .iter()
+                .map(|tool| (tool.tool_index, tool_call_values(tool)))
+                .collect(),
+            ..Self::snapshot_empty()
+        }
+    }
+    fn finish_digest(&mut self) {
+        self.digest = content_digest(&[
+            ("messages", &self.messages),
+            ("tool_calls", &self.tool_calls),
+            ("usage_events", &self.usage_events),
+            ("usage_event_inputs", &self.usage_inputs),
+        ]);
+    }
     fn build(
         conn: &Connection,
         snapshot: &SessionSnapshot,
@@ -1010,38 +1416,23 @@ impl SessionContent {
         resolver: &ProjectResolver,
         source_type: SourceType,
     ) -> StoreResult<Self> {
-        let messages: Vec<(i64, Vec<Value>)> = snapshot
-            .messages
-            .iter()
-            .map(|message| (message.index, message_values(message)))
-            .collect();
-        let tool_calls: Vec<(i64, Vec<Value>)> = snapshot
-            .tool_calls
-            .iter()
-            .map(|tool| (tool.tool_index, tool_call_values(tool)))
-            .collect();
-        let (usage_events, usage_inputs) =
-            usage_event_rows(conn, snapshot, now, resolver, source_type)?;
-        let digest = content_digest(&[
-            ("messages", &messages[..]),
-            ("tool_calls", &tool_calls[..]),
-            ("usage_events", &usage_events[..]),
-            ("usage_event_inputs", &usage_inputs[..]),
-        ]);
-        Ok(Self {
-            messages,
-            tool_calls,
-            usage_events,
-            usage_inputs,
-            digest,
-        })
+        let mut rows = Self::snapshot_rows(snapshot);
+        let resolution = usage_resolution_steps(snapshot, resolver, source_type);
+        let ids = resolve_usage_steps(conn, &resolution, now)?;
+        (rows.usage_events, rows.usage_inputs) = usage_rows_from(snapshot, &resolution, &ids);
+        rows.finish_digest();
+        Ok(rows)
     }
 }
 
 /// SHA-256 over the tables' rows: each key and each column with its type.
 fn content_digest(tables: &[(&str, &[SessionRow])]) -> String {
-    use std::fmt::Write as _;
     let mut hasher = Sha256::new();
+    digest_tables(&mut hasher, tables);
+    digest_hex(hasher)
+}
+
+fn digest_tables(hasher: &mut Sha256, tables: &[(&str, &[SessionRow])]) {
     for (table, rows) in tables {
         hasher.update(table.as_bytes());
         hasher.update((rows.len() as u64).to_le_bytes());
@@ -1072,6 +1463,10 @@ fn content_digest(tables: &[(&str, &[SessionRow])]) -> String {
             }
         }
     }
+}
+
+fn digest_hex(hasher: Sha256) -> String {
+    use std::fmt::Write as _;
     let mut hex = String::with_capacity(64);
     for byte in hasher.finalize().iter() {
         let _ = write!(hex, "{byte:02x}");
@@ -1297,51 +1692,129 @@ fn usage_day(value: &Value) -> Result<Option<String>, ()> {
     }
 }
 
-/// The `usage_events` and `usage_event_inputs` rows of a snapshot.
-fn usage_event_rows(
-    conn: &Connection,
+#[derive(Default)]
+struct UsageResolution {
+    steps: Vec<UsageStep>,
+    event_contexts: Vec<usize>,
+}
+enum UsageStep {
+    Project(String),
+    Context {
+        directory: Option<String>,
+        unc: Option<String>,
+        project: Option<String>,
+    },
+}
+
+fn usage_resolution_steps(
     snapshot: &SessionSnapshot,
-    now: &str,
     resolver: &ProjectResolver,
     source_type: SourceType,
-) -> StoreResult<(Vec<SessionRow>, Vec<SessionRow>)> {
-    let mut project_ids: HashMap<String, i64> = HashMap::new();
-    let mut context_ids: HashMap<(Option<String>, Option<String>), i64> = HashMap::new();
-    let text =
-        |value: Option<&str>| value.map_or(Value::Null, |value| Value::Text(value.to_owned()));
-    let number = |value: Option<i64>| value.map_or(Value::Null, Value::Integer);
-    let mut events: Vec<(i64, Vec<Value>)> = Vec::with_capacity(snapshot.usage_events.len());
-    let mut inputs: Vec<(i64, Vec<Value>)> = Vec::new();
+) -> UsageResolution {
+    let mut projects = HashSet::new();
+    let mut contexts = HashMap::new();
+    let mut resolution = UsageResolution::default();
     for event in &snapshot.usage_events {
-        let project_id = match resolver.resolve(event.working_directory.as_deref(), source_type) {
-            Some(name) => match project_ids.get(&name) {
-                Some(id) => Some(*id),
-                None => {
-                    let project = upsert_auto_project(conn, &name, now)?;
-                    project_ids.insert(name, project);
-                    Some(project)
-                }
-            },
-            None => None,
-        };
+        let project = resolver.resolve(event.working_directory.as_deref(), source_type);
+        if let Some(name) = &project
+            && projects.insert(name.clone())
+        {
+            resolution.steps.push(UsageStep::Project(name.clone()));
+        }
         let key = (
             event.working_directory.clone(),
             event.working_directory_unc.clone(),
         );
-        let context_id = match context_ids.get(&key) {
-            Some(context) => *context,
-            None => {
-                let context = resolve_usage_path_context(
-                    conn,
-                    event.working_directory.as_deref(),
-                    event.working_directory.as_deref(),
-                    event.working_directory_unc.as_deref(),
-                    project_id,
-                )?;
-                context_ids.insert(key, context);
-                context
+        let next = contexts.len();
+        let slot = *contexts.entry(key).or_insert_with(|| {
+            resolution.steps.push(UsageStep::Context {
+                directory: event.working_directory.clone(),
+                unc: event.working_directory_unc.clone(),
+                project,
+            });
+            next
+        });
+        resolution.event_contexts.push(slot);
+    }
+    resolution
+}
+
+fn planned_usage_ids(
+    conn: &Connection,
+    resolution: &UsageResolution,
+) -> StoreResult<Option<Vec<i64>>> {
+    let mut ids = Vec::new();
+    for step in &resolution.steps {
+        match step {
+            UsageStep::Project(name) => {
+                if lookup_project_id(conn, name)?.is_none() {
+                    return Ok(None);
+                }
             }
-        };
+            UsageStep::Context { directory, unc, .. } => {
+                let Some(id) = lookup_usage_path_context(
+                    conn,
+                    directory.as_deref(),
+                    directory.as_deref(),
+                    unc.as_deref(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                ids.push(id);
+            }
+        }
+    }
+    Ok(Some(ids))
+}
+
+fn resolve_usage_steps(
+    conn: &Connection,
+    resolution: &UsageResolution,
+    now: &str,
+) -> StoreResult<Vec<i64>> {
+    let mut projects = HashMap::new();
+    let mut ids = Vec::new();
+    for step in &resolution.steps {
+        match step {
+            UsageStep::Project(name) => {
+                projects.insert(name, upsert_auto_project(conn, name, now)?);
+            }
+            UsageStep::Context {
+                directory,
+                unc,
+                project,
+            } => {
+                let project_id = project
+                    .as_ref()
+                    .and_then(|name| projects.get(name))
+                    .copied();
+                ids.push(resolve_usage_path_context(
+                    conn,
+                    directory.as_deref(),
+                    directory.as_deref(),
+                    unc.as_deref(),
+                    project_id,
+                )?);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Pure row building from authoritative (or read-only planned) context ids.
+fn usage_rows_from(
+    snapshot: &SessionSnapshot,
+    resolution: &UsageResolution,
+    ids: &[i64],
+) -> (Vec<SessionRow>, Vec<SessionRow>) {
+    let text =
+        |value: Option<&str>| value.map_or(Value::Null, |value| Value::Text(value.to_owned()));
+    let number = |value: Option<i64>| value.map_or(Value::Null, Value::Integer);
+    let mut events = Vec::with_capacity(snapshot.usage_events.len());
+    let mut inputs = Vec::new();
+    for (event, slot) in snapshot.usage_events.iter().zip(&resolution.event_contexts) {
+        let context_id = ids[*slot];
         let buckets = usage_bucket(&event.usage);
         let mut values = vec![
             number(event.rollout_ordinal),
@@ -1376,7 +1849,7 @@ fn usage_event_rows(
             ));
         }
     }
-    Ok((events, inputs))
+    (events, inputs)
 }
 
 fn sync_usage_events(

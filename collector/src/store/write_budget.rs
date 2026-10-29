@@ -31,6 +31,7 @@ thread_local! {
     static RELEASED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     static COMPLETION_TIME: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
     static SESSION_SHAPE: std::cell::Cell<Option<SessionWriteShape>> = const { std::cell::Cell::new(None) };
+    static PREPARED_DETAIL: std::cell::Cell<(f64, u64, usize)> = const { std::cell::Cell::new((0.0, 0, 0)) };
     static CHUNK_OBSERVER: RefCell<Option<Box<ChunkObserver>>> = const { RefCell::new(None) };
     static CONTROL: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
 }
@@ -105,7 +106,26 @@ pub enum UnitCost {
     Isolated,
 }
 pub const ADMIT_MAX_UNITS: usize = 32;
-pub const ADMIT_MAX_BYTES: u64 = 1 << 20;
+/// Planned write bytes: rewritten content plus hub envelopes (CXV-204).
+pub const ADMIT_MAX_BYTES: u64 = 8 << 20;
+
+pub(crate) fn record_prepared_unit(predicted_ms: f64, write_bytes: u64) {
+    PREPARED_DETAIL.with(|current| {
+        let (prediction, bytes, fallbacks) = current.get();
+        current.set((
+            prediction + predicted_ms,
+            bytes.saturating_add(write_bytes),
+            fallbacks,
+        ));
+    });
+}
+
+pub(crate) fn record_prepared_fallback() {
+    PREPARED_DETAIL.with(|current| {
+        let (prediction, bytes, fallbacks) = current.get();
+        current.set((prediction, bytes, fallbacks + 1));
+    });
+}
 
 enum ChunkPolicy<'a, U> {
     Bounded(usize),
@@ -151,7 +171,7 @@ pub fn write_chunked<U, S>(
 
 /// Apply shape-classed units with per-unit savepoints. Callers own the collector
 /// lease. Large/merging units stand alone; small units join only below half-soft,
-/// 32 units and 1 MiB. A slow prediction disables admission for this call.
+/// 32 units and 8 MiB of planned writes. A slow prediction disables admission for this call.
 pub fn write_admitted<U>(
     conn: &Connection,
     phase: &'static str,
@@ -187,6 +207,7 @@ fn write_chunks<U, S>(
     let mut fallback = false;
     while units.peek().is_some() {
         SESSION_SHAPE.with(|current| current.set(None));
+        PREPARED_DETAIL.with(|current| current.set((0.0, 0, 0)));
         begin_write(conn)?;
         let _rollback = rollback_on_panic(conn);
         let owner_started =
@@ -293,8 +314,10 @@ fn write_chunks<U, S>(
                 start.elapsed().as_secs_f64() * 1000.0,
             );
             let shape = SESSION_SHAPE.with(std::cell::Cell::get);
+            let (predicted_ms, write_bytes, prepared_fallbacks) =
+                PREPARED_DETAIL.with(std::cell::Cell::get);
             eprintln!(
-                "write_detail phase={phase} units={count} setup_ms={:.6} apply_ms={:.6} commit_ms={:.6} gap_ms={:.6} required_gap_ms={:.6} messages={} tool_calls={} source_bytes={} content_bytes={}",
+                "write_detail phase={phase} units={count} setup_ms={:.6} apply_ms={:.6} commit_ms={:.6} gap_ms={:.6} required_gap_ms={:.6} messages={} tool_calls={} source_bytes={} content_bytes={} predicted_ms={predicted_ms:.6} write_bytes={write_bytes} prepared_fallbacks={prepared_fallbacks}",
                 (validation_time + setup_time).as_secs_f64() * 1000.0,
                 apply_time.as_secs_f64() * 1000.0,
                 COMPLETION_TIME.with(std::cell::Cell::get).as_secs_f64() * 1000.0,
@@ -602,6 +625,11 @@ fn connection_key(conn: &Connection) -> usize {
     // SAFETY: only use the live connection's SQLite handle as an opaque
     // identity; never dereference it. Unlike &Connection this survives moves.
     unsafe { conn.handle() as usize }
+}
+
+/// Identity of the currently owned physical transaction, including nested writes.
+pub(crate) fn transaction_started(conn: &Connection) -> Option<Instant> {
+    ACTIVE.with_borrow(|active| active.get(&connection_key(conn)).map(|entry| entry.0))
 }
 
 /// Measure an operation SQLite requires outside BEGIN (for example changing

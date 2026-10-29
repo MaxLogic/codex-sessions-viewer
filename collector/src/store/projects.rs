@@ -89,6 +89,13 @@ pub fn resolve_windows_project(path: &str) -> Option<String> {
     project_from_path(path)
 }
 
+pub(crate) fn lookup_project_id(conn: &Connection, name: &str) -> StoreResult<Option<i64>> {
+    Ok(conn
+        .prepare_cached("select id from projects where name = ?")?
+        .query_row([name], |row| row.get(0))
+        .optional()?)
+}
+
 pub fn upsert_auto_project(conn: &Connection, name: &str, now: &str) -> StoreResult<i64> {
     conn.prepare_cached(
         "insert into projects (name, description, is_active, created_at_utc, updated_at_utc)
@@ -192,6 +199,25 @@ fn ordered_unique(values: Vec<String>) -> Vec<String> {
 }
 
 /// `ProjectTagStateStore.resolveUsagePathContext`.
+fn usage_path_keys(
+    display: Option<&str>,
+    platform: Option<&str>,
+    unc: Option<&str>,
+) -> [String; 3] {
+    [display, platform, unc].map(|path| normalize_project_path(path.unwrap_or("")))
+}
+
+pub(crate) fn lookup_usage_path_context(
+    conn: &Connection,
+    display: Option<&str>,
+    platform: Option<&str>,
+    unc: Option<&str>,
+) -> StoreResult<Option<i64>> {
+    let keys = usage_path_keys(display, platform, unc);
+    Ok(conn.prepare_cached("select id from usage_path_contexts where normalization_version = 1 and display_path_key = ? and platform_path_key = ? and unc_path_key = ?")?
+        .query_row(params![keys[0], keys[1], keys[2]], |row| row.get(0)).optional()?)
+}
+
 pub fn resolve_usage_path_context(
     conn: &Connection,
     display_path: Option<&str>,
@@ -204,10 +230,7 @@ pub fn resolve_usage_path_context(
         platform_path.unwrap_or("").to_owned(),
         unc_path.unwrap_or("").to_owned(),
     ];
-    let keys: Vec<String> = raw
-        .iter()
-        .map(|path| normalize_project_path(path))
-        .collect();
+    let keys = usage_path_keys(display_path, platform_path, unc_path);
     let existing: Option<(i64, Option<i64>, Option<String>)> = conn
         .prepare_cached(
             "select id, detected_project_id, detected_project_source from usage_path_contexts
@@ -294,6 +317,15 @@ type SessionProjectRow = (Vec<Option<String>>, Option<i64>, Option<String>);
 /// `ProjectTagStateStore.refreshSessionProject`.
 pub fn refresh_session_project(conn: &Connection, session_id: &str) -> StoreResult<()> {
     let masks = active_masks(conn)?;
+    refresh_session_project_with_masks(conn, session_id, &masks)
+}
+
+/// Reuse masks read under this same physical write transaction.
+pub(crate) fn refresh_session_project_with_masks(
+    conn: &Connection,
+    session_id: &str,
+    masks: &[ProjectMask],
+) -> StoreResult<()> {
     let row: Option<SessionProjectRow> = conn
         .prepare_cached(
             "select display_path, working_directory_display, working_directory_platform,
@@ -326,7 +358,7 @@ pub fn refresh_session_project(conn: &Connection, session_id: &str) -> StoreResu
         keys.push(normalize_project_path(&key?));
     }
     let keys = ordered_unique(keys);
-    let matched = best_project_match(&keys, &masks);
+    let matched = best_project_match(&keys, masks);
     let project_id = matched.map(|mask| mask.project_id).or(detected_id);
     let project_name = matched
         .map(|mask| mask.project_name.clone())

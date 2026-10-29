@@ -285,4 +285,24 @@ fn contract_rejects_bad_envelopes_without_writing_and_scopes_harness_identity() 
     let output = apply(&temp, &db, &foreign);
     assert!(!output.status.success());
     assert_eq!(count(&db, "sessions"), 2);
+
+    // A newer local snapshot of the same session supersedes the foreign one in
+    // the batch; the foreign record must still refuse the whole batch.
+    let mut local = foreign.clone();
+    local["record"]["machine_id"] = Value::Null;
+    local["record"]["source"]["modified_utc"] = json!("2999-01-01T00:00:00Z");
+    let input = temp.path().join("mixed.jsonl");
+    std::fs::write(&input, format!("{foreign}\n{local}\n")).unwrap();
+    let mixed = collector()
+        .args(["apply", "--standalone"])
+        .arg(&db)
+        .arg("--input")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        !mixed.status.success(),
+        "a superseded foreign snapshot passed"
+    );
+    assert_eq!(count(&db, "sessions"), 2);
 }

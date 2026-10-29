@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Bulk collection groups small sessions into bounded transactions while retaining the 150 ms viewer-write gap; large sessions and identity merges remain isolated.
+- Full rescans prepare session rows, content hashes and hub envelopes before taking the database write lock, and group unchanged sessions by predicted write cost, including large sessions. Transactions retain the 150 ms viewer-write gap; changed large sessions and identity merges remain isolated.
 
 ### Added
 - Hub uploads negotiate zstd compression to deliver larger session snapshots; sync requeues local size refusals that now fit and clears superseded, orphaned and delivered dead letters.

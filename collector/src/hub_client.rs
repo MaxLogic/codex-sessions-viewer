@@ -158,6 +158,61 @@ pub(crate) fn plan_delivery(
     Ok(delivery)
 }
 
+/// Serialize a session without cloning its potentially large snapshot.
+pub(crate) fn session_envelope_json(
+    snapshot: &crate::contract::SessionSnapshot,
+    version: Option<u32>,
+) -> StoreResult<String> {
+    #[derive(serde::Serialize)]
+    struct SessionEnvelope<'a> {
+        contract: &'static str,
+        version: u32,
+        kind: &'static str,
+        record: &'a crate::contract::SessionSnapshot,
+    }
+    serde_json::to_string(&SessionEnvelope {
+        contract: CONTRACT_NAME,
+        version: version.unwrap_or(CONTRACT_VERSION),
+        kind: "session_snapshot",
+        record: snapshot,
+    })
+    .map_err(|error| StoreError::Io(std::io::Error::other(error)))
+}
+
+/// The caller rechecks queue enablement inside the session's savepoint.
+pub(crate) fn enqueue_prepared(
+    conn: &Connection,
+    snapshot: &crate::contract::SessionSnapshot,
+    json: &str,
+    now: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "delete from collector_hub_record_state where record_key = ?",
+        [format!(
+            "status:{}:{}",
+            snapshot.harness,
+            source_status_id(&snapshot.source.path)
+        )],
+    )?;
+    let key = format!(
+        "session:{}",
+        session_row_id(
+            &snapshot.harness,
+            snapshot.session.session_id.as_deref(),
+            &snapshot.source.path
+        )
+    );
+    conn.execute(
+        "delete from collector_upload_outbox where record_key = ?",
+        [&key],
+    )?;
+    conn.execute(
+        "insert into collector_upload_outbox(record_json, created_at_utc, record_key) values (?, ?, ?)",
+        params![json, now, key],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn enqueue_versioned(
     conn: &Connection,
     record: Record,
@@ -167,19 +222,11 @@ pub(crate) fn enqueue_versioned(
     if !queue_enabled(conn)? {
         return Ok(());
     }
-    let key = record_key(&record);
     if let Record::SessionSnapshot(snapshot) = &record {
-        // A new snapshot makes the source available again; a later identical
-        // missing status must be delivered, not treated as unchanged.
-        conn.execute(
-            "delete from collector_hub_record_state where record_key = ?",
-            [format!(
-                "status:{}:{}",
-                snapshot.harness,
-                source_status_id(&snapshot.source.path)
-            )],
-        )?;
+        let json = session_envelope_json(snapshot, Some(version))?;
+        return enqueue_prepared(conn, snapshot, &json, now);
     }
+    let key = record_key(&record);
     let envelope = serde_json::to_string(&Envelope {
         contract: crate::contract::CONTRACT_NAME.to_owned(),
         version,
