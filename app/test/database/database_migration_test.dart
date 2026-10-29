@@ -14,6 +14,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
+// Stops that abort a running statement need sqlite3_interrupt.
+final Object _withoutInterrupt = Platform.isLinux
+    ? 'package:sqlite3 on Linux does not export sqlite3_interrupt'
+    : false;
+
 void main() {
   late Directory tempDir;
   late File dbFile;
@@ -454,6 +459,7 @@ void main() {
       );
       expect(resumed.lastAppliedSchemaVersion, latestSchemaVersion);
     },
+    skip: _withoutInterrupt,
   );
 
   for (final cancelled in [false, true]) {

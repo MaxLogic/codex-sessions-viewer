@@ -21,6 +21,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import '../support/scripted_collector_bridge.dart';
 
+// Stops that abort a running statement need sqlite3_interrupt.
+final Object _withoutInterrupt = Platform.isLinux
+    ? 'package:sqlite3 on Linux does not export sqlite3_interrupt'
+    : false;
+
 void main() {
   late Directory temp;
   late File databaseFile;
@@ -129,6 +134,7 @@ void main() {
       }
       expect(File('${temp.path}/second-partition').existsSync(), isFalse);
     },
+    skip: _withoutInterrupt,
   );
 
   test(
@@ -1272,6 +1278,7 @@ void main() {
       await operation.requestStop();
       await retry.requestStop();
     },
+    skip: _withoutInterrupt,
   );
 
   test(
@@ -1364,6 +1371,7 @@ void main() {
         expect(db.select('pragma integrity_check').single.values.single, 'ok');
         expect(db.select('pragma foreign_key_check'), isEmpty);
       },
+      skip: _withoutInterrupt,
     );
   }
 
