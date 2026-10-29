@@ -2441,19 +2441,15 @@ impl DetachedWorkers {
             use std::os::windows::io::FromRawHandle;
             use windows_sys::Win32::System::Threading::*;
             let census_started = Instant::now();
-            let output = support::test_command("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &format!(
-                    "Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}' | Select-Object -ExpandProperty ProcessId")])
-                .creation_flags(0x08000000).output().unwrap();
+            // A process snapshot, not PowerShell and WMI: on a cold CI runner
+            // those took about 40 s, longer than the replacement bounds.
+            let children = child_process_ids(pid);
             eprintln!(
                 "worker census_ms={:.3}",
                 census_started.elapsed().as_secs_f64() * 1000.0
             );
-            assert!(output.status.success());
-            let handles = String::from_utf8(output.stdout)
-                .unwrap()
-                .split_whitespace()
-                .map(|p| p.parse::<u32>().unwrap())
+            let handles = children
+                .into_iter()
                 .filter_map(|pid| {
                     // SAFETY: numeric child PID, valid access flags; an exited
                     // child can disappear before OpenProcess and is ignored.
@@ -4344,9 +4340,50 @@ fn protocol_windows_first_instance_security_and_handle_cleanup() {
             "only user and SYSTEM grants: {sddl}"
         );
         assert!(sddl.contains(";;;SY)"));
+        // SDDL abbreviates well-known accounts, such as the built-in
+        // Administrator on CI runners (LA); let Windows spell this SID.
+        let account_token = {
+            let owner: Vec<u16> = format!("O:{account_sid}")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut parsed = std::ptr::null_mut();
+            let mut text = std::ptr::null_mut();
+            // SAFETY: valid NUL-terminated SDDL; both allocations are freed below.
+            let token = unsafe {
+                assert_ne!(
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        owner.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut parsed,
+                        std::ptr::null_mut(),
+                    ),
+                    0
+                );
+                assert_ne!(
+                    ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        parsed,
+                        SDDL_REVISION_1,
+                        OWNER_SECURITY_INFORMATION,
+                        &mut text,
+                        std::ptr::null_mut(),
+                    ),
+                    0
+                );
+                let mut len = 0;
+                while *text.add(len) != 0 {
+                    len += 1;
+                }
+                let spelled = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                LocalFree(text.cast());
+                LocalFree(parsed);
+                spelled
+            };
+            token.strip_prefix("O:").unwrap_or(&token).to_owned()
+        };
         assert!(
-            sddl.contains(&format!(";;;{account_sid})")),
-            "current account SID: {sddl}"
+            sddl.contains(&format!(";;;{account_token})")),
+            "current account SID {account_sid} ({account_token}): {sddl}"
         );
         assert!(!sddl.contains(";;;WD)") && !sddl.contains(";;;AU)"));
         drop(file);
@@ -4524,4 +4561,28 @@ fn resident_stop_times_out_if_disconnected_instance_stays_locked() {
     );
     assert!(started.elapsed() >= Duration::from_secs(9));
     assert!(started.elapsed() < Duration::from_secs(13));
+}
+
+/// Child process IDs of `parent`, from a Toolhelp process snapshot.
+#[cfg(windows)]
+fn child_process_ids(parent: u32) -> Vec<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+    // SAFETY: the snapshot handle is closed below, and the entry carries its size.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut children = Vec::new();
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32ParentProcessID == parent {
+                children.push(entry.th32ProcessID);
+            }
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        children
+    }
 }

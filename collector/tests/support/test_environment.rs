@@ -916,22 +916,6 @@ fn admit_executable(command: &Command, raw: Option<&str>, cwd: &Path) -> io::Res
                 return admit_native_args(&words[1..], cwd);
             }
         }
-        if program == std::fs::canonicalize(system.join("WindowsPowerShell/v1.0/powershell.exe"))?
-            && raw.is_none()
-            && args.len() == 4
-            && args[..3] == ["-NoProfile", "-NonInteractive", "-Command"]
-        {
-            let prefix = "Get-CimInstance Win32_Process -Filter 'ParentProcessId=";
-            let suffix = "' | Select-Object -ExpandProperty ProcessId";
-            if args[3]
-                .strip_prefix(prefix)
-                .and_then(|s| s.strip_suffix(suffix))
-                .and_then(|s| s.parse::<u32>().ok())
-                .is_some()
-            {
-                return Ok(());
-            }
-        }
     }
     #[cfg(unix)]
     {
