@@ -480,8 +480,9 @@ def gates(repo, target, run, env):
     if cargo_built:
         test_env = {**env, "CODEX_SESSIONS_COLLECTOR_EXE": str((cargo / "target/release" / BINARIES[0]).resolve()),
                     "CODEX_SESSIONS_HUB_EXE": str((cargo / "target/release" / BINARIES[1]).resolve())}
-        for name, args in [("flutter-test", ["flutter", "test"]),
-                           ("flutter-integration", ["flutter", "test", "integration_test"])]:
+        # CI would select the GitHub reporter, whose summary the count check cannot read.
+        for name, args in [("flutter-test", ["flutter", "test", "--reporter", "expanded"]),
+                           ("flutter-integration", ["flutter", "test", "--reporter", "expanded", "integration_test"])]:
             code = gate(name, args, app, test_env)
             first = first or code
     else:
