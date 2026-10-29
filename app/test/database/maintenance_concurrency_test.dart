@@ -21,7 +21,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import '../support/scripted_collector_bridge.dart';
 
-// Stops that abort a running statement need sqlite3_interrupt.
+// Aborting a running statement needs sqlite3_interrupt.
 final Object _withoutInterrupt = Platform.isLinux
     ? 'package:sqlite3 on Linux does not export sqlite3_interrupt'
     : false;
@@ -134,7 +134,6 @@ void main() {
       }
       expect(File('${temp.path}/second-partition').existsSync(), isFalse);
     },
-    skip: _withoutInterrupt,
   );
 
   test(
@@ -1282,6 +1281,70 @@ void main() {
   );
 
   test(
+    'without sqlite3_interrupt a stop lets the running index commit with its checkpoint',
+    () async {
+      final seed = openFileBackedDatabase(databaseFile);
+      seed.execute(
+        'create table interrupt_index_probe (value integer not null)',
+      );
+      seed.execute('''
+      with recursive values_to_index(value) as (
+        select 1 union all select value + 1 from values_to_index where value < 200
+      )
+      insert into interrupt_index_probe select value from values_to_index
+    ''');
+      seed.close();
+      final operation = await DatabaseMaintenanceCoordinator(databaseFile)
+          .start(
+            jobType: 'interrupt_index_probe',
+            initialPhase: 'build_indexes',
+            atomicPhases: const {'build_indexes'},
+            worker: _buildSlowIndex,
+          );
+      await operation.progress.firstWhere(
+        (progress) => progress.currentWork == 'SQLite index statement running.',
+      );
+      await operation.requestStop();
+      final result = await operation.result;
+
+      final db = openFileBackedDatabase(databaseFile);
+      addTearDown(db.close);
+      // The index expression's function must exist to verify the index.
+      db.createFunction(
+        functionName: 'slow_index_value',
+        deterministic: true,
+        directOnly: false,
+        function: (arguments) => arguments.single,
+      );
+      final job = MaintenanceJobRepository(
+        db,
+      ).latestForType('interrupt_index_probe')!;
+      expect(
+        result.state,
+        DatabaseMaintenanceState.interrupted,
+        reason: result.errorMessage,
+      );
+      expect(job.state, MaintenanceJobState.interrupted);
+      // The statement ran to completion, so its index and checkpoint
+      // committed together.
+      expect(job.completedUnits, 8);
+      expect(job.lastProcessedRowId, 8);
+      expect(
+        db.select(
+          "select name from sqlite_master where name = 'idx_interrupt_probe'",
+        ),
+        hasLength(1),
+      );
+      expect(db.select('pragma integrity_check').single.values.single, 'ok');
+      // A delayed UI stop callback must not touch an already closed native handle.
+      await operation.requestStop();
+    },
+    skip: Platform.isLinux
+        ? false
+        : 'Windows aborts the statement; covered by the test above',
+  );
+
+  test(
     'worker failure exposes its recovery reason and durable phase',
     () async {
       final operation = await DatabaseMaintenanceCoordinator(databaseFile)
@@ -1371,7 +1434,6 @@ void main() {
         expect(db.select('pragma integrity_check').single.values.single, 'ok');
         expect(db.select('pragma foreign_key_check'), isEmpty);
       },
-      skip: _withoutInterrupt,
     );
   }
 
