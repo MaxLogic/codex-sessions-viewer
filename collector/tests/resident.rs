@@ -3859,10 +3859,10 @@ fn bridge_protocol_wire_version_and_validation() {
         hello["capabilities"],
         serde_json::json!([protocol::BOUNDED_FINISHED_REPORT])
     );
-    // b7b59d8 bridge::compatible ignores additive fields. Keep its advertised
-    // inputs stable, so an old bridge accepts a new bounded-report resident.
+    // b7b59d8 bridge::compatible ignores additive fields. Keep its other
+    // advertised inputs stable; since 1.0.0 its exact collector_version check
+    // fails, so an old bridge replaces the resident instead of accepting it.
     assert_eq!(hello["viewer_protocol"], 1);
-    assert_eq!(hello["collector_version"], "0.1.0");
     assert_eq!(hello["parsers"]["codex"], 5);
     assert_eq!(hello["parsers"]["claude"], 1);
     assert_eq!(hello["lifetime"], "viewer");

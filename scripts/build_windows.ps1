@@ -358,6 +358,11 @@ else {
     Write-FallbackReadme -Destination $releaseReadme
 }
 
+$licenseFile = Join-Path $repoRoot 'LICENSE'
+if (Test-Path -LiteralPath $licenseFile -PathType Leaf) {
+    Copy-Item -LiteralPath $licenseFile -Destination (Join-Path $OutputDirectory 'LICENSE') -Force
+}
+
 $releaseSampleSettings = Join-Path $OutputDirectory 'settings.sample.toml'
 Copy-Item -LiteralPath $settingsFile -Destination $releaseSampleSettings -Force
 
