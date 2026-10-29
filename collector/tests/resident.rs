@@ -4055,14 +4055,19 @@ fn protocol_saturated_clients_do_not_break_accept_or_shutdown() {
     // New connections beyond capacity are closed. Release all test-owned clients;
     // a control client must then be admitted and shutdown must still join everyone.
     drop(clients);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Each attempt starts a collector process, which can take over a second on
+    // a loaded two-core CI runner; the bound proves recovery, not speed.
+    let started = Instant::now();
+    let mut attempts = 0;
     loop {
+        attempts += 1;
         if fixture.cli("stop").status.success() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
-            "accept loop failed under saturation"
+            started.elapsed() < Duration::from_secs(10),
+            "accept loop failed under saturation after {attempts} stop attempts in {:?}",
+            started.elapsed()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
