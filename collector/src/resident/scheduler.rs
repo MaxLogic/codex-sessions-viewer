@@ -274,6 +274,27 @@ fn claim(queue: &Path, key: &str, name: &str) -> io::Result<Option<hooks::Claim>
     Ok(Some(claim))
 }
 
+fn take_claim(
+    pending: &Mutex<Pending>,
+    queue: &Path,
+    key: &str,
+    name: &str,
+) -> Option<hooks::Claim> {
+    match claim(queue, key, name) {
+        Ok(Some(claim)) => Some(claim),
+        // Timers run on the monotonic clock and retry times on the wall clock,
+        // so a due entry can still be early. Without this it waits for the sweep.
+        Ok(None) => {
+            requeue(pending, queue, key, name);
+            None
+        }
+        Err(error) => {
+            hooks::log_error(queue, &format!("queue claim: {error}"));
+            None
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Pass {
     pub completed: usize,
@@ -334,13 +355,8 @@ fn process(
             .file_name()
             .and_then(|name| name.to_str())
             .expect("validated entry name");
-        let claim = match claim(queue, key, name) {
-            Ok(Some(claim)) => claim,
-            Ok(None) => continue,
-            Err(error) => {
-                hooks::log_error(queue, &format!("queue claim: {error}"));
-                continue;
-            }
+        let Some(claim) = take_claim(pending, queue, key, name) else {
+            continue;
         };
         struct Claimed<'a>(&'a Mutex<Pending>);
         impl Drop for Claimed<'_> {
@@ -1151,6 +1167,38 @@ mod tests {
             "progress overflow disconnected a stalled peer"
         );
         assert_eq!(receiver.try_iter().last().unwrap()["event"], "done");
+    }
+    #[test]
+    fn hook_entry_claimed_before_its_retry_time_stays_pending() {
+        let root = std::env::temp_dir().join(format!(
+            "cxv-early-claim-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let entry =
+            hooks::enqueue(&root, &hooks::codex_work_item(r#"{"thread-id":"test"}"#)).unwrap();
+        let mut item: Value = serde_json::from_slice(&std::fs::read(&entry).unwrap()).unwrap();
+        item["not_before_utc"] = json!("2999-01-01T00:00:00.000000Z");
+        std::fs::write(&entry, serde_json::to_vec(&item).unwrap()).unwrap();
+        let name = entry.file_name().unwrap().to_str().unwrap();
+        // The timer and the retry time use different clocks, so a due entry can
+        // still be microseconds early when it is claimed.
+        let pending = Mutex::new(Pending::default());
+        let taken = take_claim(&pending, &root, "key", name);
+        let requeued = pending.lock().unwrap().entries.contains_key(&entry);
+        let restored = entry.is_file();
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        assert!(taken.is_none());
+        assert!(restored);
+        assert!(
+            requeued,
+            "an early claim stranded the entry until the sweep"
+        );
     }
     #[test]
     fn hook_back_pressure_keeps_the_overflow_entry_durable() {
