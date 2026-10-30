@@ -173,16 +173,16 @@ bash -n scripts/build_linux.sh
 bash -n scripts/build_macos.sh
 ```
 
-`.github/workflows/native-release.yml` runs the native Windows, macOS and Linux
+`.github/workflows/native-release.yml` runs the native Windows and Linux
 pipelines on separate hosted runners, with a 150-minute job deadline and at
-most two concurrent matrix jobs. Windows retains the existing PowerShell
-pipeline. CI pins Flutter 3.44.1, Rust 1.98.1 and immutable action commits
+most two concurrent matrix jobs. macOS is not in the workflow: it failed there
+and has no Mac to diagnose it on, so `scripts/build_macos.sh` has to be run on a
+Mac. Windows retains the existing PowerShell pipeline. CI pins Flutter 3.44.1, Rust 1.98.1 and immutable action commits
 verified from their upstream release tags: [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1),
 [setup-python v7.0.0](https://github.com/actions/setup-python/releases/tag/v7.0.0),
 [upload-artifact v7.0.1](https://github.com/actions/upload-artifact/releases/tag/v7.0.1)
 and [flutter-action v2.23.0](https://github.com/subosito/flutter-action/releases/tag/v2.23.0).
-macOS CI uses ad-hoc signing and no distribution secrets. Workflow source does
-not constitute a CI run or authorize a push.
+Workflow source does not constitute a CI run or authorize a push.
 
 Before accepting a native release, run its complete script on that host,
 inspect the archive, start the packaged viewer, verify native SQLite with a

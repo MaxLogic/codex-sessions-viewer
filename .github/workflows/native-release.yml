@@ -19,9 +19,6 @@ jobs:
           - target: windows
             os: windows-2025
             archive: release/codex_session_viewer_windows.zip
-          - target: macos
-            os: macos-15
-            archive: release/codex_sessions_viewer_macos.zip
           - target: linux
             os: ubuntu-24.04
             archive: release/codex_sessions_viewer_linux.tar.gz
@@ -32,8 +29,6 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
       FLUTTER_SUPPRESS_ANALYTICS: 'true'
-      CXV_MACOS_SIGN_IDENTITY: ''
-      CXV_MACOS_NOTARY_PROFILE: ''
       RUSTUP_TOOLCHAIN: '1.98.1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,15 +61,10 @@ jobs:
           New-Item -ItemType Directory -Force release/logs | Out-Null
           & ./scripts/package_release.ps1 *> release/logs/windows-release.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: macOS native release gates and ZIP (ad-hoc signing)
-        if: matrix.target == 'macos'
-        # Hosted checkouts sit inside HOME, which test isolation refuses. A short
-        # parent keeps test socket paths under the 104-byte Unix limit.
-        env:
-          CXV_TEST_SANDBOX_PARENT: /tmp/cx
-        run: bash scripts/build_macos.sh
       - name: Linux native release gates and tarball
         if: matrix.target == 'linux'
+        # Hosted checkouts sit inside HOME, which test isolation refuses. A short
+        # parent keeps test socket paths under the 104-byte Unix limit.
         env:
           CXV_TEST_SANDBOX_PARENT: /tmp/cx
         # Integration tests start the GTK app, which needs a display.
