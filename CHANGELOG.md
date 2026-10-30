@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- `resident stop` no longer fails after 10 seconds when the collector is at its connection limit; it repeats the shutdown request until the collector stops.
+- A hook entry whose retry timer fired slightly before its retry time could wait for the 30-second queue sweep. It now stays scheduled.
+
 ## [1.0.0] - 2026-10-29
 
 First public release, with Windows and Linux x64 builds, under the MIT license. The collector now reports version 1.0.0, like the app; a resident started by an older collector is replaced when a 1.0.0 viewer connects. On Linux, stopping a database maintenance job waits for its current step, because the bundled SQLite does not export `sqlite3_interrupt`.

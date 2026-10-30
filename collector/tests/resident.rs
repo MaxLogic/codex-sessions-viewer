@@ -4055,22 +4055,44 @@ fn protocol_saturated_clients_do_not_break_accept_or_shutdown() {
     // New connections beyond capacity are closed. Release all test-owned clients;
     // a control client must then be admitted and shutdown must still join everyone.
     drop(clients);
-    // Each attempt starts a collector process, which can take over a second on
-    // a loaded two-core CI runner; the bound proves recovery, not speed.
-    let started = Instant::now();
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        if fixture.cli("stop").status.success() {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "accept loop failed under saturation after {attempts} stop attempts in {:?}",
-            started.elapsed()
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    assert!(fixture.cli("stop").status.success());
+    fixture.wait_all(Duration::from_secs(5));
+}
+
+#[test]
+fn protocol_stop_outlasts_a_connection_closed_at_capacity() {
+    let _fixture_load = ordinary_fixture_lane();
+    let mut fixture = Fixture::new();
+    fixture.start("resident");
+    fixture.ready();
+    let mut clients = Vec::new();
+    for _ in 0..6 {
+        let mut client = fixture.wire();
+        protocol::send(
+            client.get_mut(),
+            &serde_json::json!({"v":1,"id":"busy","op":"status"}),
+        )
+        .unwrap();
+        next_event(&mut client);
+        clients.push(client);
     }
+    let stop = fixture
+        .command()
+        .args(["resident", "stop", "--db"])
+        .arg(&fixture.db)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The first shutdown request arrives while every slot is taken.
+    std::thread::sleep(Duration::from_millis(300));
+    drop(clients);
+    let output = stop.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     fixture.wait_all(Duration::from_secs(5));
 }
 

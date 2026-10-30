@@ -873,11 +873,15 @@ pub fn control(database: &Path, action: &str) -> io::Result<Value> {
         if instance_stopped(database)? {
             return Ok(json!({"v":1,"event":"stopped"}));
         }
-        let reply = request(
-            &key,
-            &json!({"v":1,"id":"stop","op":"shutdown","reason":"resident stop"}),
-            CLIENT_TIMEOUT,
-        );
+        let shutdown = json!({"v":1,"id":"stop","op":"shutdown","reason":"resident stop"});
+        let mut reply = request(&key, &shutdown, CLIENT_TIMEOUT);
+        // A listener at capacity closes new connections unread, so a failed
+        // request may mean the resident never saw it. Ask again until it stops.
+        while reply.is_err() && !instance_stopped(database)? {
+            let remaining = stop_deadline::remaining(deadline)?;
+            thread::sleep(remaining.min(Duration::from_millis(20)));
+            reply = request(&key, &shutdown, remaining.min(CLIENT_TIMEOUT));
+        }
         // Shutdown may close the pipe before its final reply is consumed, or
         // race another stop/idle exit before sending. Never infer success from
         // a pipe error (or an acknowledgement): wait for the process-owned lock.
