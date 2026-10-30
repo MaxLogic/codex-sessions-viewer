@@ -833,205 +833,199 @@ void main() {
     timeout: const Timeout(Duration(minutes: 2)),
   );
 
-  testWidgets(
-    'collector snapshots update production selection without scanning',
-    (tester) async {
-      await tester.binding.setSurfaceSize(const Size(1800, 1000));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-      final dir = Directory.systemTemp.createTempSync('external_collector_');
-      final file = File('${dir.path}/viewer.sqlite');
-      final settingsFile = File('${dir.path}/settings.toml');
-      final root = Directory('${dir.path}/codex');
-      final sessions = Directory('${root.path}/sessions');
-      sessions.createSync(recursive: true);
-      final source = File(
-        '../samples/sessions/sample_codex_jsonl_session.jsonl',
-      ).copySync('${sessions.path}/fixture.jsonl');
-      final settings = AppSettings.defaults().copyWith(
-        paths: PathSettings(
-          windowsCodexPath: root.path,
-          wslCodexUncPath: '${dir.path}/absent',
+  testWidgets('collector snapshots update production selection without scanning', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final dir = Directory.systemTemp.createTempSync('external_collector_');
+    final file = File('${dir.path}/viewer.sqlite');
+    final settingsFile = File('${dir.path}/settings.toml');
+    final root = Directory('${dir.path}/codex');
+    final sessions = Directory('${root.path}/sessions');
+    sessions.createSync(recursive: true);
+    final source = File(
+      '../samples/sessions/sample_codex_jsonl_session.jsonl',
+    ).copySync('${sessions.path}/fixture.jsonl');
+    final settings = AppSettings.defaults().copyWith(
+      paths: PathSettings(
+        windowsCodexPath: root.path,
+        wslCodexUncPath: '${dir.path}/absent',
+      ),
+    );
+    await tester.runAsync(() async {
+      await SettingsRepository(settingsFile).save(settings);
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(file, deferUsageMigration: true);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.details,
+      );
+      final migration = await startPendingDatabaseMigration(
+        file,
+        sqlRoot: Directory('../sql'),
+      );
+      if (migration != null) {
+        final outcome = await migration.result;
+        expect(outcome.succeeded, isTrue, reason: outcome.state.name);
+      }
+    });
+    final executable =
+        Platform.environment['CODEX_SESSIONS_COLLECTOR_EXE'] ??
+        p.absolute('../collector/target/debug/codex-sessions-collector.exe');
+    Future<void> collect() async {
+      final result = await runTestProcess(executable, [
+        'codex',
+        'scan',
+        '--no-wsl-projects',
+        '--settings',
+        settingsFile.path,
+        '--db',
+        file.path,
+      ]);
+      expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
+    }
+
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: file,
+    );
+    var scans = 0;
+    var revision = 0;
+    var detailLoads = 0;
+    Future<SessionRowViewModel?>? lastDetailLoad;
+    final watcher = ExternalDatabaseChanges(file, onChange: () => revision++);
+    watcher.check();
+    try {
+      late ExternalSessionRows snapshot;
+      var displayedRows = <SessionRowViewModel>[];
+      await tester.runAsync(() async {
+        await collect();
+        snapshot = await controller.loadExternalRowChanges();
+        displayedRows = snapshot.merge(displayedRows);
+      });
+      expect(displayedRows, isNotEmpty);
+      Future<void> show() => tester.pumpWidget(
+        MaterialApp(
+          home: SessionsScreen(
+            initialRows: displayedRows,
+            externalRevision: revision,
+            now: () => DateTime.utc(2026, 6, 15),
+            onRefresh: () async {
+              scans++;
+              return displayedRows;
+            },
+            onLoadSessionDetail: (id) async {
+              detailLoads++;
+              return lastDetailLoad = tester.runAsync<SessionRowViewModel?>(
+                () => controller.loadSessionDetail(id),
+              );
+            },
+            watchSessionFile: (_) => const Stream.empty(),
+          ),
         ),
       );
-      await tester.runAsync(() async {
-        await SettingsRepository(settingsFile).save(settings);
-        final result = await DatabaseMigrator(
-          sqlRoot: Directory('../sql'),
-        ).openAndMigrate(file, deferUsageMigration: true);
-        expect(
-          result.canStartNormalUi,
-          isTrue,
-          reason: result.fatalError?.details,
-        );
-        final migration = await startPendingDatabaseMigration(
-          file,
-          sqlRoot: Directory('../sql'),
-        );
-        if (migration != null) {
-          final outcome = await migration.result;
-          expect(outcome.succeeded, isTrue, reason: outcome.state.name);
-        }
-      });
-      final executable =
-          Platform.environment['CODEX_SESSIONS_COLLECTOR_EXE'] ??
-          p.absolute('../collector/target/debug/codex-sessions-collector.exe');
-      Future<void> collect() async {
-        final result = await runTestProcess(executable, [
-          'codex',
-          'scan',
-          '--no-wsl-projects',
-          '--settings',
-          settingsFile.path,
-          '--db',
-          file.path,
-        ]);
-        expect(
-          result.exitCode,
-          0,
-          reason: '${result.stdout}\n${result.stderr}',
-        );
-      }
-
-      final controller = RuntimeSessionController(
-        settingsFile: settingsFile,
-        databaseFile: file,
-      );
-      var scans = 0;
-      var revision = 0;
-      var detailLoads = 0;
-      Future<SessionRowViewModel?>? lastDetailLoad;
-      final watcher = ExternalDatabaseChanges(file, onChange: () => revision++);
       watcher.check();
-      try {
-        late ExternalSessionRows snapshot;
-        var displayedRows = <SessionRowViewModel>[];
-        await tester.runAsync(() async {
-          await collect();
-          snapshot = await controller.loadExternalRowChanges();
-          displayedRows = snapshot.merge(displayedRows);
-        });
-        expect(displayedRows, isNotEmpty);
-        Future<void> show() => tester.pumpWidget(
-          MaterialApp(
-            home: SessionsScreen(
-              initialRows: displayedRows,
-              externalRevision: revision,
-              now: () => DateTime.utc(2026, 6, 15),
-              onRefresh: () async {
-                scans++;
-                return displayedRows;
-              },
-              onLoadSessionDetail: (id) async {
-                detailLoads++;
-                return lastDetailLoad = tester.runAsync<SessionRowViewModel?>(
-                  () => controller.loadSessionDetail(id),
-                );
-              },
-              watchSessionFile: (_) => const Stream.empty(),
-            ),
+      await show();
+      final sessionRow = find.byWidgetPredicate(
+        (widget) =>
+            widget is Semantics &&
+            widget.properties.onTap != null &&
+            (widget.properties.label ?? '').startsWith('Session ') &&
+            (widget.properties.label ?? '').contains('. Status '),
+      );
+      expect(sessionRow, findsOneWidget);
+      await tester.tap(sessionRow);
+      expect(detailLoads, 1);
+      expect(await lastDetailLoad, isNotNull);
+      await tester.pump(const Duration(milliseconds: 300));
+      final before = tester
+          .widget<SessionDetailPane>(find.byType(SessionDetailPane))
+          .row;
+      final search = find.descendant(
+        of: find.bySemanticsLabel('Session search'),
+        matching: find.byType(TextField),
+      );
+      final query = before.title.split(' ').first;
+      await tester.enterText(search, query);
+      await tester.pump(const Duration(milliseconds: 350));
+      final focus = FocusManager.instance.primaryFocus;
+      final beforeUnrelatedLoads = detailLoads;
+      await tester.runAsync(() async {
+        final otherSource = File('${sessions.path}/other.jsonl');
+        await otherSource.writeAsString(
+          source.readAsStringSync().replaceAll(
+            'jsonl-session-001',
+            'jsonl-session-002',
           ),
         );
-        watcher.check();
-        await show();
-        final sessionRow = find.byWidgetPredicate(
-          (widget) =>
-              widget is Semantics &&
-              widget.properties.onTap != null &&
-              (widget.properties.label ?? '').startsWith('Session ') &&
-              (widget.properties.label ?? '').contains('. Status '),
+        await collect();
+        final unrelated = await controller.loadExternalRowChanges(
+          afterRevision: snapshot.revision,
         );
-        expect(sessionRow, findsOneWidget);
-        await tester.tap(sessionRow);
-        expect(detailLoads, 1);
-        expect(await lastDetailLoad, isNotNull);
-        await tester.pump(const Duration(milliseconds: 300));
-        final before = tester
-            .widget<SessionDetailPane>(find.byType(SessionDetailPane))
-            .row;
-        final search = find.descendant(
-          of: find.bySemanticsLabel('Session search'),
-          matching: find.byType(TextField),
+        expect(unrelated.changedIds, isNot(contains(before.id)));
+        snapshot = unrelated;
+        displayedRows = snapshot.merge(displayedRows);
+      });
+      watcher.check();
+      await show();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(
+        detailLoads,
+        beforeUnrelatedLoads,
+        reason:
+            'Another session commit must not reload the selected conversation.',
+      );
+      await tester.runAsync(() async {
+        await source.writeAsString(
+          '\n{"timestamp":"2026-06-15T10:05:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"external collector appended answer"}]}}\n',
+          mode: FileMode.append,
         );
-        final query = before.title.split(' ').first;
-        await tester.enterText(search, query);
-        await tester.pump(const Duration(milliseconds: 350));
-        final focus = FocusManager.instance.primaryFocus;
-        final beforeUnrelatedLoads = detailLoads;
-        await tester.runAsync(() async {
-          final otherSource = File('${sessions.path}/other.jsonl');
-          await otherSource.writeAsString(
-            source.readAsStringSync().replaceAll(
-              'jsonl-session-001',
-              'jsonl-session-002',
-            ),
-          );
-          await collect();
-          final unrelated = await controller.loadExternalRowChanges(
-            afterRevision: snapshot.revision,
-          );
-          expect(unrelated.changedIds, isNot(contains(before.id)));
-          snapshot = unrelated;
-          displayedRows = snapshot.merge(displayedRows);
-        });
-        watcher.check();
-        await show();
-        await tester.pump(const Duration(milliseconds: 300));
-        expect(
-          detailLoads,
-          beforeUnrelatedLoads,
-          reason:
-              'Another session commit must not reload the selected conversation.',
+        await collect();
+        snapshot = await controller.loadExternalRowChanges(
+          afterRevision: snapshot.revision,
         );
-        await tester.runAsync(() async {
-          await source.writeAsString(
-            '\n{"timestamp":"2026-06-15T10:05:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"external collector appended answer"}]}}\n',
-            mode: FileMode.append,
-          );
-          await collect();
-          snapshot = await controller.loadExternalRowChanges(
-            afterRevision: snapshot.revision,
-          );
-          expect(snapshot.changedIds, {before.id});
-          displayedRows = snapshot.merge(displayedRows);
-        });
-        expect(
-          displayedRows.firstWhere((row) => row.id == before.id).messageCount,
-          greaterThan(before.messageCount),
-        );
-        watcher.check();
-        await show();
-        await tester.pump(const Duration(milliseconds: 300));
-        expect(detailLoads, greaterThan(1));
-        final loadedDetail = await lastDetailLoad;
-        expect(loadedDetail, isNotNull);
-        expect(
-          loadedDetail!.messageCount,
-          greaterThan(before.messageCount),
-          reason: 'The selected detail loader must see the collector commit.',
-        );
-        await tester.pump(const Duration(seconds: 1));
-        final after = tester
-            .widget<SessionDetailPane>(find.byType(SessionDetailPane).last)
-            .row;
-        expect(after.id, before.id);
-        expect(after.messageCount, greaterThan(before.messageCount));
-        expect(
-          after.conversationMessages.any(
-            (m) => m.body.contains('external collector appended answer'),
-          ),
-          isTrue,
-        );
-        expect(scans, 0);
-        expect(tester.widget<TextField>(search).controller!.text, query);
-        expect(FocusManager.instance.primaryFocus, same(focus));
-      } finally {
-        await tester.pumpWidget(const SizedBox.shrink());
-        watcher.dispose();
-        await tester.runAsync(() => deleteCollectorFixture(dir));
-      }
-    },
-    timeout: const Timeout(Duration(minutes: 4)),
-  );
+        expect(snapshot.changedIds, {before.id});
+        displayedRows = snapshot.merge(displayedRows);
+      });
+      expect(
+        displayedRows.firstWhere((row) => row.id == before.id).messageCount,
+        greaterThan(before.messageCount),
+      );
+      watcher.check();
+      await show();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(detailLoads, greaterThan(1));
+      final loadedDetail = await lastDetailLoad;
+      expect(loadedDetail, isNotNull);
+      expect(
+        loadedDetail!.messageCount,
+        greaterThan(before.messageCount),
+        reason: 'The selected detail loader must see the collector commit.',
+      );
+      await tester.pump(const Duration(seconds: 1));
+      final after = tester
+          .widget<SessionDetailPane>(find.byType(SessionDetailPane).last)
+          .row;
+      expect(after.id, before.id);
+      expect(after.messageCount, greaterThan(before.messageCount));
+      expect(
+        after.conversationMessages.any(
+          (m) => m.body.contains('external collector appended answer'),
+        ),
+        isTrue,
+      );
+      expect(scans, 0);
+      expect(tester.widget<TextField>(search).controller!.text, query);
+      expect(FocusManager.instance.primaryFocus, same(focus));
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      watcher.dispose();
+      await tester.runAsync(() => deleteCollectorFixture(dir));
+    }
+  }, timeout: const Timeout(Duration(minutes: 4)));
 }
 
 void _createSchema(Database db) {

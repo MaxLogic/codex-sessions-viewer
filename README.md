@@ -164,7 +164,7 @@ The release scripts run every check before they build: Rust formatting,
 Clippy and tests, Dart formatting and analysis, and the Flutter unit, widget
 and integration tests. Any failure stops the build.
 
-Windows needs Flutter 3.44.1 with Windows desktop support and Rust 1.98:
+Windows needs Flutter 3.47.9 with Windows desktop support and Rust 1.99:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_release.ps1

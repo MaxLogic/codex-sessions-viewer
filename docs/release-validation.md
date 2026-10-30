@@ -177,10 +177,10 @@ bash -n scripts/build_macos.sh
 pipelines on separate hosted runners, with a 150-minute job deadline and at
 most two concurrent matrix jobs. macOS is not in the workflow: it failed there
 and has no Mac to diagnose it on, so `scripts/build_macos.sh` has to be run on a
-Mac. Windows retains the existing PowerShell pipeline. CI pins Flutter 3.44.1, Rust 1.98.1 and immutable action commits
+Mac. Windows retains the existing PowerShell pipeline. CI pins Flutter 3.47.9, Rust 1.99.1 and immutable action commits
 verified from their upstream release tags: [checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1),
-[setup-python v7.0.0](https://github.com/actions/setup-python/releases/tag/v7.0.0),
-[upload-artifact v7.0.1](https://github.com/actions/upload-artifact/releases/tag/v7.0.1)
+[setup-python v7.1.0](https://github.com/actions/setup-python/releases/tag/v7.1.0),
+[upload-artifact v7.0.2](https://github.com/actions/upload-artifact/releases/tag/v7.0.2)
 and [flutter-action v2.23.0](https://github.com/subosito/flutter-action/releases/tag/v2.23.0).
 Workflow source does not constitute a CI run or authorize a push.
 

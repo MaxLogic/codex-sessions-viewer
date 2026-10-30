@@ -582,7 +582,7 @@ class ApplicationMaintenance extends ChangeNotifier {
           final hubTimes = [
             for (final item in hubObservations!)
               if (item.authority == 'hub') item.observedAtUtc,
-            ...hubResult.confirmations.values,
+            ...hubResult!.confirmations.values,
           ];
           final allTimes = [
             for (final item in hubObservations) item.observedAtUtc,

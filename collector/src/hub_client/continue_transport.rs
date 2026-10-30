@@ -82,7 +82,7 @@ impl Transport for ContinueTransport {
                 count,
                 NextTimeout {
                     after: after.into(),
-                    reason: timeout.reason,
+                    ..timeout
                 },
             )?;
             sent += count;
@@ -108,7 +108,7 @@ impl Transport for ContinueTransport {
                 }
                 let remaining = NextTimeout {
                     after: after.into(),
-                    reason: timeout.reason,
+                    ..timeout
                 };
                 if !self.inner.maybe_await_input(remaining)? {
                     if !self.head.is_empty() {
@@ -223,6 +223,8 @@ mod tests {
         NextTimeout {
             after: Duration::from_secs(1).into(),
             reason: ureq::Timeout::RecvResponse,
+            per_read: None,
+            per_write: None,
         }
     }
     fn drain(transport: &mut ContinueTransport) -> Result<Vec<u8>, ureq::Error> {

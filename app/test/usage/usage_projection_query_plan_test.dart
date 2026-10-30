@@ -6,37 +6,34 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 
 void main() {
-  test(
-    'day-only billable index preserves production Usage summaries',
-    () {
-      final directory = Directory.systemTemp.createTempSync('usage-index-ab-');
-      final db = sqlite3.open('${directory.path}/synthetic.db');
-      addTearDown(() {
-        db.close();
-        directory.deleteSync(recursive: true);
-      });
-      db.execute('pragma foreign_keys=on');
-      db.execute('pragma journal_mode=wal');
-      final scripts =
-          [
-            ...Directory('../sql/init').listSync().whereType<File>(),
-            ...Directory('../sql/migration').listSync().whereType<File>(),
-          ].where((file) => file.path.endsWith('.sql')).toList()..sort(
-            (a, b) =>
-                a.uri.pathSegments.last.compareTo(b.uri.pathSegments.last),
-          );
-      for (final script in scripts) {
-        db.execute(script.readAsStringSync());
-      }
-      final generations = DatabaseGenerationRepository(db);
-      final generation = generations.createBuilding(
-        sourceSchemaVersion: 15,
-        targetSchemaVersion: 16,
-        sourceFingerprint: 'synthetic-index-ab',
-      );
-      generations.markReady(generation.id, validationReportJson: '{}');
-      generations.activate(generation.id);
-      db.execute('''
+  test('day-only billable index preserves production Usage summaries', () {
+    final directory = Directory.systemTemp.createTempSync('usage-index-ab-');
+    final db = sqlite3.open('${directory.path}/synthetic.db');
+    addTearDown(() {
+      db.close();
+      directory.deleteSync(recursive: true);
+    });
+    db.execute('pragma foreign_keys=on');
+    db.execute('pragma journal_mode=wal');
+    final scripts =
+        [
+          ...Directory('../sql/init').listSync().whereType<File>(),
+          ...Directory('../sql/migration').listSync().whereType<File>(),
+        ].where((file) => file.path.endsWith('.sql')).toList()..sort(
+          (a, b) => a.uri.pathSegments.last.compareTo(b.uri.pathSegments.last),
+        );
+    for (final script in scripts) {
+      db.execute(script.readAsStringSync());
+    }
+    final generations = DatabaseGenerationRepository(db);
+    final generation = generations.createBuilding(
+      sourceSchemaVersion: 15,
+      targetSchemaVersion: 16,
+      sourceFingerprint: 'synthetic-index-ab',
+    );
+    generations.markReady(generation.id, validationReportJson: '{}');
+    generations.activate(generation.id);
+    db.execute('''
       begin immediate;
       with recursive n(i) as (select 1 union all select i+1 from n where i<255)
       insert into usage_path_contexts (display_path_raw,platform_path_raw,unc_path_raw,
@@ -67,9 +64,9 @@ void main() {
       from sessions s cross join days;
       commit;
     ''');
-      // Sparse usage is important to planner choice: 90% of known sessions
-      // have no local usage, while 1000 sessions retain all 300000 daily rows.
-      db.execute('''
+    // Sparse usage is important to planner choice: 90% of known sessions
+    // have no local usage, while 1000 sessions retain all 300000 daily rows.
+    db.execute('''
         with recursive n(i) as (select 0 union all select i+1 from n where i<8999)
         insert into sessions (id,session_id,source_type,source_file_path,display_path,
           platform_path,parse_status,usage_projection_status,parser_version,
@@ -78,95 +75,93 @@ void main() {
           'synthetic-zero/'||i,'synthetic-zero','synthetic-zero','available',
           'complete',3,'2025-11-12T00:00:00.000Z','2025-11-12','2025-11-12',0 from n;
       ''');
-      expect(
-        db.select('select count(*) from sessions').single.values.single,
-        10000,
+    expect(
+      db.select('select count(*) from sessions').single.values.single,
+      10000,
+    );
+    expect(
+      db
+          .select('select count(*) from usage_session_daily')
+          .single
+          .values
+          .single,
+      300000,
+    );
+    final repository = UsageSummaryRepository(db);
+    final requests = [
+      for (final period in [UsagePeriod.last30Days, UsagePeriod.today])
+        UsageSummaryRequest(
+          period: period,
+          nowUtc: DateTime.utc(2026, 9, 7),
+          projectionVersion: 3,
+        ),
+    ];
+    final references = <Object?>[];
+    final measurements = <Object?>[];
+    for (final columns in [
+      'day_utc,path_context_id,model_key,session_id',
+      'day_utc',
+    ]) {
+      db.execute('drop index idx_usage_session_daily_billable_day');
+      final build = Stopwatch()..start();
+      db.execute(
+        "create index idx_usage_session_daily_billable_day on usage_session_daily($columns) where branch_scope='local'",
       );
-      expect(
-        db
-            .select('select count(*) from usage_session_daily')
-            .single
-            .values
-            .single,
-        300000,
-      );
-      final repository = UsageSummaryRepository(db);
-      final requests = [
-        for (final period in [UsagePeriod.last30Days, UsagePeriod.today])
-          UsageSummaryRequest(
-            period: period,
-            nowUtc: DateTime.utc(2026, 9, 7),
-            projectionVersion: 3,
-          ),
-      ];
-      final references = <Object?>[];
-      final measurements = <Object?>[];
-      for (final columns in [
-        'day_utc,path_context_id,model_key,session_id',
-        'day_utc',
-      ]) {
-        db.execute('drop index idx_usage_session_daily_billable_day');
-        final build = Stopwatch()..start();
-        db.execute(
-          "create index idx_usage_session_daily_billable_day on usage_session_daily($columns) where branch_scope='local'",
-        );
-        build.stop();
-        db.execute('analyze');
-        final bytes = db
-            .select(
-              "select sum(pgsize) from dbstat where name='idx_usage_session_daily_billable_day'",
-            )
-            .single
-            .values
-            .single;
-        final periods = <Object?>[];
-        for (var index = 0; index < requests.length; index++) {
-          final request = requests[index];
-          final warmup = repository.summarize(request);
-          final snapshot = _summarySnapshot(warmup);
-          if (columns == 'day_utc') {
-            expect(snapshot, references[index]);
-          } else {
-            references.add(snapshot);
-          }
-          final plan = repository.explainUsageEventAggregation(request);
-          expect(plan.join('\n'), isNot(contains('usage_events')));
-          final samples = <int>[];
-          for (var sample = 0; sample < 7; sample++) {
-            final watch = Stopwatch()..start();
-            final summary = repository.summarize(request);
-            watch.stop();
-            samples.add(watch.elapsedMicroseconds);
-            // Verification stays outside the production reader's timed region.
-            expect(_summarySnapshot(summary), references[index]);
-          }
-          final sorted = [...samples]..sort();
-          periods.add({
-            'period': request.period.name,
-            'rawUs': samples,
-            'medianUs': sorted[3],
-            'p95Us': sorted[6],
-            'totalTokens': warmup.totalTokens,
-            'plan': plan,
-          });
+      build.stop();
+      db.execute('analyze');
+      final bytes = db
+          .select(
+            "select sum(pgsize) from dbstat where name='idx_usage_session_daily_billable_day'",
+          )
+          .single
+          .values
+          .single;
+      final periods = <Object?>[];
+      for (var index = 0; index < requests.length; index++) {
+        final request = requests[index];
+        final warmup = repository.summarize(request);
+        final snapshot = _summarySnapshot(warmup);
+        if (columns == 'day_utc') {
+          expect(snapshot, references[index]);
+        } else {
+          references.add(snapshot);
         }
-        measurements.add({
-          'columns': columns,
-          'buildUs': build.elapsedMicroseconds,
-          'bytes': bytes,
-          'periods': periods,
+        final plan = repository.explainUsageEventAggregation(request);
+        expect(plan.join('\n'), isNot(contains('usage_events')));
+        final samples = <int>[];
+        for (var sample = 0; sample < 7; sample++) {
+          final watch = Stopwatch()..start();
+          final summary = repository.summarize(request);
+          watch.stop();
+          samples.add(watch.elapsedMicroseconds);
+          // Verification stays outside the production reader's timed region.
+          expect(_summarySnapshot(summary), references[index]);
+        }
+        final sorted = [...samples]..sort();
+        periods.add({
+          'period': request.period.name,
+          'rawUs': samples,
+          'medianUs': sorted[3],
+          'p95Us': sorted[6],
+          'totalTokens': warmup.totalTokens,
+          'plan': plan,
         });
       }
-      expect(db.select('pragma foreign_key_check'), isEmpty);
-      // ignore: avoid_print
-      print(
-        'Production Usage index A/B: synthetic file-backed Windows SQLite, '
-        '10000 sessions (90% zero-usage),300000 daily rows,256 contexts,8 models,90% local; '
-        'Flutter-test JIT;1 excluded warmup+7 samples;nearest-rank p95. $measurements',
-      );
-    },
-    timeout: const Timeout(Duration(minutes: 3)),
-  );
+      measurements.add({
+        'columns': columns,
+        'buildUs': build.elapsedMicroseconds,
+        'bytes': bytes,
+        'periods': periods,
+      });
+    }
+    expect(db.select('pragma foreign_key_check'), isEmpty);
+    // ignore: avoid_print
+    print(
+      'Production Usage index A/B: synthetic file-backed Windows SQLite, '
+      '10000 sessions (90% zero-usage),300000 daily rows,256 contexts,8 models,90% local; '
+      'Flutter-test JIT;1 excluded warmup+7 samples;nearest-rank p95. $measurements',
+    );
+  }, timeout: const Timeout(Duration(minutes: 3)));
 
   test(
     'active usage query searches persisted projections without raw events',

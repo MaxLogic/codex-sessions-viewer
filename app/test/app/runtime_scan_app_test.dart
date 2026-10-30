@@ -2493,84 +2493,79 @@ void main() {
     );
   });
 
-  test(
-    'keeps case-distinct WSL fallback identities unresolved',
-    () async {
-      final temp = await Directory.systemTemp.createTemp(
-        'csv_runtime_wsl_identity_case_',
-      );
-      addTearDown(() async {
-        if (await temp.exists()) {
-          await deleteCollectorFixture(temp);
-        }
-      });
+  test('keeps case-distinct WSL fallback identities unresolved', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_wsl_identity_case_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await deleteCollectorFixture(temp);
+      }
+    });
 
-      final codexRoot = Directory(p.join(temp.path, '.codex'));
-      final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
-      await activeRoot.create(recursive: true);
-      final sourceFile = await _writeIdentityFixture(
-        activeRoot,
-        fileName: 'Case-Sensitive.json',
-        sessionId: 'wsl-case-sensitive',
-        messages: const [
-          ('user', '2026-07-27T14:00:00Z', 'case-sensitive source'),
-        ],
-      );
-      final settingsFile = File(p.join(temp.path, 'settings.toml'));
-      await SettingsRepository(settingsFile).save(
-        AppSettings.defaults().copyWith(
-          paths: PathSettings(
-            windowsCodexPath: '',
-            wslCodexUncPath: codexRoot.path,
-          ),
-          logging: _testLogging(temp),
+    final codexRoot = Directory(p.join(temp.path, '.codex'));
+    final activeRoot = Directory(p.join(codexRoot.path, 'sessions'));
+    await activeRoot.create(recursive: true);
+    final sourceFile = await _writeIdentityFixture(
+      activeRoot,
+      fileName: 'Case-Sensitive.json',
+      sessionId: 'wsl-case-sensitive',
+      messages: const [
+        ('user', '2026-07-27T14:00:00Z', 'case-sensitive source'),
+      ],
+    );
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: '',
+          wslCodexUncPath: codexRoot.path,
         ),
-      );
-      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await _migrateCollectorFixture(databaseFile);
-      expect(startup.canStartNormalUi, isTrue);
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await _migrateCollectorFixture(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
 
-      final caseDistinctPath =
-          '/${sourceFile.path.replaceAll(r'\', '/').toLowerCase()}';
-      final fallbackId = 'source-status:$caseDistinctPath';
-      final db = openFileBackedDatabase(databaseFile);
-      db.execute(
-        '''
+    final caseDistinctPath =
+        '/${sourceFile.path.replaceAll(r'\', '/').toLowerCase()}';
+    final fallbackId = 'source-status:$caseDistinctPath';
+    final db = openFileBackedDatabase(databaseFile);
+    db.execute(
+      '''
       insert into sessions (
         id, source_type, source_file_path, display_path, platform_path,
         is_pinned, created_at_utc, updated_at_utc
       ) values (?, 'wsl', ?, ?, ?, 1,
         '2026-07-27T09:00:00Z', '2026-07-27T09:00:00Z')
       ''',
-        [fallbackId, caseDistinctPath, caseDistinctPath, caseDistinctPath],
-      );
-      db.close();
+      [fallbackId, caseDistinctPath, caseDistinctPath, caseDistinctPath],
+    );
+    db.close();
 
-      await RuntimeSessionController(
-        settingsFile: settingsFile,
-        databaseFile: databaseFile,
-      ).refresh();
+    await RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+    ).refresh();
 
-      final refreshed = openFileBackedDatabase(databaseFile);
-      addTearDown(refreshed.close);
-      expect(
-        refreshed.select(
-          'select count(*) as count from sessions where id = ?',
-          [fallbackId],
-        ).single['count'],
-        1,
-      );
-      expect(
-        refreshed
-            .select(
-              "select is_pinned from sessions where id = 'session:wsl-case-sensitive'",
-            )
-            .single['is_pinned'],
-        0,
-      );
-    },
-    skip: _skipWithoutWsl,
-  );
+    final refreshed = openFileBackedDatabase(databaseFile);
+    addTearDown(refreshed.close);
+    expect(
+      refreshed.select('select count(*) as count from sessions where id = ?', [
+        fallbackId,
+      ]).single['count'],
+      1,
+    );
+    expect(
+      refreshed
+          .select(
+            "select is_pinned from sessions where id = 'session:wsl-case-sensitive'",
+          )
+          .single['is_pinned'],
+      0,
+    );
+  }, skip: _skipWithoutWsl);
 
   test('release lifecycle certification preflight invariants', () async {
     final temp = await Directory.systemTemp.createTemp(
@@ -4387,93 +4382,85 @@ void main() {
     },
   );
 
-  test(
-    'runtime batches WSL project resolution for each refresh',
-    () async {
-      final temp = await Directory.systemTemp.createTemp(
-        'csv_runtime_wsl_project_batch_',
-      );
-      addTearDown(() async {
-        if (await temp.exists()) {
-          await deleteCollectorFixture(temp);
-        }
-      });
+  test('runtime batches WSL project resolution for each refresh', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'csv_runtime_wsl_project_batch_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await deleteCollectorFixture(temp);
+      }
+    });
 
-      final windowsRoot = Directory(p.join(temp.path, 'windows'));
-      final wslRoot = Directory(p.join(temp.path, 'wsl'));
-      await windowsRoot.create();
-      await wslRoot.create();
-      const sharedPath = '/home/pawel/projects/shared';
-      const unresolvedPath = '/home/pawel/projects/unresolved';
-      await _writeWslJsonFixture(wslRoot, 'wsl-shared-a', sharedPath);
-      await _writeWslJsonFixture(wslRoot, 'wsl-shared-b', sharedPath);
-      await _writeWslJsonFixture(wslRoot, 'wsl-unresolved', unresolvedPath);
+    final windowsRoot = Directory(p.join(temp.path, 'windows'));
+    final wslRoot = Directory(p.join(temp.path, 'wsl'));
+    await windowsRoot.create();
+    await wslRoot.create();
+    const sharedPath = '/home/pawel/projects/shared';
+    const unresolvedPath = '/home/pawel/projects/unresolved';
+    await _writeWslJsonFixture(wslRoot, 'wsl-shared-a', sharedPath);
+    await _writeWslJsonFixture(wslRoot, 'wsl-shared-b', sharedPath);
+    await _writeWslJsonFixture(wslRoot, 'wsl-unresolved', unresolvedPath);
 
-      final settingsFile = File(p.join(temp.path, 'settings.toml'));
-      await SettingsRepository(settingsFile).save(
-        AppSettings.defaults().copyWith(
-          paths: PathSettings(
-            windowsCodexPath: windowsRoot.path,
-            wslCodexUncPath: wslRoot.path,
-          ),
-          logging: _testLogging(temp),
+    final settingsFile = File(p.join(temp.path, 'settings.toml'));
+    await SettingsRepository(settingsFile).save(
+      AppSettings.defaults().copyWith(
+        paths: PathSettings(
+          windowsCodexPath: windowsRoot.path,
+          wslCodexUncPath: wslRoot.path,
         ),
-      );
-      final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
-      final startup = await _migrateCollectorFixture(databaseFile);
-      expect(startup.canStartNormalUi, isTrue);
+        logging: _testLogging(temp),
+      ),
+    );
+    final databaseFile = File(p.join(temp.path, 'viewer.sqlite'));
+    final startup = await _migrateCollectorFixture(databaseFile);
+    expect(startup.canStartNormalUi, isTrue);
 
-      final resolver = _RecordingWslProjectResolver({
-        sharedPath: 'shared-root',
-      });
-      final controller = RuntimeSessionController(
-        settingsFile: settingsFile,
-        databaseFile: databaseFile,
-        scanBatchingPolicy: const ScanBatchingPolicy(
-          parsedSessionFlushBatchSize: 1,
-          fullRowSnapshotBatchSize: 1,
-        ),
-        wslProjectResolver: resolver,
-      );
+    final resolver = _RecordingWslProjectResolver({sharedPath: 'shared-root'});
+    final controller = RuntimeSessionController(
+      settingsFile: settingsFile,
+      databaseFile: databaseFile,
+      scanBatchingPolicy: const ScanBatchingPolicy(
+        parsedSessionFlushBatchSize: 1,
+        fullRowSnapshotBatchSize: 1,
+      ),
+      wslProjectResolver: resolver,
+    );
 
-      final progressEvents = <SessionsRefreshProgress>[];
-      final refreshed = await controller.refresh(
-        onProgress: progressEvents.add,
-      );
-      expect(refreshed.persistenceFlushCount, greaterThanOrEqualTo(1));
-      expect(refreshed.rows.map((row) => row.project).toSet(), {
-        'shared-root',
-        'unresolved',
-      });
-      expect(refreshed.rows, hasLength(3));
-      expect(resolver.calls, [
-        {sharedPath, unresolvedPath},
-      ]);
+    final progressEvents = <SessionsRefreshProgress>[];
+    final refreshed = await controller.refresh(onProgress: progressEvents.add);
+    expect(refreshed.persistenceFlushCount, greaterThanOrEqualTo(1));
+    expect(refreshed.rows.map((row) => row.project).toSet(), {
+      'shared-root',
+      'unresolved',
+    });
+    expect(refreshed.rows, hasLength(3));
+    expect(resolver.calls, [
+      {sharedPath, unresolvedPath},
+    ]);
 
-      final db = openFileBackedDatabase(databaseFile);
-      addTearDown(db.close);
-      db.execute('''
+    final db = openFileBackedDatabase(databaseFile);
+    addTearDown(db.close);
+    db.execute('''
       update sessions
       set project_id = null,
           project_name_snapshot = null,
           project_override = 0
       ''');
-      db.execute('update session_search set project_name = ?', ['']);
+    db.execute('update session_search set project_name = ?', ['']);
 
-      resolver.results[sharedPath] = 'cached-root';
-      final cached = await controller.refresh();
+    resolver.results[sharedPath] = 'cached-root';
+    final cached = await controller.refresh();
 
-      expect(cached.rows.map((row) => row.project).toSet(), {
-        'cached-root',
-        'unresolved',
-      });
-      expect(resolver.calls, [
-        {sharedPath, unresolvedPath},
-        {sharedPath, unresolvedPath},
-      ]);
-    },
-    skip: _skipWithoutWsl,
-  );
+    expect(cached.rows.map((row) => row.project).toSet(), {
+      'cached-root',
+      'unresolved',
+    });
+    expect(resolver.calls, [
+      {sharedPath, unresolvedPath},
+      {sharedPath, unresolvedPath},
+    ]);
+  }, skip: _skipWithoutWsl);
 
   test('resolved WSL paths expose containing-folder actions', () async {
     final temp = await Directory.systemTemp.createTemp(

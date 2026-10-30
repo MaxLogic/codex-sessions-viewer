@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- Built with Flutter 3.47.9 and Rust 1.99.1. Dart packages are updated, including sqlite3 3.8.0, and so are the collector crates, including zstd 0.14. rusqlite stays at 0.40 because 0.41 needs exclusive connection access for hooks. screen_retriever stays at 0.2 because window_manager requires it.
+
 ### Fixed
 - `resident stop` no longer fails after 10 seconds when the collector is at its connection limit; it repeats the shutdown request until the collector stops.
 - A hook entry whose retry timer fired slightly before its retry time could wait for the 30-second queue sweep. It now stays scheduled.
