@@ -145,7 +145,8 @@ fn repair_releases_collector_lease_before_waiting_for_viewer_grant() {
         release_seen.recv_timeout(Duration::from_secs(5)).unwrap();
         // Viewer runWriter owns its slot until the child ingest writer returns.
         viewer_slot.send(()).unwrap();
-        let _wait = LeaseWait::enter(Duration::from_millis(300));
+        // The peer can race repair's legitimate backup lease before the next viewer grant.
+        let _wait = LeaseWait::enter(Duration::from_secs(5));
         let result = writer::apply_thread_names(&reload.conn, &[]);
         done.send(()).unwrap();
         result
@@ -171,7 +172,7 @@ fn repair_releases_collector_lease_before_waiting_for_viewer_grant() {
             if acquire {
                 grants += 1;
                 if grants == 2 {
-                    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+                    completed.recv_timeout(Duration::from_secs(10)).unwrap();
                 }
             } else if grants == 1 {
                 released.send(()).unwrap();
