@@ -1271,72 +1271,106 @@ fn bridge_reports_inflight_disconnect_and_reconnects_without_replaying() {
         .arg(&fixture.db)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut input = bridge.stdin.take().unwrap();
     let output = bridge.stdout.take().unwrap();
+    let mut stderr = bridge.stderr.take().unwrap();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
     fixture.children.push(bridge);
     let (sender, receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines() {
-            if sender
-                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
-                .is_err()
-            {
+            if sender.send(line).is_err() {
                 break;
             }
         }
     });
-    protocol::send(
-        &mut input,
-        &serde_json::json!({"v":1,"id":"interrupted","op":"scan","harnesses":["codex"]}),
-    )
-    .unwrap();
-    await_scanning(&fixture);
-    fixture.children[0].kill().unwrap();
-    fixture.children[0].wait().unwrap();
-    let mut disconnected = false;
-    let mut reconnecting = false;
-    loop {
-        let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
-        if event["id"] == "interrupted" && event["code"] == "disconnected" {
-            disconnected = true;
+    let mut events = Vec::new();
+    let mut next = || {
+        let line = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bridge event stream ended")
+            .expect("read bridge stdout");
+        events.push(line.clone());
+        serde_json::from_str::<Value>(&line).expect("bridge event JSON")
+    };
+    // Retain diagnostics for every assertion, including failures after recovery.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        protocol::send(
+            &mut input,
+            &serde_json::json!({"v":1,"id":"interrupted","op":"scan","harnesses":["codex"]}),
+        )
+        .unwrap();
+        await_scanning(&fixture);
+        fixture.children[0].kill().unwrap();
+        fixture.children[0].wait().unwrap();
+        let mut disconnected = false;
+        let mut reconnecting = false;
+        loop {
+            let event = next();
+            if event["id"] == "interrupted" && event["code"] == "disconnected" {
+                disconnected = true;
+            }
+            if event["event"] == "bridge" && event["state"] == "reconnecting" {
+                reconnecting = true;
+            }
+            if reconnecting && event["event"] == "bridge" && event["state"] == "connected" {
+                assert!(disconnected);
+                break;
+            }
         }
-        if event["event"] == "bridge" && event["state"] == "reconnecting" {
-            reconnecting = true;
+        drop(lock);
+        protocol::send(
+            &mut input,
+            &serde_json::json!({"v":1,"id":"fresh","op":"scan","harnesses":["codex"]}),
+        )
+        .unwrap();
+        loop {
+            let event = next();
+            assert_ne!(event["id"], "interrupted", "disconnected scan replayed");
+            assert_ne!(event["event"], "error", "{event}");
+            if event["id"] == "fresh" && event["event"] == "done" {
+                assert_eq!(event["cancelled"], false);
+                break;
+            }
         }
-        if reconnecting && event["event"] == "bridge" && event["state"] == "connected" {
-            assert!(disconnected);
-            break;
+        drop(input);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = fixture.children[1].try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
         }
+    }));
+    let bridge = &mut fixture.children[1];
+    let before_cleanup = bridge.try_wait();
+    if !matches!(before_cleanup, Ok(Some(_))) {
+        let _ = bridge.kill();
     }
-    drop(lock);
-    protocol::send(
-        &mut input,
-        &serde_json::json!({"v":1,"id":"fresh","op":"scan","harnesses":["codex"]}),
-    )
-    .unwrap();
-    loop {
-        let event = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_ne!(event["id"], "interrupted", "disconnected scan replayed");
-        assert_ne!(event["event"], "error", "{event}");
-        if event["id"] == "fresh" && event["event"] == "done" {
-            assert_eq!(event["cancelled"], false);
-            break;
-        }
-    }
-    drop(input);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if let Some(status) = fixture.children[1].try_wait().unwrap() {
-            assert!(status.success());
-            break;
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let exit = bridge.wait();
     reader.join().unwrap();
+    let stderr = stderr_reader.join().unwrap();
+    if let Err(panic) = result {
+        events.extend(
+            receiver
+                .try_iter()
+                .map(|line| line.unwrap_or_else(|error| format!("stdout read failed: {error}"))),
+        );
+        eprintln!(
+            "bridge events: {events:#?}\nbridge status before cleanup: {before_cleanup:?}\nbridge exit status: {exit:?}\nbridge stderr:\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[cfg(windows)]

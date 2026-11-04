@@ -14,6 +14,10 @@ use std::{
 #[cfg(all(test, windows))]
 pub(super) mod deadline_tests;
 
+#[cfg(all(test, windows))]
+#[path = "bridge_reconnect_tests.rs"]
+mod reconnect_tests;
+
 fn state(out: &mut impl Write, name: &str, detail: &str) -> io::Result<()> {
     protocol::send(
         out,
@@ -192,6 +196,34 @@ fn start(context: &Context, replacement_deadline: Option<Instant>) -> io::Result
 }
 
 fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpoint::Stream>> {
+    attach_inner(context, out, false)
+}
+
+fn retryable_hello_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED as i32)
+    {
+        // Windows can report a closing pipe as Uncategorized (error 233),
+        // including when the peer exits before the hello write completes.
+        return true;
+    }
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+    )
+}
+
+fn attach_inner(
+    context: &Context,
+    out: &mut impl Write,
+    reconnecting: bool,
+) -> io::Result<BufReader<endpoint::Stream>> {
     let key = instance::database_key(&context.database)?;
     const ATTACH_TIMEOUT: Duration = Duration::from_secs(6);
     // Shutdown and successor attachment have separate budgets, within this
@@ -215,11 +247,26 @@ fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpo
         ) {
             Ok(stream) => {
                 let mut reader = BufReader::new(stream);
-                protocol::send(
+                let hello = protocol::send(
                     reader.get_mut(),
                     &json!({"v":1,"id":"bridge-hello","op":"hello","client":"viewer"}),
-                )?;
-                let hello = receive_until(&mut reader, deadline)?;
+                )
+                .and_then(|()| receive_until(&mut reader, deadline));
+                let hello = match hello {
+                    Ok(hello) => hello,
+                    Err(error) if reconnecting && retryable_hello_error(&error) => {
+                        // A dying owner can accept the reconnect before losing
+                        // its pipe. Retry attachment, never replay the request or
+                        // infer incompatibility, and keep the original deadline.
+                        drop(reader);
+                        std::thread::sleep(
+                            Duration::from_millis(20)
+                                .min(deadline.saturating_duration_since(now())),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let unsupported = hello["event"] == "error"
                     && hello["code"] == "unsupported_version"
                     && hello["id"] == "bridge-hello"
@@ -314,8 +361,14 @@ fn connect(
     context: &Context,
     out: &mut impl Write,
     wake: &Arc<transport::Wake>,
+    reconnecting: bool,
 ) -> io::Result<Connected> {
-    let reader = attach(context, out).inspect_err(|error| {
+    let attached = if reconnecting {
+        attach_inner(context, out, true)
+    } else {
+        attach(context, out)
+    };
+    let reader = attached.inspect_err(|error| {
         let _ = protocol::send(out, &json!({
             "v":1, "event":"bridge", "state":"failed", "detail":error.to_string(),
             "code": if error.kind() == io::ErrorKind::InvalidData { "protocol_error" } else { "disconnected" },
@@ -354,7 +407,7 @@ fn reconnect(
         )?;
     }
     state(out, "reconnecting", &error.to_string())?;
-    *connection = Some(connect(context, out, wake)?);
+    *connection = Some(connect(context, out, wake, true)?);
     Ok(())
 }
 
@@ -384,7 +437,7 @@ fn relay(
     wake: &Arc<transport::Wake>,
 ) -> io::Result<()> {
     let context = Context::resolve(options).map_err(io::Error::other)?;
-    let mut connection = Some(connect(&context, out, wake)?);
+    let mut connection = Some(connect(&context, out, wake, false)?);
     let mut inflight: HashMap<String, Pending> = HashMap::new();
     let mut prepared: Option<(protocol::Request, Vec<u8>)> = None;
     let mut forwarding: Option<Vec<u8>> = None;
