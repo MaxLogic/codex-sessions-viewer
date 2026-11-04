@@ -511,7 +511,7 @@ fn every_viewer_boundary(phase: &str) {
             let (before, after, packets, count) = serial_references(phase, edit, target);
             for boundary in 1..count {
                 let temp = support::TempDir::new("viewer_trial");
-                let store = fixture(temp.path(), phase, edit, target);
+                let mut store = fixture(temp.path(), phase, edit, target);
                 let initial = state(&store);
                 let target_rowid: i64 = store
                     .conn

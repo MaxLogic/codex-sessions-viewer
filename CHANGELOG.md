@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Changed
-- Built with Flutter 3.47.9 and Rust 1.99.1. Dart packages are updated, including sqlite3 3.8.0, and so are the collector crates, including zstd 0.14. rusqlite stays at 0.40 because 0.41 needs exclusive connection access for hooks. screen_retriever stays at 0.2 because window_manager requires it.
+- Built with Flutter 3.47.9 and Rust 1.99.1. Dart packages are updated, including sqlite3 3.8.0, and so are the collector crates, including zstd 0.14 and rusqlite 0.41.1 (bundled SQLite 3.54.1). Collector hooks now use exclusive connection access. screen_retriever stays at 0.2 because window_manager requires it.
 
 ### Fixed
 - The viewer bridge now retries a disconnected hello during reconnection within its existing startup deadline, so a dying collector does not end recovery early.

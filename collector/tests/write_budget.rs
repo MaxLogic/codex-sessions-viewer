@@ -667,7 +667,7 @@ fn session_admission_isolates_large_and_merging_sessions() {
 
 /// Count actual SQLite VM instructions only while a physical transaction is
 /// open. Stop a quadratic regression promptly rather than hanging the suite.
-fn locked_steps(conn: &Connection) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+fn locked_steps(conn: &mut Connection) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -691,8 +691,8 @@ fn locked_steps(conn: &Connection) -> std::sync::Arc<std::sync::atomic::AtomicU6
 }
 
 fn padded_status_store(rows: usize) -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    schema::prepare_standalone(&conn, ":memory:").unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     conn.execute(
         "with recursive n(x) as (values(1) union all select x+1 from n where x < ?1)
         insert into sessions(id,harness,source_type,source_file_path,display_path,platform_path,
@@ -719,10 +719,10 @@ fn status_lock_work_scales_with_changes_and_70k_unchanged_rows_do_not_write() {
     use std::sync::atomic::Ordering;
     let mut measured = Vec::new();
     for rows in [1_000, 70_553] {
-        let conn = padded_status_store(rows);
+        let mut conn = padded_status_store(rows);
         let mut changed = unsupported_status("compressed-1.jsonl.zst");
         changed.state = "codex_archived".into();
-        let steps = locked_steps(&conn);
+        let steps = locked_steps(&mut conn);
         writer::apply_source_statuses(&conn, &[changed]).unwrap();
         measured.push(steps.load(Ordering::Relaxed));
         conn.progress_handler(0, None::<fn() -> bool>).unwrap();
@@ -730,7 +730,7 @@ fn status_lock_work_scales_with_changes_and_70k_unchanged_rows_do_not_write() {
             .map(|n| unsupported_status(&format!("compressed-{n}.jsonl.zst")))
             .collect();
         let scope = WriteHoldScope::for_phase("statuses");
-        let steps = locked_steps(&conn);
+        let steps = locked_steps(&mut conn);
         writer::apply_source_statuses(&conn, &statuses).unwrap();
         conn.progress_handler(0, None::<fn() -> bool>).unwrap();
         assert_eq!(
@@ -767,7 +767,7 @@ fn status_full_input_t2_stays_below_reviewed_bound() {
         conn.execute("vacuum into ?", [path.to_str().unwrap()])
             .unwrap();
         drop(conn);
-        let conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open(&path).unwrap();
         let viewer = Connection::open(&path).unwrap();
         let injected = Rc::new(Cell::new(false));
         let did = injected.clone();
@@ -787,7 +787,7 @@ fn status_full_input_t2_stays_below_reviewed_bound() {
                 s
             })
             .collect();
-        let steps = locked_steps(&conn);
+        let steps = locked_steps(&mut conn);
         let holds = WriteHoldScope::for_phase("statuses");
         writer::apply_source_statuses(&conn, &input).unwrap();
         drop(observer);
@@ -929,8 +929,8 @@ fn one_session_lock_work_is_independent_of_cached_table_size() {
     use std::sync::atomic::Ordering;
     let mut measured = Vec::new();
     for rows in [1_000, 50_000] {
-        let conn = padded_status_store(rows);
-        let steps = locked_steps(&conn);
+        let mut conn = padded_status_store(rows);
+        let steps = locked_steps(&mut conn);
         writer::apply_session_batch(&conn, vec![support::sample_snapshot("changed")]).unwrap();
         measured.push(steps.load(Ordering::Relaxed));
         conn.progress_handler(0, None::<fn() -> bool>).unwrap();
@@ -1131,12 +1131,12 @@ fn rollback_journal_to_wal_has_a_measured_owner() {
     let _serial = budget_test();
     let temp = support::TempDir::new("journal_mode_hold");
     let db = temp.path().join("rollback.sqlite");
-    let conn = Connection::open(&db).unwrap();
+    let mut conn = Connection::open(&db).unwrap();
     conn.execute_batch("create table fixture(id integer)")
         .unwrap();
     assert_eq!(&std::fs::read(&db).unwrap()[18..20], &[1, 1]);
     let holds = WriteHoldScope::for_phase("journal_mode");
-    schema::configure(&conn, 100).unwrap();
+    schema::configure(&mut conn, 100).unwrap();
     assert!(conn.is_autocommit());
     assert_eq!(&std::fs::read(&db).unwrap()[18..20], &[2, 2]);
     assert_eq!(holds.report().transactions, 1);
@@ -1191,11 +1191,11 @@ fn completeness_guard_detects_unowned_commit_and_special_pragma() {
     let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::audit::WriteAudit;
     let temp = support::TempDir::new("audit_negative");
-    let conn = Connection::open(temp.path().join("fixture.sqlite")).unwrap();
+    let mut conn = Connection::open(temp.path().join("fixture.sqlite")).unwrap();
     conn.execute_batch("create table fixture(id integer)")
         .unwrap();
     let audit = WriteAudit::start();
-    audit.attach(&conn).unwrap();
+    audit.attach(&mut conn).unwrap();
     // Deliberate accounting mutants: the guard must catch both historical
     // defect classes without relying on the phase-specific regression tests.
     conn.execute("insert into fixture values (1)", []).unwrap();
@@ -1219,9 +1219,10 @@ fn completeness_guard_rejects_missing_completion_after_already_wal_configure() {
     let _serial = budget_test();
     use codex_sessions_collector::store::{OwnerMode, Store, write_budget::audit::WriteAudit};
     let temp = support::TempDir::new("audit_replaced_completion");
-    let store = Store::open(&temp.path().join("fixture.sqlite"), OwnerMode::Standalone).unwrap();
+    let mut store =
+        Store::open(&temp.path().join("fixture.sqlite"), OwnerMode::Standalone).unwrap();
     let audit = WriteAudit::start();
-    audit.attach(&store.conn).unwrap();
+    audit.attach(&mut store.conn).unwrap();
     let holds = WriteHoldScope::start();
     let _lease =
         codex_sessions_collector::store::write_lease::WriteLease::acquire(&store.conn).unwrap();
@@ -1234,11 +1235,12 @@ fn completeness_guard_rejects_missing_completion_after_already_wal_configure() {
         )
         .unwrap();
     store.conn.execute_batch("commit").unwrap(); // deliberately omit finish
+    drop(_lease); // Hook setup needs exclusive access after the transaction ends.
     assert_eq!(audit.report().commits, 1);
     assert_eq!(holds.report().transactions, 0);
     // This no-op WAL configuration used to replace the unfinished owner and
     // let its unrelated sample erase the original commit's pending receipt.
-    schema::configure(&store.conn, 100).unwrap();
+    schema::configure(&mut store.conn, 100).unwrap();
     assert_eq!(audit.report().commits, 1);
     assert_eq!(holds.report().transactions, 1);
     assert_eq!(holds.report().max_phase.as_deref(), Some("journal_mode"));
@@ -1378,8 +1380,8 @@ fn hold_stats_empty_and_submillisecond() {
 #[test]
 fn hold_stats_commit_rollback_nested_and_scope_restoration() {
     let _serial = budget_test();
-    let conn = Connection::open_in_memory().unwrap();
-    schema::prepare_standalone(&conn, ":memory:").unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     let scope = WriteHoldScope::start();
     let phase = write_phase("outer");
     schema::in_write_transaction(&conn, || {
@@ -1410,8 +1412,8 @@ fn hold_stats_commit_rollback_nested_and_scope_restoration() {
 #[test]
 fn hold_stats_refusal_and_panic_rollback_are_measured() {
     let _serial = budget_test();
-    let conn = Connection::open_in_memory().unwrap();
-    schema::prepare_standalone(&conn, ":memory:").unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     let scope = WriteHoldScope::start();
     let _phase = write_phase("panic");
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1435,8 +1437,8 @@ fn hold_stats_refusal_and_panic_rollback_are_measured() {
 #[test]
 fn hold_stats_commit_failure_records_rollback() {
     let _serial = budget_test();
-    let conn = Connection::open_in_memory().unwrap();
-    schema::prepare_standalone(&conn, ":memory:").unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     // A commit hook rejection exercises the real failed-COMMIT cleanup path.
     conn.commit_hook(Some(|| true)).unwrap();
     let scope = WriteHoldScope::start();
@@ -1537,8 +1539,8 @@ fn hold_stats_scan_reports_json_and_text() {
 fn autocommit_statements_are_measured_without_counting_outer_writes_twice() {
     let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::execute_write;
-    let conn = Connection::open_in_memory().unwrap();
-    schema::prepare_standalone(&conn, ":memory:").unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     let statements = WriteHoldScope::for_phase("single_statement");
     execute_write(
         &conn,

@@ -68,8 +68,8 @@ fn open(path: &Path) -> Connection {
 
 /// A database with the viewer's schema, owned by the viewer.
 pub fn create_viewer_database(path: &Path) {
-    let conn = open(path);
-    schema::prepare_standalone(&conn, &path.display().to_string()).unwrap();
+    let mut conn = open(path);
+    schema::prepare_standalone(&mut conn, &path.display().to_string()).unwrap();
     conn.execute(
         "update app_metadata set value = 'viewer' where key = 'database_owner'",
         [],
@@ -190,11 +190,7 @@ pub fn write_generated_session(path: &Path, session_id: &str, events: usize) {
 
 pub fn rows(conn: &Connection, sql: &str) -> Vec<Value> {
     let mut statement = conn.prepare(sql).unwrap();
-    let names: Vec<String> = statement
-        .column_names()
-        .iter()
-        .map(|name| name.to_string())
-        .collect();
+    let names: Vec<String> = statement.column_names().map(str::to_owned).collect();
     let mut rows = statement.query([]).unwrap();
     let mut result = Vec::new();
     while let Some(row) = rows.next().unwrap() {

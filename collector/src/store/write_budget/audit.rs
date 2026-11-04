@@ -70,7 +70,7 @@ impl WriteAudit {
     pub fn assert_complete(&self) {
         self.report().assert_complete();
     }
-    pub fn attach(&self, conn: &Connection) -> rusqlite::Result<()> {
+    pub fn attach(&self, conn: &mut Connection) -> rusqlite::Result<()> {
         attach(conn, self.state.clone())
     }
 }
@@ -81,7 +81,7 @@ impl Drop for WriteAudit {
             .with_borrow_mut(|connections| connections.retain(|_, state| state.strong_count() > 0));
     }
 }
-pub(crate) fn configured(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn configured(conn: &mut Connection) -> rusqlite::Result<()> {
     if let Some(state) = CAPTURE.with_borrow(Clone::clone) {
         attach(conn, state)?;
     }
@@ -107,7 +107,7 @@ pub(super) fn check_replaced_owner(conn: &Connection) {
         });
     }
 }
-fn attach(conn: &Connection, state: State) -> rusqlite::Result<()> {
+fn attach(conn: &mut Connection, state: State) -> rusqlite::Result<()> {
     let key = connection_key(conn);
     CONNECTIONS.with_borrow_mut(|connections| {
         connections.insert(key, Arc::downgrade(&state));

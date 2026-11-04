@@ -52,7 +52,7 @@ impl Store {
         remaining: std::time::Duration,
     ) -> StoreResult<Self> {
         let display = path.display().to_string();
-        let conn = match mode {
+        let mut conn = match mode {
             OwnerMode::Viewer => {
                 if !path.is_file() {
                     return Err(StoreError::Refused(format!(
@@ -79,11 +79,11 @@ impl Store {
             .and_then(|value| value.parse().ok())
             .unwrap_or(schema::BUSY_TIMEOUT_MS);
         schema::configure(
-            &conn,
+            &mut conn,
             busy_timeout.min(remaining.as_millis().min(u64::MAX.into()) as u64),
         )?;
         if mode == OwnerMode::Standalone {
-            schema::prepare_standalone(&conn, &display)?;
+            schema::prepare_standalone(&mut conn, &display)?;
         }
         schema::check_writable(&conn, mode, &display)?;
         Ok(Self {

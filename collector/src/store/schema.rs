@@ -164,7 +164,7 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// work; a background collector can wait longer for a scan batch to finish.
 pub const BUSY_TIMEOUT_MS: u64 = 30_000;
 
-pub fn configure(conn: &Connection, busy_timeout_ms: u64) -> StoreResult<()> {
+pub fn configure(conn: &mut Connection, busy_timeout_ms: u64) -> StoreResult<()> {
     #[cfg(debug_assertions)]
     super::write_budget::audit::configured(conn)?;
     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))?;
@@ -428,7 +428,7 @@ const SCHEMA_VERSION_TABLE: &str = "create table if not exists schema_version (
 
 /// Create a collector-owned database, or migrate one the collector owns.
 /// Uses the viewer migrator's steps so the result is an ordinary database.
-pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
+pub fn prepare_standalone(conn: &mut Connection, path: &str) -> StoreResult<()> {
     let _phase = super::write_budget::write_phase("schema");
     if last_applied_version(conn)? == 0 {
         return create_standalone(conn, path, MIGRATIONS);
@@ -466,14 +466,14 @@ pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
             .optional()?
             .is_some();
         if !applied {
-            let apply = || {
+            let apply = |conn: &mut Connection| {
                 super::write_budget::begin_immediate(conn)?;
                 finish(conn, apply_migration_in_transaction(conn, migration))
             };
             if migration.version == 29 {
                 with_foreign_keys_disabled(conn, apply)?;
             } else {
-                apply()?;
+                apply(conn)?;
             }
         }
     }
@@ -483,7 +483,11 @@ pub fn prepare_standalone(conn: &Connection, path: &str) -> StoreResult<()> {
 /// A new standalone database in one transaction: schema, the viewer's empty
 /// usage generation, and the collector as owner commit together, so a crash
 /// leaves either nothing or a complete collector-owned database.
-fn create_standalone(conn: &Connection, path: &str, migrations: &[Migration]) -> StoreResult<()> {
+fn create_standalone(
+    conn: &mut Connection,
+    path: &str,
+    migrations: &[Migration],
+) -> StoreResult<()> {
     let has_tables: i64 = conn.query_row(
         "select count(*) from sqlite_schema where type = 'table' and name not like 'sqlite_%'",
         [],
@@ -494,7 +498,7 @@ fn create_standalone(conn: &Connection, path: &str, migrations: &[Migration]) ->
             "{path} already contains tables but no schema history; refusing to initialize it."
         )));
     }
-    let create = || -> StoreResult<()> {
+    let create = |conn: &mut Connection| -> StoreResult<()> {
         super::write_budget::begin_immediate(conn)?;
         let result = (|| -> StoreResult<()> {
             conn.execute_batch(SCHEMA_VERSION_TABLE)?;
@@ -525,7 +529,7 @@ fn create_standalone(conn: &Connection, path: &str, migrations: &[Migration]) ->
     if migrations.iter().any(|migration| migration.version == 29) {
         with_foreign_keys_disabled(conn, create)
     } else {
-        create()
+        create(conn)
     }
 }
 
@@ -676,8 +680,8 @@ fn validate_native_migration(conn: &Connection) -> StoreResult<()> {
 /// SQLite ignores a foreign_keys change after BEGIN, so this guard owns the
 /// setting outside the complete migration transaction, including bootstrap.
 fn with_foreign_keys_disabled<T>(
-    conn: &Connection,
-    body: impl FnOnce() -> StoreResult<T>,
+    conn: &mut Connection,
+    body: impl FnOnce(&mut Connection) -> StoreResult<T>,
 ) -> StoreResult<T> {
     if !conn.is_autocommit() {
         return Err(StoreError::Refused(
@@ -692,7 +696,7 @@ fn with_foreign_keys_disabled<T>(
             "Could not disable foreign keys before native source migration.".to_owned(),
         ));
     }
-    let mut result = body();
+    let mut result = body(conn);
     let mut rollback_failed = false;
     if !conn.is_autocommit() {
         let rollback = conn.execute_batch("rollback");
@@ -778,8 +782,8 @@ mod tests {
     #[test]
     fn migration_checksum_accepts_legacy_newlines_without_rewriting_receipts() {
         for crlf in [false, true] {
-            let conn = native_upgrade_fixture();
-            prepare_standalone(&conn, ":memory:").unwrap();
+            let mut conn = native_upgrade_fixture();
+            prepare_standalone(&mut conn, ":memory:").unwrap();
             conn.execute_batch(
                 "update sessions set source_type='linux',is_pinned=1 where id='parent';",
             )
@@ -787,7 +791,7 @@ mod tests {
             seed_raw_newline_receipts(&conn, crlf);
             let receipts = receipt_rows(&conn);
             let data = native_fixture_snapshot(&conn);
-            prepare_standalone(&conn, ":memory:").unwrap();
+            prepare_standalone(&mut conn, ":memory:").unwrap();
             check_writable(&conn, OwnerMode::Standalone, ":memory:").unwrap();
             conn.execute(
                 "update app_metadata set value=? where key='database_owner'",
@@ -802,11 +806,11 @@ mod tests {
 
     #[test]
     fn migration_checksum_upgrade_preserves_legacy_21_and_populated_rows() {
-        let conn = native_upgrade_fixture();
+        let mut conn = native_upgrade_fixture();
         seed_raw_newline_receipts(&conn, true);
         let receipts = receipt_rows(&conn);
         let data = native_fixture_snapshot(&conn);
-        prepare_standalone(&conn, ":memory:").unwrap();
+        prepare_standalone(&mut conn, ":memory:").unwrap();
         assert_eq!(&receipt_rows(&conn)[..28], receipts.as_slice());
         assert_eq!(native_fixture_snapshot(&conn), data);
         let digest: String = conn
@@ -837,8 +841,8 @@ mod tests {
                     }
                 })
                 .collect();
-            let conn = Connection::open_in_memory().unwrap();
-            create_standalone(&conn, ":memory:", &migrations).unwrap();
+            let mut conn = Connection::open_in_memory().unwrap();
+            create_standalone(&mut conn, ":memory:", &migrations).unwrap();
             for migration in MIGRATIONS {
                 let digest: String = conn
                     .query_row(
@@ -903,7 +907,7 @@ mod tests {
             fixture_digest(&format!("{}\n-- genuine SQL drift\n", MIGRATIONS[20].sql)),
             "0".repeat(64),
         ] {
-            let conn = native_upgrade_fixture();
+            let mut conn = native_upgrade_fixture();
             conn.execute(
                 "update schema_version set checksum=? where version=21",
                 [digest],
@@ -912,7 +916,7 @@ mod tests {
             let receipts = receipt_rows(&conn);
             let data = native_fixture_snapshot(&conn);
             assert!(
-                prepare_standalone(&conn, ":memory:")
+                prepare_standalone(&mut conn, ":memory:")
                     .unwrap_err()
                     .to_string()
                     .contains("does not match")
@@ -930,9 +934,9 @@ mod tests {
     }
 
     fn native_upgrade_fixture() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "on").unwrap();
-        create_standalone(&conn, ":memory:", &MIGRATIONS[..28]).unwrap();
+        create_standalone(&mut conn, ":memory:", &MIGRATIONS[..28]).unwrap();
         conn.execute_batch("insert into sessions(id,source_type,source_file_path,display_path,platform_path,created_at_utc,updated_at_utc) values ('parent','windows','C:/parent','C:/parent','C:/parent','now','now');
             insert into messages(session_id,message_index,author_type,content_plain,content_preview,created_at_db_utc,updated_at_db_utc) values ('parent',0,'user','nativeuniquetoken','nativeuniquetoken','now','now');
             insert into tags(name,created_at_utc,updated_at_utc) values ('retained','now','now');
@@ -994,9 +998,9 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     #[test]
     fn native_migration_preserves_populated_standalone_and_upload_bytes() {
-        let conn = native_upgrade_fixture();
+        let mut conn = native_upgrade_fixture();
         let before = native_fixture_snapshot(&conn);
-        prepare_standalone(&conn, ":memory:").unwrap();
+        prepare_standalone(&mut conn, ":memory:").unwrap();
         assert_eq!(native_fixture_snapshot(&conn), before);
         assert_eq!(
             last_applied_version(&conn).unwrap(),
@@ -1030,11 +1034,11 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             filename: MIGRATIONS[28].filename,
             sql: Box::leak(sql.into_boxed_str()),
         };
-        let conn = native_upgrade_fixture();
+        let mut conn = native_upgrade_fixture();
         let before = native_fixture_snapshot(&conn);
-        let error = with_foreign_keys_disabled(&conn, || {
+        let error = with_foreign_keys_disabled(&mut conn, |conn| {
             conn.execute_batch("begin immediate")?;
-            finish(&conn, apply_migration_in_transaction(&conn, &broken))
+            finish(conn, apply_migration_in_transaction(conn, &broken))
         })
         .unwrap_err();
         assert!(
@@ -1058,10 +1062,10 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             })
             .collect();
         migrations[28] = broken;
-        let fresh = Connection::open_in_memory().unwrap();
+        let mut fresh = Connection::open_in_memory().unwrap();
         fresh.pragma_update(None, "foreign_keys", "on").unwrap();
         assert!(
-            create_standalone(&fresh, ":memory:", &migrations)
+            create_standalone(&mut fresh, ":memory:", &migrations)
                 .unwrap_err()
                 .to_string()
                 .contains("trg_session_tags_change_insert")
@@ -1080,7 +1084,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
                 .unwrap(),
             1
         );
-        prepare_standalone(&fresh, ":memory:").unwrap();
+        prepare_standalone(&mut fresh, ":memory:").unwrap();
     }
 
     #[test]
@@ -1115,8 +1119,8 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     #[test]
     fn standalone_database_is_created_and_owned_by_the_collector() {
-        let conn = Connection::open_in_memory().unwrap();
-        prepare_standalone(&conn, ":memory:").unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        prepare_standalone(&mut conn, ":memory:").unwrap();
         assert_eq!(
             last_applied_version(&conn).unwrap(),
             SUPPORTED_SCHEMA_VERSION
@@ -1133,7 +1137,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             Err(StoreError::Refused(_))
         ));
         // Idempotent for a database the collector owns.
-        prepare_standalone(&conn, ":memory:").unwrap();
+        prepare_standalone(&mut conn, ":memory:").unwrap();
     }
 
     #[test]
@@ -1146,13 +1150,13 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
                 sql: "create table broken (; ",
             },
         ];
-        let conn = Connection::open_in_memory().unwrap();
-        assert!(create_standalone(&conn, ":memory:", BROKEN).is_err());
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(create_standalone(&mut conn, ":memory:", BROKEN).is_err());
         let tables: i64 = conn
             .query_row("select count(*) from sqlite_schema", [], |row| row.get(0))
             .unwrap();
         assert_eq!(tables, 0);
-        prepare_standalone(&conn, ":memory:").unwrap();
+        prepare_standalone(&mut conn, ":memory:").unwrap();
         assert_eq!(database_owner(&conn).unwrap(), OWNER_COLLECTOR);
         let job: String = conn
             .query_row(
@@ -1167,7 +1171,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
     #[test]
     fn native_migration_fatal_cleanup_denies_connection_reads_and_writes() {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-        let conn = native_upgrade_fixture();
+        let mut conn = native_upgrade_fixture();
         conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
             AuthAction::Pragma {
                 pragma_name: "foreign_keys",
@@ -1176,7 +1180,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             _ => Authorization::Allow,
         }))
         .unwrap();
-        let error = prepare_standalone(&conn, ":memory:").unwrap_err();
+        let error = prepare_standalone(&mut conn, ":memory:").unwrap_err();
         assert!(
             error.to_string().contains("foreign-key restoration failed"),
             "{error}"
@@ -1191,9 +1195,9 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
                 .is_err()
         );
 
-        let conn = native_upgrade_fixture();
+        let mut conn = native_upgrade_fixture();
         conn.pragma_update(None, "foreign_keys", "off").unwrap();
-        let error = with_foreign_keys_disabled(&conn, || -> StoreResult<()> {
+        let error = with_foreign_keys_disabled(&mut conn, |conn| -> StoreResult<()> {
             conn.execute_batch("begin immediate")?;
             conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
                 AuthAction::Transaction {
@@ -1222,8 +1226,8 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
     /// A standalone database that a newer release has moved past this
     /// collector's schema: `begin_write` must refuse it.
     fn migrated_past_this_release() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        prepare_standalone(&conn, ":memory:").unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        prepare_standalone(&mut conn, ":memory:").unwrap();
         conn.execute(
             "insert into schema_version (version, filename, checksum, applied_at_utc, success)
              values (?, 'future.sql', 'x', 'now', 1)",
@@ -1235,8 +1239,8 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     #[test]
     fn a_write_on_another_connection_inside_a_write_transaction_is_checked() {
-        let outer = Connection::open_in_memory().unwrap();
-        prepare_standalone(&outer, ":memory:").unwrap();
+        let mut outer = Connection::open_in_memory().unwrap();
+        prepare_standalone(&mut outer, ":memory:").unwrap();
         let other = migrated_past_this_release();
         let nested = in_write_transaction(&outer, || {
             let _lease = super::super::write_lease::WriteLease::acquire(&other)?;
@@ -1253,8 +1257,8 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     #[test]
     fn a_panic_inside_a_write_transaction_does_not_leave_writes_nested() {
-        let outer = Connection::open_in_memory().unwrap();
-        prepare_standalone(&outer, ":memory:").unwrap();
+        let mut outer = Connection::open_in_memory().unwrap();
+        prepare_standalone(&mut outer, ":memory:").unwrap();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = in_write_transaction(&outer, || -> StoreResult<()> { panic!("synthetic") });
         }));

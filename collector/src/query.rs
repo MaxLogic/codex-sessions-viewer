@@ -360,7 +360,7 @@ pub fn open_read_only(path: &Path) -> QueryResult<Connection> {
             path.display()
         )));
     }
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
@@ -424,11 +424,7 @@ fn select_rows(
     values: &[SqlValue],
 ) -> QueryResult<Vec<Map<String, Value>>> {
     let mut statement = conn.prepare(sql)?;
-    let names: Vec<String> = statement
-        .column_names()
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
+    let names: Vec<String> = statement.column_names().map(str::to_owned).collect();
     let rows = statement.query_map(params_from_iter(values.iter()), |row| {
         let mut map = Map::new();
         for (index, name) in names.iter().enumerate() {
