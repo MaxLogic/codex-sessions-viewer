@@ -586,12 +586,21 @@ fn l6_public_writers_busy_without_changes() {
     let store = Store::open(&path, OwnerMode::Standalone).unwrap();
     let holder = Store::open(&path, OwnerMode::Standalone).unwrap();
     let _lease = WriteLease::acquire(&holder.conn).unwrap();
-    let _wait = LeaseWait::enter(Duration::ZERO);
+    // Exercise refusal immediately even when a public call installs its own
+    // production wait (hub sync normally waits up to ten minutes).
+    let _wait = codex_sessions_collector::store::write_lease::TestLeaseWait::enter(Duration::ZERO);
     let before = all_rows(&store.conn);
     macro_rules! busy {
-        ($value:expr) => {
+        ($value:expr) => {{
+            let started = Instant::now();
             assert!(is_busy(&$value.unwrap_err()));
-        };
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{} waited {:?}; the test policy must override production waits",
+                stringify!($value),
+                started.elapsed()
+            );
+        }};
     }
     busy!(writer::apply_session_batch(&store.conn, vec![]));
     busy!(writer::apply_source_statuses(&store.conn, &[]));
@@ -647,10 +656,16 @@ fn l6_public_writers_busy_without_changes() {
             .unwrap_err()
             .contains("another collector")
     );
+    let sync_started = Instant::now();
     assert!(
         hub_client::sync(&path, OwnerMode::Standalone, "http://127.0.0.1:1", "token")
             .unwrap_err()
             .contains("another collector")
+    );
+    assert!(
+        sync_started.elapsed() < Duration::from_secs(5),
+        "hub sync waited {:?}; the test policy must override its 600 s scope",
+        sync_started.elapsed()
     );
     busy!(codex::collect_file(
         &store,

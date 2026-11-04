@@ -14,6 +14,8 @@ use std::{
 thread_local! {
     static HELD: RefCell<HashMap<usize,Held>> = RefCell::default();
     static WAIT: Cell<Option<Duration>> = const { Cell::new(None) };
+    #[cfg(feature = "test-hooks")]
+    static TEST_WAIT: Cell<Option<Duration>> = const { Cell::new(None) };
     static RELEASED: Cell<Option<Instant>> = const { Cell::new(None) };
     static YIELDING: Cell<bool> = const { Cell::new(false) };
 }
@@ -36,6 +38,16 @@ pub fn lock_path(database: &Path) -> std::io::Result<PathBuf> {
 }
 /// Scoped acquisition timeout, not a lease hold. Scans use ten minutes;
 /// drains use their remaining deadline. Default is the connection busy timeout.
+#[cfg_attr(
+    not(feature = "test-hooks"),
+    doc = r#"
+The test override is unavailable to default-build consumers:
+```compile_fail,E0432
+use codex_sessions_collector::store::write_lease::TestLeaseWait;
+let _policy = TestLeaseWait::enter(std::time::Duration::ZERO);
+```
+"#
+)]
 pub struct LeaseWait(Option<Duration>, PhantomData<Rc<()>>);
 impl LeaseWait {
     pub fn enter(wait: Duration) -> Self {
@@ -46,6 +58,38 @@ impl Drop for LeaseWait {
     fn drop(&mut self) {
         WAIT.with(|v| v.set(self.0));
     }
+}
+
+/// Test-only timeout policy, including calls that enter their own LeaseWait.
+/// Scoped to this thread and compiled only with the non-default test-hooks feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub struct TestLeaseWait(Option<Duration>, PhantomData<Rc<()>>);
+#[cfg(feature = "test-hooks")]
+impl TestLeaseWait {
+    pub fn enter(wait: Duration) -> Self {
+        Self(TEST_WAIT.with(|v| v.replace(Some(wait))), PhantomData)
+    }
+}
+#[cfg(feature = "test-hooks")]
+impl Drop for TestLeaseWait {
+    fn drop(&mut self) {
+        TEST_WAIT.with(|v| v.set(self.0));
+    }
+}
+
+fn acquisition_timeout(conn: &Connection) -> StoreResult<Duration> {
+    let wait = WAIT.with(Cell::get);
+    #[cfg(feature = "test-hooks")]
+    let wait = TEST_WAIT.with(Cell::get).or(wait);
+    Ok(match wait {
+        Some(wait) => wait,
+        None => Duration::from_millis(u64::from(conn.query_row(
+            "pragma busy_timeout",
+            [],
+            |row| row.get::<_, u32>(0),
+        )?)),
+    })
 }
 pub(crate) struct BetweenChunks(bool);
 pub(crate) fn between_chunks() -> BetweenChunks {
@@ -105,14 +149,7 @@ impl<'a> WriteLease<'a> {
                 _thread: PhantomData,
             });
         }
-        let timeout = match WAIT.with(Cell::get) {
-            Some(v) => v,
-            None => Duration::from_millis(u64::from(conn.query_row(
-                "pragma busy_timeout",
-                [],
-                |r| r.get::<_, u32>(0),
-            )?)),
-        };
+        let timeout = acquisition_timeout(conn)?;
         let start = Instant::now();
         // Fairness between public calls; no SQLite lock is held while waiting.
         let gap = RELEASED.with(Cell::get).map_or(Duration::ZERO, |last| {
@@ -194,5 +231,58 @@ impl Drop for WriteLease<'_> {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_policy_overrides_nested_scopes_and_restores_production_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.busy_timeout(Duration::from_millis(17)).unwrap();
+        assert_eq!(
+            acquisition_timeout(&conn).unwrap(),
+            Duration::from_millis(17)
+        );
+        assert_eq!(crate::hub_client::LEASE_WAIT, Duration::from_secs(600));
+        let scan = LeaseWait::enter(crate::hub_client::LEASE_WAIT);
+        assert_eq!(
+            acquisition_timeout(&conn).unwrap(),
+            Duration::from_secs(600)
+        );
+        {
+            let _test = TestLeaseWait::enter(Duration::ZERO);
+            let _nested = LeaseWait::enter(crate::hub_client::LEASE_WAIT);
+            assert_eq!(acquisition_timeout(&conn).unwrap(), Duration::ZERO);
+            {
+                let _nested_test = TestLeaseWait::enter(Duration::from_millis(3));
+                assert_eq!(
+                    acquisition_timeout(&conn).unwrap(),
+                    Duration::from_millis(3)
+                );
+            }
+            assert_eq!(acquisition_timeout(&conn).unwrap(), Duration::ZERO);
+            std::thread::spawn(|| {
+                let conn = Connection::open_in_memory().unwrap();
+                conn.busy_timeout(Duration::from_millis(17)).unwrap();
+                assert_eq!(
+                    acquisition_timeout(&conn).unwrap(),
+                    Duration::from_millis(17)
+                );
+            })
+            .join()
+            .unwrap();
+        }
+        assert_eq!(
+            acquisition_timeout(&conn).unwrap(),
+            Duration::from_secs(600)
+        );
+        drop(scan);
+        assert_eq!(
+            acquisition_timeout(&conn).unwrap(),
+            Duration::from_millis(17)
+        );
     }
 }

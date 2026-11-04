@@ -11,6 +11,13 @@ description = "Collects local Codex sessions into the Codex Sessions Viewer data
 name = "codex-sessions-collector"
 path = "src/main.rs"
 
+[features]
+# Tests enable the timeout override through the self dev-dependency.
+test-hooks = []
+
+[dev-dependencies]
+codex-sessions-collector = { path = ".", features = ["test-hooks"] }
+
 [dependencies]
 httparse = "1.10.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
