@@ -2,6 +2,9 @@
 
 Use the checked-in PowerShell scripts from the repository root.
 
+During development use the [change-scoped fast lane](testing.md). The complete
+gate below remains required before closing a larger slice or release, and in CI.
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_windows.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_release.ps1

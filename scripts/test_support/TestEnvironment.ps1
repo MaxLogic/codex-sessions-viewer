@@ -269,11 +269,25 @@ function Assert-TestExecutable {
         Assert-TestPath $Context $ArgumentList[2] -WorkingDirectory $WorkingDirectory
         return
     }
-    # The build orchestrator has exactly two permitted test invocations.
+    # Release invocations plus change-scoped targets. Do not admit arbitrary
+    # cargo/Flutter flags: these are existing test files in this checkout only.
     $cargo = [IO.Path]::GetFullPath((Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
     $flutter = [IO.Path]::GetFullPath((Get-Command flutter -ErrorAction Stop | Select-Object -First 1).Source)
     if ($resolved -eq $cargo -and ($ArgumentList -join '|') -eq 'test|--locked|--no-fail-fast' -and $WorkingDirectory -eq (Join-Path $repo 'collector')) { return }
     if ($resolved -eq $flutter -and ($ArgumentList -join '|') -in @('test','test|integration_test') -and $WorkingDirectory -eq (Join-Path $repo 'app')) { return }
+    if ($resolved -eq $cargo -and $WorkingDirectory -eq (Join-Path $repo 'collector')) {
+        if (($ArgumentList -join '|') -eq 'test|--locked|--lib') { return }
+        if ($ArgumentList.Count -eq 4 -and ($ArgumentList[0..2] -join '|') -eq 'test|--locked|--test' -and $ArgumentList[3] -cmatch '^[a-zA-Z0-9_]+$' -and (Test-Path -LiteralPath (Join-Path $repo ('collector/tests/' + $ArgumentList[3] + '.rs')) -PathType Leaf)) { return }
+    }
+    if ($resolved -eq $flutter -and $WorkingDirectory -eq (Join-Path $repo 'app') -and $ArgumentList.Count -eq 2 -and $ArgumentList[0] -eq 'test' -and $ArgumentList[1] -cmatch '^(test|integration_test)/[a-zA-Z0-9_/]+_test\.dart$' -and (Test-Path -LiteralPath (Join-Path $repo ('app/' + $ArgumentList[1])) -PathType Leaf)) { return }
+    if ($resolved -eq $flutter -and $WorkingDirectory -eq (Join-Path $repo 'app') -and $ArgumentList.Count -ge 3 -and ($ArgumentList[0..1] -join '|') -eq 'test|--machine') {
+        $validTargets = $true
+        foreach ($target in $ArgumentList[2..($ArgumentList.Count-1)]) {
+            if ($target -cnotmatch '^(test|integration_test)/[a-zA-Z0-9_/]+_test\.dart$' -or -not (Test-Path -LiteralPath (Join-Path $repo ('app/' + $target)) -PathType Leaf)) { $validTargets = $false; break }
+        }
+        if ($validTargets) { return }
+    }
+    if ($resolved -eq $flutter -and $WorkingDirectory -eq (Join-Path $repo 'app') -and ($ArgumentList -join '|') -eq 'test|test/app/runtime_scan_app_test.dart|--plain-name|pricing commits between background scan batches before scan completion') { return }
     if ($resolved -eq $env:ComSpec -and ($ArgumentList -join '|') -eq '/d|/c|exit 7') { return }
     $knownHosts = @((Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'), 'C:\Program Files\PowerShell\7\pwsh.exe')
     if ($resolved -in $knownHosts -and $ArgumentList.Count -in @(9,11) -and ($ArgumentList[0..7] -join '|') -eq ('-NoProfile|-ExecutionPolicy|Bypass|-File|' + (Join-Path $repo 'scripts/benchmark_scan_memory.ps1') + '|-Mode|InternalSelfTestChild|-ChildExitCode') -and $ArgumentList[8] -match '^[0-9]{1,3}$') {
