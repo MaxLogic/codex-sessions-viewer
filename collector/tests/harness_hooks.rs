@@ -16,6 +16,7 @@ use support::{TempDir, collector, viewer_database};
 const CLAUDE_SESSION: &str = "11111111-2222-4333-8444-555555555555";
 
 fn open(path: &Path) -> Connection {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(path).unwrap();
     conn.busy_timeout(Duration::from_secs(30)).unwrap();
     conn

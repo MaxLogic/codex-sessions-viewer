@@ -819,6 +819,8 @@ fn database_status(harness: &str, o: &Options) -> Value {
     let Some(path) = &o.db else {
         return json!({"ok":false,"error":"no database selected; pass --db or --standalone"});
     };
+    crate::store::connection::ensure()
+        .expect("SQLite must be configured before diagnostics opens a connection");
     let conn = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => conn,
         Err(_) => {
@@ -900,6 +902,7 @@ fn local_proof(harness: &str) -> Value {
                 "synthetic ingestion failed; run the collector regression suite for details".into(),
             );
         }
+        crate::store::connection::ensure().map_err(|error| error.to_string())?;
         let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|_| "cannot read isolated ingestion result")?;
         let count: i64 = conn

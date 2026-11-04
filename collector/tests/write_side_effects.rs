@@ -210,6 +210,7 @@ fn capture(phase: &str) -> Value {
         "t3" => {
             seed(&store.conn, "child");
             let path = temp.path().join("t3.sqlite");
+            codex_sessions_collector::store::connection::ensure().unwrap();
             let db = Connection::open(&path).unwrap();
             db.execute_batch("create table orchestration_v2_projection_threads(payload_json text);create table orchestration_v2_projection_provider_threads(payload_json text)").unwrap();
             for (id, parent) in [("local", None), ("child", Some("app-local"))] {
@@ -346,6 +347,7 @@ fn capture_order_effects(phase: &str) -> Value {
         }
         "t3" => {
             let path = temp.path().join("t3.sqlite");
+            codex_sessions_collector::store::connection::ensure().unwrap();
             let db = Connection::open(&path).unwrap();
             db.execute_batch("create table orchestration_v2_projection_threads(payload_json text);create table orchestration_v2_projection_provider_threads(payload_json text)").unwrap();
             t3::import(&store.conn, &path, "windows").unwrap();

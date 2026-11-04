@@ -54,6 +54,7 @@ fn launcher_is_the_resident_and_killing_it_releases_ownership() {
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     assert!(instance::InstanceLock::try_acquire(&db).unwrap().is_some());
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.busy_timeout(Duration::from_millis(200)).unwrap();
     conn.execute_batch("begin immediate; rollback").unwrap();

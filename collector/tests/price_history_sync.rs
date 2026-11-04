@@ -91,6 +91,7 @@ fn opposite_orders_duplicates_revision_replay_preserve_gap_and_provenance() {
     assert_eq!(sync(&a, TOKEN, values).unwrap(), first);
     assert_eq!(sync(&a, TOKEN, vec![]).unwrap(), first);
     assert_eq!(first["observations"].as_array().unwrap().len(), 3);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn =
         rusqlite::Connection::open(a._temp.path().join("data/hub-pricing/history.sqlite")).unwrap();
     let preserved: String = conn
@@ -214,8 +215,10 @@ fn unchanged_hub_catalog_confirms_instead_of_storing_new_observations() {
         server.join().unwrap();
         count
     };
-    let conn =
-        || rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap();
+    let conn = || {
+        codex_sessions_collector::store::connection::ensure().unwrap();
+        rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap()
+    };
     let count = |sql: &str| conn().query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(fetch(catalog.clone()), 2);
     let revisions = count("select count(*) from price_history_revisions");
@@ -283,6 +286,7 @@ fn a_missed_hub_fetch_ends_confirmed_coverage_so_local_gap_evidence_remains() {
         json!({"protocol":1,"observations":[]}),
     )
     .unwrap();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap();
     let now = Utc::now();
     let at = |hours: i64| (now - Span::hours(hours)).to_rfc3339_opts(SecondsFormat::Micros, true);
@@ -504,6 +508,7 @@ fn provider_fetch_publishes_complete_rules_at_completion_time_and_retries_partia
         .unwrap(),
         history
     );
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap();
     let error: String = conn
         .query_row(
@@ -537,6 +542,7 @@ fn utc_schedule_boundaries_restart_catchup_and_disabled_default() {
     );
     assert!(!temp.path().join("hub-pricing").exists());
     assert!(price_history::fetch_due(temp.path(), &config, at("2026-09-01T00:00:00Z")).unwrap());
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap();
     let slot = price_history::slot_at(at("2026-09-01T00:00:00Z"), 6);
     conn.execute("insert into app_metadata(key,value,updated_at_utc) values ('hub_prices.last_success_utc',?,'now')",["2026-09-01T00:00:00Z"]).unwrap();
@@ -648,6 +654,7 @@ fn failed_provider_honors_retry_after_and_never_publishes_error_body() {
     let before = chrono::Utc::now();
     assert_eq!(price_history::fetch_once(temp.path(), &config).unwrap(), 0);
     thread.join().unwrap();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(temp.path().join("hub-pricing/history.sqlite")).unwrap();
     let next: String = conn
         .query_row(

@@ -27,6 +27,7 @@ fn payloads(conn: &Connection, table: &str) -> Result<Vec<Value>, String> {
 pub fn import(viewer: &Connection, path: &Path, source: &str) -> Result<usize, String> {
     let _lease =
         crate::store::write_lease::WriteLease::acquire(viewer).map_err(|e| e.to_string())?;
+    crate::store::connection::ensure().map_err(|error| error.to_string())?;
     let t3 = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

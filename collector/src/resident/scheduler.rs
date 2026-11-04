@@ -789,6 +789,12 @@ impl Scheduler {
         waiters: &[Request],
         context: Option<&super::viewer::Context>,
     ) -> StoreResult<Vec<(String, crate::codex::CollectReport)>> {
+        if crate::timing::enabled() {
+            eprintln!(
+                "resident scan starting thread={:?} harnesses={harnesses:?}",
+                std::thread::current().id()
+            );
+        }
         self.state("scanning");
         let store = self.store.as_ref().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));

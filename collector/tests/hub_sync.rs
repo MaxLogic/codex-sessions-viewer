@@ -175,6 +175,7 @@ fn out_of_order_and_explicit_missing_status_preserve_newer_data() {
     assert!(upload(&hub, MACHINE_A_TOKEN, 2, "a-2", vec![newer.clone()]).is_ok());
     assert!(upload(&hub, MACHINE_A_TOKEN, 1, "a-1", vec![first.clone()]).is_ok());
     let db = temp.path().join("hub-data/machine-a.sqlite");
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let connection = rusqlite::Connection::open(db).unwrap();
     let text: String = connection
         .query_row("select content_plain from messages limit 1", [], |row| {
@@ -207,6 +208,7 @@ fn out_of_order_and_explicit_missing_status_preserve_newer_data() {
         .is_ok()
     );
     // Missing source is an explicit lifecycle update, not deletion of history.
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let connection =
         rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
     let state: String = connection
@@ -583,6 +585,7 @@ fn json_output(output: &std::process::Output) -> Value {
 }
 
 fn hub_rows(temp: &TempDir, sql: &str) -> i64 {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite"))
         .unwrap()
         .query_row(sql, [], |row| row.get(0))
@@ -977,6 +980,7 @@ fn dead_letter_reconciliation_preserves_current_state_across_event_permutations(
     drop(fixture_budget);
     drop(store);
     let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let remote = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
     let mut failures = Vec::new();
     use rusqlite::OptionalExtension;
@@ -1059,6 +1063,7 @@ fn reconciliation_preserves_retained_parse_error_history_and_status_only_paths()
         1,
         "retained parsed history must reach the hub"
     );
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let remote = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
     let actual:(String,String)=remote.query_row("select content_plain,scan_status from messages join sessions on sessions.id=messages.session_id where sessions.id='session:retained-error'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
     assert_eq!(actual, (expected, "parse_error".to_owned()));
@@ -1156,6 +1161,7 @@ fn stale_orphaned_and_delivered_dead_letters_are_pruned() {
             .unwrap();
         // Introduce a refusal after start-of-sync pruning, before the ack:
         // only acknowledgement reconciliation can remove this one.
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let conn = rusqlite::Connection::open(&local_db).unwrap();
         assert_eq!(
             conn.execute(
@@ -1200,6 +1206,7 @@ fn stale_orphaned_and_delivered_dead_letters_are_pruned() {
     assert_eq!(report["sent"], 2);
     let status = json_output(&hub_command(&db, "status", ""));
     assert_eq!(status["dead_letters"], 1);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     let kept: String = conn
         .query_row(
@@ -1252,6 +1259,7 @@ fn an_old_hub_without_ingest_capability_gets_plain_bodies_and_the_old_limit() {
         "old hub must receive raw JSON bytes, not zstd"
     );
     drop(wire);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     assert_eq!(
         conn.query_row(
@@ -2320,6 +2328,7 @@ fn busy_exhaustion_retains_queue_identity_size_and_transport_failure_count() {
     }));
     let db = paired_database(&temp, &fake.url);
     queue_sessions(&db, &["busy-a", "busy-b", "busy-c", "busy-d"]);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     // Establish an in-flight batch and one real transport failure first.
     // Misclassifying the following busy response would shrink that batch.
@@ -2590,6 +2599,7 @@ fn dead_letter_reconstruction_yields_between_independent_letters() {
     let _observer = WriteChunkScope::observe(move |phase| {
         if phase == "hub_reconcile" {
             // A viewer can acquire SQLite's write lock at every boundary.
+            codex_sessions_collector::store::connection::ensure().unwrap();
             let viewer = rusqlite::Connection::open(&db_copy).unwrap();
             viewer.busy_timeout(Duration::ZERO).unwrap();
             viewer.execute_batch("begin immediate; rollback").unwrap();
@@ -2798,6 +2808,7 @@ fn backfill_delivers_a_stored_session_whose_file_is_gone() {
     json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
 
     let id = "session:parity-rich-001";
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let local = rusqlite::Connection::open(&db).unwrap();
     let digest = |conn: &rusqlite::Connection, sql: &str| -> String {
         conn.query_row(sql, [id], |row| row.get(0)).unwrap()
@@ -2806,6 +2817,7 @@ fn backfill_delivers_a_stored_session_whose_file_is_gone() {
     let tools = "select coalesce(group_concat(t.tool_index || '|' || t.tool_name || '|' || coalesce(m.message_index, ''), char(10)), '') from (select * from tool_calls where session_id = ?1 order by tool_index) t left join messages m on m.id = t.message_id";
     let usage = "select group_concat(source_record_ordinal || '|' || coalesce(total_tokens, '') || '|' || event_fingerprint, char(10)) from (select * from usage_events where session_row_id = ? order by source_record_ordinal)";
     let session = "select title || '|' || coalesce(working_directory_display, '') || '|' || models_used || '|' || coalesce(total_tokens, '') from sessions where id = ?";
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let remote = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
     for sql in [messages, tools, usage, session] {
         assert_eq!(digest(&remote, sql), digest(&local, sql), "{sql}");

@@ -633,6 +633,7 @@ fn session_admission_isolates_large_and_merging_sessions() {
             });
             let chunk_sizes = Rc::new(RefCell::new(Vec::new()));
             let chunks = chunk_sizes.clone();
+            codex_sessions_collector::store::connection::ensure().unwrap();
             let view = Connection::open(&path).unwrap();
             let mut previous = 0usize;
             let observer = WriteChunkScope::observe(move |phase| {
@@ -691,6 +692,7 @@ fn locked_steps(conn: &mut Connection) -> std::sync::Arc<std::sync::atomic::Atom
 }
 
 fn padded_status_store(rows: usize) -> Connection {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     conn.execute(
@@ -767,7 +769,9 @@ fn status_full_input_t2_stays_below_reviewed_bound() {
         conn.execute("vacuum into ?", [path.to_str().unwrap()])
             .unwrap();
         drop(conn);
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let mut conn = Connection::open(&path).unwrap();
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let viewer = Connection::open(&path).unwrap();
         let injected = Rc::new(Cell::new(false));
         let did = injected.clone();
@@ -1064,6 +1068,7 @@ fn chunk_gap_admits_a_waiting_viewer_between_consecutive_transactions() {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (start_tx, start_rx) = mpsc::channel();
     let probe = std::thread::spawn(move || {
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let conn = Connection::open(path).unwrap();
         conn.busy_timeout(Duration::from_secs(5)).unwrap();
         ready_tx.send(()).unwrap();
@@ -1131,6 +1136,7 @@ fn rollback_journal_to_wal_has_a_measured_owner() {
     let _serial = budget_test();
     let temp = support::TempDir::new("journal_mode_hold");
     let db = temp.path().join("rollback.sqlite");
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = Connection::open(&db).unwrap();
     conn.execute_batch("create table fixture(id integer)")
         .unwrap();
@@ -1152,6 +1158,7 @@ fn completeness_open_bootstrap_and_migration() {
     let temp = support::TempDir::new("audit_bootstrap");
     let old = temp.path().join("old.sqlite");
     support::create_database_at_version(&old, 29);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&old).unwrap();
     conn.execute_batch("update database_generations set target_schema_version=16; update database_state set active_usage_generation_id=(select min(id) from database_generations)").unwrap();
     conn.execute(
@@ -1191,6 +1198,7 @@ fn completeness_guard_detects_unowned_commit_and_special_pragma() {
     let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::audit::WriteAudit;
     let temp = support::TempDir::new("audit_negative");
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = Connection::open(temp.path().join("fixture.sqlite")).unwrap();
     conn.execute_batch("create table fixture(id integer)")
         .unwrap();
@@ -1380,6 +1388,7 @@ fn hold_stats_empty_and_submillisecond() {
 #[test]
 fn hold_stats_commit_rollback_nested_and_scope_restoration() {
     let _serial = budget_test();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     let scope = WriteHoldScope::start();
@@ -1412,6 +1421,7 @@ fn hold_stats_commit_rollback_nested_and_scope_restoration() {
 #[test]
 fn hold_stats_refusal_and_panic_rollback_are_measured() {
     let _serial = budget_test();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     let scope = WriteHoldScope::start();
@@ -1437,6 +1447,7 @@ fn hold_stats_refusal_and_panic_rollback_are_measured() {
 #[test]
 fn hold_stats_commit_failure_records_rollback() {
     let _serial = budget_test();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     // A commit hook rejection exercises the real failed-COMMIT cleanup path.
@@ -1470,8 +1481,10 @@ fn hold_stats_waiting_for_begin_is_not_a_hold() {
     let _serial = budget_test();
     let temp = support::TempDir::new("hold_stats_busy");
     let db = support::viewer_database(&temp);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let blocked = Connection::open(&db).unwrap();
     blocked.busy_timeout(Duration::from_millis(30)).unwrap();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let owner = Connection::open(&db).unwrap();
     owner.execute_batch("begin immediate").unwrap();
     let scope = WriteHoldScope::start();
@@ -1539,6 +1552,7 @@ fn hold_stats_scan_reports_json_and_text() {
 fn autocommit_statements_are_measured_without_counting_outer_writes_twice() {
     let _serial = budget_test();
     use codex_sessions_collector::store::write_budget::execute_write;
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = Connection::open_in_memory().unwrap();
     schema::prepare_standalone(&mut conn, ":memory:").unwrap();
     let statements = WriteHoldScope::for_phase("single_statement");
@@ -1636,6 +1650,7 @@ fn hub_bootstrap_identity_and_each_ddl_statement_have_write_holds() {
     assert_eq!(schema.report().max_phase.as_deref(), Some("hub_schema"));
     #[cfg(debug_assertions)]
     audit.assert_complete();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(temp.path().join("machine-a.sqlite")).unwrap();
     assert_eq!(
         conn.query_row(

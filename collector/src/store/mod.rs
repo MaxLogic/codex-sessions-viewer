@@ -1,6 +1,7 @@
 //! The single persistence path for collected records.
 
 pub mod cache_repair;
+pub mod connection;
 pub mod projects;
 pub mod schema;
 pub mod write_budget;
@@ -59,6 +60,7 @@ impl Store {
                         "No viewer database at {display}. Start the viewer once to create it, or collect with --standalone into a database of the collector's own."
                     )));
                 }
+                crate::store::connection::ensure()?;
                 Connection::open_with_flags(
                     path,
                     OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -70,6 +72,7 @@ impl Store {
                 {
                     std::fs::create_dir_all(parent)?;
                 }
+                crate::store::connection::ensure()?;
                 Connection::open(path)?
             }
         };

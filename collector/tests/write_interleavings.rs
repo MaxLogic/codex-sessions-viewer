@@ -139,6 +139,7 @@ fn seed_phase(store: &Store, phase: &str) {
 }
 
 fn t3_fixture(path: &std::path::Path) {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let db = Connection::open(path).unwrap();
     db.execute_batch("create table orchestration_v2_projection_threads(payload_json text);create table orchestration_v2_projection_provider_threads(payload_json text)").unwrap();
     for id in IDS {
@@ -235,6 +236,7 @@ fn backfill_pending_override_has_no_project_side_effect() {
         if target == "a" {
             expected.conn.execute(sql, [target]).unwrap();
         }
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let peer = Connection::open(&actual.path).unwrap();
         let mut first = true;
         let observer = WriteChunkScope::observe(move |phase| {
@@ -295,6 +297,7 @@ fn project_hint_invalidated_by_override_has_no_project_side_effect() {
     let expected = setup(&temp.path().join("expected.sqlite"));
     writer::apply_project_hints(&expected.conn, "codex", &refs(), &hints()).unwrap();
     edit(&expected.conn);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let peer = Connection::open(&actual.path).unwrap();
     let mut first = true;
     let observer = WriteChunkScope::observe(move |phase| {
@@ -536,6 +539,7 @@ fn every_viewer_boundary(phase: &str) {
                 let applied = Rc::new(Cell::new(false));
                 let committed = applied.clone();
                 let watermark = revision(&store.conn);
+                codex_sessions_collector::store::connection::ensure().unwrap();
                 let viewer = Connection::open(&store.path).unwrap();
                 viewer.busy_timeout(Duration::from_secs(1)).unwrap();
                 let n = Rc::new(Cell::new(0));
@@ -644,6 +648,7 @@ fn migration_marker_stops_each_phase_at_the_next_chunk_and_rerun_converges() {
         for boundary in 1..count.get() {
             let temp = support::TempDir::new("viewer_marker");
             let store = fixture(temp.path(), phase, "marker", "a");
+            codex_sessions_collector::store::connection::ensure().unwrap();
             let viewer = Connection::open(&store.path).unwrap();
             let injected = Rc::new(Cell::new(0));
             let seen = injected.clone();

@@ -82,6 +82,7 @@ fn fresh_setup_and_offline_synthetic_ingestion_are_independent_of_live_history()
         assert_eq!(report["configuration"]["hook_registered"], true);
         assert_eq!(report["local_ingestion_proof"]["state"], "passed");
         assert_eq!(report["hub"]["state"], "offline");
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let conn = rusqlite::Connection::open(&f.db).unwrap();
         assert_eq!(
             conn.query_row::<i64, _, _>("select count(*) from sessions", [], |r| r.get(0))
@@ -229,6 +230,7 @@ fn explicit_hub_verification_authenticates_without_uploads_and_preserves_local_s
             );
         }
     }
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let hub_db = rusqlite::Connection::open(data.join("test-machine.sqlite")).unwrap();
     assert_eq!(
         hub_db

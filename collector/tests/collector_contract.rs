@@ -42,6 +42,7 @@ fn apply(temp: &TempDir, db: &Path, value: &Value) -> Output {
 }
 
 fn count(db: &Path, table: &str) -> i64 {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     Connection::open(db)
         .unwrap()
         .query_row(&format!("select count(*) from {table}"), [], |row| {
@@ -72,6 +73,7 @@ fn v2_status_requires_explicit_native_environment_before_write() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&db).unwrap();
     let source_type: String = conn
         .query_row(
@@ -118,6 +120,7 @@ fn native_snapshots_statuses_and_legacy_updates_preserve_explicit_provenance() {
         );
         let legacy = json!({"contract":"codex-sessions-viewer.ingest","version":1,"kind":"source_status","record":{"harness":"codex","path":format!("C:/windows/wsl/{environment}.jsonl"),"environment":"windows","status":"missing","state":"missing"}});
         assert!(apply(&temp, &db, &legacy).status.success());
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let conn = Connection::open(&db).unwrap();
         let stored: (String, String) = conn
             .query_row(
@@ -130,6 +133,7 @@ fn native_snapshots_statuses_and_legacy_updates_preserve_explicit_provenance() {
         drop(conn);
         let error = json!({"contract":"codex-sessions-viewer.ingest","version":2,"kind":"source_status","record":{"harness":"claude","path":format!("C:/windows/wsl/{environment}-error.jsonl"),"environment":environment,"status":"parse_error","state":"active"}});
         assert!(apply(&temp, &db, &error).status.success());
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let conn = Connection::open(&db).unwrap();
         let placeholder: (String, String) = conn
             .query_row(
@@ -187,6 +191,7 @@ fn independent_example_is_searchable_idempotent_and_revisable() {
     assert_eq!(count(&db, "sessions"), 1);
     assert_eq!(count(&db, "messages"), 2);
     assert_eq!(count(&db, "session_source_extras"), 1);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&db).unwrap();
     let hits: i64 = conn
         .query_row(
@@ -239,6 +244,7 @@ fn example_handles_empty_messages_and_uses_its_own_versions() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(count(&db, "messages"), 2);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let tokens: Option<i64> = Connection::open(&db)
         .unwrap()
         .query_row("select input_tokens from sessions", [], |row| row.get(0))

@@ -192,7 +192,17 @@ fn start(context: &Context, replacement_deadline: Option<Instant>) -> io::Result
     if let Some(result) = deadline_tests::spawn(&args) {
         return result;
     }
-    crate::hooks::spawn_detached(&std::env::current_exe()?, &args)
+    if crate::timing::enabled() {
+        // A detached resident normally discards stderr. Preserve opt-in scan
+        // and lease diagnostics across recovery, before the bridge is stopped.
+        crate::hooks::spawn_detached_with_queue(
+            &std::env::current_exe()?,
+            &args,
+            &crate::hooks::queue_dir(),
+        )
+    } else {
+        crate::hooks::spawn_detached(&std::env::current_exe()?, &args)
+    }
 }
 
 fn attach(context: &Context, out: &mut impl Write) -> io::Result<BufReader<endpoint::Stream>> {

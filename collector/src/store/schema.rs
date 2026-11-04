@@ -841,6 +841,7 @@ mod tests {
                     }
                 })
                 .collect();
+            crate::store::connection::ensure().unwrap();
             let mut conn = Connection::open_in_memory().unwrap();
             create_standalone(&mut conn, ":memory:", &migrations).unwrap();
             for migration in MIGRATIONS {
@@ -934,6 +935,7 @@ mod tests {
     }
 
     fn native_upgrade_fixture() -> Connection {
+        crate::store::connection::ensure().unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "on").unwrap();
         create_standalone(&mut conn, ":memory:", &MIGRATIONS[..28]).unwrap();
@@ -1062,6 +1064,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             })
             .collect();
         migrations[28] = broken;
+        crate::store::connection::ensure().unwrap();
         let mut fresh = Connection::open_in_memory().unwrap();
         fresh.pragma_update(None, "foreign_keys", "on").unwrap();
         assert!(
@@ -1119,6 +1122,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     #[test]
     fn standalone_database_is_created_and_owned_by_the_collector() {
+        crate::store::connection::ensure().unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
         prepare_standalone(&mut conn, ":memory:").unwrap();
         assert_eq!(
@@ -1150,6 +1154,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
                 sql: "create table broken (; ",
             },
         ];
+        crate::store::connection::ensure().unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
         assert!(create_standalone(&mut conn, ":memory:", BROKEN).is_err());
         let tables: i64 = conn
@@ -1226,6 +1231,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
     /// A standalone database that a newer release has moved past this
     /// collector's schema: `begin_write` must refuse it.
     fn migrated_past_this_release() -> Connection {
+        crate::store::connection::ensure().unwrap();
         let mut conn = Connection::open_in_memory().unwrap();
         prepare_standalone(&mut conn, ":memory:").unwrap();
         conn.execute(
@@ -1239,6 +1245,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     #[test]
     fn a_write_on_another_connection_inside_a_write_transaction_is_checked() {
+        crate::store::connection::ensure().unwrap();
         let mut outer = Connection::open_in_memory().unwrap();
         prepare_standalone(&mut outer, ":memory:").unwrap();
         let other = migrated_past_this_release();
@@ -1257,6 +1264,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
 
     #[test]
     fn a_panic_inside_a_write_transaction_does_not_leave_writes_nested() {
+        crate::store::connection::ensure().unwrap();
         let mut outer = Connection::open_in_memory().unwrap();
         prepare_standalone(&mut outer, ":memory:").unwrap();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

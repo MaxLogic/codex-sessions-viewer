@@ -524,6 +524,7 @@ fn database_state(database: &Path) -> Result<(), StoreError> {
     if !database.is_file() {
         return Err(StoreError::Refused("database missing".into()));
     }
+    crate::store::connection::ensure()?;
     let conn = Connection::open_with_flags(
         database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

@@ -167,11 +167,20 @@ impl<'a> WriteLease<'a> {
                     .create(true)
                     .truncate(false)
                     .open(lock_path(Path::new(path))?)?;
+                let mut next_diagnostic = Duration::from_secs(1);
                 loop {
                     write_budget::check_control()?;
                     match file.try_lock() {
                         Ok(()) => break,
                         Err(TryLockError::WouldBlock) => {
+                            if crate::timing::enabled() && start.elapsed() >= next_diagnostic {
+                                eprintln!(
+                                    "write_lease waiting phase={} elapsed_ms={:.1} database={path}",
+                                    write_budget::current_phase(),
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                );
+                                next_diagnostic += Duration::from_secs(5);
+                            }
                             if start.elapsed() >= timeout {
                                 return Err(busy());
                             }
@@ -240,6 +249,7 @@ mod tests {
 
     #[test]
     fn test_policy_overrides_nested_scopes_and_restores_production_defaults() {
+        crate::store::connection::ensure().unwrap();
         let conn = Connection::open_in_memory().unwrap();
         conn.busy_timeout(Duration::from_millis(17)).unwrap();
         assert_eq!(
@@ -265,6 +275,7 @@ mod tests {
             }
             assert_eq!(acquisition_timeout(&conn).unwrap(), Duration::ZERO);
             std::thread::spawn(|| {
+                crate::store::connection::ensure().unwrap();
                 let conn = Connection::open_in_memory().unwrap();
                 conn.busy_timeout(Duration::from_millis(17)).unwrap();
                 assert_eq!(

@@ -116,6 +116,7 @@ fn the_latest_thread_name_update_names_the_session() {
 }
 
 fn open(path: &std::path::Path) -> Connection {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(path).unwrap();
     conn.busy_timeout(std::time::Duration::from_secs(30))
         .unwrap();

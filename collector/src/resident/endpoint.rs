@@ -303,21 +303,28 @@ mod windows {
             })
         }
         pub fn accept(&mut self) -> io::Result<Stream> {
+            self.accept_after_poll(|| {})
+        }
+        // Expose the cancellation/reset boundary to a deterministic pipe race test.
+        fn accept_after_poll(&mut self, after_poll: impl FnOnce()) -> io::Result<Stream> {
             let pipe = self
                 .pending
                 .as_ref()
                 .ok_or_else(|| io::Error::other("listener closed"))?;
             if let Err(error) = Self::connect_pending(pipe) {
+                after_poll();
                 let disconnected = matches!(
                     error.raw_os_error().map(|code| code as u32),
                     Some(ERROR_NO_DATA | ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
                 );
                 let cancelled = error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32);
                 if disconnected || cancelled || error.kind() == io::ErrorKind::TimedOut {
-                    // Reset this same instance: closing the last server handle
-                    // would let another process claim first-instance ownership.
+                    // Only a disconnected peer needs a reset. After a cancelled
+                    // poll, a client can connect before the next ConnectNamedPipe;
+                    // resetting here would discard that live connection unread.
+                    // Keep the same instance for first-instance ownership.
                     // SAFETY: connect_pending has completed/drained all I/O.
-                    if unsafe { DisconnectNamedPipe(pipe.as_raw_handle()) } == 0 {
+                    if disconnected && unsafe { DisconnectNamedPipe(pipe.as_raw_handle()) } == 0 {
                         let reset_error = io::Error::last_os_error();
                         if !matches!(
                             reset_error.raw_os_error().map(|code| code as u32),
@@ -387,6 +394,41 @@ mod windows {
             }
             Ok(())
         }
+    }
+    #[cfg(test)]
+    #[test]
+    fn cancelled_accept_preserves_a_client_connecting_before_the_next_poll() {
+        let key = format!("{:016x}", u64::from(std::process::id()) << 32 | 211);
+        let mut listener = Listener::bind(&key).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                listener.accept().err().unwrap().kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
+        let mut client = None;
+        let error = listener
+            .accept_after_poll(|| {
+                client = Some(super::connect(&key, Duration::from_secs(2)).unwrap());
+            })
+            .err()
+            .expect("the first accept poll must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        client
+            .as_mut()
+            .unwrap()
+            .write_all(b"connected during accept cancellation\n")
+            .unwrap();
+        let mut stream = listener
+            .accept()
+            .expect("the next poll must adopt the client");
+        let mut bytes = [0; b"connected during accept cancellation\n".len()];
+        stream.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"connected during accept cancellation\n");
+        stream.write_all(b"accepted\n").unwrap();
+        let mut reply = [0; 9];
+        client.as_mut().unwrap().read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"accepted\n");
     }
     pub struct Stream {
         pipe: OwnedHandle,

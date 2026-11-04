@@ -162,6 +162,7 @@ fn fixture() -> Fixture {
         String::from_utf8_lossy(&output.stderr)
     );
     // A session collected on another machine (as a hub import would store it).
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&db).unwrap();
     conn.execute(
         "update sessions set machine_id = 'feedfacefeedfacefeedfacefeedface' where session_id = 'atlas-sub-3'",
@@ -659,6 +660,7 @@ fn databases_without_history_views_are_refused() {
 fn queries_never_change_the_database() {
     let fixture = fixture();
     // Settle the WAL so only the database file carries content.
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&fixture.db).unwrap();
     conn.query_row("pragma wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
         .unwrap();
@@ -823,6 +825,7 @@ fn tie_fixture() -> Fixture {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&db).unwrap();
     conn.execute(
         "update sessions set machine_id = '0000000000000000000000000000000a' where session_id = 'tie-c'",

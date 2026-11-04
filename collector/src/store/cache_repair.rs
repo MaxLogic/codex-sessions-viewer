@@ -782,6 +782,7 @@ fn create_verified_backup(
 /// foreign-key problem elsewhere in the source database is copied too and
 /// does not make the backup unusable, so it is not checked here.
 fn verify_backup(backup: &Path, audit: &Audit, expected_schema: i64) -> StoreResult<()> {
+    crate::store::connection::ensure()?;
     let verification = Connection::open_with_flags(
         backup,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

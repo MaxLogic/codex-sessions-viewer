@@ -784,6 +784,7 @@ fn remote_usage(data_root: &Path, config: &HubConfig, value: Value) -> Result<Va
     if !(1..=365).contains(&request.limit) {
         return Err((400, "usage limit must be between 1 and 365".to_owned()));
     }
+    crate::store::connection::ensure().map_err(|error| (500, error.to_string()))?;
     let conn = rusqlite::Connection::open_with_flags(
         machine_db(data_root, &request.machine),
         OpenFlags::SQLITE_OPEN_READ_ONLY,

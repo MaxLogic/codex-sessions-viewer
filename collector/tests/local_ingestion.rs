@@ -41,6 +41,7 @@ fn t3_lineage_resolves_scoped_native_refs_and_is_optional() {
     other_source.source.path = "\\\\wsl\\synthetic\\fork.jsonl".to_owned();
     apply_physical(&store, other_source);
     let path = temp.path().join("statev2.sqlite");
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let t3db = Connection::open(&path).unwrap();
     for table in ["threads", "provider_threads"] {
         t3db.execute_batch(&format!(
@@ -145,6 +146,7 @@ fn t3_lineage_resolves_scoped_native_refs_and_is_optional() {
     assert_eq!(relation("fork").2.as_deref(), Some("fork"));
     assert!(t3::import(&store.conn, &temp.path().join("missing.sqlite"), "windows").is_err());
     let incompatible = temp.path().join("state.sqlite");
+    codex_sessions_collector::store::connection::ensure().unwrap();
     Connection::open(&incompatible)
         .unwrap()
         .execute_batch("create table projection_threads(thread_id text)")
@@ -180,6 +182,7 @@ fn t3_lineage_scan_reads_configured_state_after_cached_collection() {
         support::write_generated_session(&sessions.join(format!("{id}.jsonl")), id, 1);
     }
     let state = temp.path().join("statev2.sqlite");
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let t3 = Connection::open(&state).unwrap();
     t3.execute_batch("create table orchestration_v2_projection_threads(payload_json text); create table orchestration_v2_projection_provider_threads(payload_json text)").unwrap();
     for id in ["root", "child"] {
@@ -213,6 +216,7 @@ fn t3_lineage_scan_reads_configured_state_after_cached_collection() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let conn = Connection::open(&db).unwrap();
         assert_eq!(
             conn.query_row(
@@ -528,6 +532,7 @@ fn posix_builtin_collection_stores_native_snapshots_and_error_statuses() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&db).unwrap();
     let mut statement = conn.prepare("select source_type from sessions").unwrap();
     let types: Vec<String> = statement
@@ -836,6 +841,7 @@ fn writer_versions_are_rechecked_under_the_write_lock_between_batches() {
 }
 
 fn open(path: &Path) -> Connection {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(path).unwrap();
     conn.busy_timeout(std::time::Duration::from_secs(30))
         .unwrap();
@@ -3685,6 +3691,7 @@ fn a_reparse_of_the_same_file_replaces_the_row_even_if_it_now_ends_earlier() {
     let home = support::codex_home(&temp, &["rich_session.jsonl"]);
     assert!(support::scan(&db, &home, &[]).status.success());
     let fresh = support::content_snapshot(&db);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&db).unwrap();
     conn.execute_batch(
         "update sessions set parser_version = 1,
@@ -3699,6 +3706,7 @@ fn a_reparse_of_the_same_file_replaces_the_row_even_if_it_now_ends_earlier() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(&db).unwrap();
     let (version, last): (i64, String) = conn
         .query_row(
@@ -3747,6 +3755,7 @@ fn a_reparse_of_the_same_file_replaces_the_row_even_if_it_now_ends_earlier() {
             .status
             .success()
     );
+    codex_sessions_collector::store::connection::ensure().unwrap();
     assert_eq!(rescanned, linked(&Connection::open(&reference_db).unwrap()));
     assert!(rescanned.iter().any(|(_, index)| index.is_some()));
 }

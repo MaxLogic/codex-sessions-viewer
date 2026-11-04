@@ -352,6 +352,7 @@ fn committed_repair_survives(interruption: RepairInterruption) {
         assert_eq!(report.deleted_rows, usize::from(deletes));
         assert_eq!(report.backup_file.is_some(), deletes);
         if deletes {
+            codex_sessions_collector::store::connection::ensure().unwrap();
             let recovery = rusqlite::Connection::open_with_flags(
                 &backups()[0],
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -529,7 +530,9 @@ fn l4_begin_write_requires_lease_and_memory_reentrancy_is_per_connection() {
     schema::begin_write(&store.conn).unwrap();
     schema::finish(&store.conn, Ok(())).unwrap();
     drop(nested);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let memory = rusqlite::Connection::open_in_memory().unwrap();
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let temporary = rusqlite::Connection::open("").unwrap();
     let _a = WriteLease::acquire(&memory).unwrap();
     let _b = WriteLease::acquire(&temporary).unwrap();

@@ -35,6 +35,7 @@ impl RepairFixture {
     fn new(label: &str, completed: bool) -> Self {
         let temp = TempDir::new(label);
         let db = support::viewer_database(&temp);
+        codex_sessions_collector::store::connection::ensure().unwrap();
         let conn = Connection::open(&db).unwrap();
         if completed {
             conn.execute(

@@ -55,6 +55,7 @@ pub fn collector() -> Command {
 
 /// Opens like the viewer does: WAL journal, foreign keys, 30 s busy wait.
 fn open(path: &Path) -> Connection {
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = Connection::open(path).unwrap();
     conn.busy_timeout(std::time::Duration::from_secs(30))
         .unwrap();
