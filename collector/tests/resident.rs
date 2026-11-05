@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// Strict hook/preemption latency checks use an exclusive lane. Bound ordinary
+// Strict hook, preemption, replacement and sweep timing checks use an exclusive
+// lane. Bound ordinary
 // residents/SQLite fsync work independently of the test runner's worker count:
 // unused SQLite accounting is off, but uncapped process/I/O bursts still delayed
 // independent controls on the 32-thread host. Within-test concurrency is unchanged.
@@ -1703,7 +1704,7 @@ fn bridge_replacement_waits_for_an_explicit_lock_release() {
 #[cfg(windows)]
 #[test]
 fn bridge_replacement_survives_the_viewer_connection_deadline() {
-    let _fixture_load = ordinary_fixture_lane();
+    let _fixture_load = latency_fixture_lane();
     slow_bridge_replacement(ShutdownRelease::AfterMillis(6500), true);
 }
 
@@ -1823,6 +1824,10 @@ fn slow_bridge_replacement(release: ShutdownRelease, abandon: bool) {
         loop {
             let status = fixture.cli("status");
             if status.status.success() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(16),
+                    "replacement exceeded its total bound"
+                );
                 break;
             }
             assert!(
@@ -1871,6 +1876,10 @@ fn slow_bridge_replacement(release: ShutdownRelease, abandon: bool) {
                 break;
             }
         }
+        assert!(
+            start.elapsed() < Duration::from_secs(16),
+            "replacement exceeded its total bound"
+        );
         drop(input);
         fixture.children.push(bridge);
         if beyond_deadline {
@@ -1885,10 +1894,8 @@ fn slow_bridge_replacement(release: ShutdownRelease, abandon: bool) {
         output.join().unwrap();
         fake.join().unwrap();
     }
-    assert!(
-        start.elapsed() < Duration::from_secs(16),
-        "replacement exceeded its total bound"
-    );
+    // The bound covers reaching a serving successor (or the expected refusal),
+    // not the subsequent reconnect probe, thread joins and process cleanup.
     if beyond_deadline {
         assert!(
             !fixture.cli("status").status.success(),
@@ -3505,7 +3512,7 @@ fn hook_enqueue_only_starts_nothing_and_absent_resident_is_started() {
 
 #[test]
 fn hook_recovery_sweep_drains_legacy_but_leaves_foreign_partition() {
-    let _fixture_load = ordinary_fixture_lane();
+    let _fixture_load = latency_fixture_lane();
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000185";
     fixture.rollout(id);
@@ -3529,17 +3536,26 @@ fn hook_recovery_sweep_drains_legacy_but_leaves_foreign_partition() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read(&foreign).unwrap(), bytes);
+    // Claiming renames the entry before ingestion commits. Keep the sweep's
+    // discovery deadline above, then wait separately for the committed row.
     codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(&fixture.db).unwrap();
-    assert_eq!(
-        conn.query_row(
-            "select count(*) from sessions where session_id = ?",
-            [id],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        1
-    );
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let count: i64 = conn
+            .query_row(
+                "select count(*) from sessions where session_id = ?",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if count == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "swept hook was not committed");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(std::fs::read(&foreign).unwrap(), bytes);
 }
 
 #[test]
