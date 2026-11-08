@@ -156,7 +156,17 @@ continue while the hub is unavailable; committed records stay in
 
 Only changes are queued. A scan that finds a source or thread name unchanged
 queues nothing, and a newer state of a source replaces its older unsent state.
-Repeated scans therefore do not grow the outbox while the hub is unreachable.
+A session snapshot identical to the last one queued for that session is not
+queued again, unless the hub refused that one. Repeated scans therefore do not
+grow the outbox while the hub is unreachable.
+
+A session snapshot holds the whole session, and an active session is queued
+again after every turn. Records of 16 KiB and more are therefore stored
+zstd-compressed (level 3) in the outbox, base64-encoded inside a small JSON
+wrapper because the column must hold valid JSON. `hub sync` decodes them
+before sending, and the record limits below refer to the decoded size. Every
+collector that writes or syncs the database must be this version or newer: an
+older `hub sync` would send the wrapper as it is.
 
 The sync command sends batches of up to 128 records and 8 MiB of UTF-8 until
 the outbox is empty; a single larger record is sent alone. When the
@@ -256,7 +266,8 @@ it with an older copy rewinds its sequence; the next sync then fails with a
 sequence conflict and names `hub resync`. The same happens after restoring an
 older hub backup. `hub resync` asks the hub for the last sequence it accepted
 from this machine and continues from there, keeping the queued records. It
-also forgets which statuses and thread names were already queued. Collect again
+also forgets which statuses, thread names and session snapshots were already
+queued. Collect again
 with `--force` so that records the hub lost are queued again:
 
 ```powershell

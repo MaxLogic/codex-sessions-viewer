@@ -1,5 +1,9 @@
 //! CXV-180: hub-enabled equivalence against e81ecf9, not another candidate budget.
 //! The golden was captured by running these fixtures against that base library.
+//! The `sessions` golden was then updated once, deliberately: a session snapshot
+//! identical to the last queued one is no longer queued again, and the digest
+//! of each queued snapshot is kept in `collector_hub_record_state`. Its queued
+//! payloads are unchanged; only that bookkeeping and the queue IDs differ.
 //! Only wall-clock timestamps are normalized; queue IDs, payloads, hashes and
 //! journal revisions are retained. No network connection is made.
 mod support;

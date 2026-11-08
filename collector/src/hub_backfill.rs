@@ -89,7 +89,7 @@ fn run(conn: &Connection) -> StoreResult<BackfillReport> {
                 let Some((snapshot, status)) = rebuild(conn, id)? else {
                     continue;
                 };
-                crate::hub_client::enqueue(
+                crate::hub_client::enqueue_always(
                     conn,
                     Record::SessionSnapshot(Box::new(snapshot)),
                     &now,

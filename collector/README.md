@@ -131,11 +131,28 @@ Installed applications use the collector next to the viewer executable.
 An unchanged scan does little work. Folders are listed on several threads, and
 WSL files are judged by the size and time in the listing; local Windows files
 are checked directly, because NTFS updates a listed file's size lazily while
-Codex still has it open. Unchanged files leave their session rows untouched.
+Codex still has it open. Unchanged files leave their session rows untouched. A file that fails to
+parse as JSON is remembered with its size, time and parser version
+(`codex_scan.unchanged_parse_failures` in `app_metadata`), so it is not read
+again until one of them changes; truncated rollouts left by crashed sessions
+otherwise cost a full read on every scan. The whole-table checks for legacy
+title placeholders and sessions without a project record the session change
+journal's revision at which they found nothing and are skipped until a session
+changes. A scan that wrote no session matches the reported statuses against
+the rows it loaded before the scan instead of reading the sessions table again.
 After a scan that listed every configured root, the collector records
 `codex_scan.completed_parser_version`; the viewer compacts the database after
 a parser change once that matches, even if rows outside the roots remain.
-Set `CODEX_SESSIONS_COLLECTOR_TIMINGS=1` to print per-phase timings to stderr.
+Set `CODEX_SESSIONS_COLLECTOR_TIMINGS=1` to print per-phase timings to stderr;
+each phase line also shows the bytes the process read and wrote during it.
+`scripts/measure_collector_io.ps1` measures the bytes one build reads and writes
+per idle scan cycle and per hook ingest of a growing session, on a copy of a
+database snapshot.
+
+A Claude ingest (the `Stop` hook) reads the named transcript and those of its
+subagents whose stored size and time no longer match. Session snapshots queued
+for a hub are stored compressed and are not queued again while unchanged
+(see [hub setup](../docs/hub-setup.md)).
 
 A changed session is written in place: messages, tool calls and usage events
 that are unchanged keep their rows, and unchanged text keeps its search entry.

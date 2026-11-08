@@ -126,12 +126,29 @@ pub struct ParsedRef {
     pub source_type: SourceType,
 }
 
+/// A session file that failed to parse as malformed JSON, and the revision
+/// it failed at. The parser is deterministic, so the same bytes fail the same
+/// way: a scan reports the stored failure instead of reading the file again
+/// until its size or time changes or the parser version does. Truncated
+/// rollouts left by crashed sessions otherwise cost a full read every scan.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnownFailure {
+    pub path: String,
+    pub size: u64,
+    pub modified_micros: i64,
+    pub parser_version: i64,
+    pub status: String,
+    pub message: String,
+}
+
 #[derive(Debug, Default)]
 pub struct ScanOutcome {
     pub counts: ScanCounts,
     pub statuses: Vec<SourceStatus>,
     pub parsed: Vec<ParsedRef>,
     pub errors: Vec<SourceStatus>,
+    /// Malformed files as of this scan: reused entries plus new failures.
+    pub failures: Vec<KnownFailure>,
     /// Every configured root's owner was reachable and listed completely,
     /// and the scan was not cancelled. Files that fail to parse do not
     /// make discovery incomplete.
@@ -622,15 +639,23 @@ pub fn scan<E>(
     scan_controlled(
         options,
         cached,
+        &[],
         sink,
         &Arc::new(AtomicBool::new(false)),
         |_| {},
     )
 }
 
+fn listed_revision(metadata: Option<&std::fs::Metadata>) -> Option<(u64, i64)> {
+    let metadata = metadata?;
+    let modified = crate::codex::parser::file_modified_utc(metadata).ok()?;
+    Some((metadata.len(), modified.micros()))
+}
+
 pub fn scan_controlled<E>(
     options: &ScanOptions,
     cached: &[CachedSource],
+    known_failures: &[KnownFailure],
     mut sink: impl FnMut(SessionSnapshot) -> Result<(), E>,
     cancel: &Arc<AtomicBool>,
     mut progress: impl FnMut(&ScanCounts),
@@ -658,12 +683,40 @@ pub fn scan_controlled<E>(
         }
         !index.status_matches(status)
     });
+    let known: HashMap<String, &KnownFailure> = known_failures
+        .iter()
+        .filter(|failure| failure.parser_version == crate::codex::parser::PARSER_VERSION)
+        .map(|failure| (canonical_scan_path(&failure.path), failure))
+        .collect();
+    let mut failures = Vec::new();
     let mut to_parse: Vec<usize> = Vec::new();
     for (position, candidate) in discovery.candidates.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         if options.force || should_parse(&candidate.path, candidate.metadata.as_ref(), &index) {
+            let unchanged_failure = (!options.force)
+                .then(|| known.get(&canonical_scan_path(&candidate.path)))
+                .flatten()
+                .filter(|failure| {
+                    failure.path == candidate.path
+                        && listed_revision(candidate.metadata.as_ref())
+                            == Some((failure.size, failure.modified_micros))
+                });
+            if let Some(failure) = unchanged_failure {
+                counts.files_failed += 1;
+                let entry = status(
+                    &candidate.path,
+                    &failure.status,
+                    candidate.source_state,
+                    candidate.source_type,
+                    Some(failure.message.clone()),
+                );
+                errors.push(entry.clone());
+                statuses.push(entry);
+                failures.push((*failure).clone());
+                continue;
+            }
             to_parse.push(position);
         } else {
             counts.files_skipped += 1;
@@ -715,9 +768,23 @@ pub fn scan_controlled<E>(
         match result {
             Err(error) => {
                 counts.files_failed += 1;
+                let status_name = parse_error_status(&error);
+                if error.kind == ParseErrorKind::MalformedJson
+                    && let Some((size, modified_micros)) =
+                        listed_revision(candidate.metadata.as_ref())
+                {
+                    failures.push(KnownFailure {
+                        path: candidate.path.clone(),
+                        size,
+                        modified_micros,
+                        parser_version: crate::codex::parser::PARSER_VERSION,
+                        status: status_name.to_owned(),
+                        message: error.display_message(),
+                    });
+                }
                 let entry = status(
                     &candidate.path,
-                    parse_error_status(&error),
+                    status_name,
                     candidate.source_state,
                     candidate.source_type,
                     Some(error.display_message()),
@@ -787,6 +854,20 @@ pub fn scan_controlled<E>(
         .collect();
     counts.cancelled = cancel.load(Ordering::Relaxed);
     let discovery_complete = !counts.cancelled && discovery.failed_owners.is_empty();
+    if !discovery_complete {
+        // A file under a root that was not listed keeps its entry.
+        let seen: HashSet<String> = discovery
+            .candidates
+            .iter()
+            .map(|candidate| canonical_scan_path(&candidate.path))
+            .collect();
+        failures.extend(
+            known
+                .iter()
+                .filter(|(path, _)| !seen.contains(*path))
+                .map(|(_, failure)| (*failure).clone()),
+        );
+    }
     if !counts.cancelled && !complete_roots.is_empty() {
         let found: HashSet<String> = discovery
             .candidates
@@ -818,11 +899,15 @@ pub fn scan_controlled<E>(
             statuses.push(entry);
         }
     }
+    // Stable order, so an unchanged set compares equal to the stored one.
+    failures.sort_by(|left, right| left.path.cmp(&right.path));
+    failures.dedup_by(|left, right| left.path == right.path);
     Ok(ScanOutcome {
         counts,
         statuses,
         parsed,
         errors,
+        failures,
         discovery_complete,
     })
 }

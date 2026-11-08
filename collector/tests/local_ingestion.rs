@@ -1192,6 +1192,152 @@ fn malformed_and_unreadable_sources_are_recorded_without_stopping_the_scan() {
     );
 }
 
+/// Rewrites `path` with `text` of the same length and restores its time, so
+/// only a collector that reads the file again can notice the change.
+fn replace_keeping_size_and_time(path: &Path, text: &str) {
+    let before = std::fs::metadata(path).unwrap();
+    assert_eq!(
+        before.len(),
+        text.len() as u64,
+        "the replacement must keep the size"
+    );
+    std::fs::write(path, text).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(before.modified().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn an_unchanged_malformed_rollout_is_not_read_again_until_it_changes() {
+    let temp = TempDir::new("malformed-memo");
+    let home = support::codex_home(&temp, &["malformed_line.jsonl"]);
+    let db = viewer_database(&temp);
+    let report = |extra: &[&str]| -> Value {
+        let output = support::scan(&db, &home, &[&["--json"], extra].concat());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = report(&[]);
+    assert_eq!(
+        (
+            first["files_parsed"].as_u64(),
+            first["files_failed"].as_u64()
+        ),
+        (Some(0), Some(1))
+    );
+    let message = first["errors"][0]["message"].clone();
+
+    // Same size and time, now valid: the stored failure is reported unread.
+    let file = support::day_folder(&home).join("malformed_line.jsonl");
+    let text = std::fs::read_to_string(&file).unwrap();
+    let repaired = text.replace("{\"type\": broken", "{\"type\":\"x\"}   ");
+    replace_keeping_size_and_time(&file, &repaired);
+    let unchanged = report(&[]);
+    assert_eq!(
+        (
+            unchanged["files_parsed"].as_u64(),
+            unchanged["files_failed"].as_u64()
+        ),
+        (Some(0), Some(1))
+    );
+    assert_eq!(unchanged["errors"][0]["message"], message);
+    assert_eq!(
+        count(
+            &open(&db),
+            "select count(*) from sessions where scan_status = 'parse_error'"
+        ),
+        1
+    );
+
+    // A forced reparse and a changed time both read the file again.
+    assert_eq!(report(&["--force"])["files_parsed"].as_u64(), Some(1));
+    replace_keeping_size_and_time(&file, &text);
+    assert_eq!(
+        report(&[])["files_failed"].as_u64(),
+        Some(0),
+        "the forced parse stored the valid revision"
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(30))
+        .unwrap();
+    let changed = report(&[]);
+    assert_eq!(
+        (
+            changed["files_parsed"].as_u64(),
+            changed["files_failed"].as_u64()
+        ),
+        (Some(0), Some(1))
+    );
+    assert_eq!(changed["errors"][0]["message"], message);
+}
+
+#[test]
+fn a_claude_ingest_skips_subagent_transcripts_that_did_not_change() {
+    let temp = TempDir::new("claude-subagent-skip");
+    let root = support::claude_root(&temp);
+    let db = viewer_database(&temp);
+    let project = root.join("F--fixtures-claude-project");
+    let main = project.join("11111111-2222-4333-8444-555555555555.jsonl");
+    let subagent = project
+        .join("11111111-2222-4333-8444-555555555555")
+        .join("subagents")
+        .join("agent-a1b2c3.jsonl");
+    let ingest = || {
+        let output = collector()
+            .args(["claude", "ingest", "--db"])
+            .arg(&db)
+            .arg(&main)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let subagent_rows = || {
+        support::rows(
+            &open(&db),
+            "select session_id, scan_status, message_count from sessions
+             where harness = 'claude' and session_id like '%:agent-%'",
+        )
+    };
+    ingest();
+    let stored = subagent_rows();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0]["scan_status"], "available");
+
+    // Unreadable as JSON, same size and time: a reread would fail it.
+    let text = std::fs::read_to_string(&subagent).unwrap();
+    replace_keeping_size_and_time(&subagent, &"x".repeat(text.len()));
+    ingest();
+    assert_eq!(subagent_rows(), stored);
+
+    // A changed subagent transcript is read again.
+    let first_line = text.lines().next().unwrap().to_owned() + "\n";
+    std::fs::write(&subagent, &first_line).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&subagent)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(30))
+        .unwrap();
+    ingest();
+    let reread = subagent_rows();
+    assert_eq!(reread.len(), 1, "{reread:?}");
+    assert_ne!(reread[0]["message_count"], stored[0]["message_count"]);
+}
+
 #[test]
 fn deleted_rollouts_become_missing_but_keep_their_history() {
     let temp = TempDir::new("missing");

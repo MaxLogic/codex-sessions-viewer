@@ -108,17 +108,27 @@ pub fn collect_coordinated(
     let is_cancelled = || cancel.load(Ordering::Relaxed);
     let mut phases = crate::timing::Phases::start();
     // Count first: a lease that would find nothing to clean only makes the
-    // GUI's writers wait.
-    if writer::session_metadata_placeholder_count(&store.conn)? > 0
-        && gated(&mut gate, || {
-            writer::clean_session_metadata_placeholders(&store.conn)
-        })?
-        .is_none()
-    {
-        cancel.store(true, Ordering::Relaxed);
+    // GUI's writers wait. After a count that found nothing, only rows changed
+    // since are counted (see `writer::checked_revision`).
+    let revision = writer::session_revision(&store.conn)?;
+    let since = writer::checked_revision(&store.conn, writer::PLACEHOLDERS_CHECKED_KEY, revision)?;
+    let mut placeholders_clear = None;
+    if since.is_none() || since != revision {
+        if writer::session_metadata_placeholder_count_since(&store.conn, since)? > 0 {
+            if gated(&mut gate, || {
+                writer::clean_session_metadata_placeholders(&store.conn)
+            })?
+            .is_none()
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        } else {
+            placeholders_clear = revision;
+        }
     }
     phases.mark("metadata placeholders");
     let cached = writer::cached_sources(&store.conn, "codex")?;
+    let known_failures = load_known_failures(&store.conn)?;
     phases.mark("load cached sources");
     let mut pending: Vec<SessionSnapshot> = Vec::new();
     let mut pending_bytes = 0u64;
@@ -131,6 +141,7 @@ pub fn collect_coordinated(
     let mut outcome = scanner::scan_controlled(
         options,
         &cached,
+        &known_failures,
         |snapshot| {
             if resolve_wsl_projects
                 && snapshot.source.environment == SourceType::Wsl.wire_name()
@@ -194,10 +205,41 @@ pub fn collect_coordinated(
     // Every parsed batch is already written, so a complete, uncancelled
     // discovery means every reachable file now carries this parser version.
     let complete = outcome.discovery_complete && !is_cancelled();
+    // Statuses are judged against the rows loaded before the scan only when
+    // the scan wrote no session; otherwise every status is matched again.
+    let unchanged: Vec<bool> = if applied.sessions == 0 && flushes.get() == 0 {
+        let index = writer::StatusIndex::new(&cached);
+        outcome
+            .statuses
+            .iter()
+            .map(|status| index.is_unchanged(status))
+            .collect()
+    } else {
+        vec![false; outcome.statuses.len()]
+    };
+    let backfill_clear = backfill_clear_revision(store)?;
     if gated(&mut gate, || {
-        writer::apply_source_statuses(&store.conn, &outcome.statuses)?;
+        writer::apply_scanned_source_statuses(&store.conn, &outcome.statuses, &unchanged)?;
         if complete {
             writer::record_complete_codex_scan(&store.conn)?;
+        }
+        if !is_cancelled() && outcome.failures != known_failures {
+            store_known_failures(&store.conn, &outcome.failures)?;
+        }
+        // Only a scan that wrote anyway records the cleared revisions: an
+        // unchanged scan keeps zero write transactions, and the next check
+        // reads only the rows changed since the recorded revision.
+        if holds.report().transactions > 0 {
+            writer::record_checked_revision(
+                &store.conn,
+                writer::PROJECT_BACKFILL_CHECKED_KEY,
+                backfill_clear,
+            )?;
+            writer::record_checked_revision(
+                &store.conn,
+                writer::PLACEHOLDERS_CHECKED_KEY,
+                placeholders_clear,
+            )?;
         }
         Ok(())
     })?
@@ -240,6 +282,58 @@ pub fn collect_coordinated(
     })
 }
 
+/// `app_metadata` key of the malformed Codex files known to the last scan.
+pub const KNOWN_FAILURES_KEY: &str = "codex_scan.unchanged_parse_failures";
+
+fn load_known_failures(conn: &rusqlite::Connection) -> StoreResult<Vec<scanner::KnownFailure>> {
+    // An unreadable entry only means the files are parsed again.
+    Ok(crate::store::schema::metadata(conn, KNOWN_FAILURES_KEY)?
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+fn store_known_failures(
+    conn: &rusqlite::Connection,
+    failures: &[scanner::KnownFailure],
+) -> StoreResult<()> {
+    let value = serde_json::to_string(failures)
+        .map_err(|error| crate::store::StoreError::Io(std::io::Error::other(error)))?;
+    let _phase = crate::store::write_budget::write_phase("known_failures");
+    let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
+    crate::store::schema::begin_write(conn)?;
+    let result = (|| {
+        conn.execute(
+            "insert into app_metadata (key, value, updated_at_utc) values (?, ?, ?)
+             on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc",
+            rusqlite::params![
+                KNOWN_FAILURES_KEY,
+                value,
+                crate::dart::DartDateTime::now().to_iso8601()
+            ],
+        )?;
+        Ok(())
+    })();
+    crate::store::schema::finish(conn, result)
+}
+
+/// The revision to record as having no project backfill candidate, checked
+/// before a scan's status write so the record shares that write's lease.
+/// `None` when there are candidates or the current revision is recorded.
+pub fn backfill_clear_revision(store: &Store) -> StoreResult<Option<i64>> {
+    let revision = writer::session_revision(&store.conn)?;
+    let since =
+        writer::checked_revision(&store.conn, writer::PROJECT_BACKFILL_CHECKED_KEY, revision)?;
+    if since.is_some() && since == revision {
+        return Ok(None);
+    }
+    Ok(
+        writer::project_backfill_candidates_since(&store.conn, since)?
+            .is_empty()
+            .then_some(revision)
+            .flatten(),
+    )
+}
+
 /// Assign automatic projects to stored sessions of any harness that still
 /// have none. The viewer used to do this while loading its list; the
 /// collector owns it so the viewer never writes parsed session state.
@@ -248,7 +342,15 @@ pub fn backfill_projects(
     gate: &mut impl FnMut(bool) -> StoreResult<bool>,
     resolve_wsl_projects: bool,
 ) -> StoreResult<usize> {
-    let candidates = writer::project_backfill_candidates(&store.conn)?;
+    // Candidates depend only on session rows: after a check that found none,
+    // only rows changed since can be candidates (see `writer::checked_revision`).
+    let revision = writer::session_revision(&store.conn)?;
+    let since =
+        writer::checked_revision(&store.conn, writer::PROJECT_BACKFILL_CHECKED_KEY, revision)?;
+    if since.is_some() && since == revision {
+        return Ok(0);
+    }
+    let candidates = writer::project_backfill_candidates_since(&store.conn, since)?;
     if candidates.is_empty() {
         return Ok(0);
     }

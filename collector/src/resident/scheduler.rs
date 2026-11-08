@@ -519,6 +519,8 @@ pub(super) struct Scheduler {
     last_import: Option<Instant>,
     last_scan_finished: Option<Instant>,
     rollouts: HashMap<String, PathBuf>,
+    /// Session revision `rollouts` was loaded at; the map only changes with sessions.
+    rollouts_revision: Option<i64>,
 }
 impl Scheduler {
     pub(super) fn wait(&self) -> Duration {
@@ -563,6 +565,7 @@ impl Scheduler {
             last_import: None,
             last_scan_finished: None,
             rollouts: HashMap::new(),
+            rollouts_revision: None,
         }
     }
     fn state(&self, name: &'static str) {
@@ -951,9 +954,14 @@ impl Scheduler {
         }
         // Discovery has reconciled the persisted identities, including unchanged rollouts.
         // Keep the lookup across hook bursts instead of repeatedly walking every dated folder.
-        if harnesses.iter().any(|harness| harness == "codex") {
+        // Skipped when no session changed since the last load: it reads the whole table.
+        let revision = crate::store::writer::session_revision(&store.conn)?;
+        if harnesses.iter().any(|harness| harness == "codex")
+            && (revision.is_none() || revision != self.rollouts_revision)
+        {
             let mut statement = store.conn.prepare("select session_id, source_file_path from sessions where harness = 'codex' and session_id is not null and source_file_path is not null")?;
             self.rollouts.clear();
+            self.rollouts_revision = revision;
             for row in statement.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,

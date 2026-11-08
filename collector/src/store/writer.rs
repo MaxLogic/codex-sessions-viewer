@@ -225,7 +225,7 @@ struct PreparedSession {
     snapshot: SessionSnapshot,
     shape: super::write_budget::SessionWriteShape,
     content: Option<PreparedContent>,
-    envelope: Option<String>,
+    envelope: Option<hub_client::PreparedEnvelope>,
     candidates: Vec<String>,
     predicted_ms: f64,
     write_bytes: u64,
@@ -303,11 +303,11 @@ fn prepare_sessions(
         if !stopped {
             let rows = SessionContent::snapshot_rows(&snapshot);
             let json = hub_predicted
-                .then(|| hub_client::session_envelope_json(&snapshot, version))
+                .then(|| hub_client::prepare_session_envelope(&snapshot, version))
                 .transpose()?;
             let size = row_bytes(&rows.messages)
                 .saturating_add(row_bytes(&rows.tool_calls))
-                .saturating_add(json.as_ref().map_or(0, String::len));
+                .saturating_add(json.as_ref().map_or(0, |envelope| envelope.stored.len()));
             if bytes.saturating_add(size) <= limit {
                 bytes += size;
                 let mut hasher = Sha256::new();
@@ -399,7 +399,9 @@ pub(crate) fn apply_session_batch_versioned(
                 let mut retained = units
                     .iter()
                     .map(|unit| {
-                        unit.envelope.as_ref().map_or(0, String::len)
+                        unit.envelope
+                            .as_ref()
+                            .map_or(0, |envelope| envelope.stored.len())
                             + unit
                                 .content
                                 .as_ref()
@@ -464,7 +466,15 @@ pub(crate) fn apply_session_batch_versioned(
                             retained -= row_bytes(&rows.messages) + row_bytes(&rows.tool_calls);
                         }
                     }
-                    let envelope_bytes = unit.envelope.as_ref().map_or(0, String::len);
+                    // An envelope the hub queue already holds is not written again.
+                    let envelope_bytes = match unit.envelope.as_ref() {
+                        Some(envelope)
+                            if !hub_client::envelope_already_queued(conn, snapshot, envelope)? =>
+                        {
+                            envelope.stored.len()
+                        }
+                        _ => 0,
+                    };
                     unit.write_bytes = (if unchanged {
                         0
                     } else {
@@ -536,7 +546,7 @@ pub(crate) fn apply_session_batch_versioned(
             if hub_client::queue_enabled(conn)? {
                 let json = match envelope {
                     Some(json) => json,
-                    None => hub_client::session_envelope_json(&snapshot, version)?,
+                    None => hub_client::prepare_session_envelope(&snapshot, version)?,
                 };
                 hub_client::enqueue_prepared(conn, &snapshot, &json, &now)?;
             }
@@ -2845,9 +2855,91 @@ pub fn apply_source_statuses(conn: &Connection, statuses: &[SourceStatus]) -> St
     apply_source_statuses_versioned(conn, statuses, None)
 }
 
+/// Stored rows of the scanned sources, by canonical path, as loaded before a
+/// scan. Decides which reported statuses cannot change a stored row.
+pub struct StatusIndex {
+    rows: HashMap<String, Vec<StatusRow>>,
+}
+
+struct StatusRow {
+    source_path: String,
+    unc_path: Option<String>,
+    scan_status: String,
+    source_state: String,
+    parse_status: Option<String>,
+}
+
+impl StatusIndex {
+    pub fn new(cached: &[CachedSource]) -> Self {
+        let mut rows: HashMap<String, Vec<StatusRow>> = HashMap::new();
+        for source in cached {
+            let mut keys = vec![canonical_scan_path(&source.source_path)];
+            if let Some(unc) = &source.unc_path {
+                keys.push(canonical_scan_path(unc));
+            }
+            keys.dedup();
+            for key in keys {
+                rows.entry(key).or_default().push(StatusRow {
+                    source_path: source.source_path.clone(),
+                    unc_path: source.unc_path.clone(),
+                    scan_status: source.scan_status.clone(),
+                    source_state: source.source_state.clone(),
+                    parse_status: source.parse_status.clone(),
+                });
+            }
+        }
+        Self { rows }
+    }
+
+    /// True when applying `status` would leave every stored row unchanged
+    /// and insert no placeholder, judged from the rows as they were loaded.
+    pub fn is_unchanged(&self, status: &SourceStatus) -> bool {
+        let Some(rows) = self.rows.get(&canonical_scan_path(&status.path)) else {
+            return false;
+        };
+        let matches = rows.iter().all(|row| {
+            row.scan_status == status.status
+                && row.source_state == status.state
+                && (status.status != "parse_error"
+                    || row.parse_status.as_deref() == Some("parse_error"))
+        });
+        // Other statuses insert a placeholder unless a row has the exact path.
+        let placeholder_free = matches!(
+            status.status.as_str(),
+            "available" | "missing" | "path_unreachable"
+        ) || rows.iter().any(|row| {
+            row.source_path == status.path || row.unc_path.as_deref() == Some(&status.path)
+        });
+        matches && placeholder_free
+    }
+}
+
+/// [`apply_source_statuses`] for a scan that knows which statuses leave the
+/// stored rows unchanged (`unchanged[i]` for `statuses[i]`). Those still take
+/// part in hub delivery; when every status is unchanged, the full read of the
+/// sessions table that matches statuses to rows is skipped. Only pass `true`
+/// for statuses judged against rows this scan has not written since.
+pub fn apply_scanned_source_statuses(
+    conn: &Connection,
+    statuses: &[SourceStatus],
+    unchanged: &[bool],
+) -> StoreResult<()> {
+    assert_eq!(statuses.len(), unchanged.len());
+    apply_source_statuses_with(conn, statuses, Some(unchanged), None)
+}
+
 pub(crate) fn apply_source_statuses_versioned(
     conn: &Connection,
     statuses: &[SourceStatus],
+    version: Option<u32>,
+) -> StoreResult<()> {
+    apply_source_statuses_with(conn, statuses, None, version)
+}
+
+fn apply_source_statuses_with(
+    conn: &Connection,
+    statuses: &[SourceStatus],
+    unchanged: Option<&[bool]>,
     version: Option<u32>,
 ) -> StoreResult<()> {
     let _phase = super::write_budget::write_phase("statuses");
@@ -2855,8 +2947,13 @@ pub(crate) fn apply_source_statuses_versioned(
     if statuses.is_empty() {
         return Ok(());
     }
-    let mut ordered: Vec<&SourceStatus> = statuses.iter().collect();
-    ordered.sort_by(|left, right| {
+    let unchanged_at = |index: usize| unchanged.is_some_and(|flags| flags[index]);
+    let mut ordered: Vec<(&SourceStatus, bool)> = statuses
+        .iter()
+        .enumerate()
+        .map(|(index, status)| (status, unchanged_at(index)))
+        .collect();
+    ordered.sort_by(|(left, _), (right, _)| {
         compare_utf16(
             &canonical_scan_path(&left.path),
             &canonical_scan_path(&right.path),
@@ -2865,12 +2962,13 @@ pub(crate) fn apply_source_statuses_versioned(
     });
     // Last status for each exact (harness,path), matching temp-table replacement.
     let mut unique = BTreeMap::new();
-    for (index, status) in ordered.into_iter().enumerate() {
+    for (index, (status, unchanged)) in ordered.into_iter().enumerate() {
         unique.insert(
             (status.harness.clone(), status.path.clone()),
-            (index, status),
+            (index, status, unchanged),
         );
     }
+    let local = unique.values().any(|(_, _, unchanged)| !unchanged);
     let now = DartDateTime::now().to_iso8601();
     super::write_budget::write_planned(
         conn,
@@ -2883,7 +2981,7 @@ pub(crate) fn apply_source_statuses_versioned(
             let mut members: HashMap<(String, String), Vec<Stored>> = HashMap::new();
             let mut statement = conn.prepare("select id,harness,source_file_path,source_file_unc_path,scan_status,source_state,parse_status,rowid from sessions order by rowid")?;
             let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
+            while local && let Some(row) = rows.next()? {
                 let harness: String = row.get(1)?;
                 let stored = (
                     row.get(7)?,
@@ -2905,7 +3003,10 @@ pub(crate) fn apply_source_statuses_versioned(
             }
             let mut changes = BTreeMap::new();
             let mut placeholders = Vec::new();
-            for (key, (index, status)) in &unique {
+            for (key, (index, status, unchanged)) in &unique {
+                if *unchanged {
+                    continue;
+                }
                 match members.get(key) {
                     Some(rows) => {
                         for (rowid, id, scan, state, parse) in rows {
@@ -3243,9 +3344,26 @@ const PROJECT_BACKFILL_CANDIDATES: &str = "select id, working_directory_display,
 pub fn project_backfill_candidates(
     conn: &Connection,
 ) -> StoreResult<Vec<ProjectBackfillCandidate>> {
-    let mut statement = conn.prepare(PROJECT_BACKFILL_CANDIDATES)?;
+    project_backfill_candidates_since(conn, None)
+}
+
+/// [`project_backfill_candidates`] among rows changed after `since`.
+pub fn project_backfill_candidates_since(
+    conn: &Connection,
+    since: Option<i64>,
+) -> StoreResult<Vec<ProjectBackfillCandidate>> {
+    let sql = match since {
+        None => PROJECT_BACKFILL_CANDIDATES.to_owned(),
+        Some(_) => PROJECT_BACKFILL_CANDIDATES.replacen(
+            "where (",
+            &format!("where {CHANGED_SINCE} and ("),
+            1,
+        ),
+    };
+    let mut statement = conn.prepare(&sql)?;
+    let params: Vec<i64> = since.into_iter().collect();
     let rows = statement
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(params), |row| {
             Ok(ProjectBackfillCandidate {
                 id: row.get(0)?,
                 working_directory: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -3318,15 +3436,105 @@ pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> Store
     Ok(updated)
 }
 
+/// The session change journal's revision. Every insert or delete of a session
+/// row, and every update of a column the viewer reads, increments it
+/// (triggers of migrations 021 and 029). `None` without the journal.
+pub fn session_revision(conn: &Connection) -> StoreResult<Option<i64>> {
+    match conn
+        .query_row(
+            "select revision from session_change_state where id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+    {
+        Ok(revision) => Ok(revision),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A whole-table check (legacy placeholders, project backfill) that found
+/// nothing at a session revision can only find something in rows changed
+/// since then, which the change journal lists by revision. Later scans check
+/// only those rows, and none when the revision has not moved, instead of
+/// reading the whole sessions table each time.
+pub const PLACEHOLDERS_CHECKED_KEY: &str = "collector.metadata_placeholders_clear_revision";
+pub const PROJECT_BACKFILL_CHECKED_KEY: &str = "collector.project_backfill_clear_revision";
+
+/// Rows to check for the check recorded under `key`, given the current
+/// `revision`: `None` for every row, `Some(r)` for rows changed after `r`.
+/// `r == revision` means no row needs checking.
+pub fn checked_revision(
+    conn: &Connection,
+    key: &str,
+    revision: Option<i64>,
+) -> StoreResult<Option<i64>> {
+    let Some(revision) = revision else {
+        return Ok(None);
+    };
+    Ok(super::schema::metadata(conn, key)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|checked| *checked <= revision))
+}
+
+/// Restricts a `sessions` query to rows changed after `?1`.
+const CHANGED_SINCE: &str =
+    "id in (select session_id from session_changes where revision > ?1 and deleted = 0)";
+
+/// Records that the check under `key` found nothing at `revision`, read
+/// before the check ran: any later change moves the revision past it.
+pub fn record_checked_revision(
+    conn: &Connection,
+    key: &str,
+    revision: Option<i64>,
+) -> StoreResult<()> {
+    let Some(revision) = revision else {
+        return Ok(());
+    };
+    let _phase = super::write_budget::write_phase("checked_revision");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
+    begin_write(conn)?;
+    let result = (|| {
+        conn.execute(
+            "insert into app_metadata (key, value, updated_at_utc) values (?, ?, ?)
+             on conflict(key) do update set value = excluded.value, updated_at_utc = excluded.updated_at_utc
+             where value is not excluded.value",
+            params![key, revision.to_string(), DartDateTime::now().to_iso8601()],
+        )?;
+        Ok(())
+    })();
+    finish(conn, result)
+}
+
 /// Sessions whose title or summary is a placeholder older viewers stored.
 pub fn session_metadata_placeholder_count(conn: &Connection) -> StoreResult<i64> {
-    Ok(conn.query_row(
-        "select count(*) from sessions
-         where lower(trim(coalesce(title, ''))) like '# agents.md%'
-            or lower(trim(coalesce(summary, ''))) = 'auto'",
-        [],
-        |row| row.get(0),
-    )?)
+    session_metadata_placeholder_count_since(conn, None)
+}
+
+/// [`session_metadata_placeholder_count`] over rows changed after `since`.
+pub fn session_metadata_placeholder_count_since(
+    conn: &Connection,
+    since: Option<i64>,
+) -> StoreResult<i64> {
+    let placeholder = "(lower(trim(coalesce(title, ''))) like '# agents.md%'
+            or lower(trim(coalesce(summary, ''))) = 'auto')";
+    Ok(match since {
+        None => conn.query_row(
+            &format!("select count(*) from sessions where {placeholder}"),
+            [],
+            |row| row.get(0),
+        )?,
+        Some(since) => conn.query_row(
+            &format!("select count(*) from sessions where {CHANGED_SINCE} and {placeholder}"),
+            [since],
+            |row| row.get(0),
+        )?,
+    })
 }
 
 /// `_cleanSessionMetadataPlaceholders`.
@@ -3368,6 +3576,7 @@ pub struct CachedSource {
     pub file_size: Option<i64>,
     pub modified_utc: Option<DartDateTime>,
     pub parser_version: Option<i64>,
+    pub parse_status: Option<String>,
 }
 
 /// Written after a scan that listed every configured root and was not
@@ -3401,33 +3610,47 @@ pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
     finish(conn, result)
 }
 
+const CACHED_SOURCE_COLUMNS: &str = "source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version, source_type, source_state, parse_status";
+
+/// The cached invalidation metadata of one session row, by primary key.
+pub fn cached_source_by_id(conn: &Connection, id: &str) -> StoreResult<Option<CachedSource>> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "select {CACHED_SOURCE_COLUMNS} from sessions where id = ?"
+        ))?
+        .query_row([id], cached_source_row)
+        .optional()?)
+}
+
 /// `_cachedSessions`, limited to one harness.
 pub fn cached_sources(conn: &Connection, harness: &str) -> StoreResult<Vec<CachedSource>> {
-    let mut statement = conn.prepare(
-        "select source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version, source_type, source_state
-         from sessions where harness = ?",
-    )?;
+    let mut statement = conn.prepare(&format!(
+        "select {CACHED_SOURCE_COLUMNS} from sessions where harness = ?"
+    ))?;
     let rows = statement
-        .query_map([harness], |row| {
-            Ok(CachedSource {
-                source_path: row.get(0)?,
-                unc_path: row.get(1)?,
-                source_type: row
-                    .get::<_, Option<String>>(6)?
-                    .as_deref()
-                    .and_then(SourceType::from_wire)
-                    .unwrap_or(SourceType::Windows),
-                scan_status: row
-                    .get::<_, Option<String>>(2)?
-                    .unwrap_or_else(|| "available".to_owned()),
-                file_size: row.get(3)?,
-                modified_utc: parse_time(row.get::<_, Option<String>>(4)?.as_deref()),
-                parser_version: row.get(5)?,
-                source_state: row.get(7)?,
-            })
-        })?
+        .query_map([harness], cached_source_row)?
         .collect::<Result<_, _>>()?;
     Ok(rows)
+}
+
+fn cached_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedSource> {
+    Ok(CachedSource {
+        source_path: row.get(0)?,
+        unc_path: row.get(1)?,
+        source_type: row
+            .get::<_, Option<String>>(6)?
+            .as_deref()
+            .and_then(SourceType::from_wire)
+            .unwrap_or(SourceType::Windows),
+        scan_status: row
+            .get::<_, Option<String>>(2)?
+            .unwrap_or_else(|| "available".to_owned()),
+        file_size: row.get(3)?,
+        modified_utc: parse_time(row.get::<_, Option<String>>(4)?.as_deref()),
+        parser_version: row.get(5)?,
+        source_state: row.get(7)?,
+        parse_status: row.get(8)?,
+    })
 }
 
 fn enqueue_for_version(

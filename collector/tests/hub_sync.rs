@@ -2403,11 +2403,22 @@ fn three_56_mib_dead_letters_rebuild_within_the_write_hold_budget() {
     for name in ["large-a", "large-b", "large-c"] {
         let mut snapshot = sample_snapshot(name);
         let tool = snapshot.tool_calls[0].clone();
+        // Incompressible text: the outbox stores large records compressed.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         snapshot.tool_calls = (0..13_600)
             .map(|index| {
                 let mut tool = tool.clone();
                 tool.tool_index = index;
-                tool.output_preview = format!("tool {index}: {}", "x".repeat(4096));
+                let noise: String = (0..4096)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        alphabet[(state % 64) as usize] as char
+                    })
+                    .collect();
+                tool.output_preview = format!("tool {index}: {noise}");
                 tool
             })
             .collect();
@@ -2418,7 +2429,8 @@ fn three_56_mib_dead_letters_rebuild_within_the_write_hold_budget() {
             .unwrap();
         move_to_dead_letter(&store.conn, &format!("session:session:{name}"), None);
     }
-    let sizes: Vec<i64>=store.conn.prepare("select length(cast(record_json as blob)) from collector_upload_dead_letters order by id").unwrap()
+    // Decoded sizes: a packed record carries its size in `$.bytes`.
+    let sizes: Vec<i64>=store.conn.prepare("select coalesce(json_extract(record_json, '$.bytes'), length(cast(record_json as blob))) from collector_upload_dead_letters order by id").unwrap()
         .query_map([],|r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
     assert_eq!(sizes.len(), 3);
     assert!(
@@ -2806,6 +2818,14 @@ fn backfill_delivers_a_stored_session_whose_file_is_gone() {
         (Some(1), Some(1))
     );
     json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    // Every run queues the session again, even though the hub has it.
+    let again = json_output(&hub_command(&db, "backfill", MACHINE_A_TOKEN));
+    assert_eq!(
+        (again["queued"].as_i64(), again["pending"].as_i64()),
+        (Some(1), Some(2)),
+        "{again}"
+    );
+    json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
 
     let id = "session:parity-rich-001";
     codex_sessions_collector::store::connection::ensure().unwrap();
@@ -2837,4 +2857,111 @@ fn backfill_delivers_a_stored_session_whose_file_is_gone() {
         )
         .unwrap();
     assert_eq!(status, "missing");
+}
+
+#[test]
+fn an_unchanged_snapshot_is_queued_once_and_large_ones_are_stored_compressed() {
+    let temp = TempDir::new("snapshot_dedupe");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let mut snapshot = sample_snapshot("dedupe");
+    let tool = snapshot.tool_calls[0].clone();
+    snapshot.tool_calls = (0..64)
+        .map(|index| {
+            let mut tool = tool.clone();
+            tool.tool_index = index;
+            tool.output_preview = format!("tool {index}: {}", "output line\n".repeat(200));
+            tool
+        })
+        .collect();
+    let envelope = |snapshot: &codex_sessions_collector::contract::SessionSnapshot| {
+        Envelope::new(Record::SessionSnapshot(Box::new(snapshot.clone())))
+    };
+    let queued = |conn: &rusqlite::Connection| -> Vec<(i64, i64, Option<i64>)> {
+        conn.prepare(
+            "select id, length(record_json), json_extract(record_json, '$.bytes')
+             from collector_upload_outbox where record_key = 'session:session:dedupe'",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    };
+    let decoded = serde_json::to_vec(&envelope(&snapshot)).unwrap().len() as i64;
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store.apply(vec![envelope(&snapshot)]).unwrap();
+        let first = queued(&store.conn);
+        assert_eq!(first.len(), 1);
+        // Stored compressed, with the decoded size the hub limits refer to.
+        assert!(first[0].1 * 4 < decoded, "{first:?} of {decoded}");
+        assert!(first[0].2.is_some_and(|bytes| bytes > first[0].1));
+        // The same snapshot again is neither rewritten nor queued twice.
+        store.apply(vec![envelope(&snapshot)]).unwrap();
+        assert_eq!(queued(&store.conn), first);
+    }
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(report["pending"].as_i64(), Some(0), "{report}");
+    assert_eq!(
+        hub_rows(&temp, "select sum(tool_call_count) from sessions"),
+        64
+    );
+    assert_eq!(
+        hub_rows(
+            &temp,
+            "select count(*) from tool_calls where output_preview like 'tool 63: output line%'"
+        ),
+        1
+    );
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        // Delivered: an identical snapshot stays delivered.
+        store.apply(vec![envelope(&snapshot)]).unwrap();
+        assert!(queued(&store.conn).is_empty());
+        // A changed snapshot is queued and delivered.
+        snapshot.tool_calls.truncate(10);
+        store.apply(vec![envelope(&snapshot)]).unwrap();
+        assert_eq!(queued(&store.conn).len(), 1);
+    }
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(report["pending"].as_i64(), Some(0), "{report}");
+    assert_eq!(
+        hub_rows(&temp, "select sum(tool_call_count) from sessions"),
+        10
+    );
+}
+
+#[test]
+fn an_undecodable_queued_record_becomes_a_dead_letter_instead_of_blocking_sync() {
+    let temp = TempDir::new("undecodable_outbox");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                sample_snapshot("readable"),
+            )))])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "insert into collector_upload_outbox(record_json, created_at_utc, record_key)
+                 values ('{\"outbox_encoding\":\"zstd-base64\",\"bytes\":10,\"data\":\"AAAA\"}', 'now', 'session:session:damaged')",
+                [],
+            )
+            .unwrap();
+    }
+    let report = json_output(&hub_command(&db, "sync", MACHINE_A_TOKEN));
+    assert_eq!(
+        (
+            report["sent"].as_u64(),
+            report["dead_lettered"].as_u64(),
+            report["pending"].as_i64()
+        ),
+        (Some(1), Some(1), Some(0)),
+        "{report}"
+    );
+    assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 1);
 }

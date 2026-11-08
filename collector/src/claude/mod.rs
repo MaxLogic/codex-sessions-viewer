@@ -233,7 +233,9 @@ pub fn collect_coordinated(
     let _wait = crate::store::write_lease::LeaseWait::enter(std::time::Duration::from_secs(600));
     let holds = crate::store::write_budget::WriteHoldScope::start();
     let is_cancelled = || cancel.load(Ordering::Relaxed);
-    let cached: HashMapCache = writer::cached_sources(&store.conn, HARNESS)?
+    let loaded = writer::cached_sources(&store.conn, HARNESS)?;
+    let status_index = writer::StatusIndex::new(&loaded);
+    let cached: HashMapCache = loaded
         .into_iter()
         .flat_map(|source| {
             let mut keys = vec![canonical_scan_path(&source.source_path)];
@@ -399,8 +401,27 @@ pub fn collect_coordinated(
             statuses.push(entry);
         }
     }
+    // Judged against the rows loaded before the scan only when it wrote no session.
+    let unchanged: Vec<bool> = if applied.sessions == 0 && flushes == 0 {
+        statuses
+            .iter()
+            .map(|status| status_index.is_unchanged(status))
+            .collect()
+    } else {
+        vec![false; statuses.len()]
+    };
+    let backfill_clear = crate::codex::backfill_clear_revision(store)?;
     if gated(&mut gate, || {
-        writer::apply_source_statuses(&store.conn, &statuses)
+        writer::apply_scanned_source_statuses(&store.conn, &statuses, &unchanged)?;
+        // As for Codex scans: unchanged scans write nothing.
+        if holds.report().transactions > 0 {
+            writer::record_checked_revision(
+                &store.conn,
+                writer::PROJECT_BACKFILL_CHECKED_KEY,
+                backfill_clear,
+            )?;
+        }
+        Ok(())
     })?
     .is_some()
     {
@@ -420,6 +441,29 @@ pub fn collect_coordinated(
     })
 }
 
+/// Whether the stored row of the subagent transcript `path` of session
+/// `parent` was collected from the file as it is now. The row ID follows the
+/// parser's `<parent>:agent-<id>` naming; any mismatch reads the file.
+fn subagent_unchanged(store: &Store, parent: &str, path: &str) -> StoreResult<bool> {
+    let Some(agent) = Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("agent-"))
+    else {
+        return Ok(false);
+    };
+    let session_id = format!("{parent}:agent-{agent}");
+    let id = writer::session_row_id(HARNESS, Some(&session_id), path);
+    let Some(source) = writer::cached_source_by_id(&store.conn, &id)? else {
+        return Ok(false);
+    };
+    let mut cache = HashMapCache::new();
+    for key in std::iter::once(&source.source_path).chain(source.unc_path.as_ref()) {
+        cache.insert(canonical_scan_path(key), source.clone());
+    }
+    Ok(is_unchanged(path, &cache))
+}
+
 /// Ingest one transcript and, for a main transcript, its subagents.
 pub fn collect_file(
     store: &Store,
@@ -436,11 +480,24 @@ pub fn collect_file(
     let mut statuses = Vec::new();
     let mut errors = Vec::new();
     let mut snapshots = Vec::new();
-    for file in files {
+    let mut parent: Option<String> = None;
+    for (index, file) in files.into_iter().enumerate() {
         let file = file.to_string_lossy().into_owned();
         counts.files_found += 1;
+        // A Stop hook names the main transcript; its subagents mostly finished
+        // earlier. One whose stored row matches its size and time is skipped.
+        if index > 0
+            && let Some(parent) = &parent
+            && subagent_unchanged(store, parent, &file)?
+        {
+            counts.files_skipped += 1;
+            continue;
+        }
         match parse_transcript(&file, options) {
             Ok(transcript) => {
+                if index == 0 {
+                    parent = transcript.session.session_id.clone();
+                }
                 counts.files_parsed += 1;
                 let snapshot = snapshot(&file, source_type, mapper, transcript);
                 statuses.push(status(&file, &snapshot.source.status, source_type, None));

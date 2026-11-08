@@ -289,8 +289,18 @@ fn unchanged_admission_respects_predicted_cost_and_write_bytes() {
             ..WriteBudget::default()
         });
         let mut input: Vec<_> = ["a", "b", "c", "d"].map(support::sample_snapshot).into();
+        // Incompressible, so each stored envelope stays about 3 MiB.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         for s in &mut input[..3] {
-            s.messages[0].content_plain = "x".repeat(3 * 1024 * 1024);
+            s.messages[0].content_plain = (0..3 * 1024 * 1024)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    alphabet[(state % 64) as usize] as char
+                })
+                .collect();
         }
         input[3].tool_calls = (0..15000)
             .map(|index| {
@@ -300,12 +310,25 @@ fn unchanged_admission_respects_predicted_cost_and_write_bytes() {
             })
             .collect();
         writer::apply_session_batch(&store.conn, input.clone()).unwrap();
+        // As after `hub resync`: unchanged sessions must queue their envelopes again.
+        store
+            .conn
+            .execute("delete from collector_hub_record_state", [])
+            .unwrap();
         let scope = WriteHoldScope::start();
-        writer::apply_session_batch(&store.conn, input).unwrap();
+        writer::apply_session_batch(&store.conn, input.clone()).unwrap();
         assert_eq!(
             scope.report().transactions,
             if soft.is_zero() { 4 } else { 3 },
             "two 3 MiB envelopes join, third splits, costly unit isolates"
+        );
+        // Envelopes already queued add no write bytes, so the three join.
+        let scope = WriteHoldScope::start();
+        writer::apply_session_batch(&store.conn, input).unwrap();
+        assert_eq!(
+            scope.report().transactions,
+            if soft.is_zero() { 4 } else { 2 },
+            "queued envelopes are not written again; costly unit isolates"
         );
         results.push(support::content_snapshot(std::path::Path::new(&store.path)));
     }
