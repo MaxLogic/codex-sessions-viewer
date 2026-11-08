@@ -20,6 +20,32 @@ fn budget_test() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+fn idle_memoized_status_scan_has_no_write_transaction() {
+    let _serial = budget_test();
+    use codex_sessions_collector::{
+        contract::SourceStatus,
+        hub_client,
+        store::{OwnerMode, Store, writer},
+    };
+    let temp = support::TempDir::new("idle_memo");
+    let db = temp.path().join("test.sqlite");
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    hub_client::enable_for_collection(&db, OwnerMode::Standalone, "http://127.0.0.1:1").unwrap();
+    let statuses = [SourceStatus {
+        harness: "codex".to_owned(),
+        path: "C:/idle.jsonl".to_owned(),
+        environment: Some("windows".to_owned()),
+        status: "available".to_owned(),
+        state: "active".to_owned(),
+        message: None,
+    }];
+    writer::apply_scanned_source_statuses(&store.conn, &statuses, &[false]).unwrap();
+    let hold = WriteHoldScope::for_phase("statuses");
+    writer::apply_scanned_source_statuses(&store.conn, &statuses, &[false]).unwrap();
+    assert_eq!(hold.report().transactions, 0);
+}
+
+#[test]
 fn a_context_changed_between_plan_and_lock_falls_back() {
     let _serial = budget_test();
     use codex_sessions_collector::store::{

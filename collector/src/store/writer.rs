@@ -2965,6 +2965,11 @@ fn apply_source_statuses_with(
     unchanged: Option<&[bool]>,
     version: Option<u32>,
 ) -> StoreResult<()> {
+    enum StatusUnit {
+        Row(String, SourceStatus, bool),
+        Deliver(SourceStatus, Option<hub_client::StatusPlanCommit>),
+        Memo(hub_client::StatusPlanCommit),
+    }
     let _phase = super::write_budget::write_phase("statuses");
     let _lease = super::write_lease::WriteLease::acquire(conn)?;
     if statuses.is_empty() {
@@ -3045,7 +3050,7 @@ fn apply_source_statuses_with(
                             {
                                 changes.insert(
                                     *rowid,
-                                    (id.clone(), (*status).clone(), Some(false), None),
+                                    (id.clone(), (*status).clone(), Some(false), None::<bool>),
                                 );
                             }
                         }
@@ -3056,18 +3061,30 @@ fn apply_source_statuses_with(
                     ) =>
                     {
                         let id = placeholder_id(&status.harness, &status.path);
-                        placeholders.push((*index, (id, (*status).clone(), Some(true), None)));
+                        placeholders
+                            .push((*index, (id, (*status).clone(), Some(true), None::<bool>)));
                     }
                     None => {}
                 }
             }
-            let mut units: Vec<_> = changes.into_values().collect();
+            let mut units: Vec<_> = changes
+                .into_values()
+                .map(|(id, status, placeholder, _)| {
+                    StatusUnit::Row(id, status, placeholder == Some(true))
+                })
+                .collect();
             // Base UPDATE FROM applies existing rows in table/rowid order.
             // Its later temp-table scan inserts missing placeholders in last
             // INSERT OR REPLACE order, which need not be ID or harness order.
             // Rowids order the plan only; writes still use stable primary IDs.
             placeholders.sort_by_key(|(index, _)| *index);
-            units.extend(placeholders.into_iter().map(|(_, unit)| unit));
+            units.extend(
+                placeholders
+                    .into_iter()
+                    .map(|(_, (id, status, placeholder, _))| {
+                        StatusUnit::Row(id, status, placeholder == Some(true))
+                    }),
+            );
             // Local status priority and hub delivery order are different base
             // contracts. Deliver original inputs, independently of local work.
             if hub_client::queue_enabled(conn)? {
@@ -3076,17 +3093,47 @@ fn apply_source_statuses_with(
                     .iter()
                     .map(|status| Record::SourceStatus((*status).clone()))
                     .collect();
-                let delivery = hub_client::plan_delivery(conn, &records, version)?;
+                let (delivery, memo) = if unchanged.is_some() {
+                    hub_client::plan_scanned_status_delivery(conn, &records, version)?
+                } else {
+                    (hub_client::plan_delivery(conn, &records, version)?, None)
+                };
                 for (status, deliver) in pending.into_iter().zip(delivery) {
                     if deliver {
-                        units.push((String::new(), status.clone(), None, Some(true)));
+                        units.push(StatusUnit::Deliver(status.clone(), None));
+                    }
+                }
+                if let Some(memo) = memo {
+                    // Keep the memo with the final delivery even when it falls
+                    // exactly on the 500-unit boundary. A separate final unit
+                    // could otherwise commit in the following transaction.
+                    if let Some(StatusUnit::Deliver(_, final_memo)) = units.last_mut() {
+                        *final_memo = Some(memo);
+                    } else {
+                        units.push(StatusUnit::Memo(memo));
                     }
                 }
             }
             Ok(units)
         },
-        |(id, status, placeholder, delivery)| {
-            if placeholder == Some(true) {
+        |unit| {
+            if let StatusUnit::Memo(memo) = unit {
+                return hub_client::commit_status_plan(conn, memo);
+            }
+            #[cfg(feature = "test-hooks")]
+            hub_client::test_hooks::before_status_unit()?;
+            let (id, status, placeholder) = match unit {
+                StatusUnit::Row(id, status, placeholder) => (id, status, placeholder),
+                StatusUnit::Deliver(status, memo) => {
+                    enqueue_for_version(conn, Record::SourceStatus(status), &now, version)?;
+                    if let Some(memo) = memo {
+                        hub_client::commit_status_plan(conn, memo)?;
+                    }
+                    return Ok(());
+                }
+                StatusUnit::Memo(_) => unreachable!("memo was applied above"),
+            };
+            if placeholder {
                 conn.prepare_cached("insert into sessions (id,source_type,source_file_path,display_path,platform_path,
                 scan_status,source_state,parse_status,created_at_utc,updated_at_utc,last_scanned_utc,harness)
                 values (?1,?2,?3,?3,?3,?4,?5,?6,?7,?7,?7,?8)
@@ -3095,7 +3142,7 @@ fn apply_source_statuses_with(
                 where sessions.scan_status is not excluded.scan_status or sessions.source_state is not excluded.source_state")?
                 .execute(params![id,status.environment.as_deref().unwrap_or_else(|| source_type_label(&status.path)),status.path,
                     status.status,status.state,if status.status == "parse_error" {"parse_error"} else {"available"},now,status.harness])?;
-            } else if placeholder == Some(false) {
+            } else {
                 conn.prepare_cached(
                     "update sessions set scan_status=?1,source_state=?2,
                 parse_status=case when ?1='parse_error' then 'parse_error' else parse_status end,
@@ -3113,9 +3160,6 @@ fn apply_source_statuses_with(
                     status.harness,
                     status.path
                 ])?;
-            }
-            if delivery.is_some() {
-                enqueue_for_version(conn, Record::SourceStatus(status), &now, version)?;
             }
             Ok(())
         },

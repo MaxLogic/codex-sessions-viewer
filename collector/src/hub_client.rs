@@ -2,12 +2,14 @@
 
 mod continue_transport;
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::contract::{CONTRACT_NAME, CONTRACT_VERSION, Envelope, Record};
 use crate::hub_server::{HUB_PROTOCOL_VERSION, MAX_RECORDS};
@@ -87,6 +89,7 @@ pub fn queue_enabled(conn: &Connection) -> StoreResult<bool> {
     if !table_exists {
         return Ok(false);
     }
+    finish_pending_reset(conn)?;
     Ok(conn
         .prepare_cached("select enabled from collector_hub_state where id = 1")?
         .query_row([], |row| row.get(0))
@@ -110,14 +113,10 @@ fn record_version(record: &Record) -> u32 {
     }
 }
 
-pub(crate) fn plan_delivery(
-    conn: &Connection,
-    records: &[Record],
-    version: Option<u32>,
-) -> StoreResult<Vec<bool>> {
-    if !queue_enabled(conn)? {
-        return Ok(vec![false; records.len()]);
-    }
+fn dedupe_key_hash(record: &Record, version: Option<u32>) -> StoreResult<Option<(String, String)>> {
+    let Some((key, true)) = record_key(record) else {
+        return Ok(None);
+    };
     #[derive(serde::Serialize)]
     struct BorrowedEnvelope<'a> {
         contract: &'static str,
@@ -125,28 +124,35 @@ pub(crate) fn plan_delivery(
         #[serde(flatten)]
         record: &'a Record,
     }
-    let mut predicted = std::collections::HashMap::new();
+    let envelope = serde_json::to_string(&BorrowedEnvelope {
+        contract: CONTRACT_NAME,
+        version: version.unwrap_or_else(|| record_version(record)),
+        record,
+    })
+    .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
+    Ok(Some((key, crate::dart::sha256_hex(envelope.as_bytes()))))
+}
+
+pub(crate) fn plan_delivery(
+    conn: &Connection,
+    records: &[Record],
+    version: Option<u32>,
+) -> StoreResult<Vec<bool>> {
+    if !queue_enabled(conn)? {
+        #[cfg(feature = "test-hooks")]
+        test_hooks::record_plan(&vec![false; records.len()]);
+        return Ok(vec![false; records.len()]);
+    }
+    let mut predicted = HashMap::new();
     let mut delivery = Vec::with_capacity(records.len());
     for record in records {
-        let Some((key, true)) = record_key(record) else {
+        let Some((key, hash)) = dedupe_key_hash(record, version)? else {
             delivery.push(true);
             continue;
         };
-        let version = version.unwrap_or_else(|| {
-            if matches!(record,Record::SourceStatus(status) if status.environment.is_none()) {
-                1
-            } else {
-                CONTRACT_VERSION
-            }
-        });
-        let envelope = serde_json::to_string(&BorrowedEnvelope {
-            contract: CONTRACT_NAME,
-            version,
-            record,
-        })
-        .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
-        let hash = crate::dart::sha256_hex(envelope.as_bytes());
         if !predicted.contains_key(&key) {
+            #[cfg(feature = "test-hooks")]
+            test_hooks::record_probe();
             let previous: Option<String> = conn
                 .prepare_cached(
                     "select record_hash from collector_hub_record_state where record_key=?",
@@ -158,7 +164,244 @@ pub(crate) fn plan_delivery(
         delivery.push(predicted[&key].as_deref() != Some(&hash));
         predicted.insert(key, Some(hash));
     }
+    #[cfg(feature = "test-hooks")]
+    test_hooks::record_plan(&delivery);
     Ok(delivery)
+}
+
+const STATUS_BUCKETS: usize = 1024;
+
+fn status_bucket(key: &str) -> usize {
+    let hash = Sha256::digest(key.as_bytes());
+    usize::from(u16::from_be_bytes([hash[0], hash[1]])) & (STATUS_BUCKETS - 1)
+}
+
+struct StatusHarnessCommit {
+    harness: String,
+    last_hash: HashMap<String, String>,
+    changed_buckets: Vec<(usize, Option<Vec<u8>>)>,
+}
+
+pub(crate) struct StatusPlanCommit {
+    scopes: Vec<StatusHarnessCommit>,
+}
+
+fn dirty_status_keys(conn: &Connection, harness: &str) -> StoreResult<Vec<String>> {
+    Ok(conn
+        .prepare_cached(
+            "select record_key from hub_status_plan_dirty where record_key>=?1 and record_key<?2",
+        )?
+        .query_map(
+            params![format!("status:{harness}:"), format!("status:{harness};")],
+            |row| row.get(0),
+        )?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Only scans use this memo. The caller holds the collector lease from planning
+/// through the final commit. Every record-state DML writer, including foreign
+/// SQL, invalidates status keys through schema triggers.
+pub(crate) fn plan_scanned_status_delivery(
+    conn: &Connection,
+    records: &[Record],
+    version: Option<u32>,
+) -> StoreResult<(Vec<bool>, Option<StatusPlanCommit>)> {
+    if !queue_enabled(conn)? {
+        let delivery = vec![false; records.len()];
+        #[cfg(feature = "test-hooks")]
+        test_hooks::record_plan(&delivery);
+        return Ok((delivery, None));
+    }
+    let hashes: Vec<_> = records
+        .iter()
+        .map(|record| dedupe_key_hash(record, version))
+        .collect::<StoreResult<_>>()?;
+    let mut harnesses: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        let Record::SourceStatus(status) = record else {
+            return Err(StoreError::Refused(
+                "scan status planner received a non-status record".to_owned(),
+            ));
+        };
+        harnesses.entry(&status.harness).or_default().push(index);
+    }
+    let mut known = HashMap::new();
+    let mut scopes = Vec::new();
+    for (harness, indices) in harnesses {
+        let mut buckets: BTreeMap<usize, Sha256> = BTreeMap::new();
+        let mut last_hash = HashMap::new();
+        for index in indices {
+            let (key, hash) = hashes[index]
+                .as_ref()
+                .expect("source status is deduplicated");
+            let digest = buckets.entry(status_bucket(key)).or_default();
+            digest.update(key.as_bytes());
+            digest.update([0]);
+            digest.update(hash.as_bytes());
+            digest.update(b"\n");
+            last_hash.insert(key.clone(), hash.clone());
+        }
+        // A 128-bit SHA-256 prefix describes each ordered bucket, not its key
+        // number alone. Colliding bucket numbers only cause extra probes.
+        let digests: BTreeMap<usize, Vec<u8>> = buckets
+            .into_iter()
+            .map(|(bucket, hash)| (bucket, hash.finalize()[..16].to_vec()))
+            .collect();
+        let stored: BTreeMap<usize, Vec<u8>> = conn
+            .prepare_cached("select bucket,digest from hub_status_plan where harness=?")?
+            .query_map([harness], |row| {
+                Ok((usize::from(row.get::<_, u16>(0)?), row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        let dirty: HashSet<_> = dirty_status_keys(conn, harness)?.into_iter().collect();
+        for (key, hash) in &last_hash {
+            let bucket = status_bucket(key);
+            if !dirty.contains(key) && digests.get(&bucket) == stored.get(&bucket) {
+                known.insert(key.clone(), hash.clone());
+            }
+        }
+        let mut changed_buckets: Vec<_> = digests
+            .iter()
+            .filter(|(bucket, digest)| stored.get(bucket) != Some(digest))
+            .map(|(bucket, digest)| (*bucket, Some(digest.clone())))
+            .collect();
+        changed_buckets.extend(
+            stored
+                .keys()
+                .filter(|bucket| !digests.contains_key(bucket))
+                .map(|bucket| (*bucket, None)),
+        );
+        if !changed_buckets.is_empty() || !dirty.is_empty() {
+            scopes.push(StatusHarnessCommit {
+                harness: harness.to_owned(),
+                last_hash,
+                changed_buckets,
+            });
+        }
+    }
+    let mut predicted = HashMap::new();
+    let mut delivery = Vec::with_capacity(records.len());
+    for pair in hashes {
+        let (key, hash) = pair.expect("source status is deduplicated");
+        if !predicted.contains_key(&key) {
+            let previous = if let Some(hash) = known.remove(&key) {
+                Some(hash)
+            } else {
+                #[cfg(feature = "test-hooks")]
+                test_hooks::record_probe();
+                conn.prepare_cached(
+                    "select record_hash from collector_hub_record_state where record_key=?",
+                )?
+                .query_row([&key], |row| row.get(0))
+                .optional()?
+            };
+            predicted.insert(key.clone(), previous);
+        }
+        delivery.push(predicted[&key].as_deref() != Some(&hash));
+        predicted.insert(key, Some(hash));
+    }
+    #[cfg(feature = "test-hooks")]
+    test_hooks::record_plan(&delivery);
+    Ok((
+        delivery,
+        if scopes.is_empty() {
+            None
+        } else {
+            Some(StatusPlanCommit { scopes })
+        },
+    ))
+}
+
+/// Applied as the final status unit, inside its write transaction. Re-read dirty
+/// keys here: own deliveries and any intervening SQL must not be vouched for
+/// unless the committed record hash actually equals the input's last hash.
+pub(crate) fn commit_status_plan(conn: &Connection, commit: StatusPlanCommit) -> StoreResult<()> {
+    finish_pending_reset(conn)?;
+    for scope in commit.scopes {
+        for key in dirty_status_keys(conn, &scope.harness)? {
+            let clean = if let Some(hash) = scope.last_hash.get(&key) {
+                let stored: Option<String> = conn
+                    .prepare_cached(
+                        "select record_hash from collector_hub_record_state where record_key=?",
+                    )?
+                    .query_row([&key], |row| row.get(0))
+                    .optional()?;
+                stored.as_ref() == Some(hash)
+            } else {
+                true
+            };
+            if clean {
+                conn.prepare_cached("delete from hub_status_plan_dirty where record_key=?")?
+                    .execute([&key])?;
+            }
+        }
+        for (bucket, digest) in scope.changed_buckets {
+            if let Some(digest) = digest {
+                conn.prepare_cached("insert into hub_status_plan(harness,bucket,digest) values (?1,?2,?3) on conflict(harness,bucket) do update set digest=excluded.digest")?
+                    .execute(params![scope.harness,bucket as u16,digest])?;
+            } else {
+                conn.prepare_cached("delete from hub_status_plan where harness=?1 and bucket=?2")?
+                    .execute(params![scope.harness, bucket as u16])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static PROBES: Cell<usize> = const { Cell::new(0) };
+        static PLAN: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+        static RESET_FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    pub fn status_plan_probes() -> usize {
+        PROBES.with(Cell::get)
+    }
+    pub fn reset_status_plan_probes() {
+        PROBES.with(|value| value.set(0));
+    }
+    pub fn status_plan() -> Vec<bool> {
+        PLAN.with_borrow(Clone::clone)
+    }
+    pub(crate) fn record_probe() {
+        PROBES.with(|value| value.set(value.get() + 1));
+    }
+    pub(crate) fn record_plan(plan: &[bool]) {
+        PLAN.with_borrow_mut(|value| *value = plan.to_vec());
+    }
+    pub fn fail_status_unit_after(units: Option<usize>) {
+        FAIL_AFTER.with(|value| value.set(units));
+    }
+    pub fn fail_reset_after_commit(boundary: Option<usize>) {
+        RESET_FAIL_AFTER.with(|value| value.set(boundary));
+    }
+    pub(crate) fn after_reset_commit() -> crate::store::schema::StoreResult<()> {
+        RESET_FAIL_AFTER.with(|value| match value.get() {
+            Some(0) => Err(crate::store::schema::StoreError::Refused(
+                "injected failure after reset commit".to_owned(),
+            )),
+            Some(left) => {
+                value.set(Some(left - 1));
+                Ok(())
+            }
+            None => Ok(()),
+        })
+    }
+    pub(crate) fn before_status_unit() -> crate::store::schema::StoreResult<()> {
+        FAIL_AFTER.with(|value| match value.get() {
+            Some(0) => Err(crate::store::schema::StoreError::Refused(
+                "injected status unit failure".to_owned(),
+            )),
+            Some(left) => {
+                value.set(Some(left - 1));
+                Ok(())
+            }
+            None => Ok(()),
+        })
+    }
 }
 
 /// Legacy fixture packing threshold; production no longer packs outbox records. A
@@ -323,6 +566,7 @@ pub fn enqueue_session(
     now: &str,
     force: bool,
 ) -> StoreResult<()> {
+    finish_pending_reset(conn)?;
     let Some(digest) = crate::hub_snapshot::state_digest(conn, id)? else {
         return Ok(());
     };
@@ -426,6 +670,7 @@ impl PreparedRecord {
     }
 
     fn enqueue(&self, conn: &Connection, now: &str) -> StoreResult<()> {
+        finish_pending_reset(conn)?;
         let Some((key, _)) = &self.key else {
             conn.execute(
                 "insert into collector_upload_outbox(record_json,created_at_utc) values (?,?)",
@@ -484,6 +729,7 @@ pub fn validate_url(url: &str) -> Result<String, String> {
 fn enable(store: &Store, url: &str, machine: &str) -> Result<i64, String> {
     let _lease = crate::store::write_lease::WriteLease::acquire(&store.conn)
         .map_err(|error| error.to_string())?;
+    finish_pending_reset(&store.conn).map_err(|error| error.to_string())?;
     let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<i64> {
@@ -524,6 +770,7 @@ pub fn disable(db_path: &Path, mode: OwnerMode) -> Result<i64, String> {
     let store = Store::open(db_path, mode).map_err(|error| error.to_string())?;
     let _lease = crate::store::write_lease::WriteLease::acquire(&store.conn)
         .map_err(|error| error.to_string())?;
+    finish_pending_reset(&store.conn).map_err(|error| error.to_string())?;
     let _phase = crate::store::write_budget::write_phase("hub");
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<i64> {
@@ -531,12 +778,107 @@ pub fn disable(db_path: &Path, mode: OwnerMode) -> Result<i64, String> {
         store.conn.execute_batch(
             "update collector_hub_state set enabled = 0, inflight_batch_id = null, inflight_last_id = null where id = 1;
              delete from collector_upload_outbox;
-             delete from collector_hub_record_state;
              delete from collector_upload_dead_letters;",
         )?;
+        store.conn.execute("insert into app_metadata(key,value,updated_at_utc) values(?,'disable',?) on conflict(key) do update set value=excluded.value,updated_at_utc=excluded.updated_at_utc", params![RESET_INTENT,crate::dart::DartDateTime::now().to_iso8601()])?;
         Ok(cleared)
     })();
-    finish(&store.conn, result).map_err(|error| error.to_string())
+    let cleared = finish(&store.conn, result).map_err(|error| error.to_string())?;
+    #[cfg(feature = "test-hooks")]
+    test_hooks::after_reset_commit().map_err(|error| error.to_string())?;
+    finish_pending_reset(&store.conn).map_err(|error| error.to_string())?;
+    Ok(cleared)
+}
+
+/// Triggers make a full reset proportional to the number of status keys. Keep
+/// the caller's collector lease across the reset, yielding SQLite's lock after
+/// each bounded prefix. No collector can plan against an incomplete reset.
+const RESET_INTENT: &str = "collector_hub_reset_intent";
+
+/// A persisted intent fences every hash consumer, including foreign enabling of
+/// the hub row. Recover only outside an existing transaction, under the lease;
+/// an in-transaction caller refuses rather than consuming a partial reset.
+fn finish_pending_reset(conn: &Connection) -> StoreResult<()> {
+    let intent: Option<String> = conn
+        .query_row(
+            "select value from app_metadata where key=?",
+            [RESET_INTENT],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(_) = intent else {
+        return Ok(());
+    };
+    if !conn.is_autocommit() {
+        return Err(StoreError::Refused(
+            "hub reset is pending; finish recovery before starting a write transaction".to_owned(),
+        ));
+    }
+    let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
+    // Another owner may have completed recovery while this caller waited.
+    let intent: Option<String> = conn
+        .query_row(
+            "select value from app_metadata where key=?",
+            [RESET_INTENT],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(intent) = intent else {
+        return Ok(());
+    };
+    let enabled = match intent.as_str() {
+        "disable" => 0,
+        "resync" => 1,
+        _ => {
+            return Err(StoreError::Refused(
+                "unknown pending hub reset kind".to_owned(),
+            ));
+        }
+    };
+    clear_record_state(conn, enabled)
+}
+
+fn clear_record_state(conn: &Connection, enabled: i64) -> StoreResult<()> {
+    use crate::store::write_budget::{current_budget, write_chunked};
+    let keys: Vec<String> = conn
+        .prepare("select record_key from collector_hub_record_state order by record_key")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut boundaries: Vec<Option<String>> =
+        keys.chunks(2048).map(|keys| keys.last().cloned()).collect();
+    if boundaries.is_empty() {
+        boundaries.push(None);
+    }
+    let last = boundaries.len() - 1;
+    for (index, boundary) in boundaries.into_iter().enumerate() {
+        write_chunked(
+            conn,
+            "hub",
+            current_budget(),
+            1,
+            std::iter::once(boundary),
+            || Ok(()),
+            |_, boundary| {
+                if let Some(boundary) = boundary {
+                    conn.prepare_cached(
+                        "delete from collector_hub_record_state where record_key<=?",
+                    )?
+                    .execute([boundary])?;
+                }
+                if index == last {
+                    conn.execute("delete from app_metadata where key=?", [RESET_INTENT])?;
+                    conn.execute(
+                        "update collector_hub_state set enabled=? where id=1",
+                        [enabled],
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        #[cfg(feature = "test-hooks")]
+        test_hooks::after_reset_commit()?;
+    }
+    Ok(())
 }
 
 pub fn pending(conn: &Connection) -> StoreResult<i64> {
@@ -714,6 +1056,7 @@ fn reconcile_dead_letters(
 ) -> StoreResult<(usize, usize)> {
     use crate::store::write_budget::{current_budget, write_chunked};
     let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
+    finish_pending_reset(conn)?;
     let orphaned: Vec<String> = conn.prepare("select record_key from collector_hub_record_state where record_key like 'session:%' and not exists(select 1 from sessions where id=substr(record_key,9))")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
     write_chunked(
         conn,
@@ -1153,6 +1496,7 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
     while report.batches < MAX_BATCHES_PER_RUN {
         let lease = crate::store::write_lease::WriteLease::acquire(conn)
             .map_err(|error| error.to_string())?;
+        finish_pending_reset(conn).map_err(|error| error.to_string())?;
         if let Some(last) = isolate_until {
             let first: i64 = conn
                 .query_row(
@@ -1361,15 +1705,16 @@ pub fn resync(
     begin_write(&store.conn).map_err(|error| error.to_string())?;
     let result = (|| -> StoreResult<()> {
         store.conn.execute(
-            "update collector_hub_state set last_sequence = ?, inflight_batch_id = null, inflight_last_id = null where id = 1",
+            "update collector_hub_state set enabled=0, last_sequence = ?, inflight_batch_id = null, inflight_last_id = null where id = 1",
             [verified.high_water],
         )?;
-        store
-            .conn
-            .execute("delete from collector_hub_record_state", [])?;
+        store.conn.execute("insert into app_metadata(key,value,updated_at_utc) values(?,'resync',?) on conflict(key) do update set value=excluded.value,updated_at_utc=excluded.updated_at_utc", params![RESET_INTENT,crate::dart::DartDateTime::now().to_iso8601()])?;
         Ok(())
     })();
     finish(&store.conn, result).map_err(|error| error.to_string())?;
+    #[cfg(feature = "test-hooks")]
+    test_hooks::after_reset_commit().map_err(|error| error.to_string())?;
+    finish_pending_reset(&store.conn).map_err(|error| error.to_string())?;
     Ok(ResyncReport {
         previous_sequence: previous,
         last_sequence: verified.high_water,

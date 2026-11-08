@@ -375,3 +375,4 @@ limits the size of each unit of work and inserts gaps, but it cannot guarantee
 a deadline for a single SQLite operation that cannot be split. The ordinary
 test suite skips this expensive measurement, so a passing ordinary suite does
 not prove the hold limit for large records.
+The status planning memo maintains itself automatically and needs no reset after hub resync, disable/enable, or dead-letter reconciliation.

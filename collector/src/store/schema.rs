@@ -14,7 +14,7 @@ use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 32;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 33;
 
 pub struct Migration {
     pub version: i64,
@@ -97,6 +97,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(30, "migration", "030_t3_lineage.sql"),
     migration!(31, "migration", "031_source_status_membership.sql"),
     migration!(32, "migration", "032_hub_snapshot_fields.sql"),
+    migration!(33, "migration", "033_hub_status_plan_memo.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1019,7 +1020,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             "select * from collector_upload_outbox",
             "select * from collector_hub_state",
             "select * from session_change_state",
-            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') and name not in ('trg_sessions_t3_change','idx_sessions_harness_source_path','idx_sessions_harness_source_unc_path') order by type,name",
+            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') and name not in ('trg_sessions_t3_change','idx_sessions_harness_source_path','idx_sessions_harness_source_unc_path','sqlite_autoindex_collector_hub_record_state_1') and name not like 'hub_status_plan_dirty_%' order by type,name",
         ] {
             let mut statement = conn.prepare(query).unwrap();
             let columns = statement.column_count();
@@ -1155,6 +1156,135 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
                 migration.version
             );
         }
+    }
+
+    #[test]
+    fn status_plan_triggers_survive_every_schema_migration() {
+        crate::store::connection::ensure().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let memo_version = MIGRATIONS
+            .iter()
+            .find(|m| m.filename.ends_with("_hub_status_plan_memo.sql"))
+            .unwrap()
+            .version;
+        for migration in MIGRATIONS {
+            conn.execute_batch(migration.sql).unwrap();
+            if migration.version >= memo_version {
+                let names: Vec<String> = conn.prepare("select name from sqlite_schema where type='trigger' and name like 'hub_status_plan_dirty_%' order by name").unwrap()
+                    .query_map([],|row|row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+                assert_eq!(
+                    names,
+                    [
+                        "hub_status_plan_dirty_delete",
+                        "hub_status_plan_dirty_insert",
+                        "hub_status_plan_dirty_update"
+                    ],
+                    "after {}",
+                    migration.filename
+                );
+                let table_sql: String = conn.query_row("select sql from sqlite_schema where type='table' and name='collector_hub_record_state'", [], |r| r.get(0)).unwrap();
+                assert!(
+                    table_sql.to_ascii_uppercase().contains("WITHOUT ROWID"),
+                    "after {}",
+                    migration.filename
+                );
+                let triggers: Vec<(String,String)> = conn.prepare("select tbl_name,sql from sqlite_schema where type='trigger' and name like 'hub_status_plan_dirty_%'").unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+                for (target, body) in triggers {
+                    assert_eq!(target, "collector_hub_record_state");
+                    let body = body.to_ascii_lowercase();
+                    assert!(body.contains("on collector_hub_record_state"));
+                    assert!(body.contains("insert into hub_status_plan_dirty"));
+                    assert!(body.contains("new.record_key") || body.contains("old.record_key"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hub_machine_database_upgrade_preserves_record_state_without_rowid() {
+        crate::store::connection::ensure().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "cxv_hub_memo_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("machine-a.sqlite");
+        crate::store::connection::ensure().unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+        let memo = MIGRATIONS
+            .iter()
+            .position(|m| m.filename.ends_with("_hub_status_plan_memo.sql"))
+            .unwrap();
+        create_standalone(&mut conn, path.to_str().unwrap(), &MIGRATIONS[..memo]).unwrap();
+        conn.execute_batch("insert into collector_hub_record_state(record_key,record_hash) values('status:codex:kept','status-hash'),('thread:kept','thread-hash')").unwrap();
+        drop(conn);
+        let machine = crate::hub_server::open_machine(&root, "machine-a").unwrap();
+        let rows: Vec<(String, String)> = machine
+            .conn
+            .prepare(
+                "select record_key,record_hash from collector_hub_record_state order by record_key",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("status:codex:kept".to_owned(), "status-hash".to_owned()),
+                ("thread:kept".to_owned(), "thread-hash".to_owned())
+            ]
+        );
+        assert!(
+            machine
+                .conn
+                .prepare("select rowid from collector_hub_record_state")
+                .is_err()
+        );
+        assert!(
+            machine
+                .conn
+                .execute(
+                    "insert into collector_hub_record_state values('thread:kept','duplicate')",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            machine
+                .conn
+                .execute(
+                    "insert into collector_hub_record_state values(null,'invalid')",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            machine
+                .conn
+                .execute(
+                    "insert into collector_hub_record_state values('new',null)",
+                    []
+                )
+                .is_err()
+        );
+        machine.conn.execute("update collector_hub_record_state set record_hash='changed' where record_key='status:codex:kept'", []).unwrap();
+        let dirty: i64 = machine
+            .conn
+            .query_row(
+                "select count(*) from hub_status_plan_dirty where record_key='status:codex:kept'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty, 1);
+        drop(machine);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

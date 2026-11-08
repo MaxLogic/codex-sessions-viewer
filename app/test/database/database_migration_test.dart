@@ -77,6 +77,71 @@ void main() {
     },
   );
 
+  test('memo migration preserves hashes and rejects rowid conflict writes', () async {
+    final previous = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+      supportedSchemaVersion: latestSchemaVersion - 1,
+    ).openAndMigrate(dbFile);
+    expect(
+      previous.canStartNormalUi,
+      isTrue,
+      reason: previous.fatalError?.details,
+    );
+    final before = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+    before.execute(
+      "insert into collector_hub_record_state(record_key,record_hash) values('status:codex:kept','kept-hash'),('thread:kept','thread-hash')",
+    );
+    before.close();
+    final upgraded = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+    ).openAndMigrate(dbFile);
+    expect(
+      upgraded.canStartNormalUi,
+      isTrue,
+      reason: upgraded.fatalError?.details,
+    );
+    final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+    addTearDown(db.close);
+    expect(
+      db
+          .select(
+            'select record_key,record_hash from collector_hub_record_state order by record_key',
+          )
+          .map((r) => [r['record_key'], r['record_hash']])
+          .toList(),
+      [
+        ['status:codex:kept', 'kept-hash'],
+        ['thread:kept', 'thread-hash'],
+      ],
+    );
+    expect(
+      db
+          .select(
+            "select sql from sqlite_schema where name='collector_hub_record_state'",
+          )
+          .single['sql']
+          .toString()
+          .toUpperCase(),
+      contains('WITHOUT ROWID'),
+    );
+    expect(
+      () => db.execute(
+        "replace into collector_hub_record_state(rowid,record_key,record_hash) values(1,'thread:replacement','new')",
+      ),
+      throwsA(isA<SqliteException>()),
+    );
+    db.execute(
+      "update or replace collector_hub_record_state set record_key='status:codex:kept' where record_key='thread:kept'",
+    );
+    expect(
+      db
+          .select("select record_key from hub_status_plan_dirty")
+          .map((r) => r['record_key'])
+          .toList(),
+      ['status:codex:kept'],
+    );
+  });
+
   for (final crlf in [false, true]) {
     test(
       'migration checksum legacy ${crlf ? 'CRLF' : 'LF'} receipts preserve all rows',
@@ -1166,7 +1231,14 @@ void main() {
     expect(versionRows[30]['filename'], '031_source_status_membership.sql');
     expect(_indexExists(db, 'idx_sessions_harness_source_path'), isTrue);
     expect(_indexExists(db, 'idx_sessions_harness_source_unc_path'), isTrue);
-    expect(versionRows.last['filename'], '032_hub_snapshot_fields.sql');
+    expect(versionRows[31]['filename'], '032_hub_snapshot_fields.sql');
+    expect(versionRows.last['filename'], '033_hub_status_plan_memo.sql');
+    expect(
+      db.select(
+        "select name from sqlite_schema where type='trigger' and name like 'hub_status_plan_dirty_%'",
+      ),
+      hasLength(3),
+    );
     expect(_columnExists(db, 'messages', 'token_cache_write'), isTrue);
     expect(_columnExists(db, 'messages', 'token_reasoning'), isTrue);
     expect(_columnExists(db, 'sessions', 'cache_write_input_tokens'), isTrue);
@@ -3966,6 +4038,7 @@ List<String> _nativeMigrationObjects(Database db) => db
       where type in ('index', 'trigger', 'view') and sql is not null
       and name not in ('trg_sessions_t3_change',
         'idx_sessions_harness_source_path', 'idx_sessions_harness_source_unc_path')
+      and name not like 'hub_status_plan_dirty_%'
       order by object
     ''')
     .map((row) => row['object'] as String)

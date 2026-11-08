@@ -1,5 +1,41 @@
 mod support;
 
+// CXV-218: the memo must preserve the base planner's ordered queue contract.
+#[test]
+fn a_quiet_cycle_probes_no_record_state() {
+    use codex_sessions_collector::store::{write_budget::WriteHoldScope, writer};
+    let temp = TempDir::new("quiet_memo");
+    let db = paired_database(&temp, "http://127.0.0.1:1");
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let statuses = vec![SourceStatus {
+        harness: "codex".to_owned(),
+        path: "C:/quiet.jsonl".to_owned(),
+        environment: Some("windows".to_owned()),
+        status: "available".to_owned(),
+        state: "active".to_owned(),
+        message: None,
+    }];
+    for _ in 0..2 {
+        writer::apply_scanned_source_statuses(&store.conn, &statuses, &[false]).unwrap();
+    }
+    let holds = WriteHoldScope::for_phase("statuses");
+    let pending = hub_client::pending(&store.conn).unwrap();
+    assert_eq!(pending, 1);
+    hub_client::test_hooks::reset_status_plan_probes();
+    writer::apply_scanned_source_statuses(&store.conn, &statuses, &[false]).unwrap();
+    assert_eq!(
+        hub_client::test_hooks::status_plan_probes(),
+        0,
+        "quiet planning must not probe record_state"
+    );
+    assert_eq!(hub_client::pending(&store.conn).unwrap(), pending);
+    assert_eq!(
+        holds.report().transactions,
+        0,
+        "a quiet status plan must not write"
+    );
+}
+
 use std::net::TcpListener;
 use std::process::{Child, Stdio};
 use std::thread;
@@ -14,6 +50,1125 @@ use support::{TempDir, sample_snapshot};
 const MACHINE_A_TOKEN: &str = "synthetic-machine-a-token-123456789";
 const MACHINE_B_TOKEN: &str = "synthetic-machine-b-token-123456789";
 const OWNER_TOKEN: &str = "synthetic-owner-token-123456789012";
+
+mod status_memo_differential {
+    use super::*;
+    use codex_sessions_collector::store::{
+        schema::StoreResult,
+        write_budget::{WriteBudget, WriteBudgetScope},
+        writer,
+    };
+    use rusqlite::{Connection, OptionalExtension};
+
+    // Frozen 3d16c529e8ee65facb8526419bc5df264a3e4912 plan_delivery.
+    // Only names/imports and the status-only record_key arm are adapted.
+    fn base_plan_delivery(
+        conn: &Connection,
+        records: &[Record],
+        version: Option<u32>,
+    ) -> StoreResult<Vec<bool>> {
+        use codex_sessions_collector::{
+            contract::{CONTRACT_NAME, CONTRACT_VERSION},
+            store::schema::StoreError,
+        };
+        if !hub_client::queue_enabled(conn)? {
+            return Ok(vec![false; records.len()]);
+        }
+        #[derive(serde::Serialize)]
+        struct BorrowedEnvelope<'a> {
+            contract: &'static str,
+            version: u32,
+            #[serde(flatten)]
+            record: &'a Record,
+        }
+        let mut predicted = std::collections::HashMap::new();
+        let mut delivery = Vec::with_capacity(records.len());
+        for record in records {
+            let Record::SourceStatus(status) = record else {
+                panic!("status-only oracle");
+            };
+            let key = format!(
+                "status:{}:{}",
+                status.harness,
+                writer::source_status_id(&status.path)
+            );
+            let version = version.unwrap_or_else(|| {
+                if matches!(record,Record::SourceStatus(status) if status.environment.is_none()) {
+                    1
+                } else {
+                    CONTRACT_VERSION
+                }
+            });
+            let envelope = serde_json::to_string(&BorrowedEnvelope {
+                contract: CONTRACT_NAME,
+                version,
+                record,
+            })
+            .map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
+            let hash = codex_sessions_collector::dart::sha256_hex(envelope.as_bytes());
+            if !predicted.contains_key(&key) {
+                let previous: Option<String> = conn
+                    .prepare_cached(
+                        "select record_hash from collector_hub_record_state where record_key=?",
+                    )?
+                    .query_row([&key], |row| row.get(0))
+                    .optional()?;
+                predicted.insert(key.clone(), previous);
+            }
+            delivery.push(predicted[&key].as_deref() != Some(&hash));
+            predicted.insert(key, Some(hash));
+        }
+        Ok(delivery)
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        }
+        fn pick(&mut self, count: usize) -> usize {
+            (self.next() % count as u64) as usize
+        }
+    }
+
+    fn pool() -> Vec<SourceStatus> {
+        (0..24)
+            .map(|i| SourceStatus {
+                harness: if i < 16 { "codex" } else { "claude" }.to_owned(),
+                path: match i % 4 {
+                    0 => format!("C:/Memo/{}.jsonl", i / 4),
+                    1 => format!("c:/memo/{}.jsonl", i / 4),
+                    2 => format!(r"\\wsl.localhost\Ubuntu\home\memo\{i}.jsonl"),
+                    _ => format!("C:/memo/{i}.jsonl"),
+                },
+                environment: Some("windows".to_owned()),
+                status: "available".to_owned(),
+                state: "active".to_owned(),
+                message: None,
+            })
+            .collect()
+    }
+
+    fn input(rng: &mut Rng, previous: &[SourceStatus]) -> Vec<SourceStatus> {
+        if !previous.is_empty() && rng.pick(10) < 4 {
+            return previous.to_vec();
+        }
+        let mut statuses = pool();
+        for status in &mut statuses {
+            status.status = [
+                "available",
+                "missing",
+                "path_unreachable",
+                "parse_error",
+                "permission_denied",
+                "unsupported_format",
+                "changed_pending_parse",
+            ][rng.pick(7)]
+            .to_owned();
+            status.state = ["active", "missing"][rng.pick(2)].to_owned();
+            status.environment =
+                [None, Some("windows".to_owned()), Some("wsl".to_owned())][rng.pick(3)].clone();
+            status.message = [
+                None,
+                Some("first message".to_owned()),
+                Some("second message".to_owned()),
+            ][rng.pick(3)]
+            .clone();
+        }
+        for i in (1..statuses.len()).rev() {
+            let j = rng.pick(i + 1);
+            statuses.swap(i, j);
+        }
+        statuses.truncate(17 + rng.pick(8));
+        if rng.pick(10) == 0 {
+            let mut duplicate = statuses[rng.pick(statuses.len())].clone();
+            duplicate.message = Some("same-key different envelope".to_owned());
+            statuses.push(duplicate);
+        }
+        statuses
+    }
+
+    fn queue_state(conn: &Connection) -> Value {
+        fn rows(conn: &Connection, sql: &str) -> Vec<Value> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let count = stmt.column_count();
+            stmt.query_map([], |row| {
+                Ok(Value::Array(
+                    (0..count)
+                        .map(|i| match row.get_ref(i).unwrap() {
+                            rusqlite::types::ValueRef::Null => Value::Null,
+                            rusqlite::types::ValueRef::Integer(n) => json!(n),
+                            rusqlite::types::ValueRef::Text(t) => {
+                                json!(std::str::from_utf8(t).unwrap())
+                            }
+                            other => panic!("unexpected queue field {other:?}"),
+                        })
+                        .collect(),
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        }
+        json!({
+            "outbox":rows(conn,"select id,record_key,record_json from collector_upload_outbox order by id"),
+            "state":rows(conn,"select record_key,record_hash from collector_hub_record_state order by record_key"),
+            "dead":rows(conn,"select outbox_id,record_key,record_json,http_status from collector_upload_dead_letters order by id"),
+            "sequence":rows(conn,"select last_sequence,inflight_last_id is null from collector_hub_state")
+        })
+    }
+
+    #[test]
+    fn status_plan_memo_matches_probe_planning_over_generated_queue_events() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        });
+        let mode = Arc::new(AtomicUsize::new(0));
+        let mode_reply = mode.clone();
+        let fake = fake_hub(Box::new(move |body| {
+            Some(match mode_reply.load(Ordering::Relaxed) {
+                1 => (
+                    422,
+                    json!({"code":"record_rejected","error":"synthetic refusal"}).to_string(),
+                ),
+                2 => (
+                    500,
+                    json!({"code":"temporary","error":"synthetic retry"}).to_string(),
+                ),
+                _ => acknowledge(body),
+            })
+        }));
+        let seeds = std::env::var("CXV218_SEEDS")
+            .ok()
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(300);
+        for seed in 0..seeds {
+            let mut rng = Rng(seed);
+            let reference_temp = TempDir::new("memo_ref");
+            let candidate_temp = TempDir::new("memo_cand");
+            let a_db = paired_database(&reference_temp, &fake.url);
+            let b_db = paired_database(&candidate_temp, &fake.url);
+            let a = Store::open(&a_db, OwnerMode::Standalone).unwrap();
+            let b = Store::open(&b_db, OwnerMode::Standalone).unwrap();
+            // Make trigger-removal mutation decisive, independently of the RNG:
+            // a clean, unchanged bucket must notice a foreign DELETE.
+            let witness = vec![pool()[3].clone()];
+            for _ in 0..2 {
+                writer::apply_source_statuses(&a.conn, &witness).unwrap();
+                writer::apply_scanned_source_statuses(&b.conn, &witness, &[false]).unwrap();
+            }
+            for store in [&a, &b] {
+                store
+                    .conn
+                    .execute("delete from collector_hub_record_state", [])
+                    .unwrap();
+            }
+            let expected =
+                base_plan_delivery(&a.conn, &[Record::SourceStatus(witness[0].clone())], None)
+                    .unwrap();
+            writer::apply_source_statuses(&a.conn, &witness).unwrap();
+            writer::apply_scanned_source_statuses(&b.conn, &witness, &[false]).unwrap();
+            assert_eq!(
+                expected,
+                hub_client::test_hooks::status_plan(),
+                "foreign DELETE witness seed={seed}"
+            );
+            assert_eq!(queue_state(&a.conn), queue_state(&b.conn));
+            let mut previous = Vec::new();
+            for step in 0..40 {
+                let operation = (step + seed as usize) % 16;
+                let selected = pool()[rng.pick(24)].clone();
+                let key = format!(
+                    "status:{}:{}",
+                    selected.harness,
+                    writer::source_status_id(&selected.path)
+                );
+                match operation {
+                    0..=4 | 15 => {
+                        let statuses = input(&mut rng, &previous);
+                        let records: Vec<_> =
+                            statuses.iter().cloned().map(Record::SourceStatus).collect();
+                        let expected = base_plan_delivery(&a.conn, &records, None).unwrap();
+                        let failure = if operation == 15 {
+                            Some(rng.pick(8))
+                        } else {
+                            None
+                        };
+                        hub_client::test_hooks::fail_status_unit_after(failure);
+                        let left = writer::apply_source_statuses(&a.conn, &statuses);
+                        hub_client::test_hooks::fail_status_unit_after(failure);
+                        let right = writer::apply_scanned_source_statuses(
+                            &b.conn,
+                            &statuses,
+                            &vec![false; statuses.len()],
+                        );
+                        hub_client::test_hooks::fail_status_unit_after(None);
+                        assert_eq!(
+                            left.is_ok(),
+                            right.is_ok(),
+                            "seed={seed} step={step} failure={failure:?}"
+                        );
+                        if failure.is_none() {
+                            left.unwrap();
+                            right.unwrap();
+                        }
+                        assert_eq!(
+                            expected,
+                            hub_client::test_hooks::status_plan(),
+                            "seed={seed} step={step} input={statuses:?}"
+                        );
+                        previous = statuses;
+                    }
+                    5 => {
+                        let mut snapshot = sample_snapshot(&format!("memo-{}", rng.pick(6)));
+                        snapshot.harness = selected.harness.clone();
+                        snapshot.source.path = selected.path.clone();
+                        snapshot.source.mapped_source_file_path = selected.path.clone();
+                        snapshot.session.summary = Some(format!("revision {}", rng.next()));
+                        for store in [&a, &b] {
+                            writer::apply_session_batch(&store.conn, vec![snapshot.clone()])
+                                .unwrap();
+                        }
+                    }
+                    6 => {
+                        // Queued reference vanishes; persist_batch prunes it on sync.
+                        for store in [&a, &b] {
+                            store.conn.execute("delete from sessions where id=(select id from sessions order by id limit 1)",[]).unwrap();
+                        }
+                    }
+                    7..=9 => {
+                        mode.store(operation - 7, Ordering::Relaxed);
+                        let left = hub_client::sync(
+                            &a_db,
+                            OwnerMode::Standalone,
+                            &fake.url,
+                            MACHINE_A_TOKEN,
+                        );
+                        let right = hub_client::sync(
+                            &b_db,
+                            OwnerMode::Standalone,
+                            &fake.url,
+                            MACHINE_A_TOKEN,
+                        );
+                        assert_eq!(left, right, "seed={seed} step={step}");
+                    }
+                    10 => {
+                        // Both session and orphan-status letters exercise reconciliation.
+                        for store in [&a, &b] {
+                            let queued: Vec<String> = store.conn.prepare("select record_key from collector_upload_outbox order by id limit 2").unwrap()
+                                .query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+                            for key in queued {
+                                move_to_dead_letter(&store.conn, &key, None);
+                            }
+                        }
+                        mode.store(0, Ordering::Relaxed);
+                        assert_eq!(
+                            hub_client::sync(
+                                &a_db,
+                                OwnerMode::Standalone,
+                                &fake.url,
+                                MACHINE_A_TOKEN
+                            ),
+                            hub_client::sync(
+                                &b_db,
+                                OwnerMode::Standalone,
+                                &fake.url,
+                                MACHINE_A_TOKEN
+                            ),
+                            "seed={seed} step={step}"
+                        );
+                    }
+                    11 => {
+                        if rng.pick(2) == 0 {
+                            assert_eq!(
+                                hub_client::disable(&a_db, OwnerMode::Standalone),
+                                hub_client::disable(&b_db, OwnerMode::Standalone)
+                            );
+                            for db in [&a_db, &b_db] {
+                                hub_client::enable_for_collection(
+                                    db,
+                                    OwnerMode::Standalone,
+                                    &fake.url,
+                                )
+                                .unwrap();
+                            }
+                        } else {
+                            assert_eq!(
+                                hub_client::resync(
+                                    &a_db,
+                                    OwnerMode::Standalone,
+                                    &fake.url,
+                                    MACHINE_A_TOKEN
+                                ),
+                                hub_client::resync(
+                                    &b_db,
+                                    OwnerMode::Standalone,
+                                    &fake.url,
+                                    MACHINE_A_TOKEN
+                                )
+                            );
+                        }
+                    }
+                    12 => {
+                        if rng.pick(2) == 0 {
+                            for store in [&a, &b] {
+                                writer::apply_source_statuses(
+                                    &store.conn,
+                                    std::slice::from_ref(&selected),
+                                )
+                                .unwrap();
+                            }
+                        } else {
+                            let names = vec![ThreadName {
+                                harness: selected.harness.clone(),
+                                session_id: "memo-0".to_owned(),
+                                thread_name: format!("name {}", rng.next()),
+                            }];
+                            for store in [&a, &b] {
+                                writer::apply_thread_names(&store.conn, &names).unwrap();
+                            }
+                        }
+                    }
+                    13 => {
+                        // Foreign SQL is deliberately outside the Rust writer inventory.
+                        let variant = rng.pick(8);
+                        for store in [&a, &b] {
+                            foreign_conflict_write(&store.conn, &key, variant);
+                        }
+                    }
+                    14 => {
+                        for store in [&a, &b] {
+                            store.conn.execute("update sessions set scan_status='missing',source_state='missing'",[]).unwrap();
+                        }
+                        assert_eq!(
+                            codex_sessions_collector::hub_backfill::backfill(
+                                &a_db,
+                                OwnerMode::Standalone
+                            ),
+                            codex_sessions_collector::hub_backfill::backfill(
+                                &b_db,
+                                OwnerMode::Standalone
+                            )
+                        );
+                        // Legacy packed oversize metadata takes the production size-refusal path
+                        // without allocating a 48 MiB status for every generated operation.
+                        for store in [&a, &b] {
+                            store.conn.execute("insert into collector_upload_outbox(record_key,record_json,created_at_utc) values('status:codex:oversize',?,'now')",[json!({"outbox_encoding":"zstd-base64","bytes":hub_client::LEGACY_MAX_RECORD_BYTES+1,"data":""}).to_string()]).unwrap();
+                        }
+                        mode.store(0, Ordering::Relaxed);
+                        assert_eq!(
+                            hub_client::sync(
+                                &a_db,
+                                OwnerMode::Standalone,
+                                &fake.url,
+                                MACHINE_A_TOKEN
+                            ),
+                            hub_client::sync(
+                                &b_db,
+                                OwnerMode::Standalone,
+                                &fake.url,
+                                MACHINE_A_TOKEN
+                            )
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    queue_state(&a.conn),
+                    queue_state(&b.conn),
+                    "seed={seed} step={step} op={operation} input={previous:?}"
+                );
+            }
+            if seed % 25 == 0 {
+                eprintln!("CXV218 differential completed seed={seed} operations=40");
+            }
+        }
+    }
+
+    fn scan(store: &Store, statuses: &[SourceStatus]) -> usize {
+        hub_client::test_hooks::reset_status_plan_probes();
+        writer::apply_scanned_source_statuses(&store.conn, statuses, &vec![false; statuses.len()])
+            .unwrap();
+        hub_client::test_hooks::status_plan_probes()
+    }
+
+    fn foreign_conflict_write(conn: &Connection, key: &str, variant: usize) {
+        conn.execute_batch("pragma recursive_triggers=off").unwrap();
+        if variant == 4 {
+            conn.execute("insert or replace into collector_hub_record_state(record_key,record_hash) values('thread:conflict-source','foreign')", []).unwrap();
+        }
+        let sql = [
+            "delete from collector_hub_record_state where record_key=?1",
+            "update collector_hub_record_state set record_hash='foreign SQL' where record_key=?1",
+            "insert or replace into collector_hub_record_state(record_key,record_hash) values(?1,'foreign SQL')",
+            "replace into collector_hub_record_state(record_key,record_hash) values(?1,'foreign SQL')",
+            "update or replace collector_hub_record_state set record_key=?1 where record_key='thread:conflict-source'",
+            "insert or replace into collector_hub_record_state(rowid,record_key,record_hash) values(1,?1,'foreign SQL')",
+            "update or replace collector_hub_record_state set rowid=1 where record_key=?1",
+            "replace into collector_hub_record_state(rowid,record_key,record_hash) values(1,?1,'foreign SQL')",
+        ][variant];
+        let result = conn.execute(sql, [key]);
+        if variant >= 5 {
+            assert!(result.is_err(), "rowid DML must be rejected: {sql}");
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn conflict_victim_dml_redelivers_or_rejects_rowid_access() {
+        let temp = TempDir::new("conflict_dml");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let statuses = [pool()[3].clone()];
+        let key = format!(
+            "status:codex:{}",
+            writer::source_status_id(&statuses[0].path)
+        );
+        scan(&store, &statuses);
+        scan(&store, &statuses);
+        for variant in 0..8 {
+            foreign_conflict_write(&store.conn, &key, variant);
+            scan(&store, &statuses);
+            assert_eq!(
+                hub_client::test_hooks::status_plan(),
+                vec![variant < 5],
+                "variant={variant}"
+            );
+            assert_eq!(scan(&store, &statuses), 0);
+        }
+    }
+
+    #[test]
+    fn rowid_conflict_replace_cannot_silently_remove_a_memoized_status() {
+        let temp = TempDir::new("replace_victim");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let statuses = [pool()[3].clone()];
+        scan(&store, &statuses);
+        assert_eq!(scan(&store, &statuses), 0);
+        store
+            .conn
+            .execute("delete from collector_upload_outbox", [])
+            .unwrap();
+        codex_sessions_collector::store::connection::ensure().unwrap();
+        let foreign = Connection::open(&db).unwrap();
+        foreign
+            .execute_batch("pragma recursive_triggers=off")
+            .unwrap();
+        let replaced = foreign.execute("insert or replace into collector_hub_record_state(rowid,record_key,record_hash) select rowid,'thread:replacement','replacement' from collector_hub_record_state where record_key like 'status:%'", []);
+        scan(&store, &statuses);
+        assert_eq!(
+            hub_client::test_hooks::status_plan(),
+            vec![replaced.is_ok()],
+            "a successful implicit deletion must redeliver; WITHOUT ROWID must reject it"
+        );
+    }
+
+    #[test]
+    fn failed_disable_finishes_its_reset_before_reenable() {
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        });
+        let temp = TempDir::new("disable_resume");
+        let url = "http://127.0.0.1:1";
+        let db = paired_database(&temp, url);
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let statuses = [pool()[3].clone()];
+        scan(&store, &statuses);
+        store.conn.execute_batch("begin immediate").unwrap();
+        for i in 0..4096 {
+            store.conn.execute("insert into collector_hub_record_state(record_key,record_hash) values(?,'previous')", [format!("status:codex:{i:06}")]).unwrap();
+        }
+        store.conn.execute_batch("commit").unwrap();
+        store.conn.execute_batch("create trigger fail_reset before delete on collector_hub_record_state when old.record_key='status:codex:002048' begin select raise(abort,'injected second chunk'); end").unwrap();
+        assert!(hub_client::disable(&db, OwnerMode::Standalone).is_err());
+        store.conn.execute_batch("drop trigger fail_reset").unwrap();
+        drop(store);
+        hub_client::enable_for_collection(&db, OwnerMode::Standalone, url).unwrap();
+        let reopened = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let remaining: i64 = reopened
+            .conn
+            .query_row("select count(*) from collector_hub_record_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "enable must finish the durable reset before consuming surviving hashes"
+        );
+        scan(&reopened, &statuses);
+        assert_eq!(hub_client::test_hooks::status_plan(), vec![true]);
+        assert_eq!(hub_client::pending(&reopened.conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn interrupted_reset_matches_atomic_reset_after_every_commit_and_recovery_path() {
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        });
+        let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+        for kind in ["disable", "resync"] {
+            for boundary in 0..=3 {
+                for consumer in 0..5 {
+                    let temp = TempDir::new("reset_boundary");
+                    let reference_temp = TempDir::new("reset_atomic");
+                    let db = paired_database(&temp, &fake.url);
+                    let reference_db = paired_database(&reference_temp, &fake.url);
+                    let statuses = [pool()[3].clone()];
+                    for path in [&db, &reference_db] {
+                        let store = Store::open(path, OwnerMode::Standalone).unwrap();
+                        scan(&store, &statuses);
+                        scan(&store, &statuses);
+                        store.conn.execute_batch("begin immediate").unwrap();
+                        for i in 0..4096 {
+                            store.conn.execute("insert into collector_hub_record_state(record_key,record_hash) values(?,'previous')", [format!("status:codex:{i:06}")]).unwrap();
+                        }
+                        store.conn.execute_batch("commit").unwrap();
+                    }
+                    // Frozen pre-chunk reset SQL, not the current reset on both sides.
+                    let reference = Store::open(&reference_db, OwnerMode::Standalone).unwrap();
+                    reference.conn.execute_batch(if kind == "disable" {
+                "begin immediate; update collector_hub_state set enabled=0,inflight_batch_id=null,inflight_last_id=null; delete from collector_upload_outbox; delete from collector_upload_dead_letters; delete from collector_hub_record_state; commit;"
+            } else {
+                "begin immediate; update collector_hub_state set last_sequence=0,inflight_batch_id=null,inflight_last_id=null; delete from collector_hub_record_state; commit;"
+            }).unwrap();
+                    hub_client::test_hooks::fail_reset_after_commit(Some(boundary));
+                    let result = if kind == "disable" {
+                        hub_client::disable(&db, OwnerMode::Standalone).map(|_| ())
+                    } else {
+                        hub_client::resync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN)
+                            .map(|_| ())
+                    };
+                    hub_client::test_hooks::fail_reset_after_commit(None);
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .contains("injected failure after reset commit"),
+                        "{kind}/{boundary}/{consumer}"
+                    );
+                    // Reopen from disk after the reset's lease/connection were dropped.
+                    let reopened = Store::open(&db, OwnerMode::Standalone).unwrap();
+                    let pending: bool = reopened.conn.query_row("select exists(select 1 from app_metadata where key='collector_hub_reset_intent')", [], |r| r.get(0)).unwrap();
+                    assert_eq!(pending, boundary < 3);
+                    if pending {
+                        assert!(
+                            !reopened
+                                .conn
+                                .query_row("select enabled from collector_hub_state", [], |r| r
+                                    .get::<_, bool>(0))
+                                .unwrap()
+                        );
+                        reopened.conn.execute_batch("begin immediate").unwrap();
+                        assert!(
+                            hub_client::queue_enabled(&reopened.conn).is_err(),
+                            "cannot recover/consume hashes inside an existing transaction"
+                        );
+                        assert!(
+                            hub_client::enqueue_session(
+                                &reopened.conn,
+                                "unused",
+                                "codex",
+                                "C:/unused",
+                                "now",
+                                false
+                            )
+                            .is_err()
+                        );
+                        reopened.conn.execute_batch("rollback").unwrap();
+                    }
+                    drop(reopened);
+                    for (path, memo) in [(&reference_db, false), (&db, true)] {
+                        match consumer {
+                            0 => hub_client::enable_for_collection(
+                                path,
+                                OwnerMode::Standalone,
+                                &fake.url,
+                            )
+                            .unwrap(),
+                            1 => {
+                                hub_client::sync(
+                                    path,
+                                    OwnerMode::Standalone,
+                                    &fake.url,
+                                    MACHINE_A_TOKEN,
+                                )
+                                .unwrap();
+                            }
+                            2 => {
+                                let store = Store::open(path, OwnerMode::Standalone).unwrap();
+                                if memo {
+                                    scan(&store, &statuses);
+                                } else {
+                                    writer::apply_source_statuses(&store.conn, &statuses).unwrap();
+                                }
+                            }
+                            3 => {
+                                let result = codex_sessions_collector::hub_backfill::backfill(
+                                    path,
+                                    OwnerMode::Standalone,
+                                );
+                                assert_eq!(result.is_ok(), kind == "resync");
+                            }
+                            4 => {
+                                let store = Store::open(path, OwnerMode::Standalone).unwrap();
+                                writer::apply_source_statuses(&store.conn, &statuses).unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let actual = Store::open(&db, OwnerMode::Standalone).unwrap();
+                    assert_eq!(
+                        queue_state(&actual.conn),
+                        queue_state(&reference.conn),
+                        "{kind}/{boundary}/{consumer}"
+                    );
+                    let enabled = |store: &Store| {
+                        store
+                            .conn
+                            .query_row("select enabled from collector_hub_state", [], |r| {
+                                r.get::<_, bool>(0)
+                            })
+                            .unwrap()
+                    };
+                    assert_eq!(enabled(&actual), enabled(&reference));
+                    let remaining: i64 = actual.conn.query_row("select count(*) from collector_hub_record_state where record_key < 'status:codex:source-status:'", [], |r| r.get(0)).unwrap();
+                    assert_eq!(remaining, 0);
+                    assert!(!actual.conn.query_row("select exists(select 1 from app_metadata where key='collector_hub_reset_intent')", [], |r| r.get::<_,bool>(0)).unwrap());
+                    for path in [&reference_db, &db] {
+                        hub_client::enable_for_collection(path, OwnerMode::Standalone, &fake.url)
+                            .unwrap();
+                    }
+                    writer::apply_source_statuses(&reference.conn, &statuses).unwrap();
+                    scan(&actual, &statuses);
+                    assert_eq!(
+                        queue_state(&actual.conn),
+                        queue_state(&reference.conn),
+                        "next scan {kind}/{boundary}/{consumer}"
+                    );
+                    assert_eq!(
+                        hub_client::pending(&actual.conn).unwrap(),
+                        1,
+                        "no discarded delivery may be suppressed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_scan_of_a_harness_drains_its_dirty_keys() {
+        let temp = TempDir::new("dirty_harness");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let mut absent = pool()[3].clone();
+        absent.harness = "absent-harness".to_owned();
+        scan(&store, &[absent.clone()]);
+        store.conn.execute("delete from collector_hub_record_state where record_key like 'status:absent-harness:%'", []).unwrap();
+        scan(&store, &[pool()[3].clone()]);
+        let count = || {
+            store.conn.query_row("select count(*) from hub_status_plan_dirty where record_key like 'status:absent-harness:%'", [], |r| r.get::<_,i64>(0)).unwrap()
+        };
+        assert_eq!(count(), 1, "an absent harness retains its dirty rows");
+        scan(&store, &[absent]);
+        assert_eq!(count(), 0);
+    }
+
+    #[test]
+    fn resync_or_disable_enable_plans_every_status_again() {
+        let temp = TempDir::new("memo_reset");
+        let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+        let db = paired_database(&temp, &fake.url);
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let statuses: Vec<_> = pool()
+            .into_iter()
+            .filter(|s| s.path.starts_with("C:/memo/"))
+            .collect();
+        scan(&store, &statuses);
+        assert_eq!(scan(&store, &statuses), 0);
+        hub_client::resync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+        assert_eq!(scan(&store, &statuses), statuses.len());
+        assert!(hub_client::test_hooks::status_plan().into_iter().all(|v| v));
+        hub_client::disable(&db, OwnerMode::Standalone).unwrap();
+        assert_eq!(scan(&store, &statuses), 0);
+        hub_client::enable_for_collection(&db, OwnerMode::Standalone, &fake.url).unwrap();
+        assert_eq!(scan(&store, &statuses), statuses.len());
+        assert!(hub_client::test_hooks::status_plan().into_iter().all(|v| v));
+    }
+
+    #[test]
+    fn a_reconciled_status_dead_letter_is_planned_again() {
+        let temp = TempDir::new("memo_letter");
+        let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+        let db = paired_database(&temp, &fake.url);
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let mut status = pool()[3].clone();
+        status.status = "parse_error".to_owned();
+        status.message = Some("exact input differs from reconstructed status".to_owned());
+        let statuses = [status];
+        scan(&store, &statuses);
+        assert_eq!(scan(&store, &statuses), 0);
+        let key = format!(
+            "status:codex:{}",
+            writer::source_status_id(&statuses[0].path)
+        );
+        move_to_dead_letter(&store.conn, &key, None);
+        let report =
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+        assert_eq!(report.requeued, 1);
+        assert_eq!(scan(&store, &statuses), 1);
+        assert_eq!(hub_client::test_hooks::status_plan(), vec![true]);
+    }
+
+    #[test]
+    fn a_session_ingest_reprobes_only_its_status() {
+        let temp = TempDir::new("memo_ingest");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let statuses: Vec<_> = pool()
+            .into_iter()
+            .filter(|s| s.path.starts_with("C:/memo/"))
+            .collect();
+        scan(&store, &statuses);
+        assert_eq!(scan(&store, &statuses), 0);
+        let mut snapshot = sample_snapshot("memo-ingest");
+        snapshot.source.path = statuses[0].path.clone();
+        snapshot.source.mapped_source_file_path = statuses[0].path.clone();
+        writer::apply_session_batch(&store.conn, vec![snapshot]).unwrap();
+        assert_eq!(scan(&store, &statuses), 1);
+        assert_eq!(
+            hub_client::test_hooks::status_plan()
+                .into_iter()
+                .filter(|v| *v)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_foreign_record_state_write_invalidates_its_key() {
+        let temp = TempDir::new("memo_foreign");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let statuses = [pool()[3].clone()];
+        let key = format!(
+            "status:codex:{}",
+            writer::source_status_id(&statuses[0].path)
+        );
+        scan(&store, &statuses);
+        assert_eq!(scan(&store, &statuses), 0);
+        for sql in [
+            "update collector_hub_record_state set record_hash='foreign' where record_key=?1",
+            "delete from collector_hub_record_state where record_key=?1",
+            "update collector_hub_record_state set record_key='thread:renamed' where record_key=?1",
+            "insert or replace into collector_hub_record_state(record_key,record_hash) values(?1,'replaced')",
+        ] {
+            store.conn.execute(sql, [&key]).unwrap();
+            assert_eq!(scan(&store, &statuses), 1, "{sql}");
+            assert_eq!(hub_client::test_hooks::status_plan(), vec![true], "{sql}");
+            assert_eq!(scan(&store, &statuses), 0);
+        }
+    }
+
+    #[test]
+    fn one_new_status_probes_one_bucket() {
+        use sha2::{Digest, Sha256};
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            ..WriteBudget::default()
+        });
+        let temp = TempDir::new("memo_bucket");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let mut statuses: Vec<_> = (0..5000)
+            .map(|i| {
+                let mut s = pool()[3].clone();
+                s.path = format!("C:/bucket/{i}.jsonl");
+                s
+            })
+            .collect();
+        assert_eq!(scan(&store, &statuses), 5000);
+        assert_eq!(scan(&store, &statuses), 0);
+        let mut next = statuses[0].clone();
+        next.path = "C:/bucket/new.jsonl".to_owned();
+        let bucket = |s: &SourceStatus| {
+            let hash = Sha256::digest(
+                format!("status:codex:{}", writer::source_status_id(&s.path)).as_bytes(),
+            );
+            u16::from_be_bytes([hash[0], hash[1]]) & 1023
+        };
+        let expected = statuses
+            .iter()
+            .filter(|s| bucket(s) == bucket(&next))
+            .count()
+            + 1;
+        statuses.push(next);
+        assert_eq!(scan(&store, &statuses), expected);
+        assert_eq!(
+            hub_client::test_hooks::status_plan()
+                .into_iter()
+                .filter(|v| *v)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_key_duplicates_redeliver_as_today() {
+        let temp = TempDir::new("memo_dupes");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let mut second = pool()[3].clone();
+        second.message = Some("other content".to_owned());
+        let statuses = [pool()[3].clone(), second];
+        for _ in 0..3 {
+            scan(&store, &statuses);
+            assert_eq!(hub_client::test_hooks::status_plan(), vec![true, true]);
+        }
+    }
+
+    #[test]
+    fn upgrade_from_previous_schema_probes_once_then_memoizes() {
+        use codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION;
+        let temp = TempDir::new("memo_upgrade");
+        let db = temp.path().join("local.sqlite");
+        let original = Store::open(&db, OwnerMode::Standalone).unwrap();
+        original.conn.execute_batch("drop trigger hub_status_plan_dirty_insert; drop trigger hub_status_plan_dirty_update; drop trigger hub_status_plan_dirty_delete; drop table hub_status_plan; drop table hub_status_plan_dirty;").unwrap();
+        original
+            .conn
+            .execute(
+                "delete from schema_version where version=?",
+                [SUPPORTED_SCHEMA_VERSION],
+            )
+            .unwrap();
+        assert_eq!(
+            original
+                .conn
+                .query_row("select max(version) from schema_version", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            SUPPORTED_SCHEMA_VERSION - 1
+        );
+        drop(original);
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store.conn.execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','machine-a')",[]).unwrap();
+        let statuses = [pool()[3].clone()];
+        assert_eq!(scan(&store, &statuses), 1);
+        assert_eq!(scan(&store, &statuses), 0);
+    }
+
+    #[test]
+    fn a_partial_scan_never_commits_its_memo() {
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            soft: Duration::from_secs(10),
+            ..WriteBudget::default()
+        });
+        let temp = TempDir::new("memo_partial");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let statuses: Vec<_> = (0..1200)
+            .map(|i| {
+                let mut s = pool()[3].clone();
+                s.path = format!("C:/partial/{i}.jsonl");
+                s
+            })
+            .collect();
+        hub_client::test_hooks::fail_status_unit_after(Some(600));
+        let error = writer::apply_scanned_source_statuses(
+            &store.conn,
+            &statuses,
+            &vec![false; statuses.len()],
+        )
+        .unwrap_err();
+        hub_client::test_hooks::fail_status_unit_after(None);
+        assert_eq!(error.to_string(), "injected status unit failure");
+        assert_eq!(hub_client::pending(&store.conn).unwrap(), 500);
+        assert_eq!(
+            store
+                .conn
+                .query_row("select count(*) from hub_status_plan", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(scan(&store, &statuses), 1200);
+        assert_eq!(hub_client::pending(&store.conn).unwrap(), 1200);
+        assert_eq!(scan(&store, &statuses), 0);
+    }
+
+    #[test]
+    fn a_memo_failure_rolls_back_its_final_delivery() {
+        let _budget = WriteBudgetScope::enter(WriteBudget {
+            gap: Duration::ZERO,
+            soft: Duration::from_secs(10),
+            ..WriteBudget::default()
+        });
+        for count in [1, 500, 501] {
+            let temp = TempDir::new("memo_atomic");
+            let db = paired_database(&temp, "http://127.0.0.1:1");
+            let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+            let statuses: Vec<_> = (0..count)
+                .map(|i| {
+                    let mut status = pool()[3].clone();
+                    status.path = format!("C:/atomic/{i}.jsonl");
+                    status
+                })
+                .collect();
+            store.conn.execute_batch("create trigger fail_memo before insert on hub_status_plan begin select raise(abort,'synthetic memo failure'); end;").unwrap();
+            let error =
+                writer::apply_scanned_source_statuses(&store.conn, &statuses, &vec![false; count])
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("synthetic memo failure"),
+                "{error}"
+            );
+            let committed_prefix = if count > 500 { 500 } else { 0 };
+            assert_eq!(hub_client::pending(&store.conn).unwrap(), committed_prefix);
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("select count(*) from collector_hub_record_state", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                committed_prefix
+            );
+            store.conn.execute_batch("drop trigger fail_memo").unwrap();
+            assert_eq!(scan(&store, &statuses), count);
+            assert_eq!(hub_client::pending(&store.conn).unwrap(), count as i64);
+            assert_eq!(scan(&store, &statuses), 0);
+        }
+    }
+
+    #[test]
+    fn exact_envelope_changes_ignore_the_membership_hint() {
+        let temp = TempDir::new("memo_envelope");
+        let db = paired_database(&temp, "http://127.0.0.1:1");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        let mut status = pool()[3].clone();
+        scan(&store, std::slice::from_ref(&status));
+        let mut legacy = Envelope::new(Record::SourceStatus(status.clone()));
+        legacy.version = 1;
+        store.apply(vec![legacy]).unwrap();
+        assert_eq!(scan(&store, std::slice::from_ref(&status)), 1);
+        assert_eq!(hub_client::test_hooks::status_plan(), vec![true]);
+        for field in 0..4 {
+            match field {
+                0 => status.message = Some("new message".to_owned()),
+                1 => status.environment = None,
+                2 => status.environment = Some("wsl".to_owned()),
+                _ => status.path = status.path.to_uppercase(),
+            }
+            writer::apply_scanned_source_statuses(
+                &store.conn,
+                std::slice::from_ref(&status),
+                &[true],
+            )
+            .unwrap();
+            assert_eq!(
+                hub_client::test_hooks::status_plan(),
+                vec![true],
+                "field {field}"
+            );
+            writer::apply_scanned_source_statuses(
+                &store.conn,
+                std::slice::from_ref(&status),
+                &[true],
+            )
+            .unwrap();
+            assert_eq!(hub_client::test_hooks::status_plan(), vec![false]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires this lane's disposable 78,000-session snapshot copy"]
+    fn measure_status_plan_reset_holds_on_owned_snapshot() {
+        use codex_sessions_collector::store::write_budget::WriteHoldScope;
+        let path = std::path::PathBuf::from(
+            std::env::var_os("CXV218_MEASURE_DB").expect("owned measurement copy"),
+        );
+        let root = std::path::Path::new(r"F:\dev-artifacts\runs\codex-sessions-viewer-t3-1212ccce\orchestrate-collector-io\laneD").canonicalize().unwrap();
+        let path = path.canonicalize().unwrap();
+        assert!(path.starts_with(root));
+        assert_eq!(path.file_name().unwrap(), "viewer.sqlite");
+        let store = Store::open(&path, OwnerMode::Viewer).unwrap();
+        let fake = fake_hub(Box::new(|_| {
+            panic!("resync must only verify, never upload snapshot content")
+        }));
+        store
+            .conn
+            .execute(
+                "update app_metadata set value='machine-a' where key='machine_id'",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "update collector_hub_state set machine_id='machine-a',hub_url=?",
+                [&fake.url],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "create temp table reset_state as select * from collector_hub_record_state;",
+            )
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "select count(*) from reset_state where record_key like 'status:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(count >= 70_000, "representative status population: {count}");
+        for operation in ["resync", "disable"] {
+            for sample in 0..3 {
+                store.conn.execute_batch("begin immediate; delete from collector_hub_record_state; insert into collector_hub_record_state select * from reset_state; delete from hub_status_plan_dirty; update collector_hub_state set enabled=1; commit;").unwrap();
+                let holds = WriteHoldScope::for_phase("hub");
+                let started = Instant::now();
+                match operation {
+                    "resync" => {
+                        hub_client::resync(&path, OwnerMode::Viewer, &fake.url, MACHINE_A_TOKEN)
+                            .unwrap();
+                    }
+                    _ => {
+                        hub_client::disable(&path, OwnerMode::Viewer).unwrap();
+                    }
+                }
+                let elapsed = started.elapsed();
+                let report = holds.report();
+                let dirty: i64 = store
+                    .conn
+                    .query_row("select count(*) from hub_status_plan_dirty", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(dirty, count);
+                eprintln!(
+                    "CXV218_RESET_HOLD {}",
+                    json!({"operation":operation,"sample":sample,"status_keys":count,"dirty_keys":dirty,"milliseconds":elapsed.as_secs_f64()*1000.0,"write_hold":report})
+                );
+                // This is a measurement, including indivisible SQLite COMMIT
+                // outliers. Report every sample rather than stopping before
+                // disable's samples when a resync checkpoint is slow.
+            }
+        }
+    }
+}
 
 struct Hub {
     child: Child,
@@ -3259,7 +4414,7 @@ fn legacy_packed(json: &str) -> String {
     )
 }
 
-/// Preserve populated rows, but remove the snapshot-fields migration so the
+/// Preserve populated rows, but remove the snapshot-fields and later migrations so the
 /// next Store::open must perform the real upgrade. After integration, any
 /// preceding index-only migration remains applied to the ff6675c-era rows.
 fn before_snapshot_fields_upgrade(conn: &rusqlite::Connection) {
@@ -3269,6 +4424,11 @@ fn before_snapshot_fields_upgrade(conn: &rusqlite::Connection) {
         .unwrap();
     conn.execute_batch(
         "begin immediate;
+         drop trigger hub_status_plan_dirty_insert;
+         drop trigger hub_status_plan_dirty_update;
+         drop trigger hub_status_plan_dirty_delete;
+         drop table hub_status_plan;
+         drop table hub_status_plan_dirty;
          alter table messages drop column token_cache_write;
          alter table messages drop column token_reasoning;
          alter table sessions drop column cache_write_input_tokens;
@@ -3278,11 +4438,12 @@ fn before_snapshot_fields_upgrade(conn: &rusqlite::Connection) {
     .unwrap();
     assert_eq!(
         conn.execute(
-            "delete from schema_version where version=?",
+            "delete from schema_version where version>=?",
             [migration.version]
         )
         .unwrap(),
-        1
+        (codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION - migration.version + 1)
+            as usize
     );
     conn.execute_batch("commit").unwrap();
     let version: i64 = conn

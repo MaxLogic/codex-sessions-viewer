@@ -32,7 +32,7 @@ Directory defaultSqlRoot() {
 
 /// The newest schema this viewer applies and the collector writes
 /// (`SUPPORTED_SCHEMA_VERSION` in `collector/src/store/schema.rs`).
-const latestSchemaVersion = 32;
+const latestSchemaVersion = 33;
 
 class DatabaseMigrator {
   DatabaseMigrator({
