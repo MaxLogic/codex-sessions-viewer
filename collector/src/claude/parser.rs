@@ -10,10 +10,15 @@
 //! not model are kept in the snapshot's `extra` evidence.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use crate::resume::{
+    AbandonReason, BuildFailed, Checkpoint, CheckpointOptions, CheckpointRecord, DeltaScope,
+    RESUME_FORMAT, Resume, ResumeOutcome, RowCounts, SessionTotals, SourceReader, WindowCapture,
+    observe_checkpoint,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::codex::parser::{
@@ -95,8 +100,22 @@ fn text_of(content: Option<&Value>) -> String {
     }
 }
 
-struct Builder<'o> {
-    options: &'o ClaudeOptions,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Builder {
+    message_base: i64,
+    tool_base: i64,
+    usage_base: i64,
+    line_base: u64,
+    open_tools: BTreeMap<usize, ToolCallRecord>,
+    unresolved: BTreeSet<String>,
+    closed_usage_keys: BTreeSet<u64>,
+    closed_usage_total: UsageRecord,
+    closed: SessionTotals,
+    tool_names_prefix: String,
+    tool_prefix_count: i64,
+    abandon: bool,
+
     messages: Vec<MessageRecord>,
     tool_calls: Vec<ToolCallRecord>,
     pending_tools: HashMap<String, usize>,
@@ -128,9 +147,262 @@ const MODELED_USAGE_KEYS: [&str; 6] = [
     "server_tool_use",
 ];
 
-impl Builder<'_> {
+macro_rules! state_value {
+    ($state:expr, $value:expr) => {
+        match $value {
+            Some(value) => value,
+            None => {
+                $state.abandon = true;
+                return;
+            }
+        }
+    };
+}
+
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+impl Builder {
+    fn message_count(&self) -> Option<i64> {
+        self.message_base
+            .checked_add(i64::try_from(self.messages.len()).ok()?)
+    }
+    fn tool_count(&self) -> Option<usize> {
+        usize::try_from(self.tool_base)
+            .ok()?
+            .checked_add(self.tool_calls.len())
+    }
+    fn scope(&self) -> Option<DeltaScope> {
+        Some(DeltaScope {
+            message_from: self.message_base,
+            tool_from: self.tool_base,
+            tool_open: self
+                .open_tools
+                .keys()
+                .map(|index| i64::try_from(*index).ok())
+                .collect::<Option<Vec<_>>>()?,
+            usage_from_ordinal: self.usage_by_message.first().map_or_else(
+                || i64::try_from(self.line_base).ok(),
+                |(_, event)| Some(event.source_record_ordinal),
+            )?,
+        })
+    }
+    fn valid_checkpoint(&self, cp: &Checkpoint) -> bool {
+        serde_json::to_value(self).ok().as_ref() == Some(&cp.state)
+            && self.closed == cp.closed
+            && self.tool_names_prefix == cp.tool_names_prefix
+            && self.tool_prefix_count == cp.tool_prefix_count
+            && self.line_base == cp.next_line
+            && self.closed.valid_counts(cp.row_counts)
+            && self.message_base >= 0
+            && self.tool_base >= 0
+            && self.usage_base >= 0
+            && self.message_base == cp.row_counts.messages
+            && self.tool_base == cp.row_counts.tools
+            && i64::try_from(self.usage_by_message.len())
+                .ok()
+                .and_then(|len| self.usage_base.checked_add(len))
+                == Some(cp.row_counts.usage)
+            && u64::try_from(cp.row_counts.usage).is_ok_and(|count| count <= self.line_base)
+            && usize::try_from(self.usage_base).ok() == Some(self.closed_usage_keys.len())
+            && self
+                .record_types
+                .values()
+                .try_fold(0u64, |sum, count| sum.checked_add(*count))
+                .is_some_and(|count| count <= self.line_base)
+            && self
+                .unmodeled_blocks
+                .values()
+                .all(|count| *count <= cp.consumed)
+            && self.closed.messages == self.message_base
+            && i64::try_from(self.open_tools.len())
+                .ok()
+                .and_then(|len| self.closed.tool_calls.checked_add(len))
+                == Some(self.tool_base)
+            && self.tool_prefix_count == self.tool_base
+            && self.message_base < i64::MAX
+            && self.tool_base < i64::MAX
+            && self.usage_base < i64::MAX - 2
+            && self.messages.is_empty()
+            && self.tool_calls.is_empty()
+            && self.usage_by_message.len() <= 2
+            && !self.abandon
+            && self.open_tools.iter().all(|(index, tool)| {
+                i64::try_from(*index).is_ok_and(|index| {
+                    index >= 0 && index < self.tool_base && tool.tool_index == index
+                }) && tool
+                    .message_index
+                    .is_some_and(|index| index >= 0 && index <= self.message_base)
+            })
+            && self.open_tools.len() == self.unresolved.len()
+            && self
+                .pending_tools
+                .values()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                == self.open_tools.len()
+            && self.unresolved.iter().all(|id| {
+                self.pending_tools
+                    .get(id)
+                    .is_some_and(|index| self.open_tools.contains_key(index))
+            })
+            && self
+                .pending_tools
+                .keys()
+                .all(|id| self.unresolved.contains(id))
+            && self.usage_index.len() == self.usage_by_message.len()
+            && self
+                .usage_by_message
+                .iter()
+                .enumerate()
+                .all(|(index, (key, event))| {
+                    usize::try_from(self.usage_base)
+                        .ok()
+                        .and_then(|base| base.checked_add(index))
+                        .is_some_and(|position| self.usage_index.get(key) == Some(&position))
+                        && event.source_record_ordinal >= 0
+                        && u64::try_from(event.source_record_ordinal)
+                            .is_ok_and(|ordinal| ordinal < self.line_base)
+                        && event.rollout_ordinal.is_none()
+                        && event.turn_ordinal.is_none()
+                        && event.counter_epoch == 0
+                })
+            && self
+                .usage_by_message
+                .iter()
+                .zip(self.usage_by_message.iter().skip(1))
+                .all(|(a, b)| a.1.source_record_ordinal < b.1.source_record_ordinal)
+    }
+    fn checkpoint(
+        &self,
+        path: &str,
+        options: CheckpointOptions,
+        capture: &WindowCapture,
+        steps: u32,
+        min_bytes: u64,
+    ) -> Result<Option<CheckpointRecord>, BuildFailed> {
+        if capture.consumed() < min_bytes {
+            return Ok(None);
+        }
+        let checkpoint = (|| -> Option<Checkpoint> {
+            let mut state = self.clone();
+            state.message_base = state.message_count()?;
+            for message in std::mem::take(&mut state.messages) {
+                state.closed.add_message(&message);
+            }
+            let tool_count = state.tool_count()?;
+            for tool in &state.tool_calls {
+                if tool.tool_index >= state.tool_prefix_count {
+                    if state.tool_prefix_count != 0 {
+                        state.tool_names_prefix.push(' ');
+                    }
+                    state.tool_names_prefix.push_str(&tool.tool_name);
+                    state.tool_prefix_count = state.tool_prefix_count.checked_add(1)?;
+                }
+            }
+            let open_indices: BTreeSet<usize> = state
+                .unresolved
+                .iter()
+                .filter_map(|id| state.pending_tools.get(id).copied())
+                .collect();
+            for tool in std::mem::take(&mut state.tool_calls) {
+                state
+                    .open_tools
+                    .insert(usize::try_from(tool.tool_index).ok()?, tool);
+            }
+            for (index, row) in std::mem::take(&mut state.open_tools) {
+                if open_indices.contains(&index) {
+                    state.open_tools.insert(index, row);
+                } else {
+                    state.closed.add_tool(&row);
+                }
+            }
+            state.tool_base = i64::try_from(tool_count).ok()?;
+            state
+                .pending_tools
+                .retain(|id, _| state.unresolved.contains(id));
+            let close = state.usage_by_message.len().saturating_sub(2);
+            for (key, event) in state.usage_by_message.drain(..close) {
+                state.closed_usage_keys.insert(usage_key_hash(&key));
+                add_usage(&mut state.closed_usage_total, event.usage);
+                state.usage_index.remove(&key);
+            }
+            state.usage_base = state.usage_base.checked_add(i64::try_from(close).ok()?)?;
+            Some(Checkpoint {
+                format: RESUME_FORMAT,
+                harness: HARNESS.to_owned(),
+                parser_version: CLAUDE_PARSER_VERSION,
+                options,
+                source_path: path.to_owned(),
+                consumed: capture.consumed(),
+                next_line: state.line_base,
+                row_counts: RowCounts {
+                    messages: state.message_count()?,
+                    tools: i64::try_from(state.tool_count()?).ok()?,
+                    usage: state
+                        .usage_base
+                        .checked_add(i64::try_from(state.usage_by_message.len()).ok()?)?,
+                },
+                windows: capture.finish()?,
+                steps_since_full: steps,
+                closed: state.closed.clone(),
+                tool_names_prefix: state.tool_names_prefix.clone(),
+                tool_prefix_count: state.tool_prefix_count,
+                state: serde_json::to_value(state).ok()?,
+            })
+        })()
+        .ok_or(BuildFailed)?;
+        Ok(checkpoint.encode())
+    }
+
+    fn new() -> Self {
+        Self {
+            message_base: 0,
+            tool_base: 0,
+            usage_base: 0,
+            line_base: 0,
+            open_tools: BTreeMap::new(),
+            unresolved: BTreeSet::new(),
+            closed_usage_keys: BTreeSet::new(),
+            closed_usage_total: UsageRecord::default(),
+            closed: SessionTotals::default(),
+            tool_names_prefix: String::new(),
+            tool_prefix_count: 0,
+            abandon: false,
+            messages: Vec::new(),
+            tool_calls: Vec::new(),
+            pending_tools: HashMap::new(),
+            usage_by_message: Vec::new(),
+            usage_index: HashMap::new(),
+            models: Vec::new(),
+            session_id: None,
+            agent_id: None,
+            is_sidechain: false,
+            cwd: None,
+            title: None,
+            summary: None,
+            started: None,
+            last_message: None,
+            record_types: BTreeMap::new(),
+            unmodeled_blocks: BTreeMap::new(),
+            usage_fields: BTreeSet::new(),
+            service_tiers: BTreeSet::new(),
+            versions: BTreeSet::new(),
+            git_branches: BTreeSet::new(),
+        }
+    }
+
     fn message(
         &mut self,
+        options: &ClaudeOptions,
         author: &str,
         raw_type: &str,
         at: Option<DartDateTime>,
@@ -141,9 +413,10 @@ impl Builder<'_> {
             return;
         }
         let (content_plain, content_truncated) =
-            truncate_utf16(content, self.options.max_message_content_chars);
+            truncate_utf16(content, options.max_message_content_chars);
+        let index = state_value!(self, self.message_count());
         self.messages.push(MessageRecord {
-            index: self.messages.len() as i64,
+            index,
             author_type: author.to_owned(),
             raw_type: Some(raw_type.to_owned()),
             created_at_utc: at.map(DartDateTime::to_iso8601),
@@ -167,7 +440,14 @@ impl Builder<'_> {
         }
     }
 
-    fn record(&mut self, ordinal: i64, record: &Map<String, Value>) {
+    fn record(
+        &mut self,
+        options: &ClaudeOptions,
+        resumed: bool,
+        ordinal: i64,
+        record: &Map<String, Value>,
+        abandon_reason: &mut AbandonReason,
+    ) {
         let kind = string(record, "type").unwrap_or("unknown").to_owned();
         let at = string(record, "timestamp").and_then(DartDateTime::try_parse);
         if let Some(at) = at {
@@ -201,12 +481,19 @@ impl Builder<'_> {
             self.git_branches.insert(branch.to_owned());
         }
         match kind.as_str() {
-            "user" => self.user(record, at),
-            "assistant" => self.assistant(ordinal, record, at),
+            "user" => self.user(options, resumed, record, at, abandon_reason),
+            "assistant" => self.assistant(options, resumed, ordinal, record, at, abandon_reason),
             "system" => {
                 let content = text_of(record.get("content"));
                 let subtype = string(record, "subtype").unwrap_or("message");
-                self.message("system", &format!("system:{subtype}"), at, &content, None);
+                self.message(
+                    options,
+                    "system",
+                    &format!("system:{subtype}"),
+                    at,
+                    &content,
+                    None,
+                );
             }
             "ai-title" => {
                 if let Some(title) = string(record, "aiTitle")
@@ -228,11 +515,19 @@ impl Builder<'_> {
             kind.as_str(),
             "user" | "assistant" | "system" | "ai-title" | "summary"
         ) {
-            *self.record_types.entry(kind).or_default() += 1;
+            let count = self.record_types.entry(kind).or_default();
+            *count = state_value!(self, count.checked_add(1));
         }
     }
 
-    fn user(&mut self, record: &Map<String, Value>, at: Option<DartDateTime>) {
+    fn user(
+        &mut self,
+        options: &ClaudeOptions,
+        resumed: bool,
+        record: &Map<String, Value>,
+        at: Option<DartDateTime>,
+        abandon_reason: &mut AbandonReason,
+    ) {
         let Some(message) = object(record, "message") else {
             return;
         };
@@ -256,39 +551,76 @@ impl Builder<'_> {
                                 texts.push(text.to_owned());
                             }
                         }
-                        Some("tool_result") => self.tool_result(block, at),
+                        Some("tool_result") => {
+                            self.tool_result(options, resumed, block, at, abandon_reason)
+                        }
                         Some(other) => {
-                            *self
+                            let count = self
                                 .unmodeled_blocks
                                 .entry(format!("user:{other}"))
-                                .or_default() += 1;
+                                .or_default();
+                            *count = state_value!(self, count.checked_add(1));
                         }
                         None => {}
                     }
                 }
-                self.message(author, "message", at, &texts.join("\n"), None);
+                self.message(options, author, "message", at, &texts.join("\n"), None);
             }
             other => {
                 let text = text_of(other);
-                self.message(author, "message", at, &text, None);
+                self.message(options, author, "message", at, &text, None);
             }
         }
     }
 
-    fn tool_result(&mut self, block: &Map<String, Value>, at: Option<DartDateTime>) {
+    fn tool_result(
+        &mut self,
+        options: &ClaudeOptions,
+        resumed: bool,
+        block: &Map<String, Value>,
+        at: Option<DartDateTime>,
+        abandon_reason: &mut AbandonReason,
+    ) {
         let output = text_of(block.get("content"));
         let (output_preview, output_truncated) =
-            truncate_utf16(&output, self.options.max_tool_output_preview_chars);
+            truncate_utf16(&output, options.max_tool_output_preview_chars);
         let is_error = block.get("is_error") == Some(&Value::Bool(true));
-        let position = string(block, "tool_use_id")
-            .and_then(|id| self.pending_tools.get(id))
-            .copied();
+        let id = string(block, "tool_use_id");
+        let position = id.and_then(|id| self.pending_tools.get(id)).copied();
+        if resumed && id.is_some() && position.is_none() {
+            *abandon_reason = AbandonReason::Finality;
+            self.abandon = true;
+            return;
+        }
+        if let Some(id) = id {
+            self.unresolved.remove(id);
+        }
         let tool = match position {
-            Some(position) => &mut self.tool_calls[position],
+            Some(position) => {
+                let base = state_value!(self, usize::try_from(self.tool_base).ok());
+                let tool = if position < base {
+                    self.open_tools.get_mut(&position)
+                } else {
+                    position
+                        .checked_sub(base)
+                        .and_then(|index| self.tool_calls.get_mut(index))
+                };
+                let Some(tool) = tool else {
+                    self.abandon = true;
+                    return;
+                };
+                tool
+            }
             None => {
+                let tool_index = state_value!(
+                    self,
+                    self.tool_count()
+                        .and_then(|value| i64::try_from(value).ok())
+                );
+                let message_index = state_value!(self, self.message_count());
                 self.tool_calls.push(ToolCallRecord {
-                    tool_index: self.tool_calls.len() as i64,
-                    message_index: Some(self.messages.len() as i64),
+                    tool_index,
+                    message_index: Some(message_index),
                     tool_name: "unknown".to_owned(),
                     status: "started".to_owned(),
                     started_at_utc: None,
@@ -298,7 +630,11 @@ impl Builder<'_> {
                     output_truncated: false,
                     error_message: None,
                 });
-                self.tool_calls.last_mut().expect("just pushed")
+                let Some(tool) = self.tool_calls.last_mut() else {
+                    self.abandon = true;
+                    return;
+                };
+                tool
             }
         };
         tool.status = if is_error { "error" } else { "finished" }.to_owned();
@@ -310,7 +646,15 @@ impl Builder<'_> {
         }
     }
 
-    fn assistant(&mut self, ordinal: i64, record: &Map<String, Value>, at: Option<DartDateTime>) {
+    fn assistant(
+        &mut self,
+        options: &ClaudeOptions,
+        resumed: bool,
+        ordinal: i64,
+        record: &Map<String, Value>,
+        at: Option<DartDateTime>,
+        abandon_reason: &mut AbandonReason,
+    ) {
         let Some(message) = object(record, "message") else {
             return;
         };
@@ -327,7 +671,7 @@ impl Builder<'_> {
                 match string(block, "type") {
                     Some("text") => {
                         let text = string(block, "text").unwrap_or("").to_owned();
-                        self.message("assistant", "text", at, &text, model.clone());
+                        self.message(options, "assistant", "text", at, &text, model.clone());
                     }
                     Some("thinking") => {
                         let thinking = string(block, "thinking").unwrap_or("");
@@ -336,9 +680,10 @@ impl Builder<'_> {
                         } else {
                             thinking
                         };
-                        self.message("reasoning", "thinking", at, text, None);
+                        self.message(options, "reasoning", "thinking", at, text, None);
                     }
                     Some("redacted_thinking") => self.message(
+                        options,
                         "reasoning",
                         "redacted_thinking",
                         at,
@@ -347,11 +692,13 @@ impl Builder<'_> {
                     ),
                     Some("tool_use") => {
                         let input = block.get("input").map(json_encode).unwrap_or_default();
-                        let position = self.tool_calls.len();
+                        let position = state_value!(self, self.tool_count());
+                        let tool_index = state_value!(self, i64::try_from(position).ok());
+                        let message_index = state_value!(self, self.message_count());
                         self.tool_calls.push(ToolCallRecord {
-                            tool_index: position as i64,
+                            tool_index,
                             // The text blocks before it are already stored.
-                            message_index: Some(self.messages.len() as i64),
+                            message_index: Some(message_index),
                             tool_name: string(block, "name").unwrap_or("unknown").to_owned(),
                             status: "started".to_owned(),
                             started_at_utc: at.map(DartDateTime::to_iso8601),
@@ -362,36 +709,42 @@ impl Builder<'_> {
                             error_message: None,
                         });
                         if let Some(id) = string(block, "id") {
+                            self.unresolved.insert(id.to_owned());
                             self.pending_tools.insert(id.to_owned(), position);
                         }
                     }
                     Some(other) => {
-                        *self
+                        let count = self
                             .unmodeled_blocks
                             .entry(format!("assistant:{other}"))
-                            .or_default() += 1;
+                            .or_default();
+                        *count = state_value!(self, count.checked_add(1));
                     }
                     None => {}
                 }
             }
         } else if let Some(Value::String(text)) = message.get("content") {
             let text = text.clone();
-            self.message("assistant", "text", at, &text, model.clone());
+            self.message(options, "assistant", "text", at, &text, model.clone());
         }
         if let Some(usage) = object(message, "usage") {
-            self.usage(ordinal, record, message, usage, at, model);
+            let key = string(message, "id")
+                .or_else(|| string(record, "requestId"))
+                .map_or_else(|| format!("record:{ordinal}"), str::to_owned);
+            self.usage((resumed, abandon_reason), ordinal, key, usage, at, model);
         }
     }
 
     fn usage(
         &mut self,
+        transition: (bool, &mut AbandonReason),
         ordinal: i64,
-        record: &Map<String, Value>,
-        message: &Map<String, Value>,
+        key: String,
         usage: &Map<String, Value>,
         at: Option<DartDateTime>,
         model: Option<String>,
     ) {
+        let (resumed, abandon_reason) = transition;
         for key in usage.keys() {
             if !MODELED_USAGE_KEYS.contains(&key.as_str()) {
                 self.usage_fields.insert(key.clone());
@@ -409,7 +762,12 @@ impl Builder<'_> {
         );
         let prompt = match (input, cache_read, cache_write) {
             (None, None, None) => None,
-            _ => Some(input.unwrap_or(0) + cache_read.unwrap_or(0) + cache_write.unwrap_or(0)),
+            _ => Some(
+                input
+                    .unwrap_or(0)
+                    .wrapping_add(cache_read.unwrap_or(0))
+                    .wrapping_add(cache_write.unwrap_or(0)),
+            ),
         };
         let reasoning = object(usage, "output_tokens_details")
             .and_then(|details| details.get("thinking_tokens").and_then(json_int));
@@ -431,9 +789,11 @@ impl Builder<'_> {
                 }
             }
         }
-        let key = string(message, "id")
-            .or_else(|| string(record, "requestId"))
-            .map_or_else(|| format!("record:{ordinal}"), str::to_owned);
+        if resumed && self.closed_usage_keys.contains(&usage_key_hash(&key)) {
+            *abandon_reason = AbandonReason::Finality;
+            self.abandon = true;
+            return;
+        }
         let event = UsageEventRecord {
             source_record_ordinal: ordinal,
             rollout_ordinal: None,
@@ -452,7 +812,7 @@ impl Builder<'_> {
                 reasoning_output_tokens: reasoning,
                 total_tokens: match (prompt, output) {
                     (None, None) => None,
-                    _ => Some(prompt.unwrap_or(0) + output.unwrap_or(0)),
+                    _ => Some(prompt.unwrap_or(0).wrapping_add(output.unwrap_or(0))),
                 },
             },
             request_input_tokens: prompt,
@@ -466,7 +826,13 @@ impl Builder<'_> {
             // Later records of one response repeat or complete its usage;
             // keep the first record's position and time.
             Some(position) => {
-                let existing = &mut self.usage_by_message[*position].1;
+                let Some((_, existing)) = position
+                    .checked_sub(state_value!(self, usize::try_from(self.usage_base).ok()))
+                    .and_then(|index| self.usage_by_message.get_mut(index))
+                else {
+                    self.abandon = true;
+                    return;
+                };
                 existing.usage = event.usage;
                 existing.request_input_tokens = event.request_input_tokens;
                 existing.billable_units = event.billable_units;
@@ -475,19 +841,61 @@ impl Builder<'_> {
                 }
             }
             None => {
-                self.usage_index
-                    .insert(key.clone(), self.usage_by_message.len());
+                let position = state_value!(
+                    self,
+                    usize::try_from(self.usage_base)
+                        .ok()
+                        .and_then(|base| base.checked_add(self.usage_by_message.len()))
+                );
+                self.usage_index.insert(key.clone(), position);
                 self.usage_by_message.push((key, event));
             }
         }
     }
 }
 
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn add(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     match (left, right) {
         (None, None) => None,
-        _ => Some(left.unwrap_or(0) + right.unwrap_or(0)),
+        _ => Some(left.unwrap_or(0).wrapping_add(right.unwrap_or(0))),
     }
+}
+
+fn usage_key_hash(key: &str) -> u64 {
+    u64::from_str_radix(&sha256_hex(format!("claude:{key}").as_bytes())[..16], 16)
+        .expect("SHA-256 is hexadecimal")
+}
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+fn add_usage(total: &mut UsageRecord, usage: UsageRecord) {
+    total.input_tokens = add(total.input_tokens, usage.input_tokens);
+    total.cached_input_tokens = add(total.cached_input_tokens, usage.cached_input_tokens);
+    total.cache_write_input_tokens = add(
+        total.cache_write_input_tokens,
+        usage.cache_write_input_tokens,
+    );
+    total.output_tokens = add(total.output_tokens, usage.output_tokens);
+    total.reasoning_output_tokens =
+        add(total.reasoning_output_tokens, usage.reasoning_output_tokens);
+    total.total_tokens = add(total.total_tokens, usage.total_tokens);
 }
 
 /// Parse one transcript. `subagent_of` names the parent session when the
@@ -496,6 +904,64 @@ pub fn parse_transcript(
     path: &str,
     options: &ClaudeOptions,
 ) -> Result<ClaudeTranscript, ParseError> {
+    Ok(parse_transcript_with(path, options, Resume::Disabled)?.success)
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaudeParse {
+    pub success: ClaudeTranscript,
+    pub outcome: ResumeOutcome,
+    pub scope: Option<DeltaScope>,
+    pub checkpoint: Option<CheckpointRecord>,
+}
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+pub fn parse_transcript_with(
+    path: &str,
+    options: &ClaudeOptions,
+    resume: Resume,
+) -> Result<ClaudeParse, ParseError> {
+    let policy = resume.policy();
+    match parse_transcript_inner(path, options, resume)? {
+        Ok(parsed) => Ok(parsed),
+        Err(reason) => match parse_transcript_inner(path, options, Resume::Fresh(policy))? {
+            Ok(mut parsed) => {
+                parsed.outcome = ResumeOutcome::Abandoned(reason);
+                Ok(parsed)
+            }
+            Err(_) => Err(ParseError {
+                source_path: path.to_owned(),
+                kind: ParseErrorKind::Io,
+                message: "Source positions exceed supported bounds.".to_owned(),
+                line: None,
+                column: None,
+            }),
+        },
+    }
+}
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+fn parse_transcript_inner(
+    path: &str,
+    options: &ClaudeOptions,
+    resume: Resume,
+) -> Result<Result<ClaudeParse, AbandonReason>, ParseError> {
     let io_error = |error: std::io::Error| ParseError {
         source_path: path.to_owned(),
         kind: ParseErrorKind::Io,
@@ -506,50 +972,123 @@ pub fn parse_transcript(
     let metadata = std::fs::metadata(path).map_err(io_error)?;
     let size = metadata.len();
     let modified_utc = file_modified_utc(&metadata).map_err(io_error)?;
-    let mut bytes = Vec::with_capacity(size as usize);
-    File::open(path)
-        .map_err(io_error)?
-        .take(size)
+    let policy = resume.policy();
+    let checkpoint_options = CheckpointOptions {
+        max_tool_output_preview_chars: options.max_tool_output_preview_chars,
+        max_message_content_chars: options.max_message_content_chars,
+    };
+    let mut file = SourceReader::open(path).map_err(io_error)?;
+    let mut builder = Builder::new();
+    let mut capture = WindowCapture::fresh(size);
+    let mut scope = None;
+    let mut steps = 0;
+    if let Resume::From(loaded) = resume {
+        let cp = *loaded.checkpoint;
+        if !policy.enabled
+            || !path.to_lowercase().ends_with(".jsonl")
+            || !cp.matches(
+                path,
+                HARNESS,
+                CLAUDE_PARSER_VERSION,
+                checkpoint_options,
+                size,
+            )
+        {
+            return Ok(Err(AbandonReason::Mismatch));
+        }
+        builder = match serde_json::from_value(cp.state.clone()) {
+            Ok(state) => state,
+            Err(_) => return Ok(Err(AbandonReason::Structure)),
+        };
+        if !builder.valid_checkpoint(&cp) {
+            return Ok(Err(AbandonReason::Structure));
+        }
+        let Some((tail, head)) = cp
+            .windows
+            .validate(&mut file, cp.consumed)
+            .map_err(io_error)?
+        else {
+            return Ok(Err(AbandonReason::Windows));
+        };
+        let Some(restored_scope) = builder.scope() else {
+            return Ok(Err(AbandonReason::Structure));
+        };
+        scope = Some(restored_scope);
+        let Some(next_step) = cp.steps_since_full.checked_add(1) else {
+            return Ok(Err(AbandonReason::Structure));
+        };
+        steps = next_step;
+        let Some(restored) = WindowCapture::resumed(&cp, tail, head) else {
+            return Ok(Err(AbandonReason::Structure));
+        };
+        capture = restored;
+    }
+    let start = capture.consumed();
+    let line_base = builder.line_base;
+    let Some(remaining) = size.checked_sub(start) else {
+        return Ok(Err(AbandonReason::Structure));
+    };
+    let Ok(capacity) = usize::try_from(remaining) else {
+        return Ok(Err(AbandonReason::Structure));
+    };
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(remaining)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    let mut builder = Builder {
-        options,
-        messages: Vec::new(),
-        tool_calls: Vec::new(),
-        pending_tools: HashMap::new(),
-        usage_by_message: Vec::new(),
-        usage_index: HashMap::new(),
-        models: Vec::new(),
-        session_id: None,
-        agent_id: None,
-        is_sidechain: false,
-        cwd: None,
-        title: None,
-        summary: None,
-        started: None,
-        last_message: None,
-        record_types: BTreeMap::new(),
-        unmodeled_blocks: BTreeMap::new(),
-        usage_fields: BTreeSet::new(),
-        service_tiers: BTreeSet::new(),
-        versions: BTreeSet::new(),
-        git_branches: BTreeSet::new(),
-    };
-    let mut needs_reread = bytes.len() as u64 != size;
+    let can_checkpoint = policy.enabled && path.to_lowercase().ends_with(".jsonl");
+    let mut checkpoint = None;
+    let mut captured_tail = false;
+    let mut needs_reread = u64::try_from(bytes.len()).ok() != Some(remaining);
     let ends_with_newline = bytes.last() == Some(&b'\n');
     let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
     let last_content_line = lines
         .iter()
         .rposition(|line| !line.iter().all(u8::is_ascii_whitespace));
     for (number, line) in lines.iter().enumerate() {
+        let Some(ordinal) = u64::try_from(number)
+            .ok()
+            .and_then(|number| line_base.checked_add(number))
+        else {
+            return Ok(Err(AbandonReason::Structure));
+        };
+        let Some(next_line) = ordinal.checked_add(1) else {
+            return Ok(Err(AbandonReason::Structure));
+        };
+        let Ok(record_ordinal) = i64::try_from(ordinal) else {
+            return Ok(Err(AbandonReason::Structure));
+        };
+        let complete = number.checked_add(1).is_some_and(|next| next < lines.len());
+        if !complete && can_checkpoint {
+            checkpoint = match observe_checkpoint(
+                builder.checkpoint(path, checkpoint_options, &capture, steps, policy.min_bytes),
+                scope.is_some(),
+            ) {
+                Ok(record) => record,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            captured_tail = true;
+        }
+        let finish_line = |builder: &mut Builder, capture: &mut WindowCapture| {
+            if complete {
+                if can_checkpoint {
+                    capture.push(line)?;
+                    capture.push(b"\n")?;
+                }
+                builder.line_base = next_line;
+            }
+            Some(())
+        };
         if line.iter().all(u8::is_ascii_whitespace) {
+            if finish_line(&mut builder, &mut capture).is_none() {
+                return Ok(Err(AbandonReason::Structure));
+            }
             continue;
         }
         let malformed = |message: String| ParseError {
             source_path: path.to_owned(),
             kind: ParseErrorKind::MalformedJson,
             message,
-            line: Some(number as u64 + 1),
+            line: Some(next_line),
             column: None,
         };
         let decoded = std::str::from_utf8(line)
@@ -566,11 +1105,49 @@ pub fn parse_transcript(
             // is expected. Keep what is complete and read the file again later.
             Err(_) if Some(number) == last_content_line && !ends_with_newline => {
                 needs_reread = true;
+                if can_checkpoint {
+                    checkpoint = match observe_checkpoint(
+                        builder.checkpoint(
+                            path,
+                            checkpoint_options,
+                            &capture,
+                            steps,
+                            policy.min_bytes,
+                        ),
+                        scope.is_some(),
+                    ) {
+                        Ok(record) => record,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    captured_tail = true;
+                }
                 break;
             }
             Err(error) => return Err(malformed(error)),
         };
-        builder.record(number as i64, &record);
+        let mut abandon_reason = AbandonReason::Structure;
+        builder.record(
+            options,
+            scope.is_some(),
+            record_ordinal,
+            &record,
+            &mut abandon_reason,
+        );
+        if builder.abandon {
+            return Ok(Err(abandon_reason));
+        }
+        if finish_line(&mut builder, &mut capture).is_none() {
+            return Ok(Err(AbandonReason::Structure));
+        }
+    }
+    if can_checkpoint && !captured_tail {
+        checkpoint = match observe_checkpoint(
+            builder.checkpoint(path, checkpoint_options, &capture, steps, policy.min_bytes),
+            scope.is_some(),
+        ) {
+            Ok(record) => record,
+            Err(reason) => return Ok(Err(reason)),
+        };
     }
     let after = std::fs::metadata(path).map_err(io_error)?;
     if after.len() != size || file_modified_utc(&after).map_err(io_error)? != modified_utc {
@@ -603,20 +1180,9 @@ pub fn parse_transcript(
         .into_iter()
         .map(|(_, event)| event)
         .collect();
-    let mut total = UsageRecord::default();
+    let mut total = builder.closed_usage_total;
     for event in &usage_events {
-        total.input_tokens = add(total.input_tokens, event.usage.input_tokens);
-        total.cached_input_tokens = add(total.cached_input_tokens, event.usage.cached_input_tokens);
-        total.cache_write_input_tokens = add(
-            total.cache_write_input_tokens,
-            event.usage.cache_write_input_tokens,
-        );
-        total.output_tokens = add(total.output_tokens, event.usage.output_tokens);
-        total.reasoning_output_tokens = add(
-            total.reasoning_output_tokens,
-            event.usage.reasoning_output_tokens,
-        );
-        total.total_tokens = add(total.total_tokens, event.usage.total_tokens);
+        add_usage(&mut total, event.usage);
     }
     let extra = json!({
         "harness_format": "claude-code-transcript",
@@ -628,34 +1194,47 @@ pub fn parse_transcript(
         "git_branches": builder.git_branches,
         "incomplete_tail": needs_reread,
     });
-    Ok(ClaudeTranscript {
-        session: SessionRecord {
-            session_id,
-            thread_name: builder.title.clone(),
-            thread_source: agent.as_ref().map(|_| "subagent".to_owned()),
-            parent_thread_id: agent.as_ref().and(parent),
-            // All of a subagent's own usage is local; this keeps the viewer's
-            // legacy fork reconciliation (a Codex concept) away from it.
-            subagent_history_start_ordinal: agent.as_ref().map(|_| 0),
-            usage_projection_status: "complete".to_owned(),
-            agent_nickname: agent,
-            working_directory_display: builder.cwd.clone(),
-            working_directory_platform: builder.cwd,
-            title: builder.title,
-            summary: builder.summary,
-            started_at_utc: builder.started.map(DartDateTime::to_iso8601),
-            last_message_at_utc: builder.last_message.map(DartDateTime::to_iso8601),
-            models: builder.models,
-            usage: total,
-            parser_version: CLAUDE_PARSER_VERSION,
-            ..SessionRecord::default()
+    Ok(Ok(ClaudeParse {
+        outcome: if scope.is_some() {
+            ResumeOutcome::Resumed
+        } else {
+            ResumeOutcome::NotAttempted
         },
-        messages: builder.messages,
-        tool_calls: builder.tool_calls,
-        usage_events,
-        extra,
-        size,
-        modified_utc,
-        needs_reread,
-    })
+        scope,
+        checkpoint,
+        success: ClaudeTranscript {
+            session: SessionRecord {
+                session_id,
+                thread_name: builder.title.clone(),
+                thread_source: agent.as_ref().map(|_| "subagent".to_owned()),
+                parent_thread_id: agent.as_ref().and(parent),
+                // All of a subagent's own usage is local; this keeps the viewer's
+                // legacy fork reconciliation (a Codex concept) away from it.
+                subagent_history_start_ordinal: agent.as_ref().map(|_| 0),
+                usage_projection_status: "complete".to_owned(),
+                agent_nickname: agent,
+                working_directory_display: builder.cwd.clone(),
+                working_directory_platform: builder.cwd,
+                title: builder.title,
+                summary: builder.summary,
+                started_at_utc: builder.started.map(DartDateTime::to_iso8601),
+                last_message_at_utc: builder.last_message.map(DartDateTime::to_iso8601),
+                models: builder.models,
+                usage: total,
+                parser_version: CLAUDE_PARSER_VERSION,
+                ..SessionRecord::default()
+            },
+            messages: builder.messages,
+            tool_calls: builder
+                .open_tools
+                .into_values()
+                .chain(builder.tool_calls)
+                .collect(),
+            usage_events,
+            extra,
+            size,
+            modified_utc,
+            needs_reread,
+        },
+    }))
 }

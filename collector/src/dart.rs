@@ -153,7 +153,9 @@ const MICROS_PER_DAY: i64 = 86_400_000_000;
 const MAX_MICROS: i64 = 8_640_000_000_000_000_000;
 
 /// A Dart `DateTime` instant in UTC microseconds since the epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct DartDateTime(pub i64);
 
 impl DartDateTime {

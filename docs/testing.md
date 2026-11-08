@@ -110,6 +110,64 @@ Only selection is offered on Linux/macOS in this slice; the execution wrapper
 is Windows-only. Use the existing native release scripts for a complete
 platform gate. No new dependencies are required.
 
+## Parser resume differential modes
+
+`cargo test --manifest-path collector/Cargo.toml --test incremental_parse` defaults
+to a fast parser lane, targeting 15 seconds on PAWEL3 with a warm build cache.
+It includes every session fixture (Codex, Claude, WSL projections, subagents and
+malformed inputs), generated seed 1, four chains per input/source projection with
+at most five cuts, selected complete-line/mid-line/UTF-8 boundaries, and all
+targeted fallback, corruption, BOM/CRLF and deterministic growth tests.
+
+Run the exhaustive parser gate at slice review/batch boundaries:
+
+```powershell
+$env:CXV_INCREMENTAL_EXHAUSTIVE = '1'
+try {
+    cargo test --manifest-path collector/Cargo.toml --test incremental_parse -- --nocapture
+} finally {
+    Remove-Item Env:CXV_INCREMENTAL_EXHAUSTIVE
+}
+```
+
+Exhaustive mode keeps every fixture and seeds 1..16, every line end, end minus
+one, midpoint and UTF-8 interior cut, plus 50 random chains per input/source
+projection of length 2..10. `CXV_INCREMENTAL_SEEDS=N` can override the number of
+generated seeds (1..256) in either mode; leave it unset for these default bounds.
+The suite prints mode, bounds and coverage counts. Its checkpoint-corruption
+property uses seed `0xc2150001`, 24 mutation classes and 24 mutations on each of
+two checkpoints per harness in fast mode; exhaustive mode uses 64 mutations on
+each of eight checkpoints per harness. Corpus generation and test execution are
+deterministic. A second generic property walks every leaf and array in one rich
+generated checkpoint per harness (seed 1), using numeric extrema, changed strings,
+flipped booleans, null replacements, and truncated/duplicated/swapped arrays.
+Each mutation runs with its original digest (must reject) and a recomputed digest.
+A correctly digested writer bug may change rows: it must return success without
+panic, read at most source bytes plus the appended bytes read by the resume attempt
+before abandoning plus 288 KiB, and emit at most 256 KiB compressed / 64 MiB decoded.
+This is the coordinator's CXV-215-CR-05 decision (2026-11-08, review-r4 disposition):
+a rare late abandon may read the appended suffix once before one full fallback.
+The test-only per-reader counters measure the attempt separately, including an
+early mismatch that reads zero bytes. The generic helper also asserts at most one
+fallback reader and at most one source worth of fallback bytes, including the
+reused second-step path. Both harnesses have deterministic large-source early-
+abandon cases that inject a duplicate full fallback and independently require the
+read bound and fallback-count assertions to reject it. Large-append regressions
+account for exact fingerprint and suffix reads and one full-source fallback.
+A fallback must equal Disabled exactly. A resumed case must emit a
+decodable checkpoint and survive a second appended step under the same criteria.
+The suite prints per-harness/mode counts and elapsed time. Default inputs include
+extreme token values for both harnesses; token arithmetic always wraps, while
+positions use checked operations. Every differential cut also compares Fresh with
+Disabled and accepts only finality abandons from healthy saved state. A seeded
+fold-grouping property and named default-policy overflow regressions cover the
+checkpoint observer and wrapping totals. ResumeOutcome reports the abandon reason;
+steps_since_full is zero after a full parse and positive after incremental ingest,
+which phase-2 wiring can use for the accepted full reparse when growth stops.
+WSL projections use local fixture files and do not certify live
+UNC I/O. BOM behavior is compared with the existing full parser, including its
+errors; the tests do not change the accepted input format.
+
 ## Full slice/release/CI gate
 
 The full path is unchanged:

@@ -19,6 +19,7 @@ pub mod platform_locations;
 pub mod price_history;
 pub mod query;
 pub mod resident;
+pub mod resume;
 pub mod settings;
 pub mod store;
 pub mod t3;

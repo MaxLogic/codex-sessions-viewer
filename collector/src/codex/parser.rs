@@ -5,12 +5,18 @@
 //! and the collector write the same rows. Keep the two in lockstep; the parity
 //! fixtures under `samples/collector-parity/` fail when they drift.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+use crate::resume::{
+    AbandonReason, BuildFailed, Checkpoint, CheckpointOptions, CheckpointRecord, DeltaScope,
+    RESUME_FORMAT, Resume, ResumeOutcome, RowCounts, SessionTotals, SourceReader, WindowCapture,
+    observe_checkpoint,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::dart::{
@@ -29,7 +35,7 @@ pub const DEFAULT_MAX_MESSAGE_CONTENT_CHARS: usize = 12000;
 const MAX_LEGACY_JSON_BYTES: u64 = 8 * 1024 * 1024;
 const JSON_FORMAT_PROBE_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorType {
     User,
     Assistant,
@@ -75,7 +81,7 @@ impl AuthorType {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SourceType {
     Windows,
     Wsl,
@@ -115,7 +121,7 @@ impl SourceType {
 }
 
 /// `CodexUsage`: every bucket may be unknown; totals follow the Dart getter.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -125,6 +131,16 @@ pub struct Usage {
     pub explicit_total_tokens: Option<i64>,
 }
 
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 impl Usage {
     pub const EMPTY: Self = Self {
         input_tokens: None,
@@ -242,15 +258,15 @@ impl Usage {
     }
 
     fn difference_from(&self, previous: &Self) -> Self {
-        let current = self.vector();
-        let before = previous.vector();
+        let [ci, cc, cw, co, cr, ct] = self.vector();
+        let [bi, bc, bw, bo, br, bt] = previous.vector();
         Self {
-            input_tokens: Some(current[0].wrapping_sub(before[0])),
-            cached_input_tokens: Some(current[1].wrapping_sub(before[1])),
-            cache_write_input_tokens: Some(current[2].wrapping_sub(before[2])),
-            output_tokens: Some(current[3].wrapping_sub(before[3])),
-            reasoning_output_tokens: Some(current[4].wrapping_sub(before[4])),
-            explicit_total_tokens: Some(current[5].wrapping_sub(before[5])),
+            input_tokens: Some(ci.wrapping_sub(bi)),
+            cached_input_tokens: Some(cc.wrapping_sub(bc)),
+            cache_write_input_tokens: Some(cw.wrapping_sub(bw)),
+            output_tokens: Some(co.wrapping_sub(bo)),
+            reasoning_output_tokens: Some(cr.wrapping_sub(br)),
+            explicit_total_tokens: Some(ct.wrapping_sub(bt)),
         }
     }
 
@@ -288,7 +304,7 @@ fn sum_nullable(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     Some(left.unwrap_or(0).wrapping_add(right.unwrap_or(0)))
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParsedMessage {
     pub index: i64,
     pub author_type: AuthorType,
@@ -304,7 +320,7 @@ pub struct ParsedMessage {
     pub has_error: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParsedToolCall {
     pub message_index: i64,
     pub tool_index: i64,
@@ -324,7 +340,7 @@ impl ParsedToolCall {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParsedUsageEvent {
     pub source_record_ordinal: i64,
     pub rollout_ordinal: Option<i64>,
@@ -346,7 +362,7 @@ pub struct ParsedUsageEvent {
     pub model_context_window: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseWarning {
     pub code: String,
     pub record_type: String,
@@ -354,7 +370,7 @@ pub struct ParseWarning {
     pub message: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParsedSession {
     pub internal_id: String,
     pub session_id: Option<String>,
@@ -367,6 +383,7 @@ pub struct ParsedSession {
     pub history_base_end_byte_offset: Option<i64>,
     pub subagent_history_start_ordinal: Option<i64>,
     pub usage_events: Vec<ParsedUsageEvent>,
+    pub usage_working_directories: Vec<String>,
     pub usage_projection_status: String,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
@@ -479,10 +496,69 @@ pub fn parse_file(path: &str, options: ParserOptions) -> Result<ParseSuccess, Pa
     result.map_err(|error| match error {
         Failure::Parse(error) => error,
         Failure::Io(error) => ParseError::new(path, ParseErrorKind::Io, dart_io_message(&error)),
+        Failure::Abandon(_) => unreachable!("full parse cannot abandon"),
+    })
+}
+
+pub struct CodexParse {
+    pub success: ParseSuccess,
+    pub outcome: ResumeOutcome,
+    pub scope: Option<crate::resume::DeltaScope>,
+    pub checkpoint: Option<crate::resume::CheckpointRecord>,
+}
+
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+pub fn parse_file_with(
+    path: &str,
+    options: ParserOptions,
+    resume: Resume,
+) -> Result<CodexParse, ParseError> {
+    if !path.to_lowercase().ends_with(".jsonl") {
+        return parse_file(path, options).map(|success| CodexParse {
+            success,
+            outcome: ResumeOutcome::NotAttempted,
+            scope: None,
+            checkpoint: None,
+        });
+    }
+    let policy = resume.policy();
+    let run = |resume| -> Result<CodexParse, Failure> {
+        let metadata = std::fs::metadata(path)?;
+        Parser { path, options }.parse_jsonl_with(
+            metadata.len(),
+            file_modified_utc(&metadata)?,
+            resume,
+        )
+    };
+    let result = match run(resume) {
+        Err(Failure::Abandon(reason)) => run(Resume::Fresh(policy)).map(|mut parsed| {
+            parsed.outcome = ResumeOutcome::Abandoned(reason);
+            parsed
+        }),
+        other => other,
+    };
+    result.map_err(|error| match error {
+        Failure::Parse(error) => error,
+        Failure::Io(error) => ParseError::new(path, ParseErrorKind::Io, dart_io_message(&error)),
+        Failure::Abandon(_) => ParseError::new(
+            path,
+            ParseErrorKind::MalformedJson,
+            "Session arithmetic exceeds supported bounds.",
+        ),
     })
 }
 
 enum Failure {
+    Abandon(AbandonReason),
     Parse(ParseError),
     Io(std::io::Error),
 }
@@ -1142,6 +1218,7 @@ impl Parser<'_> {
             history_base_end_byte_offset: None,
             subagent_history_start_ordinal: None,
             usage_events: Vec::new(),
+            usage_working_directories: Vec::new(),
             usage_projection_status: usage_projection_status.to_owned(),
             agent_nickname: owned(json, "agent_nickname"),
             agent_role: owned(json, "agent_role"),
@@ -1195,10 +1272,66 @@ impl Parser<'_> {
     }
 
     fn parse_jsonl_session(&self, size: u64) -> Result<ParsedSession, Failure> {
-        let file = File::open(self.path)?;
-        // `size` counts compressed bytes for a `.zst` file, so the decoder
-        // reads the whole stream; the metadata check after parsing still
-        // detects a file that changed meanwhile.
+        Ok(self
+            .parse_jsonl_with(size, DartDateTime::from_micros(0), Resume::Disabled)?
+            .success
+            .session)
+    }
+
+    #[deny(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    fn parse_jsonl_with(
+        &self,
+        size: u64,
+        modified: DartDateTime,
+        resume: Resume,
+    ) -> Result<CodexParse, Failure> {
+        let mut file = SourceReader::open(self.path)?;
+        let policy = resume.policy();
+        let options = CheckpointOptions {
+            max_tool_output_preview_chars: self.options.max_tool_output_preview_chars,
+            max_message_content_chars: self.options.max_message_content_chars,
+        };
+        let mut state = JsonlState::new(self.path);
+        let mut capture = WindowCapture::fresh(size);
+        let mut scope = None;
+        let mut steps = 0;
+        let mut line_number = 0u64;
+        if let Resume::From(loaded) = resume {
+            let cp = *loaded.checkpoint;
+            if !policy.enabled || !cp.matches(self.path, "codex", PARSER_VERSION, options, size) {
+                return Err(Failure::Abandon(AbandonReason::Mismatch));
+            }
+            state = serde_json::from_value(cp.state.clone())
+                .map_err(|_| Failure::Abandon(AbandonReason::Structure))?;
+            if !state.valid_checkpoint(&cp) {
+                return Err(Failure::Abandon(AbandonReason::Structure));
+            }
+            let Some((tail, head)) = cp.windows.validate(&mut file, cp.consumed)? else {
+                return Err(Failure::Abandon(AbandonReason::Windows));
+            };
+            scope = Some(
+                state
+                    .scope()
+                    .ok_or(Failure::Abandon(AbandonReason::Structure))?,
+            );
+            line_number = cp.next_line;
+            steps = cp
+                .steps_since_full
+                .checked_add(1)
+                .ok_or(Failure::Abandon(AbandonReason::Structure))?;
+            capture = WindowCapture::resumed(&cp, tail, head)
+                .ok_or(Failure::Abandon(AbandonReason::Structure))?;
+        }
+        let start = capture.consumed();
         let compressed = is_compressed_jsonl(self.path);
         let mut reader: Box<dyn BufRead> = if compressed {
             let decoder = zstd::stream::read::Decoder::new(file.take(size)).map_err(|error| {
@@ -1206,10 +1339,18 @@ impl Parser<'_> {
             })?;
             Box::new(BufReader::with_capacity(256 * 1024, decoder))
         } else {
-            Box::new(BufReader::with_capacity(256 * 1024, file.take(size)))
+            Box::new(BufReader::with_capacity(
+                256 * 1024,
+                file.take(
+                    size.checked_sub(start)
+                        .ok_or(Failure::Abandon(AbandonReason::Structure))?,
+                ),
+            ))
         };
-        let mut state = JsonlState::new(self.path);
-        let mut line_number = 0u64;
+        let can_checkpoint =
+            policy.enabled && !compressed && self.path.to_lowercase().ends_with(".jsonl");
+        let mut checkpoint = None;
+        let mut captured_tail = false;
         let mut bytes_read = 0u64;
         let mut segment = Vec::new();
         loop {
@@ -1229,7 +1370,25 @@ impl Parser<'_> {
             if read == 0 {
                 break;
             }
-            bytes_read += read as u64;
+            bytes_read = bytes_read
+                .checked_add(
+                    u64::try_from(read).map_err(|_| Failure::Abandon(AbandonReason::Structure))?,
+                )
+                .ok_or(Failure::Abandon(AbandonReason::Structure))?;
+            let complete = segment.last() == Some(&b'\n');
+            if !complete && can_checkpoint {
+                checkpoint = observe_checkpoint(
+                    state.checkpoint(options, &capture, line_number, steps, policy.min_bytes),
+                    scope.is_some(),
+                )
+                .map_err(Failure::Abandon)?;
+                captured_tail = true;
+            }
+            if complete && can_checkpoint {
+                capture
+                    .push(&segment)
+                    .ok_or(Failure::Abandon(AbandonReason::Structure))?;
+            }
             if segment.last() == Some(&b'\n') {
                 segment.pop();
                 if segment.last() == Some(&b'\r') {
@@ -1240,7 +1399,9 @@ impl Parser<'_> {
             }
             // A lone carriage return also ends a line in Dart's LineSplitter.
             for line in segment.split(|byte| *byte == b'\r') {
-                line_number += 1;
+                line_number = line_number
+                    .checked_add(1)
+                    .ok_or(Failure::Abandon(AbandonReason::Structure))?;
                 let text = std::str::from_utf8(line).map_err(|error| {
                     let mut parse_error = ParseError::new(
                         self.path,
@@ -1251,7 +1412,12 @@ impl Parser<'_> {
                     parse_error
                 })?;
                 let normalized = text.trim_start_matches('\0');
-                let padding = (text.len() - normalized.len()) as u64;
+                let padding = u64::try_from(
+                    text.len()
+                        .checked_sub(normalized.len())
+                        .ok_or(Failure::Abandon(AbandonReason::Structure))?,
+                )
+                .map_err(|_| Failure::Abandon(AbandonReason::Structure))?;
                 if trim(normalized).is_empty() {
                     continue;
                 }
@@ -1267,10 +1433,16 @@ impl Parser<'_> {
                     parse_error.column = Some(1);
                     return Err(parse_error.into());
                 };
+                if scope.is_some() && state.must_abandon(&record) {
+                    return Err(Failure::Abandon(AbandonReason::Finality));
+                }
                 state.record(&record, self);
+                if state.abandon {
+                    return Err(Failure::Abandon(AbandonReason::Structure));
+                }
             }
         }
-        if !compressed && bytes_read != size {
+        if !compressed && Some(bytes_read) != size.checked_sub(start) {
             return Err(ParseError::new(
                 self.path,
                 ParseErrorKind::Io,
@@ -1278,7 +1450,29 @@ impl Parser<'_> {
             )
             .into());
         }
-        Ok(state.finish())
+        if can_checkpoint && !captured_tail {
+            checkpoint = observe_checkpoint(
+                state.checkpoint(options, &capture, line_number, steps, policy.min_bytes),
+                scope.is_some(),
+            )
+            .map_err(Failure::Abandon)?;
+        }
+        let after = std::fs::metadata(self.path)?;
+        Ok(CodexParse {
+            success: ParseSuccess {
+                session: state.finish()?,
+                snapshot_size: size,
+                snapshot_modified_utc: modified,
+                changed_during_parse: after.len() != size || file_modified_utc(&after)? != modified,
+            },
+            outcome: if scope.is_some() {
+                ResumeOutcome::Resumed
+            } else {
+                ResumeOutcome::NotAttempted
+            },
+            scope,
+            checkpoint,
+        })
     }
 }
 
@@ -1288,7 +1482,10 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonlState {
+    abandon: bool,
     source_path: String,
     source_file_unc_path: Option<String>,
     working_directory: Option<String>,
@@ -1309,12 +1506,21 @@ struct JsonlState {
     subagent_depth: Option<i64>,
     started_at_utc: Option<DartDateTime>,
     last_message_at_utc: Option<DartDateTime>,
+    message_base: i64,
+    tool_base: i64,
+    usage_base: i64,
+    open_tools: BTreeMap<i64, ParsedToolCall>,
+    unresolved: BTreeSet<String>,
+    usage_directories: Vec<String>,
+    closed: SessionTotals,
+    tool_names_prefix: String,
+    tool_prefix_count: i64,
     messages: Vec<ParsedMessage>,
     tool_calls: Vec<ParsedToolCall>,
     warnings: Vec<ParseWarning>,
     usage_events: Vec<ParsedUsageEvent>,
     model_ids: Vec<String>,
-    model_id_set: HashSet<String>,
+    model_id_set: BTreeSet<String>,
     pending_tool_calls: HashMap<String, ParsedToolCall>,
     usage: Usage,
     has_aggregate_usage: bool,
@@ -1334,9 +1540,229 @@ struct JsonlState {
     goal: Option<Value>,
 }
 
+macro_rules! state_value {
+    ($state:expr, $value:expr) => {
+        match $value {
+            Some(value) => value,
+            None => {
+                $state.abandon = true;
+                return;
+            }
+        }
+    };
+}
+
+#[deny(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 impl JsonlState {
+    fn message_count(&self) -> Option<i64> {
+        self.message_base
+            .checked_add(i64::try_from(self.messages.len()).ok()?)
+    }
+    fn tool_count(&self) -> Option<i64> {
+        self.tool_base
+            .checked_add(i64::try_from(self.tool_calls.len()).ok()?)
+    }
+    fn usage_count(&self) -> Option<i64> {
+        self.usage_base
+            .checked_add(i64::try_from(self.usage_events.len()).ok()?)
+    }
+    fn set_tool(&mut self, index: i64, row: ParsedToolCall) {
+        let target = if index < self.tool_base {
+            self.open_tools.get_mut(&index)
+        } else {
+            index
+                .checked_sub(self.tool_base)
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| self.tool_calls.get_mut(i))
+        };
+        match target {
+            Some(target) => *target = row,
+            None => self.abandon = true,
+        }
+    }
+    fn scope(&self) -> Option<DeltaScope> {
+        Some(DeltaScope {
+            message_from: self.message_base,
+            tool_from: self.tool_base,
+            tool_open: self.open_tools.keys().copied().collect(),
+            usage_from_ordinal: self.source_record_ordinal.checked_add(1)?,
+        })
+    }
+    fn valid_checkpoint(&self, checkpoint: &Checkpoint) -> bool {
+        serde_json::to_value(self).ok().as_ref() == Some(&checkpoint.state)
+            && self.source_path == checkpoint.source_path
+            && self.closed == checkpoint.closed
+            && self.tool_names_prefix == checkpoint.tool_names_prefix
+            && self.tool_prefix_count == checkpoint.tool_prefix_count
+            && !self.abandon
+            && self.closed.valid_counts(checkpoint.row_counts)
+            && self.message_base >= 0
+            && self.tool_base >= 0
+            && self.usage_base >= 0
+            && self.source_record_ordinal >= -1
+            && i64::try_from(checkpoint.next_line)
+                .is_ok_and(|line| self.source_record_ordinal < line)
+            && self
+                .source_record_ordinal
+                .checked_add(1)
+                .is_some_and(|records| {
+                    checkpoint.row_counts.messages <= records
+                        && checkpoint.row_counts.tools <= records
+                        && checkpoint.row_counts.usage <= records
+                })
+            && i64::try_from(self.messages.len())
+                .ok()
+                .and_then(|len| self.message_base.checked_add(len))
+                == Some(checkpoint.row_counts.messages)
+            && self.tool_base == checkpoint.row_counts.tools
+            && self.usage_base == checkpoint.row_counts.usage
+            && self
+                .turn_ordinal
+                .is_none_or(|ordinal| ordinal >= 0 && ordinal <= self.source_record_ordinal)
+            && self.counter_epoch >= 0
+            && self.counter_epoch <= self.usage_base
+            && self.model_ids.len() == self.model_id_set.len()
+            && self.model_ids.iter().cloned().collect::<BTreeSet<_>>() == self.model_id_set
+            && self.closed.messages == self.message_base
+            && i64::try_from(self.open_tools.len())
+                .ok()
+                .and_then(|len| self.closed.tool_calls.checked_add(len))
+                == Some(self.tool_base)
+            && self.tool_prefix_count == self.tool_base
+            && self.message_base < i64::MAX
+            && self.tool_base < i64::MAX
+            && self.usage_base < i64::MAX
+            && self.messages.len() <= 1
+            && self.tool_calls.is_empty()
+            && self.usage_events.is_empty()
+            && self.messages.iter().enumerate().all(|(i, row)| {
+                i64::try_from(i)
+                    .ok()
+                    .and_then(|i| self.message_base.checked_add(i))
+                    == Some(row.index)
+            })
+            && self.open_tools.iter().all(|(i, row)| {
+                *i >= 0
+                    && *i < self.tool_base
+                    && row.tool_index == *i
+                    && row.message_index >= 0
+                    && row.message_index <= checkpoint.row_counts.messages
+            })
+            && self.open_tools.len() == self.unresolved.len()
+            && self
+                .pending_tool_calls
+                .values()
+                .map(|row| row.tool_index)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == self.open_tools.len()
+            && self
+                .pending_tool_calls
+                .keys()
+                .all(|id| self.unresolved.contains(id))
+            && self.unresolved.iter().all(|id| {
+                self.pending_tool_calls
+                    .get(id)
+                    .is_some_and(|p| self.open_tools.get(&p.tool_index) == Some(p))
+            })
+    }
+    fn must_abandon(&self, record: &Map<String, Value>) -> bool {
+        let payload = object(record, "payload");
+        string(record, "type") == Some("response_item")
+            && is_tool_output_payload(string(payload, "type"))
+            && string(payload, "call_id")
+                .is_some_and(|id| !self.pending_tool_calls.contains_key(id))
+    }
+    fn checkpoint(
+        &self,
+        options: CheckpointOptions,
+        capture: &WindowCapture,
+        next_line: u64,
+        steps: u32,
+        min_bytes: u64,
+    ) -> Result<Option<CheckpointRecord>, BuildFailed> {
+        if capture.consumed() < min_bytes || self.usage_projection_status == "legacy_pending" {
+            return Ok(None);
+        }
+        let checkpoint = (|| -> Option<Checkpoint> {
+            let mut state = self.clone();
+            let keep_message = state.messages.len().saturating_sub(1);
+            for message in state.messages.drain(..keep_message) {
+                state.closed.add_message(&(&message).into());
+            }
+            state.message_base = state
+                .message_base
+                .checked_add(i64::try_from(keep_message).ok()?)?;
+            let tool_count = state.tool_count()?;
+            for tool in &state.tool_calls {
+                if tool.tool_index >= state.tool_prefix_count {
+                    if state.tool_prefix_count != 0 {
+                        state.tool_names_prefix.push(' ');
+                    }
+                    state.tool_names_prefix.push_str(&tool.tool_name);
+                    state.tool_prefix_count = state.tool_prefix_count.checked_add(1)?;
+                }
+            }
+            let open_indices: BTreeSet<i64> = state
+                .unresolved
+                .iter()
+                .filter_map(|id| state.pending_tool_calls.get(id).map(|tool| tool.tool_index))
+                .collect();
+            for tool in std::mem::take(&mut state.tool_calls) {
+                state.open_tools.insert(tool.tool_index, tool);
+            }
+            for (index, row) in std::mem::take(&mut state.open_tools) {
+                if open_indices.contains(&index) {
+                    state.open_tools.insert(index, row);
+                } else {
+                    state.closed.add_tool(&(&row).into());
+                }
+            }
+            state.tool_base = tool_count;
+            state.usage_base = state.usage_count()?;
+            state.usage_events.clear();
+            state
+                .pending_tool_calls
+                .retain(|id, _| state.unresolved.contains(id));
+            // Warnings are not persisted rows, but remain in the whole state so the
+            // checkpoint shape and subsequent parsing do not silently lose fields.
+            Some(Checkpoint {
+                format: RESUME_FORMAT,
+                harness: "codex".to_owned(),
+                parser_version: PARSER_VERSION,
+                options,
+                source_path: self.source_path.clone(),
+                consumed: capture.consumed(),
+                next_line,
+                row_counts: RowCounts {
+                    messages: state.message_count()?,
+                    tools: state.tool_count()?,
+                    usage: state.usage_count()?,
+                },
+                windows: capture.finish()?,
+                steps_since_full: steps,
+                closed: state.closed.clone(),
+                tool_names_prefix: state.tool_names_prefix.clone(),
+                tool_prefix_count: state.tool_prefix_count,
+                state: serde_json::to_value(state).ok()?,
+            })
+        })()
+        .ok_or(BuildFailed)?;
+        Ok(checkpoint.encode())
+    }
+
     fn new(path: &str) -> Self {
         Self {
+            abandon: false,
             source_path: path.to_owned(),
             source_file_unc_path: None,
             working_directory: None,
@@ -1357,12 +1783,21 @@ impl JsonlState {
             subagent_depth: None,
             started_at_utc: None,
             last_message_at_utc: None,
+            message_base: 0,
+            tool_base: 0,
+            usage_base: 0,
+            open_tools: BTreeMap::new(),
+            unresolved: BTreeSet::new(),
+            usage_directories: Vec::new(),
+            closed: SessionTotals::default(),
+            tool_names_prefix: String::new(),
+            tool_prefix_count: 0,
             messages: Vec::new(),
             tool_calls: Vec::new(),
             warnings: Vec::new(),
             usage_events: Vec::new(),
             model_ids: Vec::new(),
-            model_id_set: HashSet::new(),
+            model_id_set: BTreeSet::new(),
             pending_tool_calls: HashMap::new(),
             usage: Usage::EMPTY,
             has_aggregate_usage: false,
@@ -1398,7 +1833,9 @@ impl JsonlState {
     }
 
     fn record(&mut self, record: &Map<String, Value>, parser: &Parser<'_>) {
-        self.source_record_ordinal += 1;
+        let message_count = state_value!(self, self.message_count());
+        let tool_count = state_value!(self, self.tool_count());
+        self.source_record_ordinal = state_value!(self, self.source_record_ordinal.checked_add(1));
         let record_type = string(record, "type");
         let timestamp = date_time(record, "timestamp");
         let payload = object(record, "payload");
@@ -1412,7 +1849,10 @@ impl JsonlState {
             if self.inherited(record) {
                 return;
             }
-            self.turn_ordinal = Some(self.turn_ordinal.unwrap_or(-1) + 1);
+            self.turn_ordinal = Some(state_value!(
+                self,
+                self.turn_ordinal.unwrap_or(-1).checked_add(1)
+            ));
             let cwd = owned(payload, "cwd");
             let cwd_unc = owned(payload, "working_directory_unc");
             if cwd.is_some() {
@@ -1516,7 +1956,7 @@ impl JsonlState {
                 usage: message_usage,
                 model,
                 ..parser.message(
-                    self.messages.len() as i64,
+                    message_count,
                     author_type,
                     payload_type.map(str::to_owned),
                     timestamp,
@@ -1540,7 +1980,7 @@ impl JsonlState {
                 return;
             }
             let message = parser.message(
-                self.messages.len() as i64,
+                message_count,
                 author_type,
                 payload_type.map(str::to_owned),
                 timestamp,
@@ -1552,8 +1992,8 @@ impl JsonlState {
         }
         if record_type == Some("response_item") && is_tool_call_payload(payload_type) {
             let tool_call = ParsedToolCall {
-                message_index: self.messages.len() as i64,
-                tool_index: self.tool_calls.len() as i64,
+                message_index: message_count,
+                tool_index: tool_count,
                 tool_name: tool_name(payload, payload_type),
                 status: "started".to_owned(),
                 started_at_utc: timestamp,
@@ -1564,6 +2004,7 @@ impl JsonlState {
                 error_message: None,
             };
             if let Some(call_id) = string(payload, "call_id") {
+                self.unresolved.insert(call_id.to_owned());
                 self.pending_tool_calls
                     .insert(call_id.to_owned(), tool_call.clone());
             }
@@ -1574,16 +2015,15 @@ impl JsonlState {
             let prior = string(payload, "call_id")
                 .and_then(|call_id| self.pending_tool_calls.get(call_id))
                 .cloned();
+            if let Some(call_id) = string(payload, "call_id") {
+                self.unresolved.remove(call_id);
+            }
             let output = string(payload, "output").unwrap_or("");
             let (output_preview, output_truncated) =
                 parser.truncate(output, parser.options.max_tool_output_preview_chars);
             let updated = ParsedToolCall {
-                message_index: prior
-                    .as_ref()
-                    .map_or(self.messages.len() as i64, |p| p.message_index),
-                tool_index: prior
-                    .as_ref()
-                    .map_or(self.tool_calls.len() as i64, |p| p.tool_index),
+                message_index: prior.as_ref().map_or(message_count, |p| p.message_index),
+                tool_index: prior.as_ref().map_or(tool_count, |p| p.tool_index),
                 tool_name: prior
                     .as_ref()
                     .map_or_else(|| "unknown".to_owned(), |p| p.tool_name.clone()),
@@ -1599,14 +2039,14 @@ impl JsonlState {
             };
             match prior {
                 None => self.tool_calls.push(updated),
-                Some(prior) => self.tool_calls[prior.tool_index as usize] = updated,
+                Some(prior) => self.set_tool(prior.tool_index, updated),
             }
             return;
         }
         if record_type == Some("response_item") && payload_type == Some("reasoning") {
             let content = reasoning_content(payload);
             let message = parser.message(
-                self.messages.len() as i64,
+                message_count,
                 AuthorType::Reasoning,
                 payload_type.map(str::to_owned),
                 timestamp,
@@ -1624,7 +2064,7 @@ impl JsonlState {
                 return;
             }
             let message = parser.message(
-                self.messages.len() as i64,
+                message_count,
                 AuthorType::System,
                 payload_type.map(str::to_owned),
                 timestamp,
@@ -1658,7 +2098,7 @@ impl JsonlState {
 
         let content = json_encode(&Value::Object(payload.clone()));
         let message = parser.message(
-            self.messages.len() as i64,
+            message_count,
             AuthorType::Unknown,
             payload_type.or(record_type).map(str::to_owned),
             timestamp,
@@ -1735,7 +2175,13 @@ impl JsonlState {
                     let message = ParsedMessage {
                         has_error: true,
                         ..parser.message(
-                            self.messages.len() as i64,
+                            match self.message_count() {
+                                Some(count) => count,
+                                None => {
+                                    self.abandon = true;
+                                    return true;
+                                }
+                            },
                             AuthorType::System,
                             payload_type.map(str::to_owned),
                             timestamp,
@@ -1869,7 +2315,7 @@ impl JsonlState {
             total.difference_from(&self.previous_cumulative_usage)
         };
         let first_legacy_event =
-            self.usage_events.is_empty() && self.usage_projection_status == "legacy_pending";
+            self.usage_count() == Some(0) && self.usage_projection_status == "legacy_pending";
         let use_last_token_usage = !last.is_empty()
             && last.is_non_negative()
             && if counter_reset {
@@ -1884,7 +2330,7 @@ impl JsonlState {
                 last.has_same_vector(&delta)
             };
         if counter_reset {
-            self.counter_epoch += 1;
+            self.counter_epoch = state_value!(self, self.counter_epoch.checked_add(1));
             self.pending_counter_reset = false;
         }
         let event_usage = if use_last_token_usage { last } else { delta }.with_component_total();
@@ -1905,6 +2351,9 @@ impl JsonlState {
         };
         if branch_scope == "ambiguous" && self.subagent_history_start_ordinal.is_some() {
             self.usage_projection_status = "ambiguous".to_owned();
+        }
+        if let Some(directory) = &self.effective_working_directory {
+            push_unique(&mut self.usage_directories, directory);
         }
         self.usage_events.push(ParsedUsageEvent {
             source_record_ordinal: self.source_record_ordinal,
@@ -1939,8 +2388,12 @@ impl JsonlState {
         self.has_cumulative_usage = true;
     }
 
-    fn finish(mut self) -> ParsedSession {
-        if self.usage_events.is_empty() {
+    fn finish(mut self) -> Result<ParsedSession, Failure> {
+        if self
+            .usage_count()
+            .ok_or(Failure::Abandon(AbandonReason::Structure))?
+            == 0
+        {
             self.usage_projection_status = if self.usage.has_positive_usage() {
                 "ambiguous"
             } else {
@@ -1950,7 +2403,7 @@ impl JsonlState {
         }
         let display_path = self.source_path.clone();
         let extra = codex_extra(&self.files_changed, self.goal.take());
-        ParsedSession {
+        Ok(ParsedSession {
             extra,
             internal_id: internal_id(&self.source_path, self.session_id.as_deref()),
             session_id: self.session_id,
@@ -1963,6 +2416,7 @@ impl JsonlState {
             history_base_end_byte_offset: self.history_base_end_byte_offset,
             subagent_history_start_ordinal: self.subagent_history_start_ordinal,
             usage_events: self.usage_events,
+            usage_working_directories: self.usage_directories,
             usage_projection_status: self.usage_projection_status,
             agent_nickname: self.agent_nickname,
             agent_role: self.agent_role,
@@ -1980,12 +2434,16 @@ impl JsonlState {
             last_message_at_utc: self.last_message_at_utc,
             model_ids: self.model_ids,
             messages: self.messages,
-            tool_calls: self.tool_calls,
+            tool_calls: self
+                .open_tools
+                .into_values()
+                .chain(self.tool_calls)
+                .collect(),
             warnings: self.warnings,
             usage: self.usage,
             last_turn_usage: self.last_turn_usage,
             source_path: self.source_path,
-        }
+        })
     }
 }
 
