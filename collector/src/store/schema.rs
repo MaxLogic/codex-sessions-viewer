@@ -14,7 +14,7 @@ use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 30;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 31;
 
 pub struct Migration {
     pub version: i64,
@@ -95,6 +95,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(28, "migration", "028_session_project_refined.sql"),
     migration!(29, "migration", "029_native_source_types.sql"),
     migration!(30, "migration", "030_t3_lineage.sql"),
+    migration!(31, "migration", "031_source_status_membership.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -982,7 +983,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             "select * from collector_upload_outbox",
             "select * from collector_hub_state",
             "select * from session_change_state",
-            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') and name <> 'trg_sessions_t3_change' order by type,name",
+            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') and name not in ('trg_sessions_t3_change','idx_sessions_harness_source_path','idx_sessions_harness_source_unc_path') order by type,name",
         ] {
             let mut statement = conn.prepare(query).unwrap();
             let columns = statement.column_count();

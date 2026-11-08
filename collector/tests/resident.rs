@@ -4122,7 +4122,10 @@ fn bridge_protocol_wire_version_and_validation() {
     assert_eq!(hello["event"], "hello");
     assert_eq!(hello["id"], "h");
     assert_eq!(hello["protocol"], 1);
-    assert_eq!(hello["schema"], 30);
+    assert_eq!(
+        hello["schema"],
+        codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION
+    );
     assert_eq!(hello["contract"], 2);
     assert!(hello["parsers"]["codex"].as_i64().unwrap() > 0);
     assert!(hello["parsers"]["claude"].as_i64().unwrap() > 0);
@@ -4478,8 +4481,8 @@ fn protocol_newer_schema_exits_three() {
     codex_sessions_collector::store::connection::ensure().unwrap();
     let conn = rusqlite::Connection::open(&fixture.db).unwrap();
     conn.execute(
-        "insert into schema_version values (31, 'future.sql','future','now',1,null)",
-        [],
+        "insert into schema_version values (?, 'future.sql','future','now',1,null)",
+        [codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION + 1],
     )
     .unwrap();
     drop(conn);

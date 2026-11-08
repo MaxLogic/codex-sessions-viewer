@@ -2916,8 +2916,8 @@ impl StatusIndex {
 
 /// [`apply_source_statuses`] for a scan that knows which statuses leave the
 /// stored rows unchanged (`unchanged[i]` for `statuses[i]`). Those still take
-/// part in hub delivery; when every status is unchanged, the full read of the
-/// sessions table that matches statuses to rows is skipped. Only pass `true`
+/// part in hub delivery; unchanged statuses skip the indexed
+/// membership lookups that match statuses to rows. Only pass `true`
 /// for statuses judged against rows this scan has not written since.
 pub fn apply_scanned_source_statuses(
     conn: &Connection,
@@ -2968,37 +2968,42 @@ fn apply_source_statuses_with(
             (index, status, unchanged),
         );
     }
-    let local = unique.values().any(|(_, _, unchanged)| !unchanged);
     let now = DartDateTime::now().to_iso8601();
     super::write_budget::write_planned(
         conn,
         "statuses",
         500,
         || {
-            // One membership map over both physical path columns. Never run the
-            // correlated anti-join under BEGIN IMMEDIATE (CXV-180).
+            // Resolve only applied sources using the two physical-path indexes.
+            // UNION deduplicates rows whose two paths match. Exact BINARY path
+            // comparisons and rowid order preserve the old membership map.
             type Stored = (i64, String, Option<String>, Option<String>, Option<String>);
             let mut members: HashMap<(String, String), Vec<Stored>> = HashMap::new();
-            let mut statement = conn.prepare("select id,harness,source_file_path,source_file_unc_path,scan_status,source_state,parse_status,rowid from sessions order by rowid")?;
-            let mut rows = statement.query([])?;
-            while local && let Some(row) = rows.next()? {
-                let harness: String = row.get(1)?;
-                let stored = (
-                    row.get(7)?,
-                    row.get(0)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                );
-                for path in [row.get::<_, Option<String>>(2)?, row.get(3)?]
-                    .into_iter()
-                    .flatten()
-                    .collect::<HashSet<_>>()
-                {
-                    members
-                        .entry((harness.clone(), path))
-                        .or_default()
-                        .push(stored.clone());
+            let mut statement = conn.prepare_cached(
+                "select rowid,id,scan_status,source_state,parse_status from sessions
+                 where harness=?1 and source_file_path=?2
+                 union
+                 select rowid,id,scan_status,source_state,parse_status from sessions
+                 where harness=?1 and source_file_unc_path=?2
+                 order by 1",
+            )?;
+            for (key, (_, _, unchanged)) in &unique {
+                if *unchanged {
+                    continue;
+                }
+                let rows = statement
+                    .query_map(params![key.0, key.1], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<Stored>, _>>()?;
+                if !rows.is_empty() {
+                    members.insert(key.clone(), rows);
                 }
             }
             let mut changes = BTreeMap::new();

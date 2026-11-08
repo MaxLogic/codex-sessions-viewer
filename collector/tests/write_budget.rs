@@ -738,6 +738,46 @@ fn unsupported_status(path: &str) -> codex_sessions_collector::contract::SourceS
 }
 
 #[test]
+fn status_membership_total_work_scales_with_applied_sources() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::writer;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let mut measured = Vec::new();
+    for rows in [1_000, 70_553] {
+        let mut conn = padded_status_store(rows);
+        let steps = Arc::new(AtomicU64::new(0));
+        let counted = steps.clone();
+        conn.progress_handler(
+            100,
+            Some(move || {
+                counted.fetch_add(100, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+        let mut status = unsupported_status("compressed-1.jsonl.zst");
+        status.state = "codex_archived".into();
+        writer::apply_source_statuses(&conn, &[status]).unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        measured.push(steps.load(Ordering::Relaxed));
+        let state: String = conn
+            .query_row(
+                "select source_state from sessions where id='padding:1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "codex_archived");
+    }
+    assert!(
+        measured[1] < measured[0] * 3,
+        "total membership VM steps: {measured:?}"
+    );
+}
+#[test]
 fn status_lock_work_scales_with_changes_and_70k_unchanged_rows_do_not_write() {
     let _serial = budget_test();
     use codex_sessions_collector::store::writer;
@@ -1196,10 +1236,16 @@ fn completeness_open_bootstrap_and_migration() {
     drop(conn);
     let audit = WriteAudit::start();
     let store = Store::open(&old, OwnerMode::Standalone).unwrap();
-    assert_eq!(schema::last_applied_version(&store.conn).unwrap(), 30);
+    assert_eq!(
+        schema::last_applied_version(&store.conn).unwrap(),
+        schema::SUPPORTED_SCHEMA_VERSION
+    );
     drop(store);
     let fresh = Store::open(&temp.path().join("new.sqlite"), OwnerMode::Standalone).unwrap();
-    assert_eq!(schema::last_applied_version(&fresh.conn).unwrap(), 30);
+    assert_eq!(
+        schema::last_applied_version(&fresh.conn).unwrap(),
+        schema::SUPPORTED_SCHEMA_VERSION
+    );
     // Includes writes after Connection moved out of Store::open.
     schema::in_write_transaction(&fresh.conn, || {
         fresh.conn.execute(
@@ -1457,8 +1503,8 @@ fn hold_stats_refusal_and_panic_rollback_are_measured() {
     assert!(panic.is_err());
     assert!(conn.is_autocommit());
     conn.execute(
-        "update schema_version set version = 999 where version = 30",
-        [],
+        "update schema_version set version = 999 where version = ?",
+        [schema::SUPPORTED_SCHEMA_VERSION],
     )
     .unwrap();
     let _lease = codex_sessions_collector::store::write_lease::WriteLease::acquire(&conn).unwrap();

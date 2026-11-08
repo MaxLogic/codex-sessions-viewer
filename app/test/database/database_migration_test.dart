@@ -29,6 +29,54 @@ void main() {
     }
   });
 
+  test(
+    'migration 31 indexes both status paths without changing stored rows',
+    () async {
+      await _seedNativeMigration28(dbFile);
+      final previous = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+        supportedSchemaVersion: 30,
+      ).openAndMigrate(dbFile);
+      expect(
+        previous.canStartNormalUi,
+        isTrue,
+        reason: previous.fatalError?.details,
+      );
+      final before = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      final rows = _nativeMigrationRows(before);
+      before.close();
+      final result = await DatabaseMigrator(
+        sqlRoot: Directory('../sql'),
+      ).openAndMigrate(dbFile);
+      expect(
+        result.canStartNormalUi,
+        isTrue,
+        reason: result.fatalError?.details,
+      );
+      final db = openFileBackedDatabase(dbFile, maintenanceWriter: true);
+      addTearDown(db.close);
+      expect(_nativeMigrationRows(db), rows);
+      final plan = db
+          .select(
+            """
+      explain query plan
+      select rowid,id,scan_status,source_state,parse_status from sessions
+      where harness=?1 and source_file_path=?2
+      union
+      select rowid,id,scan_status,source_state,parse_status from sessions
+      where harness=?1 and source_file_unc_path=?2
+      order by 1
+    """,
+            ['codex', 'fixture.jsonl'],
+          )
+          .map((row) => row['detail'])
+          .join('\n');
+      expect(plan, contains('idx_sessions_harness_source_path'));
+      expect(plan, contains('idx_sessions_harness_source_unc_path'));
+      expect(plan, isNot(contains('SCAN sessions')));
+    },
+  );
+
   for (final crlf in [false, true]) {
     test(
       'migration checksum legacy ${crlf ? 'CRLF' : 'LF'} receipts preserve all rows',
@@ -1115,7 +1163,9 @@ void main() {
       '025_session_change_journal_precision.sql',
     );
     expect(versionRows.last['version'], latestSchemaVersion);
-    expect(versionRows.last['filename'], '030_t3_lineage.sql');
+    expect(versionRows.last['filename'], '031_source_status_membership.sql');
+    expect(_indexExists(db, 'idx_sessions_harness_source_path'), isTrue);
+    expect(_indexExists(db, 'idx_sessions_harness_source_unc_path'), isTrue);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -3908,7 +3958,8 @@ List<String> _nativeMigrationObjects(Database db) => db
     .select('''
       select type || ':' || name as object from sqlite_schema
       where type in ('index', 'trigger', 'view') and sql is not null
-      and name <> 'trg_sessions_t3_change'
+      and name not in ('trg_sessions_t3_change',
+        'idx_sessions_harness_source_path', 'idx_sessions_harness_source_unc_path')
       order by object
     ''')
     .map((row) => row['object'] as String)
