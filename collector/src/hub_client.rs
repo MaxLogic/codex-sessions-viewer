@@ -161,12 +161,13 @@ pub(crate) fn plan_delivery(
     Ok(delivery)
 }
 
-/// Envelopes at least this large are stored zstd-compressed in the outbox. A
+/// Legacy fixture packing threshold; production no longer packs outbox records. A
 /// session snapshot carries every message and tool call, and an active session
 /// is queued again after each turn, so storing it as plain text dominated the
 /// collector's disk writes. The outbox column must stay valid JSON (its CHECK),
 /// so the compressed bytes travel base64-encoded inside a wrapper object that
 /// only this module writes and reads; `hub sync` sends the original envelope.
+#[cfg(test)]
 const PACK_AT: usize = 16 * 1024;
 const PACKED_PREFIX: &str = r#"{"outbox_encoding":"zstd-base64","bytes":"#;
 /// Largest decoded record a packed outbox row may claim.
@@ -184,12 +185,13 @@ fn record_bytes_sql() -> String {
     format!(
         "(case when substr(record_json, 1, {}) = '{PACKED_PREFIX}' \
          then cast(json_extract(record_json, '$.bytes') as integer) \
-         else length(cast(record_json as blob)) end)",
+         when substr(record_json,1,15) = '{{\"outbox_ref\":\"' then coalesce(cast(json_extract(record_json,'$.bytes') as integer),0) else length(cast(record_json as blob)) end)",
         PACKED_PREFIX.len()
     )
 }
 
 /// The stored form of an envelope: compressed when large and when that is smaller.
+#[cfg(test)]
 pub(crate) fn pack_record(json: String) -> StoreResult<String> {
     if json.len() < PACK_AT {
         return Ok(json);
@@ -230,8 +232,10 @@ pub(crate) fn unpack_record(stored: String) -> StoreResult<String> {
     String::from_utf8(json).map_err(|_| invalid("decoded record is not UTF-8"))
 }
 
+#[cfg(test)]
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[cfg(test)]
 fn base64_encode(bytes: &[u8], out: &mut String) {
     out.reserve(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -287,25 +291,6 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A session snapshot envelope ready for the outbox: its stored form and the
-/// digest of the original text, built before the write lock is taken.
-pub(crate) struct PreparedEnvelope {
-    pub(crate) stored: String,
-    hash: String,
-}
-
-pub(crate) fn prepare_session_envelope(
-    snapshot: &crate::contract::SessionSnapshot,
-    version: Option<u32>,
-) -> StoreResult<PreparedEnvelope> {
-    let json = session_envelope_json(snapshot, version)?;
-    let hash = crate::dart::sha256_hex(json.as_bytes());
-    Ok(PreparedEnvelope {
-        stored: pack_record(json)?,
-        hash,
-    })
-}
-
 /// Serialize a session without cloning its potentially large snapshot.
 pub(crate) fn session_envelope_json(
     snapshot: &crate::contract::SessionSnapshot,
@@ -327,94 +312,56 @@ pub(crate) fn session_envelope_json(
     .map_err(|error| StoreError::Io(std::io::Error::other(error)))
 }
 
-/// The caller rechecks queue enablement inside the session's savepoint.
-///
-/// A snapshot identical to the last one queued for the session is not queued
-/// again unless that one was refused: it is still pending, or the hub already
-/// holds it. Every ingest of an unchanged file (a hook, or a forced reparse
-/// after a parser change) parses to the same snapshot.
-pub(crate) fn enqueue_prepared(
+/// Session outbox rows refer to committed stored state; ingest never serializes children.
+pub const SESSION_REF: &str = r#"{"outbox_ref":"session_snapshot"}"#;
+
+pub fn enqueue_session(
     conn: &Connection,
-    snapshot: &crate::contract::SessionSnapshot,
-    envelope: &PreparedEnvelope,
+    id: &str,
+    harness: &str,
+    source_path: &str,
     now: &str,
+    force: bool,
 ) -> StoreResult<()> {
-    if envelope_already_queued(conn, snapshot, envelope)? {
+    let Some(digest) = crate::hub_snapshot::state_digest(conn, id)? else {
         return Ok(());
+    };
+    let key = format!("session:{id}");
+    if !force {
+        let previous: Option<String> = conn
+            .query_row(
+                "select record_hash from collector_hub_record_state where record_key=?",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let refused: bool = conn.query_row(
+            "select exists(select 1 from collector_upload_dead_letters where record_key=?)",
+            [&key],
+            |r| r.get(0),
+        )?;
+        if previous.as_deref() == Some(&digest) && !refused {
+            return Ok(());
+        }
     }
-    let key = session_key(snapshot);
     conn.execute(
-        "delete from collector_hub_record_state where record_key = ?",
+        "delete from collector_hub_record_state where record_key=?",
         [format!(
-            "status:{}:{}",
-            snapshot.harness,
-            source_status_id(&snapshot.source.path)
+            "status:{harness}:{}",
+            source_status_id(source_path)
         )],
     )?;
-    remember_session_hash(conn, &key, &envelope.hash)?;
+    conn.execute("insert into collector_hub_record_state(record_key,record_hash) values (?,?) on conflict(record_key) do update set record_hash=excluded.record_hash",params![key,digest])?;
+    // A new id puts changed state beyond a persisted ambiguous batch's boundary.
     conn.execute(
-        "delete from collector_upload_outbox where record_key = ?",
+        "delete from collector_upload_outbox where record_key=?",
         [&key],
     )?;
     conn.execute(
-        "insert into collector_upload_outbox(record_json, created_at_utc, record_key) values (?, ?, ?)",
-        params![envelope.stored, now, key],
+        "insert into collector_upload_outbox(record_json,created_at_utc,record_key) values (?,?,?)",
+        params![SESSION_REF, now, key],
     )?;
     Ok(())
-}
-
-fn session_key(snapshot: &crate::contract::SessionSnapshot) -> String {
-    format!(
-        "session:{}",
-        session_row_id(
-            &snapshot.harness,
-            snapshot.session.session_id.as_deref(),
-            &snapshot.source.path
-        )
-    )
-}
-
-/// Whether [`enqueue_prepared`] would skip `envelope` as already queued.
-pub(crate) fn envelope_already_queued(
-    conn: &Connection,
-    snapshot: &crate::contract::SessionSnapshot,
-    envelope: &PreparedEnvelope,
-) -> StoreResult<bool> {
-    let key = session_key(snapshot);
-    let previous: Option<String> = conn
-        .prepare_cached("select record_hash from collector_hub_record_state where record_key = ?")?
-        .query_row([&key], |row| row.get(0))
-        .optional()?;
-    if previous.as_deref() != Some(envelope.hash.as_str()) {
-        return Ok(false);
-    }
-    // After a refusal the same snapshot is queued again: a new local
-    // collection supersedes the dead letter, as for any changed snapshot.
-    let refused: bool = conn
-        .prepare_cached(
-            "select exists(select 1 from collector_upload_dead_letters where record_key = ?)",
-        )?
-        .query_row([&key], |row| row.get(0))?;
-    Ok(!refused)
-}
-
-/// Records which snapshot was queued last for a session key.
-fn remember_session_hash(conn: &Connection, key: &str, hash: &str) -> StoreResult<()> {
-    conn.prepare_cached(
-        "insert into collector_hub_record_state(record_key, record_hash) values (?, ?)
-         on conflict(record_key) do update set record_hash = excluded.record_hash",
-    )?
-    .execute(params![key, hash])?;
-    Ok(())
-}
-
-/// Queues `record` even when it equals the last queued state, recording its
-/// digest. `hub backfill` promises to queue every qualifying session.
-pub(crate) fn enqueue_always(conn: &Connection, record: Record, now: &str) -> StoreResult<()> {
-    if !queue_enabled(conn)? {
-        return Ok(());
-    }
-    PreparedRecord::current(record)?.enqueue(conn, now)
 }
 
 pub(crate) fn enqueue_versioned(
@@ -427,8 +374,19 @@ pub(crate) fn enqueue_versioned(
         return Ok(());
     }
     if let Record::SessionSnapshot(snapshot) = &record {
-        let envelope = prepare_session_envelope(snapshot, Some(version))?;
-        return enqueue_prepared(conn, snapshot, &envelope, now);
+        let id = session_row_id(
+            &snapshot.harness,
+            snapshot.session.session_id.as_deref(),
+            &snapshot.source.path,
+        );
+        return enqueue_session(
+            conn,
+            &id,
+            &snapshot.harness,
+            &snapshot.source.path,
+            now,
+            false,
+        );
     }
     PreparedRecord::new(record, version)?.enqueue(conn, now)
 }
@@ -437,11 +395,9 @@ pub(crate) fn enqueue_versioned(
 /// The collector lease still protects every stored input until enqueue commits.
 struct PreparedRecord {
     key: Option<(String, bool)>,
-    /// The stored form, compressed when large (see [`pack_record`]).
+    /// Plain metadata envelope; session records use SESSION_REF.
     envelope: String,
     hash: Option<String>,
-    session_hash: Option<String>,
-    reset_status: Option<String>,
 }
 
 impl PreparedRecord {
@@ -452,15 +408,6 @@ impl PreparedRecord {
 
     fn new(record: Record, version: u32) -> StoreResult<Self> {
         let key = record_key(&record);
-        let reset_status = if let Record::SessionSnapshot(snapshot) = &record {
-            Some(format!(
-                "status:{}:{}",
-                snapshot.harness,
-                source_status_id(&snapshot.source.path)
-            ))
-        } else {
-            None
-        };
         let envelope = serde_json::to_string(&Envelope {
             contract: CONTRACT_NAME.to_owned(),
             version,
@@ -471,28 +418,14 @@ impl PreparedRecord {
             .as_ref()
             .filter(|(_, deduplicate)| *deduplicate)
             .map(|_| crate::dart::sha256_hex(envelope.as_bytes()));
-        // A rebuilt snapshot is always queued. Its digest replaces the parsed
-        // one, so the next parsed snapshot, which differs, is queued after it.
-        let session_hash = reset_status
-            .is_some()
-            .then(|| crate::dart::sha256_hex(envelope.as_bytes()));
         Ok(Self {
             key,
-            envelope: pack_record(envelope)?,
+            envelope,
             hash,
-            session_hash,
-            reset_status,
         })
     }
 
     fn enqueue(&self, conn: &Connection, now: &str) -> StoreResult<()> {
-        // A snapshot restores availability, so its current status must follow it.
-        if let Some(key) = &self.reset_status {
-            conn.execute(
-                "delete from collector_hub_record_state where record_key=?",
-                [key],
-            )?;
-        }
         let Some((key, _)) = &self.key else {
             conn.execute(
                 "insert into collector_upload_outbox(record_json,created_at_utc) values (?,?)",
@@ -500,9 +433,6 @@ impl PreparedRecord {
             )?;
             return Ok(());
         };
-        if let Some(hash) = &self.session_hash {
-            remember_session_hash(conn, key, hash)?;
-        }
         if let Some(hash) = &self.hash {
             let previous: Option<String> = conn
                 .query_row(
@@ -757,12 +687,18 @@ fn now_utc() -> String {
 
 // NULL status means a local refusal that was never sent: a record above the
 // size limit, or a stored record that cannot be decoded. Both are rebuilt.
-// Only next_batch may pass None; hub refusals always retain their HTTP status.
-fn dead_letter(conn: &Connection, id: i64, status: Option<u16>, error: &str) -> StoreResult<()> {
+// Only persist_batch may pass None; hub refusals always retain their HTTP status.
+fn dead_letter(
+    conn: &Connection,
+    id: i64,
+    status: Option<u16>,
+    error: &str,
+    stored_override: Option<&str>,
+) -> StoreResult<()> {
     conn.execute(
             "insert into collector_upload_dead_letters(outbox_id, record_key, record_json, created_at_utc, failed_at_utc, http_status, error)
-             select id, record_key, record_json, created_at_utc, ?, ?, ? from collector_upload_outbox where id = ?",
-            params![now_utc(), status, error, id],
+             select id, record_key, coalesce(?,record_json), created_at_utc, ?, ?, ? from collector_upload_outbox where id = ?",
+            params![stored_override, now_utc(), status, error, id],
         )?;
     conn.execute("delete from collector_upload_outbox where id = ?", [id])?;
     conn.execute(
@@ -778,6 +714,22 @@ fn reconcile_dead_letters(
 ) -> StoreResult<(usize, usize)> {
     use crate::store::write_budget::{current_budget, write_chunked};
     let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
+    let orphaned: Vec<String> = conn.prepare("select record_key from collector_hub_record_state where record_key like 'session:%' and not exists(select 1 from sessions where id=substr(record_key,9))")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
+    write_chunked(
+        conn,
+        "hub_reconcile",
+        current_budget(),
+        1,
+        orphaned,
+        || Ok(()),
+        |_, key| {
+            conn.execute(
+                "delete from collector_hub_record_state where record_key=?",
+                [key],
+            )?;
+            Ok(())
+        },
+    )?;
     // Collector-owned inputs cannot change under this lease. Discovery, table
     // scans, reconstruction and serialization stay OUTSIDE SQLite write holds.
     // Viewer-owned annotations are never copied into the upload contract.
@@ -849,20 +801,27 @@ fn reconcile_dead_letters(
             let pending: bool = conn.query_row(
                 "select exists(select 1 from collector_upload_outbox where record_key=?)",
                 [format!("session:{session}")],
-                |row| row.get(0),
+                |r| r.get(0),
             )?;
             if pending {
                 continue;
             }
-            if let Some((snapshot, status)) = crate::hub_backfill::rebuild_current(conn, &session)?
-            {
-                records.push(vec![
-                    PreparedRecord::current(Record::SessionSnapshot(Box::new(snapshot)))?,
-                    PreparedRecord::current(Record::SourceStatus(status))?,
-                ]);
-            } else if let Some(status) = crate::hub_backfill::current_status(conn, &session)? {
+            let snapshot =
+                crate::hub_snapshot::build(conn, &session, crate::hub_snapshot::Children::Omit)?;
+            let status = crate::hub_snapshot::current_status(conn, &session)?;
+            if let Some(snapshot) = snapshot {
+                records.push((
+                    Some((session, snapshot.harness, snapshot.source.path)),
+                    status
+                        .map(|s| PreparedRecord::current(Record::SourceStatus(s)))
+                        .transpose()?,
+                ));
+            } else if let Some(status) = status {
                 clear_status = true;
-                records.push(vec![PreparedRecord::current(Record::SourceStatus(status))?]);
+                records.push((
+                    None,
+                    Some(PreparedRecord::current(Record::SourceStatus(status))?),
+                ));
             }
         }
         let queued = !records.is_empty();
@@ -888,8 +847,11 @@ fn reconcile_dead_letters(
                         clear_status = false;
                     }
                     let now = now_utc();
-                    for record in records {
-                        record.enqueue(conn, &now)?;
+                    if let Some((session, harness, path)) = &records.0 {
+                        enqueue_session(conn, session, harness, path, &now, true)?;
+                    }
+                    if let Some(status) = &records.1 {
+                        status.enqueue(conn, &now)?;
                     }
                 } else {
                     conn.execute("delete from collector_upload_dead_letters where id=?", [id])?;
@@ -906,135 +868,188 @@ fn reconcile_dead_letters(
     Ok((requeued, pruned))
 }
 
-/// Returns the persisted in-flight batch, or builds and persists the next one.
-/// `isolate_until` sends records one at a time so a rejected batch reveals
-/// which record is refused.
-fn next_batch(
+/// One WAL snapshot spans every header and child read in a batch.
+fn read_consistent<T>(conn: &Connection, read: impl FnOnce() -> StoreResult<T>) -> StoreResult<T> {
+    conn.execute_batch("begin deferred")?;
+    let result = read();
+    match result {
+        Ok(value) => match conn.execute_batch("commit") {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let _ = conn.execute_batch("rollback");
+                Err(error.into())
+            }
+        },
+        Err(error) => {
+            let _ = conn.execute_batch("rollback");
+            Err(error)
+        }
+    }
+}
+
+struct ReadBatch {
+    batch: Option<Batch>,
+    vanished: Vec<(i64, Option<String>)>,
+    refusal: Option<(i64, String, Option<String>)>,
+    inflight: bool,
+}
+
+fn read_record(
+    conn: &Connection,
+    id: i64,
+    key: Option<&str>,
+    reference: bool,
+) -> StoreResult<Option<String>> {
+    if reference {
+        let Some(session) = key.and_then(|key| key.strip_prefix("session:")) else {
+            return Err(StoreError::Refused(
+                "session reference has no session key".into(),
+            ));
+        };
+        crate::hub_snapshot::build(conn, session, crate::hub_snapshot::Children::Include)?
+            .map(|snapshot| session_envelope_json(&snapshot, None))
+            .transpose()
+    } else {
+        let stored: String = conn.query_row(
+            "select record_json from collector_upload_outbox where id=?",
+            [id],
+            |r| r.get(0),
+        )?;
+        unpack_record(stored).map(Some)
+    }
+}
+
+fn read_batch(
     conn: &Connection,
     machine: &str,
     sequence: i64,
     isolate_until: Option<i64>,
     max_record_bytes: usize,
-    dead_lettered: &mut usize,
-) -> StoreResult<Option<Batch>> {
+) -> StoreResult<ReadBatch> {
     let inflight: Option<(Option<String>, Option<i64>)> = conn
         .query_row(
-            "select inflight_batch_id, inflight_last_id from collector_hub_state where id = 1",
+            "select inflight_batch_id,inflight_last_id from collector_hub_state where id=1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    let mut result = ReadBatch {
+        batch: None,
+        vanished: Vec::new(),
+        refusal: None,
+        inflight: false,
+    };
     if let Some((Some(batch_id), Some(last_id))) = inflight {
-        let mut statement = conn.prepare(
-            "select id, record_json from collector_upload_outbox where id <= ? order by id",
-        )?;
-        let rows = statement
-            .query_map([last_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|(id, stored)| Ok((id, unpack_record(stored)?)))
-            .collect::<StoreResult<Vec<_>>>()?;
-        return Ok(Some(Batch {
-            batch_id,
-            last_id,
-            rows,
-        }));
-    }
-    loop {
-        let mut rows: Vec<(i64, String)> = Vec::new();
-        let mut bytes = 0usize;
-        let mut oversized = None;
-        let mut undecodable = None;
-        {
-            // Decoded sizes in UTF-8 bytes: length() of text counts characters.
-            let mut statement = conn.prepare(&format!(
-                "select id, {} from collector_upload_outbox order by id limit ?",
-                record_bytes_sql()
-            ))?;
-            let limit = if isolate_until.is_some() {
-                1
-            } else {
-                MAX_RECORDS as i64
-            };
-            let candidates = statement
-                .query_map([limit], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            for (id, size) in candidates {
-                let size = usize::try_from(size).unwrap_or(usize::MAX);
-                if size > max_record_bytes {
-                    if rows.is_empty() {
-                        oversized = Some((id, size));
-                    }
-                    break;
-                }
-                // A record above the batch budget is sent alone.
-                if !rows.is_empty() && bytes + size > MAX_BATCH_BYTES {
-                    break;
-                }
-                bytes += size;
-                let json: String = conn.query_row(
-                    "select record_json from collector_upload_outbox where id = ?",
-                    [id],
-                    |row| row.get(0),
-                )?;
-                match unpack_record(json) {
-                    Ok(json) => rows.push((id, json)),
-                    // Never block the queue on one damaged row.
-                    Err(error) => {
-                        if rows.is_empty() {
-                            undecodable = Some((id, error.to_string()));
-                        }
-                        break;
-                    }
-                }
+        let candidates: Vec<(i64,Option<String>,bool)> = conn.prepare("select id,record_key,record_json=?1 from collector_upload_outbox where id<=?2 order by id")?.query_map(params![SESSION_REF,last_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+        let mut rows = Vec::new();
+        for (id, key, reference) in candidates {
+            if let Some(json) = read_record(conn, id, key.as_deref(), reference)? {
+                rows.push((id, json));
             }
         }
-        if let Some((id, error)) = undecodable {
-            dead_letter(conn, id, None, &error)?;
-            *dead_lettered += 1;
-            continue;
-        }
-        if let Some((id, size)) = oversized {
-            dead_letter(
-                conn,
-                id,
-                None,
-                &format!(
-                    "record of {size} bytes exceeds the hub's {max_record_bytes}-byte record limit and was not sent"
-                ),
-            )?;
-            *dead_lettered += 1;
-            continue;
-        }
-        let Some(&(last_id, _)) = rows.last() else {
-            return Ok(None);
-        };
-        // The random part keeps the ID unique when a restored database
-        // builds a different batch with the same sequence and outbox row:
-        // the hub then reports a sequence conflict instead of a duplicate
-        // that would drop records it never stored. Retries reuse the
-        // persisted ID.
-        let nonce: String =
-            conn.query_row("select lower(hex(randomblob(8)))", [], |row| row.get(0))?;
-        let batch_id = format!("{machine}:{sequence}:{last_id}:{nonce}");
-        conn.execute(
-            "update collector_hub_state set inflight_batch_id = ?, inflight_last_id = ? where id = 1",
-            params![batch_id, last_id],
-        )?;
-        conn.execute(
-            "delete from app_metadata where key = ?",
-            [INFLIGHT_FAILURES_KEY],
-        )?;
-        return Ok(Some(Batch {
+        result.inflight = true;
+        result.batch = Some(Batch {
             batch_id,
             last_id,
             rows,
-        }));
+        });
+        return Ok(result);
     }
+    let candidates: Vec<(i64,Option<String>,bool,i64)> = conn.prepare(&format!("select id,record_key,record_json=?1,{} from collector_upload_outbox order by id limit ?2",record_bytes_sql()))?.query_map(params![SESSION_REF,if isolate_until.is_some(){1}else{MAX_RECORDS as i64}],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<Result<_,_>>()?;
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    for (id, key, reference, stored_size) in candidates {
+        let mut size = usize::try_from(stored_size).unwrap_or(usize::MAX);
+        let json = if reference || size <= max_record_bytes {
+            if !reference && !rows.is_empty() && bytes.saturating_add(size) > MAX_BATCH_BYTES {
+                break;
+            }
+            match crate::timing::timed("hub: build record", || {
+                read_record(conn, id, key.as_deref(), reference)
+            }) {
+                Ok(Some(json)) => {
+                    if reference {
+                        size = json.len();
+                    }
+                    Some(json)
+                }
+                Ok(None) => {
+                    result.vanished.push((id, key));
+                    continue;
+                }
+                Err(error @ StoreError::Io(_)) if !reference => {
+                    if rows.is_empty() {
+                        result.refusal = Some((id, error.to_string(), None));
+                    }
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        if size > max_record_bytes {
+            if rows.is_empty() {
+                result.refusal = Some((
+                    id,
+                    format!(
+                        "record of {size} bytes exceeds the hub's {max_record_bytes}-byte record limit and was not sent"
+                    ),
+                    reference
+                        .then(|| json!({"outbox_ref":"session_snapshot","bytes":size}).to_string()),
+                ));
+            }
+            break;
+        }
+        if !rows.is_empty() && bytes.saturating_add(size) > MAX_BATCH_BYTES {
+            break;
+        }
+        bytes += size;
+        rows.push((id, json.expect("an allowed record was decoded")));
+    }
+    if let Some(&(last_id, _)) = rows.last() {
+        let nonce: String = conn.query_row("select lower(hex(randomblob(8)))", [], |r| r.get(0))?;
+        result.batch = Some(Batch {
+            batch_id: format!("{machine}:{sequence}:{last_id}:{nonce}"),
+            last_id,
+            rows,
+        });
+    }
+    Ok(result)
+}
+
+/// Only small queue bookkeeping runs under SQLite's write lock.
+fn persist_batch(conn: &Connection, read: &ReadBatch) -> StoreResult<(usize, usize)> {
+    if read.inflight {
+        return Ok((0, 0));
+    }
+    let mut pruned = 0;
+    for (id, key) in &read.vanished {
+        pruned += conn.execute("delete from collector_upload_outbox where id=?", [id])?;
+        if let Some(key) = key {
+            conn.execute(
+                "delete from collector_hub_record_state where record_key=?",
+                [key],
+            )?;
+        }
+    }
+    let dead = if let Some((id, error, stored)) = &read.refusal {
+        dead_letter(conn, *id, None, error, stored.as_deref())?;
+        1
+    } else {
+        0
+    };
+    if let Some(batch) = &read.batch {
+        conn.execute(
+            "update collector_hub_state set inflight_batch_id=?,inflight_last_id=? where id=1",
+            params![batch.batch_id, batch.last_id],
+        )?;
+        conn.execute(
+            "delete from app_metadata where key=?",
+            [INFLIGHT_FAILURES_KEY],
+        )?;
+    }
+    Ok((pruned, dead))
 }
 
 /// Counts a transport failure of the persisted in-flight batch. After
@@ -1138,31 +1153,40 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
     while report.batches < MAX_BATCHES_PER_RUN {
         let lease = crate::store::write_lease::WriteLease::acquire(conn)
             .map_err(|error| error.to_string())?;
-        if isolate_until.is_some_and(|last| {
-            conn.query_row(
-                "select coalesce(min(id), 0) from collector_upload_outbox",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_or(true, |first| first == 0 || first > last)
-        }) {
-            isolate_until = None;
+        if let Some(last) = isolate_until {
+            let first: i64 = conn
+                .query_row(
+                    "select coalesce(min(id),0) from collector_upload_outbox",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if first == 0 || first > last {
+                isolate_until = None;
+            }
         }
-        let _phase = crate::store::write_budget::write_phase("hub");
-        begin_write(conn).map_err(|error| error.to_string())?;
-        let mut dead = 0;
-        let batch = next_batch(
-            conn,
-            &verified.machine,
-            sequence + 1,
-            isolate_until,
-            verified.max_record_bytes,
-            &mut dead,
-        );
-        let batch = finish(conn, batch).map_err(|error| error.to_string())?;
+        let read = read_consistent(conn, || {
+            read_batch(
+                conn,
+                &verified.machine,
+                sequence + 1,
+                isolate_until,
+                verified.max_record_bytes,
+            )
+        })
+        .map_err(|e| e.to_string())?;
+        let (pruned, dead) = {
+            let _phase = crate::store::write_budget::write_phase("hub");
+            begin_write(conn).map_err(|e| e.to_string())?;
+            finish(conn, persist_batch(conn, &read)).map_err(|e| e.to_string())?
+        };
+        report.pruned += pruned;
         report.dead_lettered += dead;
         drop(lease);
-        let Some(batch) = batch else {
+        let Some(batch) = read.batch else {
+            if pruned > 0 || dead > 0 {
+                continue;
+            }
             break;
         };
         let expected = sequence + 1;
@@ -1247,7 +1271,7 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
                     .map_err(|error| error.to_string())?;
                 let _phase = crate::store::write_budget::write_phase("hub");
                 begin_write(conn).map_err(|error| error.to_string())?;
-                let result = dead_letter(conn, batch.rows[0].0, Some(status), &message);
+                let result = dead_letter(conn, batch.rows[0].0, Some(status), &message, None);
                 finish(conn, result).map_err(|error| error.to_string())?;
                 report.dead_lettered += 1;
             } else {
@@ -1369,6 +1393,39 @@ pub fn enable_for_collection(db_path: &Path, mode: OwnerMode, url: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversize_reference_records_decoded_bytes_and_reconciles_after_limit_increases() {
+        crate::store::connection::ensure().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::store::schema::prepare_standalone(&mut conn, ":memory:").unwrap();
+        conn.execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','test')",[]).unwrap();
+        let snapshot = serde_json::from_value(json!({
+            "harness":"codex",
+            "source":{"path":"C:/oversize","environment":"windows","state":"active","status":"available","size":1,"modified_utc":"2026-09-10T10:00:00.000Z","display_path":"C:/oversize","mapped_source_file_path":"C:/oversize","platform_path":"C:/oversize"},
+            "session":{"session_id":"oversize","usage_projection_status":"complete","parser_version":5,"summary":"x".repeat(4096)}
+        })).unwrap();
+        crate::store::writer::apply_session_batch(&conn, vec![snapshot]).unwrap();
+        let lease = crate::store::write_lease::WriteLease::acquire(&conn).unwrap();
+        let read = read_consistent(&conn, || read_batch(&conn, "test", 1, None, 256)).unwrap();
+        assert!(read.batch.is_none());
+        let stored = read.refusal.as_ref().unwrap().2.as_ref().unwrap();
+        let value: Value = serde_json::from_str(stored).unwrap();
+        assert_eq!(value["outbox_ref"], "session_snapshot");
+        assert!(value["bytes"].as_u64().unwrap() > 4096);
+        begin_write(&conn).unwrap();
+        assert_eq!(finish(&conn, persist_batch(&conn, &read)).unwrap(), (0, 1));
+        drop(lease);
+        assert_eq!(reconcile_dead_letters(&conn, 256).unwrap(), (0, 0));
+        assert_eq!(reconcile_dead_letters(&conn, 1024 * 1024).unwrap(), (1, 0));
+        let rebuilt =
+            read_consistent(&conn, || read_batch(&conn, "test", 1, None, 1024 * 1024)).unwrap();
+        let records = &rebuilt.batch.unwrap().rows;
+        let session: Value = serde_json::from_str(&records[0].1).unwrap();
+        assert_eq!(session["record"]["session"]["summary"], "x".repeat(4096));
+        assert_eq!(session["version"], 2);
+        assert_eq!(records.len(), 2); // current snapshot plus its lifecycle status
+    }
 
     #[test]
     fn a_full_batch_fits_its_upload_timeout_on_a_slow_uplink() {

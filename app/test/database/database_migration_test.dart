@@ -1163,9 +1163,15 @@ void main() {
       '025_session_change_journal_precision.sql',
     );
     expect(versionRows.last['version'], latestSchemaVersion);
-    expect(versionRows.last['filename'], '031_source_status_membership.sql');
+    expect(versionRows[30]['filename'], '031_source_status_membership.sql');
     expect(_indexExists(db, 'idx_sessions_harness_source_path'), isTrue);
     expect(_indexExists(db, 'idx_sessions_harness_source_unc_path'), isTrue);
+    expect(versionRows.last['filename'], '032_hub_snapshot_fields.sql');
+    expect(_columnExists(db, 'messages', 'token_cache_write'), isTrue);
+    expect(_columnExists(db, 'messages', 'token_reasoning'), isTrue);
+    expect(_columnExists(db, 'sessions', 'cache_write_input_tokens'), isTrue);
+    expect(_columnExists(db, 'sessions', 'reasoning_output_tokens'), isTrue);
+    expect(_columnExists(db, 'sessions', 'project_hints_json'), isTrue);
     expect(_columnExists(db, 'scan_runs', 'status'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_name'), isTrue);
     expect(_columnExists(db, 'sessions', 'thread_source'), isTrue);
@@ -4027,11 +4033,35 @@ Map<String, List<Map<String, Object?>>> _nativeMigrationRows(Database db) => {
   ])
     table: db
         .select('select ${table == 'sessions' ? 'rowid,' : ''}* from $table')
-        .map(
-          (row) => Map<String, Object?>.fromEntries(
-            row.entries.where((entry) => !entry.key.startsWith('t3_')),
-          ),
-        )
+        .map((row) {
+          // The pre-29 fixture has no values for newly added nullable fields.
+          // Check their migration defaults while comparing every old column.
+          final addedColumns = switch (table) {
+            'sessions' => const {
+              'cache_write_input_tokens',
+              'reasoning_output_tokens',
+              'project_hints_json',
+            },
+            'messages' => const {'token_cache_write', 'token_reasoning'},
+            _ => const <String>{},
+          };
+          for (final column in addedColumns) {
+            if (row.containsKey(column)) {
+              expect(
+                row[column],
+                isNull,
+                reason: '$table.$column starts unknown',
+              );
+            }
+          }
+          return Map<String, Object?>.fromEntries(
+            row.entries.where(
+              (entry) =>
+                  !entry.key.startsWith('t3_') &&
+                  !addedColumns.contains(entry.key),
+            ),
+          );
+        })
         .toList(),
 };
 

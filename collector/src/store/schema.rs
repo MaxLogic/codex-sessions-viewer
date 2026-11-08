@@ -14,7 +14,7 @@ use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 31;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 32;
 
 pub struct Migration {
     pub version: i64,
@@ -96,6 +96,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(29, "migration", "029_native_source_types.sql"),
     migration!(30, "migration", "030_t3_lineage.sql"),
     migration!(31, "migration", "031_source_status_membership.sql"),
+    migration!(32, "migration", "032_hub_snapshot_fields.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -963,16 +964,51 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
         // Compare the pre-lineage data projection across the schema upgrade;
         // new nullable provenance columns and their trigger are proven separately.
         let columns: Vec<String> = conn
-            .prepare("select name from pragma_table_info('sessions') where name not like 't3_%'")
+            .prepare("select name from pragma_table_info('sessions') where name not like 't3_%' and name not in ('cache_write_input_tokens','reasoning_output_tokens','project_hints_json')")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
             .map(Result::unwrap)
             .collect();
         let session_query = format!("select rowid,{} from sessions", columns.join(","));
+        let message_columns: Vec<String> = conn
+            .prepare("select name from pragma_table_info('messages') where name not in ('token_cache_write','token_reasoning')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let message_query = format!("select {} from messages", message_columns.join(","));
+        for (table, added) in [
+            (
+                "sessions",
+                "'cache_write_input_tokens','reasoning_output_tokens','project_hints_json'",
+            ),
+            ("messages", "'token_cache_write','token_reasoning'"),
+        ] {
+            let added: Vec<String> = conn
+                .prepare(&format!(
+                    "select name from pragma_table_info('{table}') where name in ({added})"
+                ))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for column in added {
+                let non_null: i64 = conn
+                    .query_row(
+                        &format!("select count(*) from {table} where {column} is not null"),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(non_null, 0, "legacy {table}.{column} starts unknown");
+            }
+        }
         for query in [
             session_query.as_str(),
-            "select * from messages",
+            message_query.as_str(),
             "select * from session_source_extras",
             "select * from tool_calls",
             "select * from session_path_keys",

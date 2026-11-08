@@ -204,7 +204,7 @@ pub fn normalize_path_key(path: &str) -> String {
 }
 
 /// `_mntToWindowsPath`.
-fn mnt_to_windows_path(linux_path: &str) -> Option<String> {
+pub(crate) fn mnt_to_windows_path(linux_path: &str) -> Option<String> {
     let rest = linux_path.strip_prefix("/mnt/")?;
     let mut chars = rest.chars();
     let drive = chars.next().filter(char::is_ascii_alphabetic)?;

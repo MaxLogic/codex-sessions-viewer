@@ -3,7 +3,8 @@
 //! The `sessions` golden was then updated once, deliberately: a session snapshot
 //! identical to the last queued one is no longer queued again, and the digest
 //! of each queued snapshot is kept in `collector_hub_record_state`. Its queued
-//! payloads are unchanged; only that bookkeeping and the queue IDs differ.
+//! payloads were unchanged until CXV-214, which replaces session payloads with
+//! SESSION_REF and hashes the stored header plus child-row digest.
 //! Only wall-clock timestamps are normalized; queue IDs, payloads, hashes and
 //! journal revisions are retained. No network connection is made.
 mod support;

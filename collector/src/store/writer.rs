@@ -181,7 +181,6 @@ const PREPARE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const UNCHANGED_ISOLATE_MS: f64 = 50.0;
 const PREDICT_UNIT_MS: f64 = 3.0;
 const PREDICT_ITEM_US: f64 = 3.3;
-const PREDICT_ENVELOPE_MS_PER_MIB: f64 = 3.6;
 
 type PlanHook = dyn FnMut(&Connection);
 thread_local! {
@@ -225,7 +224,6 @@ struct PreparedSession {
     snapshot: SessionSnapshot,
     shape: super::write_budget::SessionWriteShape,
     content: Option<PreparedContent>,
-    envelope: Option<hub_client::PreparedEnvelope>,
     candidates: Vec<String>,
     predicted_ms: f64,
     write_bytes: u64,
@@ -286,12 +284,7 @@ fn session_unit_cost(
 }
 
 /// Snapshot-only work precedes the lease, overlapping its mandatory gap.
-fn prepare_sessions(
-    conn: &Connection,
-    snapshots: Vec<SessionSnapshot>,
-    version: Option<u32>,
-) -> StoreResult<Vec<PreparedSession>> {
-    let hub_predicted = hub_client::queue_enabled(conn)?;
+fn prepare_sessions(snapshots: Vec<SessionSnapshot>) -> StoreResult<Vec<PreparedSession>> {
     let limit = PREPARE_LIMIT.with(std::cell::Cell::get);
     let mut bytes = 0usize;
     let mut stopped = false;
@@ -299,15 +292,9 @@ fn prepare_sessions(
     for (id, snapshot) in canonical_snapshots(snapshots) {
         let shape = session_shape(&snapshot);
         let mut content = None;
-        let mut envelope = None;
         if !stopped {
             let rows = SessionContent::snapshot_rows(&snapshot);
-            let json = hub_predicted
-                .then(|| hub_client::prepare_session_envelope(&snapshot, version))
-                .transpose()?;
-            let size = row_bytes(&rows.messages)
-                .saturating_add(row_bytes(&rows.tool_calls))
-                .saturating_add(json.as_ref().map_or(0, |envelope| envelope.stored.len()));
+            let size = row_bytes(&rows.messages).saturating_add(row_bytes(&rows.tool_calls));
             if bytes.saturating_add(size) <= limit {
                 bytes += size;
                 let mut hasher = Sha256::new();
@@ -325,7 +312,6 @@ fn prepare_sessions(
                     planned_ids: Vec::new(),
                     digest: String::new(),
                 });
-                envelope = json;
             } else {
                 stopped = true;
             }
@@ -335,7 +321,6 @@ fn prepare_sessions(
             snapshot,
             shape,
             content,
-            envelope,
             candidates: Vec::new(),
             predicted_ms: 0.0,
             write_bytes: 0,
@@ -348,7 +333,7 @@ fn prepare_sessions(
 pub(crate) fn apply_session_batch_versioned(
     conn: &Connection,
     snapshots: Vec<SessionSnapshot>,
-    version: Option<u32>,
+    _version: Option<u32>,
 ) -> StoreResult<usize> {
     let _phase = super::write_budget::write_phase("sessions");
     // Every original snapshot is validated: canonicalization in preparation
@@ -358,9 +343,8 @@ pub(crate) fn apply_session_batch_versioned(
         .filter_map(|snapshot| snapshot.machine_id.clone())
         .collect();
     let preparation_started = crate::timing::enabled().then(std::time::Instant::now);
-    let mut units = crate::timing::timed("write: prepare snapshots", || {
-        prepare_sessions(conn, snapshots, version)
-    })?;
+    let mut units =
+        crate::timing::timed("write: prepare snapshots", || prepare_sessions(snapshots))?;
     if let Some(started) = preparation_started {
         eprintln!(
             "write_prepare phase=sessions units={} elapsed_ms={:.6}",
@@ -399,16 +383,12 @@ pub(crate) fn apply_session_batch_versioned(
                 let mut retained = units
                     .iter()
                     .map(|unit| {
-                        unit.envelope
+                        unit.content
                             .as_ref()
-                            .map_or(0, |envelope| envelope.stored.len())
-                            + unit
-                                .content
-                                .as_ref()
-                                .and_then(|content| content.rows.as_ref())
-                                .map_or(0, |rows| {
-                                    row_bytes(&rows.messages) + row_bytes(&rows.tool_calls)
-                                })
+                            .and_then(|content| content.rows.as_ref())
+                            .map_or(0, |rows| {
+                                row_bytes(&rows.messages) + row_bytes(&rows.tool_calls)
+                            })
                     })
                     .sum::<usize>();
                 for unit in &mut units {
@@ -466,27 +446,15 @@ pub(crate) fn apply_session_batch_versioned(
                             retained -= row_bytes(&rows.messages) + row_bytes(&rows.tool_calls);
                         }
                     }
-                    // An envelope the hub queue already holds is not written again.
-                    let envelope_bytes = match unit.envelope.as_ref() {
-                        Some(envelope)
-                            if !hub_client::envelope_already_queued(conn, snapshot, envelope)? =>
-                        {
-                            envelope.stored.len()
-                        }
-                        _ => 0,
-                    };
-                    unit.write_bytes = (if unchanged {
+                    unit.write_bytes = if unchanged {
                         0
                     } else {
-                        unit.shape.content_bytes
-                    }) as u64
-                        + envelope_bytes as u64;
+                        unit.shape.content_bytes as u64
+                    };
                     unit.predicted_ms = if unchanged {
                         PREDICT_UNIT_MS
                             + PREDICT_ITEM_US * (unit.shape.messages + unit.shape.tool_calls) as f64
                                 / 1000.0
-                            + PREDICT_ENVELOPE_MS_PER_MIB * envelope_bytes as f64
-                                / (1024.0 * 1024.0)
                     } else {
                         0.0
                     };
@@ -521,7 +489,6 @@ pub(crate) fn apply_session_batch_versioned(
                 snapshot,
                 shape,
                 content,
-                envelope,
                 candidates,
                 predicted_ms,
                 write_bytes,
@@ -544,11 +511,14 @@ pub(crate) fn apply_session_batch_versioned(
                 )
             })?;
             if hub_client::queue_enabled(conn)? {
-                let json = match envelope {
-                    Some(json) => json,
-                    None => hub_client::prepare_session_envelope(&snapshot, version)?,
-                };
-                hub_client::enqueue_prepared(conn, &snapshot, &json, &now)?;
+                hub_client::enqueue_session(
+                    conn,
+                    &id,
+                    &snapshot.harness,
+                    &snapshot.source.path,
+                    &now,
+                    false,
+                )?;
             }
             let elapsed = start.elapsed();
             super::write_budget::record_session_unit(elapsed);
@@ -711,13 +681,31 @@ fn upsert_session(
     })? {
         if let Some(merge) = identity_merge {
             apply_identity_merge(conn, id, &merge)?;
-            let (affected, _) = reconcile_affected_legacy_usage(
+            let (affected, _, changed) = reconcile_affected_legacy_usage(
                 conn,
                 &snapshot.harness,
                 id,
                 session.session_id.as_deref(),
             )?;
             replace_daily_projections(conn, &affected, None)?;
+            if !changed.is_empty() && hub_client::queue_enabled(conn)? {
+                for changed_id in changed.iter().filter(|changed| changed.as_str() != id) {
+                    if let Some(header) = crate::hub_snapshot::build(
+                        conn,
+                        changed_id,
+                        crate::hub_snapshot::Children::Omit,
+                    )? {
+                        hub_client::enqueue_session(
+                            conn,
+                            changed_id,
+                            &header.harness,
+                            &header.source.path,
+                            now,
+                            true,
+                        )?;
+                    }
+                }
+            }
         }
         return Ok(());
     }
@@ -818,7 +806,8 @@ fn upsert_session(
            input_tokens = ?, output_tokens = ?, cached_input_tokens = ?,
            user_message_tokens = ?, assistant_response_tokens = ?, tool_call_tokens = ?,
            detected_project_id = ?, project_refined = ?, last_scanned_utc = ?, last_parsed_utc = ?,
-           harness = ?, machine_id = coalesce(?, machine_id)
+           harness = ?, machine_id = coalesce(?, machine_id),
+           cache_write_input_tokens = ?, reasoning_output_tokens = ?, project_hints_json = ?
          where id = ?",
     )?
     .execute(params![
@@ -860,6 +849,10 @@ fn upsert_session(
         now,
         snapshot.harness,
         snapshot.machine_id,
+        usage.cache_write_input_tokens,
+        usage.reasoning_output_tokens,
+        serde_json::to_string(&snapshot.project_hints)
+            .map_err(|e| StoreError::Io(std::io::Error::other(e)))?,
         id,
     ])?;
     // While the stored digest matches, the stored rows already equal this
@@ -891,7 +884,7 @@ fn upsert_session(
     crate::timing::timed("write: project refresh", || {
         refresh_session_project_with_masks(conn, id, masks)
     })?;
-    let (affected, rescoped) = crate::timing::timed("write: legacy usage", || {
+    let (affected, rescoped, changed) = crate::timing::timed("write: legacy usage", || {
         reconcile_affected_legacy_usage(conn, &snapshot.harness, id, session.session_id.as_deref())
     })?;
     // Rescoped inherited usage changes this session's days beyond the events
@@ -906,7 +899,24 @@ fn upsert_session(
                 partitions: partitions.as_deref(),
             }),
         )
-    })
+    })?;
+    if !changed.is_empty() && hub_client::queue_enabled(conn)? {
+        for changed_id in changed.iter().filter(|changed| changed.as_str() != id) {
+            if let Some(header) =
+                crate::hub_snapshot::build(conn, changed_id, crate::hub_snapshot::Children::Omit)?
+            {
+                hub_client::enqueue_session(
+                    conn,
+                    changed_id,
+                    &header.harness,
+                    &header.source.path,
+                    now,
+                    true,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 struct SearchDocument<'a> {
@@ -1089,7 +1099,7 @@ fn upsert_search_document(conn: &Connection, document: &SearchDocument<'_>) -> S
 }
 
 /// The stored message columns a snapshot sets, in this order.
-const MESSAGE_COLUMNS: [&str; 14] = [
+const MESSAGE_COLUMNS: [&str; 16] = [
     "author_type",
     "created_at_utc",
     "first_line",
@@ -1104,6 +1114,8 @@ const MESSAGE_COLUMNS: [&str; 14] = [
     "has_tool_calls",
     "has_error",
     "raw_type",
+    "token_cache_write",
+    "token_reasoning",
 ];
 const CONTENT_PLAIN: usize = 3;
 
@@ -1127,6 +1139,8 @@ fn message_values(message: &MessageRecord) -> Vec<Value> {
         flag(message.has_tool_calls),
         flag(message.has_error),
         text(message.raw_type.clone()),
+        number(usage.cache_write_input_tokens),
+        number(usage.reasoning_output_tokens),
     ]
 }
 
@@ -2421,7 +2435,7 @@ fn reconcile_affected_legacy_usage(
     harness: &str,
     replaced_row_id: &str,
     replaced_logical_id: Option<&str>,
-) -> StoreResult<(Vec<String>, bool)> {
+) -> StoreResult<(Vec<String>, bool, Vec<String>)> {
     let mut affected: Vec<LegacyUsageSession> = Vec::new();
     let mut affected_index: HashMap<String, usize> = HashMap::new();
     let mut add =
@@ -2622,12 +2636,21 @@ fn reconcile_affected_legacy_usage(
         set_projection_status(conn, &child.row_id, "complete")?;
     }
     let mut result = vec![replaced_row_id.to_owned()];
+    let mut changed = Vec::new();
     for session in affected {
+        let current: String = conn.query_row(
+            "select usage_projection_status from sessions where id=?",
+            [&session.row_id],
+            |row| row.get(0),
+        )?;
+        if rescoped.contains(&session.row_id) || current != session.projection_status {
+            changed.push(session.row_id.clone());
+        }
         if rescoped.contains(&session.row_id) && !result.contains(&session.row_id) {
             result.push(session.row_id);
         }
     }
-    Ok((result, rescoped.contains(replaced_row_id)))
+    Ok((result, rescoped.contains(replaced_row_id), changed))
 }
 
 /// Whether session `parent_row` has usage events, and how many of its first

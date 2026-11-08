@@ -151,7 +151,7 @@ database snapshot.
 
 A Claude ingest (the `Stop` hook) reads the named transcript and those of its
 subagents whose stored size and time no longer match. Session snapshots queued
-for a hub are stored compressed and are not queued again while unchanged
+for a hub use small stored-row references and are not queued again while unchanged
 (see [hub setup](../docs/hub-setup.md)).
 
 A changed session is written in place: messages, tool calls and usage events
@@ -348,3 +348,11 @@ the collector stored. Two suites hold that contract:
   conversations, usage, and costs) return the same results from both.
   `app/test/app/multi_harness_ingestion_test.dart` does the same for Claude
   Code sessions, including the Stats tab and eval exports.
+
+Hub delivery queues one small reference per changed session and builds the latest
+committed snapshot at send time. Intermediate unsent revisions are coalesced.
+Delivery, backfill and dead-letter recovery share the stored-row builder, which
+retains message/session reasoning and cache-write tokens after migration and
+re-ingest. Pre-upgrade plain and compressed outbox payloads still deliver once.
+If a queued session is deleted locally, its unsent changes are dropped and the
+hub keeps its last copy. Deploy matching viewer, collector and hub binaries.

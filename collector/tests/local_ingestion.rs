@@ -3906,45 +3906,151 @@ fn a_reparse_of_the_same_file_replaces_the_row_even_if_it_now_ends_earlier() {
     assert!(rescanned.iter().any(|(_, index)| index.is_some()));
 }
 #[test]
-fn prepared_envelope_matches_in_lock_serialization() {
+fn prepared_and_fallback_ingests_queue_one_reference_to_a_lossless_v2_snapshot() {
     use codex_sessions_collector::{
-        contract::{Envelope, Record},
+        codex::parser::{self, AuthorType, Usage},
+        contract::{self, Envelope, Record, SessionSnapshot},
+        dart::DartDateTime,
+        hub_client::SESSION_REF,
+        hub_snapshot::{self, Children},
+        path_mapping::PathMapper,
         store::{OwnerMode, Store, writer::SessionPreparationScope},
     };
-    let temp = support::TempDir::new("prepared_json");
+    // Independent contract normalization N1-N7. This non-lineage fixture needs no N8.
+    fn normalize(mut s: SessionSnapshot) -> SessionSnapshot {
+        fn usage(u: &mut contract::UsageRecord, event: bool) {
+            u.total_tokens = Usage::from(*u).total_tokens();
+            if event {
+                u.input_tokens = Some(u.input_tokens.unwrap_or(0));
+                u.cached_input_tokens = Some(u.cached_input_tokens.unwrap_or(0));
+                u.cache_write_input_tokens = Some(u.cache_write_input_tokens.unwrap_or(0));
+                u.output_tokens = Some(u.output_tokens.unwrap_or(0));
+                u.reasoning_output_tokens = Some(u.reasoning_output_tokens.unwrap_or(0));
+                u.total_tokens = Some(u.total_tokens.unwrap_or(0));
+            }
+        }
+        fn time(t: &mut Option<String>) {
+            *t = t
+                .as_deref()
+                .and_then(DartDateTime::try_parse)
+                .map(DartDateTime::to_iso8601);
+        }
+        usage(&mut s.session.usage, false);
+        s.session.title = s
+            .session
+            .title
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && !s.to_lowercase().starts_with("# agents.md"));
+        s.session.summary = s
+            .session
+            .summary
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && s.to_lowercase() != "auto");
+        s.session.thread_name = s
+            .session
+            .thread_name
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        time(&mut s.session.started_at_utc);
+        time(&mut s.session.last_message_at_utc);
+        for m in &mut s.messages {
+            usage(&mut m.usage, false);
+            time(&mut m.created_at_utc);
+            m.author_type = AuthorType::from_name(&m.author_type).name().to_owned();
+        }
+        for t in &mut s.tool_calls {
+            t.message_index = t.message_index.and_then(|i| {
+                s.messages
+                    .iter()
+                    .filter(|m| m.index < i)
+                    .map(|m| m.index)
+                    .max()
+            });
+            time(&mut t.started_at_utc);
+            time(&mut t.finished_at_utc);
+        }
+        for e in &mut s.usage_events {
+            usage(&mut e.usage, true);
+            time(&mut e.occurred_at_utc);
+        }
+        if s.extra == Some(serde_json::Value::Null) {
+            s.extra = None;
+        }
+        s
+    }
+    let temp = support::TempDir::new("prepared_ref");
+    let parsed = parser::parse_file(
+        "../samples/collector-parity/sessions/rich_session.jsonl",
+        Default::default(),
+    )
+    .unwrap();
+    let path = "C:/synthetic/envelope.jsonl";
+    let mapped = PathMapper::new("").map_windows_path(path);
+    let snapshot = contract::codex_snapshot(
+        &parsed.session,
+        &contract::CodexSource {
+            path,
+            mapped: &mapped,
+            state: "active",
+            status: "available",
+            size: parsed.snapshot_size,
+            modified_utc: parsed.snapshot_modified_utc,
+        },
+        None,
+        Vec::new(),
+    );
+    assert!(snapshot.session.usage.reasoning_output_tokens.is_some());
+    let id = codex_sessions_collector::store::writer::session_row_id(
+        "codex",
+        snapshot.session.session_id.as_deref(),
+        path,
+    );
+    let key = format!("session:{id}");
     for version in [1, 2] {
         let store = Store::open(
             &temp.path().join(format!("{version}.sqlite")),
             OwnerMode::Standalone,
         )
         .unwrap();
-        store
-            .conn
-            .execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','fixture')", [])
-            .unwrap();
-        let snapshot = support::sample_snapshot("envelope");
+        store.conn.execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','fixture')", []).unwrap();
         let envelope = Envelope {
-            contract: codex_sessions_collector::contract::CONTRACT_NAME.to_owned(),
+            contract: contract::CONTRACT_NAME.to_owned(),
             version,
-            record: Record::SessionSnapshot(Box::new(snapshot)),
+            record: Record::SessionSnapshot(Box::new(snapshot.clone())),
         };
-        let expected = serde_json::to_string(&envelope).unwrap();
+        let assert_reference = || {
+            let rows: Vec<(i64, String, String)> = store
+                .conn
+                .prepare(
+                    "select id,record_key,record_json from collector_upload_outbox order by id",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, key);
+            assert_eq!(rows[0].2, SESSION_REF);
+            let rebuilt = hub_snapshot::build(&store.conn, &id, Children::Include)
+                .unwrap()
+                .unwrap();
+            let sent = Envelope::new(Record::SessionSnapshot(Box::new(rebuilt.clone())));
+            assert_eq!(sent.version, 2);
+            support::assert_same(
+                &serde_json::to_value(normalize(snapshot.clone())).unwrap(),
+                &serde_json::to_value(normalize(rebuilt)).unwrap(),
+            );
+            rows[0].0
+        };
         store.apply(vec![envelope.clone()]).unwrap();
-        let prepared: String = store
-            .conn
-            .query_row("select record_json from collector_upload_outbox", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(prepared, expected);
+        let first = assert_reference();
         let _scope = SessionPreparationScope::enter(Some(0), |_| {});
         store.apply(vec![envelope]).unwrap();
-        let in_lock: String = store
-            .conn
-            .query_row("select record_json from collector_upload_outbox", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(prepared, in_lock);
+        assert_eq!(
+            assert_reference(),
+            first,
+            "unchanged fallback ingest must not replace the reference"
+        );
     }
 }

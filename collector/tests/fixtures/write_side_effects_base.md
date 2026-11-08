@@ -41,3 +41,10 @@ in the receipt), not candidate output. Exact source, commands, native exits and
 hashes: F:/dev-artifacts/runs/codex-sessions-viewer-main/run-7wfa9msb/
 `order-base-provenance.json`, `order-base-generator.rs`, `base_writer.rs`,
 `base_t3.rs`, `order-base-compile.log`, `order-base-run.log`.
+
+CXV-214 deliberately updates only `write_sessions_base.json` session outbox
+`record_json` values to `{"outbox_ref":"session_snapshot"}` and session
+`record_hash` values to the stored-state digest (header plus child-row digest).
+All queue IDs, journal revisions and other golden values remain unchanged.
+The old golden RED and the field-restricted transformation evidence are retained
+in laneA/worker/golden-red.* and sessions-actual.json.

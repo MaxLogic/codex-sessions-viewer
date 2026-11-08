@@ -156,17 +156,20 @@ continue while the hub is unavailable; committed records stay in
 
 Only changes are queued. A scan that finds a source or thread name unchanged
 queues nothing, and a newer state of a source replaces its older unsent state.
-A session snapshot identical to the last one queued for that session is not
-queued again, unless the hub refused that one. Repeated scans therefore do not
-grow the outbox while the hub is unreachable.
+A changed session queues one small reference, not a snapshot payload. The next
+sync builds its latest committed state from stored rows, so ten turns between
+syncs produce one snapshot build and one upload. A small stored-state digest
+suppresses unchanged repeats; a refused session is queued again on re-ingest.
+Backfill and dead-letter recovery use the same builder. Message/session
+reasoning and cache-write tokens and exact project hints are retained after
+migration and re-ingest; older stored rows have unknown new token buckets.
 
-A session snapshot holds the whole session, and an active session is queued
-again after every turn. Records of 16 KiB and more are therefore stored
-zstd-compressed (level 3) in the outbox, base64-encoded inside a small JSON
-wrapper because the column must hold valid JSON. `hub sync` decodes them
-before sending, and the record limits below refer to the decoded size. Every
-collector that writes or syncs the database must be this version or newer: an
-older `hub sync` would send the wrapper as it is.
+Plain JSON and zstd-base64 payload rows queued by older builds still deliver
+once, unchanged. New records are not packed in the database. Transport zstd
+compression and decoded size limits are unchanged. Update the viewer,
+collector, Hub Sync scheduled-task binary and hub together: schema mismatches
+are refused. A queued session deleted locally loses its unsent changes; the hub
+keeps its last received copy. A merged session is sent under its surviving ID.
 
 The sync command sends batches of up to 128 records and 8 MiB of UTF-8 until
 the outbox is empty; a single larger record is sent alone. When the
@@ -210,7 +213,7 @@ nothing, and records already in the queue take priority. Non-session metadata
 without an authoritative snapshot stays in dead letters.
 
 Discovery, reconstruction and JSON serialization of these records run outside
-SQLite's write lock. Each current snapshot and its lifecycle status are
+SQLite's write lock. Each current session reference and its lifecycle status are
 committed together. The old dead letter is then deleted in a separate chunk
 that uses the existing write budget of 250 ms soft / 1,000 ms hard with a
 150 ms gap. A single large SQLite write or COMMIT can exceed these targets,
@@ -253,11 +256,10 @@ codex-sessions-collector.exe hub backfill --db C:\Path\codex_sessions_viewer.sql
 codex-sessions-collector.exe hub sync --db C:\Path\codex_sessions_viewer.sqlite
 ```
 
-The rebuilt snapshot reflects the stored state, not the source file, so
-per-message reasoning and cache-write tokens are absent. A hub that already
-holds a parsed copy of the session keeps it, because a missing source ranks
-below an available one. Each run queues every qualifying session again, so run
-it once after pairing, or after restoring an older hub backup.
+The rebuilt snapshot reflects the stored state. New token columns are nullable:
+rows not re-ingested since migration send unknown reasoning/cache-write tokens.
+A hub that already has an available source keeps it in preference to a missing
+source, as it does for normal collection.
 
 ### Reconcile after restoring a backup
 

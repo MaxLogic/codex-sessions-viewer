@@ -13,6 +13,7 @@ pub mod hub_annotations;
 pub mod hub_backfill;
 pub mod hub_client;
 pub mod hub_server;
+pub mod hub_snapshot;
 pub mod path_mapping;
 pub mod platform_locations;
 pub mod price_history;

@@ -347,14 +347,10 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
         assert_eq!(hub_client::pending(&store.conn).unwrap(), 1);
         // Persisted pre-upgrade v1 bytes, including unknown fields and spacing,
         // must survive failed delivery and restart without reserialization.
-        let raw = store
-            .conn
-            .query_row(
-                "select record_json from collector_upload_outbox",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap();
+        let raw = serde_json::to_string(&Envelope::new(Record::SessionSnapshot(Box::new(
+            sample_snapshot("queued-session"),
+        ))))
+        .unwrap();
         let legacy = raw.replacen(
             "\"version\":2",
             "\"version\":1, \"future_field\":{\"preserve\":true}",
@@ -469,12 +465,12 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
 }
 
 #[test]
-fn typed_external_v1_and_builtin_v2_records_keep_versions_in_the_outbox() {
+fn typed_v1_sessions_queue_references_and_are_sent_as_v2() {
     use codex_sessions_collector::contract::parse_line;
     let temp = TempDir::new("mixed_version_outbox");
-    let db = temp.path().join("local.sqlite");
+    let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+    let db = paired_database(&temp, &fake.url);
     let store = Store::open(&db, OwnerMode::Standalone).unwrap();
-    store.conn.execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values (1,1,'http://127.0.0.1:1','legacy')", []).unwrap();
     let mut legacy = serde_json::to_value(Envelope::new(Record::SessionSnapshot(Box::new(
         sample_snapshot("legacy"),
     ))))
@@ -499,14 +495,23 @@ fn typed_external_v1_and_builtin_v2_records_keep_versions_in_the_outbox() {
         .unwrap()
         .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
         .collect();
-    assert_eq!(
-        rows.iter()
-            .map(|row| row["version"].as_u64().unwrap())
-            .collect::<Vec<_>>(),
-        vec![1, 1, 2]
-    );
+    assert_eq!(rows[0], json!({"outbox_ref":"session_snapshot"}));
+    assert_eq!(rows[1]["version"], 1);
     assert!(rows[1]["record"].get("environment").is_none());
-    assert_eq!(rows[2]["record"]["source"]["environment"], "linux");
+    assert_eq!(rows[2], json!({"outbox_ref":"session_snapshot"}));
+    drop(statement);
+    drop(store);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(report.sent, 3);
+    let bodies = fake.bodies.lock().unwrap();
+    let sent = bodies[0]["records"].as_array().unwrap();
+    assert_eq!(
+        sent.iter()
+            .map(|r| r["version"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![2, 1, 2]
+    );
+    assert_eq!(sent[2]["record"]["source"]["environment"], "linux");
 }
 
 #[test]
@@ -1686,7 +1691,15 @@ fn outbox_queues_only_changes_and_coalesces_unsent_state_per_source() {
     };
     assert!(queued[0].contains("\"missing\""));
     assert!(queued[1].contains("Renamed"));
-    assert!(queued[2].contains("Second") && !queued[2].contains("First"));
+    assert_eq!(queued[2], hub_client::SESSION_REF);
+    let rebuilt = codex_sessions_collector::hub_snapshot::build(
+        &store.conn,
+        "session:coalesced",
+        codex_sessions_collector::hub_snapshot::Children::Include,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(rebuilt.session.title.as_deref(), Some("Second"));
 }
 
 #[test]
@@ -2017,6 +2030,7 @@ struct FakeHub {
 struct CapturedUpload {
     content_encoding: Option<String>,
     plain_json: bool,
+    raw_body: Vec<u8>,
 }
 
 fn fake_hub(reply: IngestReply) -> FakeHub {
@@ -2086,6 +2100,7 @@ fn fake_hub_contract(contract_version: u32, mut reply: IngestReply) -> FakeHub {
                 seen_wire.lock().unwrap().push(CapturedUpload {
                     content_encoding: encoding.clone(),
                     plain_json,
+                    raw_body: body,
                 });
                 seen.lock().unwrap().push(value.clone());
                 if encoding.is_some() || !plain_json {
@@ -2430,7 +2445,7 @@ fn three_56_mib_dead_letters_rebuild_within_the_write_hold_budget() {
         move_to_dead_letter(&store.conn, &format!("session:session:{name}"), None);
     }
     // Decoded sizes: a packed record carries its size in `$.bytes`.
-    let sizes: Vec<i64>=store.conn.prepare("select coalesce(json_extract(record_json, '$.bytes'), length(cast(record_json as blob))) from collector_upload_dead_letters order by id").unwrap()
+    let sizes: Vec<i64>=store.conn.prepare("select sum(length(cast(output_preview as blob))) from tool_calls group by session_id order by session_id").unwrap()
         .query_map([],|r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
     assert_eq!(sizes.len(), 3);
     assert!(
@@ -2860,7 +2875,7 @@ fn backfill_delivers_a_stored_session_whose_file_is_gone() {
 }
 
 #[test]
-fn an_unchanged_snapshot_is_queued_once_and_large_ones_are_stored_compressed() {
+fn an_unchanged_snapshot_is_queued_once_as_a_small_reference() {
     let temp = TempDir::new("snapshot_dedupe");
     let hub = start(&temp);
     let db = paired_database(&temp, &hub.url);
@@ -2894,9 +2909,17 @@ fn an_unchanged_snapshot_is_queued_once_and_large_ones_are_stored_compressed() {
         store.apply(vec![envelope(&snapshot)]).unwrap();
         let first = queued(&store.conn);
         assert_eq!(first.len(), 1);
-        // Stored compressed, with the decoded size the hub limits refer to.
-        assert!(first[0].1 * 4 < decoded, "{first:?} of {decoded}");
-        assert!(first[0].2.is_some_and(|bytes| bytes > first[0].1));
+        assert!(decoded > 100_000);
+        assert!(first[0].1 < 200, "{first:?} of {decoded}");
+        assert_eq!(first[0].2, None);
+        assert_eq!(
+            store
+                .conn
+                .query_row("select record_json from collector_upload_outbox", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            hub_client::SESSION_REF
+        );
         // The same snapshot again is neither rewritten nor queued twice.
         store.apply(vec![envelope(&snapshot)]).unwrap();
         assert_eq!(queued(&store.conn), first);
@@ -2930,6 +2953,22 @@ fn an_unchanged_snapshot_is_queued_once_and_large_ones_are_stored_compressed() {
         hub_rows(&temp, "select sum(tool_call_count) from sessions"),
         10
     );
+    // Both reset paths clear the small digest so unchanged stored history can be queued.
+    hub_client::resync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store.apply(vec![envelope(&snapshot)]).unwrap();
+        assert_eq!(queued(&store.conn).len(), 1);
+        assert!(queued(&store.conn)[0].1 < 200);
+    }
+    hub_client::disable(&db, OwnerMode::Standalone).unwrap();
+    hub_client::enable_for_collection(&db, OwnerMode::Standalone, &hub.url).unwrap();
+    {
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store.apply(vec![envelope(&snapshot)]).unwrap();
+        assert_eq!(queued(&store.conn).len(), 1);
+        assert!(queued(&store.conn)[0].1 < 200);
+    }
 }
 
 #[test]
@@ -2964,4 +3003,621 @@ fn an_undecodable_queued_record_becomes_a_dead_letter_instead_of_blocking_sync()
         "{report}"
     );
     assert_eq!(hub_rows(&temp, "select count(*) from sessions"), 1);
+}
+
+#[test]
+fn ten_ingests_between_syncs_queue_one_reference_and_send_the_latest_state() {
+    let temp = TempDir::new("ten-ingests");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let mut snapshot = sample_snapshot("growing");
+    let message = snapshot.messages[0].clone();
+    for turn in 1..=10 {
+        snapshot.messages = (0..turn)
+            .map(|index| {
+                let mut m = message.clone();
+                m.index = index;
+                m.content_plain = format!("turn {index}");
+                m
+            })
+            .collect();
+        snapshot.source.size = 100 + turn as u64;
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                snapshot.clone(),
+            )))])
+            .unwrap();
+        assert_eq!(hub_client::pending(&store.conn).unwrap(), 1);
+        let stored: String = store
+            .conn
+            .query_row("select record_json from collector_upload_outbox", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, hub_client::SESSION_REF);
+    }
+    let expected = retained_replay_state(&store.conn, "growing");
+    drop(store);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.sent, report.pending), (1, 0));
+    codex_sessions_collector::store::connection::ensure().unwrap();
+    let peer = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
+    support::assert_same(&expected, &retained_replay_state(&peer, "growing"));
+}
+
+#[test]
+fn a_newer_state_ingested_during_an_ambiguous_retry_is_delivered() {
+    let temp = TempDir::new("newer-retry");
+    let real = start(&temp);
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = attempts.clone();
+    let real_url = real.url.clone();
+    let fake = fake_hub(Box::new(move |body| {
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Some((
+                500,
+                json!({"error":"ambiguous transport failure"}).to_string(),
+            ));
+        }
+        let ack: Value = ureq::post(format!("{real_url}/v1/ingest"))
+            .header("Authorization", format!("Bearer {MACHINE_A_TOKEN}"))
+            .send_json(body)
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+        Some((200, ack.to_string()))
+    }));
+    let db = paired_database(&temp, &fake.url);
+    queue_sessions(&db, &["retry-state"]);
+    assert!(hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).is_err());
+    let first = fake.bodies.lock().unwrap()[0].clone();
+    let records = first["records"].as_array().unwrap().clone();
+    upload(
+        &real,
+        MACHINE_A_TOKEN,
+        1,
+        first["batch_id"].as_str().unwrap(),
+        records,
+    )
+    .unwrap();
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let mut newer = sample_snapshot("retry-state");
+    newer.messages[0].content_plain = "NEWEST".into();
+    newer.source.size += 1;
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            newer,
+        )))])
+        .unwrap();
+    let queued: i64 = store
+        .conn
+        .query_row("select id from collector_upload_outbox", [], |r| r.get(0))
+        .unwrap();
+    let boundary: i64 = store
+        .conn
+        .query_row(
+            "select inflight_last_id from collector_hub_state",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(queued > boundary);
+    drop(store);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(
+        (report.sent, report.pending, report.last_sequence),
+        (1, 0, 2)
+    );
+    let bodies = fake.bodies.lock().unwrap();
+    assert_eq!(bodies[1]["batch_id"], first["batch_id"]);
+    assert_eq!(bodies[1]["records"], json!([]));
+    assert_eq!(
+        bodies[2]["records"][0]["record"]["messages"][0]["content_plain"],
+        "NEWEST"
+    );
+    codex_sessions_collector::store::connection::ensure().unwrap();
+    let conn = rusqlite::Connection::open(temp.path().join("hub-data/machine-a.sqlite")).unwrap();
+    assert_eq!(
+        conn.query_row("select content_plain from messages", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "NEWEST"
+    );
+}
+
+#[test]
+fn a_queued_session_deleted_or_merged_before_sync_does_not_block() {
+    for inflight in [false, true] {
+        let temp = TempDir::new("vanished-ref");
+        let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+        let db = paired_database(&temp, &fake.url);
+        queue_sessions(&db, &["deleted", "survivor"]);
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        if inflight {
+            store.conn.execute("update collector_hub_state set inflight_batch_id='persisted',inflight_last_id=(select max(id) from collector_upload_outbox)",[]).unwrap();
+        }
+        store
+            .conn
+            .execute("delete from sessions where session_id='deleted'", [])
+            .unwrap();
+        drop(store);
+        let report =
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+        assert_eq!((report.sent, report.pending), (1, 0));
+        assert_eq!(report.pruned, usize::from(!inflight));
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(
+            bodies[0]["records"][0]["record"]["session"]["session_id"],
+            "survivor"
+        );
+        if inflight {
+            assert_eq!(bodies[0]["batch_id"], "persisted");
+        }
+    }
+    let temp = TempDir::new("merged-ref");
+    let hub = start(&temp);
+    let db = paired_database(&temp, &hub.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let mut anonymous = sample_snapshot("merged");
+    anonymous.session.session_id = None;
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            anonymous,
+        )))])
+        .unwrap();
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            sample_snapshot("merged"),
+        )))])
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(store);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &hub.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.sent, report.pending), (1, 0));
+    assert_eq!(report.pruned, 1);
+    assert_eq!(session_count(&hub, "machine-a"), 1);
+}
+
+#[test]
+fn a_refused_reference_is_kept_and_requeued_from_rows() {
+    let temp = TempDir::new("refused-ref");
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = n.clone();
+    let fake = fake_hub(Box::new(move |body| {
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Some((
+                422,
+                json!({"code":"record_rejected","error":"synthetic refusal"}).to_string(),
+            ))
+        } else {
+            Some(acknowledge(body))
+        }
+    }));
+    let db = paired_database(&temp, &fake.url);
+    queue_sessions(&db, &["refused"]);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(report.dead_lettered, 1);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let letter: (String, i64, String) = store
+        .conn
+        .query_row(
+            "select record_key,http_status,record_json from collector_upload_dead_letters",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        letter,
+        (
+            "session:session:refused".into(),
+            422,
+            hub_client::SESSION_REF.into()
+        )
+    );
+    store
+        .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+            sample_snapshot("refused"),
+        )))])
+        .unwrap();
+    drop(store);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.sent, report.pending), (1, 0));
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_dead_letters"),
+        0
+    );
+}
+
+fn legacy_packed(json: &str) -> String {
+    let compressed = zstd::bulk::compress(json.as_bytes(), 3).unwrap();
+    let mut encoded = String::new();
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in compressed.chunks(3) {
+        let v = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            encoded.push(if i <= chunk.len() {
+                alphabet[((v >> (18 - 6 * i)) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    format!(
+        r#"{{"outbox_encoding":"zstd-base64","bytes":{},"data":"{}"}}"#,
+        json.len(),
+        encoded
+    )
+}
+
+/// Preserve populated rows, but remove the snapshot-fields migration so the
+/// next Store::open must perform the real upgrade. After integration, any
+/// preceding index-only migration remains applied to the ff6675c-era rows.
+fn before_snapshot_fields_upgrade(conn: &rusqlite::Connection) {
+    let migration = codex_sessions_collector::store::schema::MIGRATIONS
+        .iter()
+        .find(|migration| migration.filename.ends_with("_hub_snapshot_fields.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "begin immediate;
+         alter table messages drop column token_cache_write;
+         alter table messages drop column token_reasoning;
+         alter table sessions drop column cache_write_input_tokens;
+         alter table sessions drop column reasoning_output_tokens;
+         alter table sessions drop column project_hints_json;",
+    )
+    .unwrap();
+    assert_eq!(
+        conn.execute(
+            "delete from schema_version where version=?",
+            [migration.version]
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute_batch("commit").unwrap();
+    let version: i64 = conn
+        .query_row(
+            "select max(version) from schema_version where success=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, migration.version - 1);
+    let columns: i64 = conn.query_row("select count(*) from pragma_table_info('sessions') where name in ('cache_write_input_tokens','reasoning_output_tokens','project_hints_json')", [], |r| r.get(0)).unwrap();
+    assert_eq!(columns, 0);
+}
+
+#[test]
+fn ff6675c_outbox_rows_are_delivered_once_unchanged() {
+    let temp = TempDir::new("legacy-rows");
+    let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+    let db = paired_database(&temp, &fake.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    before_snapshot_fields_upgrade(&store.conn);
+    let mut expected = Vec::new();
+    for (i, packed) in [false, true, false].into_iter().enumerate() {
+        let raw = serde_json::to_string(&Envelope::new(Record::SessionSnapshot(Box::new(
+            sample_snapshot(&format!("legacy-{i}")),
+        ))))
+        .unwrap()
+        .replacen(
+            "\"version\":2",
+            "\"version\":1, \"unknown\": {\"retained\":true}",
+            1,
+        );
+        let stored = if packed {
+            legacy_packed(&raw)
+        } else {
+            raw.clone()
+        };
+        let key = if i == 2 {
+            None
+        } else {
+            Some(format!("session:legacy-{i}"))
+        };
+        store.conn.execute("insert into collector_upload_outbox(record_json,created_at_utc,record_key) values (?,'now',?)",rusqlite::params![stored,key]).unwrap();
+        expected.push(raw);
+    }
+    drop(store);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!((report.sent, report.pending), (3, 0));
+    let again = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(again.sent, 0);
+    let bodies = fake.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let wire = fake.wire.lock().unwrap();
+    assert_eq!(wire.len(), bodies.len());
+    let raw_body = &wire[0].raw_body;
+    let prefix = b"\"records\":[";
+    let start = raw_body
+        .windows(prefix.len())
+        .position(|part| part == prefix)
+        .unwrap()
+        + prefix.len();
+    assert!(raw_body.ends_with(b"]}"));
+    assert_eq!(
+        &raw_body[start..raw_body.len() - 2],
+        expected.join(",").as_bytes(),
+        "legacy envelopes must retain their raw whitespace and unknown fields"
+    );
+}
+
+#[test]
+fn ff6675c_plain_and_packed_dead_letters_rebuild_from_rows_after_upgrade() {
+    let temp = TempDir::new("legacy-dead");
+    let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+    let db = paired_database(&temp, &fake.url);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let cases = [("legacy-dead-plain", false), ("legacy-dead-packed", true)];
+    for (session, _) in cases {
+        let mut current = sample_snapshot(session);
+        current.messages[0].content_plain = format!("current stored {session}");
+        store
+            .apply(vec![Envelope::new(Record::SessionSnapshot(Box::new(
+                current,
+            )))])
+            .unwrap();
+    }
+    before_snapshot_fields_upgrade(&store.conn);
+    store
+        .conn
+        .execute("delete from collector_upload_outbox", [])
+        .unwrap();
+    let mut stored_letters = Vec::new();
+    for (index, (session, packed)) in cases.iter().enumerate() {
+        let mut old = sample_snapshot(session);
+        old.messages[0].content_plain = "STALE HISTORICAL LETTER".into();
+        let mut envelope = Envelope::new(Record::SessionSnapshot(Box::new(old)));
+        envelope.version = 1;
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let stored = if *packed {
+            legacy_packed(&raw)
+        } else {
+            raw.clone()
+        };
+        let key = format!("session:session:{session}");
+        store.conn.execute("insert into collector_upload_dead_letters(outbox_id,record_key,record_json,created_at_utc,failed_at_utc,http_status,error) values (?,?,?,'2000-01-01','2000-01-01',null,'ff6675c local size refusal')",rusqlite::params![index as i64+1,key,stored]).unwrap();
+        store
+            .conn
+            .execute(
+                "update collector_hub_record_state set record_hash=? where record_key=?",
+                rusqlite::params![
+                    codex_sessions_collector::dart::sha256_hex(raw.as_bytes()),
+                    key
+                ],
+            )
+            .unwrap();
+        stored_letters.push(stored);
+    }
+    drop(store);
+    let upgraded = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let preserved: Vec<String> = upgraded
+        .conn
+        .prepare("select record_json from collector_upload_dead_letters order by id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        preserved, stored_letters,
+        "the schema upgrade preserves both stored representations"
+    );
+    assert_eq!(hub_client::pending(&upgraded.conn).unwrap(), 0);
+    drop(upgraded);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(report.requeued, cases.len());
+    assert_eq!(report.pending, 0);
+    assert_eq!(
+        local_count(&db, "select count(*) from collector_upload_dead_letters"),
+        0
+    );
+    let bodies = fake.bodies.lock().unwrap();
+    let records: Vec<&Value> = bodies
+        .iter()
+        .flat_map(|b| b["records"].as_array().unwrap())
+        .collect();
+    assert_eq!(report.sent, records.len());
+    let snapshots: Vec<_> = records
+        .iter()
+        .filter(|r| r["kind"] == "session_snapshot")
+        .collect();
+    assert_eq!(snapshots.len(), cases.len());
+    for (session, _) in cases {
+        let matches: Vec<_> = snapshots
+            .iter()
+            .filter(|r| r["record"]["session"]["session_id"] == session)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["version"], 2);
+        assert_eq!(
+            matches[0]["record"]["messages"][0]["content_plain"],
+            format!("current stored {session}")
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .all(|r| !r.to_string().contains("STALE HISTORICAL LETTER"))
+    );
+    let sent_batches = bodies.len();
+    drop(bodies);
+    assert_eq!(
+        hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN)
+            .unwrap()
+            .sent,
+        0
+    );
+    assert_eq!(fake.bodies.lock().unwrap().len(), sent_batches);
+}
+
+#[test]
+fn ff6675c_envelope_hash_transitions_once_on_post_upgrade_ingest() {
+    for legacy_payload_pending in [false, true] {
+        let temp = TempDir::new("legacy-hash");
+        let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
+        let db = paired_database(&temp, &fake.url);
+        let snapshot = sample_snapshot("old-hash");
+        let mut envelope = Envelope::new(Record::SessionSnapshot(Box::new(snapshot.clone())));
+        envelope.version = 1;
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let old_hash = codex_sessions_collector::dart::sha256_hex(raw.as_bytes());
+        let key = "session:session:old-hash";
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        store.apply(vec![envelope.clone()]).unwrap();
+        before_snapshot_fields_upgrade(&store.conn);
+        store
+            .conn
+            .execute("delete from collector_upload_outbox", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "update collector_hub_record_state set record_hash=? where record_key=?",
+                rusqlite::params![old_hash, key],
+            )
+            .unwrap();
+        let legacy_id = legacy_payload_pending.then(|| {
+            store.conn.execute("insert into collector_upload_outbox(record_key,record_json,created_at_utc) values (?,?,'2000-01-01')",rusqlite::params![key,raw]).unwrap();
+            store.conn.last_insert_rowid()
+        });
+        drop(store);
+        let upgraded = Store::open(&db, OwnerMode::Standalone).unwrap();
+        assert_eq!(
+            upgraded
+                .conn
+                .query_row(
+                    "select record_hash from collector_hub_record_state where record_key=?",
+                    [key],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            old_hash
+        );
+        upgraded.apply(vec![envelope.clone()]).unwrap();
+        let queued = || {
+            let rows: Vec<(i64, String, String)> = upgraded
+                .conn
+                .prepare(
+                    "select id,record_key,record_json from collector_upload_outbox order by id",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "an old envelope hash must neither suppress nor duplicate the first new ingest"
+            );
+            assert_eq!(rows[0].1, key);
+            assert_eq!(rows[0].2, hub_client::SESSION_REF);
+            rows[0].0
+        };
+        let first = queued();
+        if let Some(old_id) = legacy_id {
+            assert!(first > old_id);
+        }
+        let digest = codex_sessions_collector::hub_snapshot::state_digest(
+            &upgraded.conn,
+            "session:old-hash",
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(digest, old_hash);
+        assert_eq!(
+            upgraded
+                .conn
+                .query_row(
+                    "select record_hash from collector_hub_record_state where record_key=?",
+                    [key],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            digest
+        );
+        upgraded.apply(vec![envelope.clone()]).unwrap();
+        assert_eq!(
+            queued(),
+            first,
+            "the second unchanged ingest must preserve the reference identity"
+        );
+        drop(upgraded);
+        let report =
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+        assert_eq!((report.sent, report.pending), (1, 0));
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["records"].as_array().unwrap().len(), 1);
+        assert_eq!(bodies[0]["records"][0]["version"], 2);
+        assert_eq!(
+            bodies[0]["records"][0]["record"]["session"]["session_id"],
+            "old-hash"
+        );
+        drop(bodies);
+        let upgraded = Store::open(&db, OwnerMode::Standalone).unwrap();
+        upgraded.apply(vec![envelope]).unwrap();
+        assert_eq!(hub_client::pending(&upgraded.conn).unwrap(), 0);
+        drop(upgraded);
+        assert_eq!(
+            hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN)
+                .unwrap()
+                .sent,
+            0
+        );
+        assert_eq!(fake.bodies.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn failed_batch_persistence_never_uploads_and_failed_ack_commit_retries_identity() {
+    let temp = TempDir::new("batch-commit");
+    let real = start(&temp);
+    let real_url = real.url.clone();
+    let fake = fake_hub(Box::new(move |body| {
+        let ack: Value = ureq::post(format!("{real_url}/v1/ingest"))
+            .header("Authorization", format!("Bearer {MACHINE_A_TOKEN}"))
+            .send_json(body)
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+        Some((200, ack.to_string()))
+    }));
+    let db = paired_database(&temp, &fake.url);
+    queue_sessions(&db, &["commit"]);
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    store.conn.execute_batch("create trigger fail_persist before update of inflight_batch_id on collector_hub_state when new.inflight_batch_id is not null begin select raise(abort,'synthetic persist failure'); end;").unwrap();
+    assert!(
+        hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN)
+            .unwrap_err()
+            .contains("synthetic persist failure")
+    );
+    assert!(fake.bodies.lock().unwrap().is_empty());
+    assert_eq!(hub_client::pending(&store.conn).unwrap(), 1);
+    store.conn.execute_batch("drop trigger fail_persist; create table deferred_failure(id integer primary key,parent integer references deferred_failure(id) deferrable initially deferred); create trigger fail_ack after delete on collector_upload_outbox begin insert into deferred_failure values (1,999); end;").unwrap();
+    assert!(hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).is_err());
+    assert_eq!(hub_client::pending(&store.conn).unwrap(), 1);
+    store.conn.execute_batch("drop trigger fail_ack").unwrap();
+    drop(store);
+    let report = hub_client::sync(&db, OwnerMode::Standalone, &fake.url, MACHINE_A_TOKEN).unwrap();
+    assert_eq!(
+        (report.sent, report.pending, report.last_sequence),
+        (1, 0, 1)
+    );
+    let bodies = fake.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(session_count(&real, "machine-a"), 1);
 }
