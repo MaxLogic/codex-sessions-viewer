@@ -268,7 +268,8 @@ fn unchanged_admission_respects_predicted_cost_and_write_bytes() {
     let _serial = budget_test();
     use codex_sessions_collector::store::{
         OwnerMode, Store,
-        write_budget::{WriteBudget, WriteBudgetScope},
+        write_budget::{UnitCost, WriteBudget, WriteBudgetScope, write_admitted},
+        write_lease::WriteLease,
         writer,
     };
     let temp = support::TempDir::new("unchanged_bytes");
@@ -289,7 +290,7 @@ fn unchanged_admission_respects_predicted_cost_and_write_bytes() {
             ..WriteBudget::default()
         });
         let mut input: Vec<_> = ["a", "b", "c", "d"].map(support::sample_snapshot).into();
-        // Incompressible, so each stored envelope stays about 3 MiB.
+        // Retain large message bodies while unchanged sessions queue references.
         let mut state = 0x2545_f491_4f6c_dd1d_u64;
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         for s in &mut input[..3] {
@@ -310,25 +311,99 @@ fn unchanged_admission_respects_predicted_cost_and_write_bytes() {
             })
             .collect();
         writer::apply_session_batch(&store.conn, input.clone()).unwrap();
-        // As after `hub resync`: unchanged sessions must queue their envelopes again.
+        // A changed 3 MiB session is already isolated by the session-size rule.
+        // Exercise the shared admission byte cap with real 3 MiB fixture rows;
+        // a generous nonzero time budget makes the byte cap decide the split.
         store
             .conn
-            .execute("delete from collector_hub_record_state", [])
+            .execute_batch("create table admission_payloads(id integer primary key, content text)")
             .unwrap();
+        let lease = WriteLease::acquire(&store.conn).unwrap();
         let scope = WriteHoldScope::start();
-        writer::apply_session_batch(&store.conn, input.clone()).unwrap();
+        write_admitted(
+            &store.conn,
+            "reference_queue_byte_cap",
+            WriteBudget {
+                soft: if soft.is_zero() {
+                    soft
+                } else {
+                    Duration::from_secs(3600)
+                },
+                gap: Duration::ZERO,
+                ..WriteBudget::default()
+            },
+            input[..3].iter().enumerate(),
+            |(_, snapshot)| UnitCost::Small {
+                bytes: snapshot.messages[0].content_plain.len() as u64,
+            },
+            |(index, snapshot)| {
+                store.conn.execute(
+                    "insert into admission_payloads values (?,?)",
+                    rusqlite::params![index as i64, snapshot.messages[0].content_plain],
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
         assert_eq!(
             scope.report().transactions,
-            if soft.is_zero() { 4 } else { 3 },
-            "two 3 MiB envelopes join, third splits, costly unit isolates"
+            if soft.is_zero() { 3 } else { 2 },
+            "two 3 MiB row writes join below 8 MiB; the third exceeds the byte cap"
         );
-        // Envelopes already queued add no write bytes, so the three join.
+        let payloads: Vec<String> = store
+            .conn
+            .prepare("select content from admission_payloads order by id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            payloads,
+            input[..3]
+                .iter()
+                .map(|snapshot| snapshot.messages[0].content_plain.clone())
+                .collect::<Vec<_>>()
+        );
+        drop(lease);
+        // As after hub resync, unchanged sessions must queue references again.
+        store
+            .conn
+            .execute_batch(
+                "delete from collector_hub_record_state; delete from collector_upload_outbox",
+            )
+            .unwrap();
+        let scope = WriteHoldScope::start();
+        writer::apply_session_batch(&store.conn, input[..3].to_vec()).unwrap();
+        assert_eq!(
+            scope.report().transactions,
+            if soft.is_zero() { 3 } else { 1 },
+            "unchanged large messages queue only small references and join one transaction"
+        );
+        let references: Vec<(String, String)> = store
+            .conn
+            .prepare(
+                "select record_key,record_json from collector_upload_outbox order by record_key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            references,
+            ["a", "b", "c"].map(|id| (
+                format!("session:session:{id}"),
+                codex_sessions_collector::hub_client::SESSION_REF.to_owned()
+            ))
+        );
+        // Already queued references stay small; predicted costly work isolates.
         let scope = WriteHoldScope::start();
         writer::apply_session_batch(&store.conn, input).unwrap();
         assert_eq!(
             scope.report().transactions,
             if soft.is_zero() { 4 } else { 2 },
-            "queued envelopes are not written again; costly unit isolates"
+            "queued references join; the predicted costly unit isolates"
         );
         results.push(support::content_snapshot(std::path::Path::new(&store.path)));
     }
@@ -345,15 +420,51 @@ fn digest_bytes_are_unchanged() {
     writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
     // The first write has an unknown context. The second exercises the
     // partial message/tool hasher completed with read-only planned usage ids.
-    writer::apply_session_batch(&store.conn, vec![snapshot]).unwrap();
+    writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
     let digest: String = store
         .conn
         .query_row("select content_hash from sessions", [], |row| row.get(0))
         .unwrap();
+    // CXV-214 adds two message token columns to the hashed row stream.
     assert_eq!(
         digest,
-        "93ce84a5d2e4202f56346a4921766ec7f072642e29a049ad24c9149454652274"
+        "73979d7f95ed5faae937ce9aaa6f9c6f1fcc168d1edd34c86a6f43dc849b22be"
     );
+    // Pin the derived total so changing a bucket changes only that column.
+    let mut snapshot = snapshot;
+    snapshot.messages[0].usage.total_tokens = Some(0);
+    writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
+    let baseline_digest: String = store
+        .conn
+        .query_row("select content_hash from sessions", [], |row| row.get(0))
+        .unwrap();
+    let original = support::content_snapshot(std::path::Path::new(&store.path));
+    for column in ["token_cache_write", "token_reasoning"] {
+        // Restore the same baseline so each new bucket changes independently.
+        writer::apply_session_batch(&store.conn, vec![snapshot.clone()]).unwrap();
+        let mut changed = snapshot.clone();
+        if column == "token_cache_write" {
+            changed.messages[0].usage.cache_write_input_tokens = Some(17);
+        } else {
+            changed.messages[0].usage.reasoning_output_tokens = Some(17);
+        }
+        writer::apply_session_batch(&store.conn, vec![changed]).unwrap();
+        let changed_digest: String = store
+            .conn
+            .query_row("select content_hash from sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(
+            baseline_digest, changed_digest,
+            "{column} must affect the digest"
+        );
+        let mut expected = original.clone();
+        expected["sessions"][0]["content_hash"] = changed_digest.into();
+        expected["messages"][0][column] = 17.into();
+        support::assert_same(
+            &expected,
+            &support::content_snapshot(std::path::Path::new(&store.path)),
+        );
+    }
 }
 
 fn admission_chunks(
