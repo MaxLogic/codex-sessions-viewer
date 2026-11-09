@@ -131,6 +131,51 @@ pub struct CheckpointOptions {
     pub max_message_content_chars: usize,
 }
 
+impl CheckpointOptions {
+    /// Versioned, architecture-independent identity of every parser input option.
+    pub fn digest(self) -> String {
+        let Self {
+            max_tool_output_preview_chars,
+            max_message_content_chars,
+        } = self;
+        sha256_hex(
+            format!(
+                "parse-options-v1\n{}\n{}\n",
+                max_tool_output_preview_chars, max_message_content_chars
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+impl From<crate::codex::parser::ParserOptions> for CheckpointOptions {
+    fn from(options: crate::codex::parser::ParserOptions) -> Self {
+        // Exhaustive destructuring makes adding a parser option require updating
+        // this identity, rather than silently omitting it from cache validity.
+        let crate::codex::parser::ParserOptions {
+            max_tool_output_preview_chars,
+            max_message_content_chars,
+        } = options;
+        Self {
+            max_tool_output_preview_chars,
+            max_message_content_chars,
+        }
+    }
+}
+
+impl From<crate::claude::parser::ClaudeOptions> for CheckpointOptions {
+    fn from(options: crate::claude::parser::ClaudeOptions) -> Self {
+        let crate::claude::parser::ClaudeOptions {
+            max_tool_output_preview_chars,
+            max_message_content_chars,
+        } = options;
+        Self {
+            max_tool_output_preview_chars,
+            max_message_content_chars,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FingerprintWindow {
@@ -321,6 +366,30 @@ impl LoadedCheckpoint {
         }
     }
 }
+/// Only the writer receipt survives the move of decoded state into a parser job.
+#[derive(Clone, Debug)]
+pub struct ResumeReceipt {
+    pub row_id: String,
+    pub expected_content_hash: String,
+    pub consumed_bytes: u64,
+    pub parse_options_hash: String,
+    pub closed: SessionTotals,
+    pub tool_names_prefix: String,
+    pub tool_prefix_count: i64,
+}
+impl From<&LoadedCheckpoint> for ResumeReceipt {
+    fn from(loaded: &LoadedCheckpoint) -> Self {
+        Self {
+            row_id: loaded.row_id.clone(),
+            expected_content_hash: loaded.expected_content_hash.clone(),
+            consumed_bytes: loaded.checkpoint.consumed,
+            parse_options_hash: loaded.checkpoint.options.digest(),
+            closed: loaded.checkpoint.closed.clone(),
+            tool_names_prefix: loaded.checkpoint.tool_names_prefix.clone(),
+            tool_prefix_count: loaded.checkpoint.tool_prefix_count,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaScope {
@@ -334,11 +403,38 @@ pub struct SessionDelta {
     pub snapshot: SessionSnapshot,
     pub row_id: String,
     pub expected_content_hash: String,
+    pub parse_options_hash: String,
     pub scope: DeltaScope,
     pub closed: SessionTotals,
     pub tool_names_prefix: String,
     pub tool_prefix_count: i64,
     pub checkpoint: Option<CheckpointRecord>,
+    /// False when only an unterminated tail was read. The stored receipt must
+    /// remain untouched; a changed row digest will naturally fence it out.
+    pub checkpoint_advanced: bool,
+}
+impl SessionDelta {
+    pub fn new(
+        snapshot: SessionSnapshot,
+        scope: DeltaScope,
+        checkpoint: Option<CheckpointRecord>,
+        loaded: &ResumeReceipt,
+    ) -> Self {
+        Self {
+            checkpoint_advanced: checkpoint
+                .as_ref()
+                .is_none_or(|next| next.consumed_bytes > loaded.consumed_bytes),
+            snapshot,
+            row_id: loaded.row_id.clone(),
+            expected_content_hash: loaded.expected_content_hash.clone(),
+            parse_options_hash: loaded.parse_options_hash.clone(),
+            scope,
+            closed: loaded.closed.clone(),
+            tool_names_prefix: loaded.tool_names_prefix.clone(),
+            tool_prefix_count: loaded.tool_prefix_count,
+            checkpoint,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

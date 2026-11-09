@@ -2253,10 +2253,24 @@ fn parse_emits_contract_records_that_apply_like_a_scan() {
     // Project names are resolved after the scan; statuses come from scan outcomes.
     let conn = open(&applied_db);
     assert_eq!(count(&conn, "select count(*) from messages"), 12);
-    support::assert_same(
-        &support::content_snapshot_without_projects(&scanned),
-        &support::content_snapshot_without_projects(&applied_db),
-    );
+    let mut scanned_content = support::content_snapshot_without_projects(&scanned);
+    let mut applied_content = support::content_snapshot_without_projects(&applied_db);
+    // CXV-215-P2-02: parser cache identity is local metadata, absent from the
+    // public contract. Applying contract rows cannot claim known parser options.
+    for (content, parsed_locally) in [(&mut scanned_content, true), (&mut applied_content, false)] {
+        for row in content["sessions"].as_array_mut().unwrap() {
+            let identity = row
+                .as_object_mut()
+                .unwrap()
+                .remove("parse_options_hash")
+                .unwrap();
+            assert_eq!(identity.is_string(), parsed_locally);
+            if !parsed_locally {
+                assert!(identity.is_null());
+            }
+        }
+    }
+    support::assert_same(&scanned_content, &applied_content);
 }
 
 #[test]

@@ -3597,14 +3597,195 @@ fn cli_scan_and_ingest_run_alongside_the_resident() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap()["files_parsed"],
-        1
-    );
+    // CXV-215-P2-01: a direct ingest of the revision just scanned succeeds
+    // without parsing it again; explicit --force remains available.
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["files_parsed"], 0);
+    assert_eq!(report["files_skipped"], 1);
     assert_eq!(
         serde_json::from_slice::<Value>(&fixture.cli("status").stdout).unwrap()["pid"],
         fixture.children[0].id()
     );
+}
+
+#[test]
+fn unchanged_viewer_ingest_skips_both_harnesses_without_error() {
+    let _fixture_load = ordinary_fixture_lane();
+    let mut fixture = Fixture::new();
+    let id = "01a0aaaa-0000-7000-8000-000000000187";
+    fixture.rollout(id);
+    let codex = fixture
+        .root
+        .join("codex/sessions")
+        .join(format!("rollout-{id}.jsonl"));
+    let claude = fixture.root.join("transcript.jsonl");
+    std::fs::write(
+        &claude,
+        "{\"type\":\"user\",\"sessionId\":\"viewer-skip\",\"message\":{\"content\":\"first\"}}\n",
+    )
+    .unwrap();
+    fixture.start("resident");
+    fixture.ready();
+    for (harness, path) in [("codex", codex), ("claude", claude)] {
+        for expected in [1, 0, 0] {
+            let mut wire = fixture.wire();
+            let mut request = fixture.viewer_request("skip", "ingest");
+            request["harness"] = harness.into();
+            request["path"] = serde_json::json!(path);
+            protocol::send(wire.get_mut(), &request).unwrap();
+            let reply = next_event(&mut wire);
+            assert_eq!(reply["event"], "finished", "{reply}");
+            assert_eq!(reply["files_parsed"], expected, "{harness}: {reply}");
+            assert_eq!(reply["files_skipped"], 1 - expected, "{harness}: {reply}");
+        }
+    }
+}
+
+#[test]
+fn options_change_viewer_ingest_both_harnesses() {
+    // CXV-215-P2-02: settings are reloaded for each resident request.
+    let _fixture_load = ordinary_fixture_lane();
+    let mut fixture = Fixture::new();
+    let settings = fixture.root.join("options.toml");
+    std::fs::write(
+        &settings,
+        "[tool_output]\nmax_tool_output_preview_chars = 50\n",
+    )
+    .unwrap();
+    let child = fixture
+        .command()
+        .args(["serve", "--db"])
+        .arg(&fixture.db)
+        .arg("--settings")
+        .arg(&settings)
+        .args(["--no-wsl-projects", "--lifetime", "resident"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(fixture.root.join("options.stderr")).unwrap())
+        .spawn()
+        .unwrap();
+    fixture.children.push(child);
+    fixture.ready();
+    for harness in ["codex", "claude"] {
+        let path = fixture.root.join(format!("options-{harness}.jsonl"));
+        let records = if harness == "codex" {
+            vec![
+                serde_json::json!({"type":"session_meta","payload":{"id":"options-probe"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"exec","arguments":"{}"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call","output":"abcdefghijklmnopqrstuvwxyz"}}),
+            ]
+        } else {
+            vec![
+                serde_json::json!({"type":"assistant","sessionId":"options-probe","message":{"id":"a","content":[{"type":"tool_use","id":"call","name":"exec","input":{}}]}}),
+                serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":"abcdefghijklmnopqrstuvwxyz"}]}}),
+            ]
+        };
+        let mut bytes = records
+            .iter()
+            .map(|r| r.to_string() + "\n")
+            .collect::<String>();
+        // Exercise a persisted production checkpoint as well as a small file.
+        for large in [false, true] {
+            if large {
+                bytes.push_str(&"\n".repeat(1024 * 1024));
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            for (limit, expected) in [(50, 1), (50, 0), (5, 1), (5, 0)] {
+                std::fs::write(
+                    &settings,
+                    format!("[tool_output]\nmax_tool_output_preview_chars = {limit}\n"),
+                )
+                .unwrap();
+                let mut wire = fixture.wire();
+                let mut request = fixture.viewer_request("options", "ingest");
+                request["context"]["settings"] = serde_json::json!(settings);
+                request["harness"] = harness.into();
+                request["path"] = serde_json::json!(path);
+                protocol::send(wire.get_mut(), &request).unwrap();
+                let reply = next_event(&mut wire);
+                assert_eq!(reply["event"], "finished", "{reply}");
+                assert_eq!(
+                    reply["files_parsed"], expected,
+                    "{harness} large={large} limit={limit}: {reply}"
+                );
+                if expected == 0 {
+                    assert_eq!(reply["sessions_written"], 0);
+                    assert_eq!(reply["statuses_written"], 0);
+                    assert_eq!(reply["write_hold"]["transactions"], 0);
+                }
+                let reference = codex_sessions_collector::store::Store::open(
+                    &fixture
+                        .root
+                        .join(format!("reference-{harness}-{large}-{limit}.sqlite")),
+                    codex_sessions_collector::store::OwnerMode::Standalone,
+                )
+                .unwrap();
+                // Fresh database is an independent full-parse reference.
+                if harness == "claude" {
+                    codex_sessions_collector::claude::collect_file(
+                        &reference,
+                        &path,
+                        codex_sessions_collector::codex::parser::SourceType::Windows,
+                        &codex_sessions_collector::path_mapping::PathMapper::new(""),
+                        &codex_sessions_collector::claude::parser::ClaudeOptions {
+                            max_tool_output_preview_chars: limit,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                } else {
+                    let mut options = codex_sessions_collector::codex::scanner::ScanOptions {
+                        roots: vec![],
+                        mapper: codex_sessions_collector::path_mapping::PathMapper::new(""),
+                        parser: Default::default(),
+                        parser_workers: 1,
+                        wsl_root_retry_delays: vec![],
+                        thread_names: Default::default(),
+                        force: false,
+                    };
+                    options.parser.max_tool_output_preview_chars = limit;
+                    let root = codex_sessions_collector::codex::scanner::ScanRoot {
+                        path: path.display().to_string(),
+                        availability_root_path: None,
+                        source_type: codex_sessions_collector::codex::parser::SourceType::Windows,
+                        source_state: "active",
+                    };
+                    codex_sessions_collector::codex::collect_file_with(
+                        &reference,
+                        &options,
+                        &root,
+                        |_| Default::default(),
+                    )
+                    .unwrap();
+                }
+                codex_sessions_collector::store::connection::ensure().unwrap();
+                let conn = rusqlite::Connection::open(&fixture.db).unwrap();
+                let id: String = conn
+                    .query_row(
+                        "select id from sessions where harness=? and source_file_path=?",
+                        rusqlite::params![harness, path.display().to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let snapshot = |conn: &rusqlite::Connection| {
+                    let mut snapshot = codex_sessions_collector::hub_snapshot::build(
+                        conn,
+                        &id,
+                        codex_sessions_collector::hub_snapshot::Children::Include,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    snapshot.machine_id = None;
+                    serde_json::to_value(snapshot).unwrap()
+                };
+                assert_eq!(
+                    snapshot(&conn),
+                    snapshot(&reference.conn),
+                    "resident options full reference"
+                );
+            }
+        }
+    }
 }
 
 #[test]

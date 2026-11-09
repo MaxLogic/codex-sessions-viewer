@@ -168,6 +168,33 @@ WSL projections use local fixture files and do not certify live
 UNC I/O. BOM behavior is compared with the existing full parser, including its
 errors; the tests do not change the accepted input format.
 
+The same target includes `support/incremental_store.rs`, exercising the real
+Codex/Claude ingest APIs, writer, checkpoint table and hub session references.
+The default database subset uses seed 1, all generated lineage variants,
+both extreme-token inputs, rich Codex, Claude main/subagent and malformed
+fixtures, as Windows and WSL sources. One bounded chain per input contains
+the first line end, its preceding byte, midpoint and EOF. Exhaustive mode
+uses every fixture and seeds 1..16, every boundary/mid-line chain plus ten
+seeded chains per input/source. Reference databases discard their checkpoint
+before each ingest, forcing full parsing through the same production writer.
+Each pair uses isolated file-backed WAL databases copied from immutable empty
+schema setup, avoiding repeated migrations inside the generated test loop.
+All stored columns are compared, replacing surrogate IDs with natural keys
+and excluding content hashes and database write timestamps. `activity_at_utc`
+is excluded only when it falls back to the write time because both source
+timestamps are absent. Checkpoints exclude only fingerprint windows and step
+counters. Hub snapshots are compared after storage, with the same CXV-214
+storage normalizations on both sides. SQL rejection of extreme values must
+match the full writer's existing constraints. Targeted cases cover scoped
+delayed tool updates, stale CAS before/after planning, invalidated receipts,
+bounded scan loading and exactly one full idle parse, including a partial
+Claude tail. No external hub or live WSL process is required.
+The CLI regression checks ordinary ingest resumes and explicit `--force` parses
+fully. The echo-replacement case checks resolved tool links and search entries
+survive a scoped message update. Empty checkpoint markers retain the final
+reparse obligation when a blob exceeds its cap; a zero-step marker also keeps
+a settled partial tail quiet if the final full parse cannot save another blob.
+
 ## Full slice/release/CI gate
 
 The full path is unchanged:

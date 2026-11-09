@@ -17,7 +17,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::codex::parser::{
-    ParseError, ParseErrorKind, ParseSuccess, ParserOptions, SourceType, parse_file,
+    CodexParse, ParseError, ParseErrorKind, ParseSuccess, ParserOptions, SourceType,
+    parse_file_with,
 };
 use crate::codex::session_index::ThreadNameEntry;
 use crate::contract::{CodexSource, ProjectHint, SessionSnapshot, SourceStatus, codex_snapshot};
@@ -26,6 +27,8 @@ use crate::path_mapping::{
     PathMapper, basename, canonical_scan_path, dirname, is_path_under_root, join,
     normalize_native_path,
 };
+use crate::resume::{CheckpointRecord, Resume, SessionDelta};
+use crate::store::checkpoints::CheckpointIndex;
 use crate::store::projects::resolve_windows_project;
 use crate::store::writer::CachedSource;
 
@@ -257,28 +260,44 @@ fn snapshot_keys(source: &CachedSource) -> Vec<String> {
 }
 
 /// `_parseDecision`.
-fn should_parse(path: &str, listed: Option<&std::fs::Metadata>, cached: &CachedIndex) -> bool {
+fn should_parse(
+    path: &str,
+    listed: Option<&std::fs::Metadata>,
+    cached: &CachedIndex,
+    allow_pending: bool,
+) -> bool {
     let Some(cached) = cached.lookup(path) else {
         return true;
     };
+    !source_unchanged(listed, cached, allow_pending)
+}
+
+pub(super) fn source_unchanged(
+    listed: Option<&std::fs::Metadata>,
+    cached: &CachedSource,
+    allow_pending: bool,
+) -> bool {
     let (Some(size), Some(modified), Some(version)) =
         (cached.file_size, cached.modified_utc, cached.parser_version)
     else {
-        return true;
+        return false;
     };
-    if cached.scan_status != "available" || version != crate::codex::parser::PARSER_VERSION {
-        return true;
+    if (cached.scan_status != "available"
+        && !(allow_pending && cached.scan_status == "changed_pending_parse"))
+        || version != crate::codex::parser::PARSER_VERSION
+    {
+        return false;
     }
     let Some(metadata) = listed else {
-        return true;
+        return false;
     };
     if metadata.len() as i64 != size {
-        return true;
+        return false;
     }
     let Ok(current) = crate::codex::parser::file_modified_utc(metadata) else {
-        return true;
+        return false;
     };
-    (current.micros() - modified.micros()).abs() > CACHE_MODIFIED_TOLERANCE_MICROS
+    (current.micros() - modified.micros()).abs() <= CACHE_MODIFIED_TOLERANCE_MICROS
 }
 
 struct Discovery {
@@ -626,8 +645,25 @@ fn directory_failed(
     discovery.statuses.push(entry);
 }
 
-type ParseJob = (usize, String);
-type ParseResult = (usize, Result<ParseSuccess, ParseError>);
+type ParseJob = (usize, String, Resume);
+type ParseResult = (
+    usize,
+    Result<CodexParse, ParseError>,
+    Option<crate::resume::ResumeReceipt>,
+);
+
+pub enum ScanItem {
+    Full(Box<SessionSnapshot>, Option<CheckpointRecord>),
+    Delta(Box<SessionDelta>),
+}
+impl ScanItem {
+    pub fn snapshot(&self) -> &SessionSnapshot {
+        match self {
+            Self::Full(snapshot, _) => snapshot,
+            Self::Delta(delta) => &delta.snapshot,
+        }
+    }
+}
 
 /// Scan the roots, handing every parsed session to `sink` as it completes.
 /// The sink's error stops the scan.
@@ -657,6 +693,32 @@ pub fn scan_controlled<E>(
     cached: &[CachedSource],
     known_failures: &[KnownFailure],
     mut sink: impl FnMut(SessionSnapshot) -> Result<(), E>,
+    cancel: &Arc<AtomicBool>,
+    progress: impl FnMut(&ScanCounts),
+) -> Result<ScanOutcome, E> {
+    scan_incremental(
+        options,
+        cached,
+        known_failures,
+        &CheckpointIndex::new(),
+        |_, _| Ok(Resume::Disabled),
+        |item| match item {
+            ScanItem::Full(snapshot, _) => sink(*snapshot),
+            ScanItem::Delta(_) => unreachable!("Disabled never resumes"),
+        },
+        cancel,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn scan_incremental<E>(
+    options: &ScanOptions,
+    cached: &[CachedSource],
+    known_failures: &[KnownFailure],
+    checkpoints: &CheckpointIndex,
+    mut prepare: impl FnMut(&str, bool) -> Result<Resume, E>,
+    mut sink: impl FnMut(ScanItem) -> Result<(), E>,
     cancel: &Arc<AtomicBool>,
     mut progress: impl FnMut(&ScanCounts),
 ) -> Result<ScanOutcome, E> {
@@ -689,13 +751,28 @@ pub fn scan_controlled<E>(
         .map(|failure| (canonical_scan_path(&failure.path), failure))
         .collect();
     let mut failures = Vec::new();
-    let mut to_parse: Vec<usize> = Vec::new();
+    let mut to_parse: Vec<(usize, bool)> = Vec::new();
+    let options_hash = crate::resume::CheckpointOptions::from(options.parser).digest();
     for (position, candidate) in discovery.candidates.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if options.force || should_parse(&candidate.path, candidate.metadata.as_ref(), &index) {
-            let unchanged_failure = (!options.force)
+        let checkpoint = checkpoints.get(&canonical_scan_path(&candidate.path));
+        let same_revision =
+            !should_parse(&candidate.path, candidate.metadata.as_ref(), &index, true);
+        // Preserve legacy scan behavior when there is no checkpoint: unchanged
+        // files ignore option changes until growth, force or a parser-version bump.
+        let options_changed = checkpoint
+            .is_some_and(|cp| cp.parse_options_hash.as_deref() != Some(options_hash.as_str()));
+        let settle = same_revision && checkpoint.is_some_and(|cp| cp.steps_since_full > 0);
+        let changed = should_parse(
+            &candidate.path,
+            candidate.metadata.as_ref(),
+            &index,
+            checkpoint.is_some_and(|cp| cp.steps_since_full == 0),
+        );
+        if options.force || changed || settle || options_changed {
+            let unchanged_failure = (!options.force && !options_changed)
                 .then(|| known.get(&canonical_scan_path(&candidate.path)))
                 .flatten()
                 .filter(|failure| {
@@ -717,12 +794,15 @@ pub fn scan_controlled<E>(
                 failures.push((*failure).clone());
                 continue;
             }
-            to_parse.push(position);
+            to_parse.push((position, options.force || settle || options_changed));
         } else {
             counts.files_skipped += 1;
+            let status_name = index
+                .lookup(&candidate.path)
+                .map_or("available", |c| c.scan_status.as_str());
             statuses.push(status(
                 &candidate.path,
-                "available",
+                status_name,
                 candidate.source_state,
                 candidate.source_type,
                 None,
@@ -731,6 +811,14 @@ pub fn scan_controlled<E>(
     }
 
     phases.mark("skip decisions");
+    let jobs: Vec<ParseJob> = to_parse
+        .iter()
+        .map(|(position, fresh)| {
+            let path = discovery.candidates[*position].path.clone();
+            let resume = prepare(&path, *fresh)?;
+            Ok((*position, path, resume))
+        })
+        .collect::<Result<_, E>>()?;
     let workers = options.parser_workers.max(1);
     let (job_sender, job_receiver) = sync_channel::<ParseJob>(workers * 2);
     let (result_sender, result_receiver) = sync_channel::<ParseResult>(workers * 2);
@@ -750,17 +838,13 @@ pub fn scan_controlled<E>(
         );
     }
     drop(result_sender);
-    let jobs: Vec<ParseJob> = to_parse
-        .iter()
-        .map(|position| (*position, discovery.candidates[*position].path.clone()))
-        .collect();
     let cancellation = Arc::clone(cancel);
     let feeder = std::thread::spawn(move || feed(jobs, job_sender, &cancellation));
 
     let mut parsed = Vec::new();
     let mut project_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut sink_error = None;
-    for (position, result) in result_receiver.iter() {
+    for (position, result, loaded) in result_receiver.iter() {
         if sink_error.is_some() {
             continue;
         }
@@ -792,14 +876,15 @@ pub fn scan_controlled<E>(
                 errors.push(entry.clone());
                 statuses.push(entry);
             }
-            Ok(success) => {
+            Ok(parsed_result) => {
+                let success = &parsed_result.success;
                 counts.files_parsed += 1;
                 let snapshot = build_snapshot(
                     options,
                     &candidate.path,
                     candidate.source_type,
                     candidate.source_state,
-                    &success,
+                    success,
                     &mut project_cache,
                 );
                 statuses.push(status(
@@ -815,7 +900,16 @@ pub fn scan_controlled<E>(
                     working_directory: success.session.working_directory_display.clone(),
                     source_type: candidate.source_type,
                 });
-                if let Err(error) = sink(snapshot) {
+                let item = match parsed_result.scope.zip(loaded.as_ref()) {
+                    Some((scope, loaded)) => ScanItem::Delta(Box::new(SessionDelta::new(
+                        snapshot,
+                        scope,
+                        parsed_result.checkpoint,
+                        loaded,
+                    ))),
+                    None => ScanItem::Full(Box::new(snapshot), parsed_result.checkpoint),
+                };
+                if let Err(error) = sink(item) {
                     sink_error = Some(error);
                 }
             }
@@ -946,11 +1040,19 @@ fn parser_worker(
             };
             receiver.recv()
         };
-        let Ok((position, path)) = job else {
+        let Ok((position, path, resume)) = job else {
             return;
         };
-        let result = parse_file(&path, options);
-        if results.send((position, result)).is_err() {
+        let loaded = match &resume {
+            Resume::From(cp) => Some(crate::resume::ResumeReceipt::from(cp)),
+            _ => None,
+        };
+        let mut phases = crate::timing::Phases::start();
+        let result = parse_file_with(&path, options, resume);
+        if let Ok(parsed) = &result {
+            phases.mark(&format!("parse {:?}", parsed.outcome));
+        }
+        if results.send((position, result, loaded)).is_err() {
             return;
         }
     }
@@ -1019,11 +1121,7 @@ fn project_hints(
     if let Some(directory) = session.working_directory_display.as_deref() {
         directories.push(directory);
     }
-    for event in &session.usage_events {
-        if let Some(directory) = event.working_directory.as_deref() {
-            directories.push(directory);
-        }
-    }
+    directories.extend(session.usage_working_directories.iter().map(String::as_str));
     let mut hints: Vec<ProjectHint> = Vec::new();
     for directory in directories {
         let path = trim(directory);

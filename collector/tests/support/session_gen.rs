@@ -92,7 +92,40 @@ pub fn inputs() -> Vec<Input> {
             extension: "jsonl".to_owned(),
         });
     }
+    let (prefix, suffix) = echo_with_resolved_tool();
+    inputs.push(Input {
+        name: "codex-seed-1-echo-resolved-tool".to_owned(),
+        claude: false,
+        bytes: [prefix, suffix].concat(),
+        extension: "jsonl".to_owned(),
+    });
     inputs
+}
+
+/// A later authoritative message replaces an event echo that already owns a
+/// resolved tool. Updating its text must preserve the historical tool link.
+pub fn echo_with_resolved_tool() -> (Vec<u8>, Vec<u8>) {
+    (
+        lines(
+            vec![
+                record("session_meta", json!({"id":"echo-link"})),
+                event(json!({"type":"agent_message","message":"echo  message"})),
+                response(
+                    json!({"type":"function_call","call_id":"call","name":"exec","arguments":"{}"}),
+                ),
+                response(json!({"type":"function_call_output","call_id":"call","output":"done"})),
+            ],
+            1,
+            false,
+        ),
+        lines(
+            vec![response(
+                json!({"type":"message","role":"assistant","content":"echo message"}),
+            )],
+            1,
+            false,
+        ),
+    )
 }
 fn extreme_values(claude: bool) -> Vec<u8> {
     let values = [

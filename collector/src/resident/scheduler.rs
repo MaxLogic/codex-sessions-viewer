@@ -445,7 +445,9 @@ fn ingest_item(
             let root = cli::root_for_file(settings, &path.to_string_lossy());
             let scan = cli::scan_options(options, settings, Vec::new());
             let report = crate::codex::collect_file(store, &scan, &root, options.wsl_projects)?;
-            if report.counts.files_parsed == 0 {
+            if report.counts.files_parsed == 0
+                && (report.counts.files_skipped == 0 || !report.errors.is_empty())
+            {
                 return Err(file_error("rollout not parsed"));
             }
         }
@@ -1110,8 +1112,7 @@ fn ingest_request(store: &Store, base: &cli::Options, request: &Request) {
         let report = match harness {
             "codex" => {
                 let root = cli::root_for_file(&settings, path);
-                let mut scan = cli::scan_options(&options, &settings, Vec::new());
-                scan.force = true;
+                let scan = cli::scan_options(&options, &settings, Vec::new());
                 crate::codex::collect_file(store, &scan, &root, options.wsl_projects)
             }
             "claude" => crate::claude::collect_file(
@@ -1124,7 +1125,9 @@ fn ingest_request(store: &Store, base: &cli::Options, request: &Request) {
             _ => return Err("invalid ingest harness".into()),
         }
         .map_err(|e| e.to_string())?;
-        if report.counts.files_parsed == 0 {
+        if report.counts.files_parsed == 0
+            && (report.counts.files_skipped == 0 || !report.errors.is_empty())
+        {
             return Err(format!("{path} was not ingested"));
         }
         let mut bytes = Vec::new();

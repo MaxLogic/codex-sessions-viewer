@@ -739,12 +739,13 @@ pub(crate) fn codex_ingest_on(
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| file.clone());
     let root = root_for_file(&settings, &absolute);
-    let mut scan = scan_options(options, &settings, Vec::new());
-    scan.force = true;
+    let scan = scan_options(options, &settings, Vec::new());
     let report = codex::collect_file(store, &scan, &root, options.wsl_projects)?;
     crate::t3::import_optional(&store.conn, &settings);
     print_report(out, "codex ingest", store, &report, options.json)?;
-    if report.counts.files_parsed == 0 {
+    if report.counts.files_parsed == 0
+        && (report.counts.files_skipped == 0 || !report.errors.is_empty())
+    {
         return Err(CliError::Failed(match report.errors.first() {
             Some(error) => format!(
                 "{} was not ingested ({}): {}",
@@ -1013,7 +1014,9 @@ pub(crate) fn claude_ingest_on(
     )?;
     crate::t3::import_optional(&store.conn, &settings);
     print_report(out, "claude ingest", store, &report, options.json)?;
-    if report.counts.files_parsed == 0 {
+    if report.counts.files_parsed == 0
+        && (report.counts.files_skipped == 0 || !report.errors.is_empty())
+    {
         return Err(CliError::Failed(format!("{file} was not ingested")));
     }
     Ok(())

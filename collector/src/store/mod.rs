@@ -1,6 +1,7 @@
 //! The single persistence path for collected records.
 
 pub mod cache_repair;
+pub mod checkpoints;
 pub mod connection;
 pub mod projects;
 pub mod schema;

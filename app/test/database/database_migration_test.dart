@@ -1232,12 +1232,29 @@ void main() {
     expect(_indexExists(db, 'idx_sessions_harness_source_path'), isTrue);
     expect(_indexExists(db, 'idx_sessions_harness_source_unc_path'), isTrue);
     expect(versionRows[31]['filename'], '032_hub_snapshot_fields.sql');
-    expect(versionRows.last['filename'], '033_hub_status_plan_memo.sql');
+    expect(versionRows[32]['filename'], '033_hub_status_plan_memo.sql');
     expect(
       db.select(
         "select name from sqlite_schema where type='trigger' and name like 'hub_status_plan_dirty_%'",
       ),
       hasLength(3),
+    );
+    expect(
+      versionRows.last['filename'],
+      '${latestSchemaVersion.toString().padLeft(3, '0')}_session_parse_checkpoints.sql',
+    );
+    expect(
+      db.select(
+        "select name from sqlite_master where name = 'session_parse_checkpoints'",
+      ),
+      hasLength(1),
+    );
+    expect(_indexExists(db, 'idx_tool_calls_session_tool_index'), isTrue);
+    expect(_indexExists(db, 'idx_session_parse_checkpoints_session'), isTrue);
+    expect(_columnExists(db, 'sessions', 'parse_options_hash'), isTrue);
+    expect(
+      _columnExists(db, 'session_parse_checkpoints', 'parse_options_hash'),
+      isTrue,
     );
     expect(_columnExists(db, 'messages', 'token_cache_write'), isTrue);
     expect(_columnExists(db, 'messages', 'token_reasoning'), isTrue);
@@ -4037,7 +4054,8 @@ List<String> _nativeMigrationObjects(Database db) => db
       select type || ':' || name as object from sqlite_schema
       where type in ('index', 'trigger', 'view') and sql is not null
       and name not in ('trg_sessions_t3_change',
-        'idx_sessions_harness_source_path', 'idx_sessions_harness_source_unc_path')
+        'idx_sessions_harness_source_path', 'idx_sessions_harness_source_unc_path',
+        'idx_session_parse_checkpoints_session', 'idx_tool_calls_session_tool_index')
       and name not like 'hub_status_plan_dirty_%'
       order by object
     ''')
@@ -4114,6 +4132,7 @@ Map<String, List<Map<String, Object?>>> _nativeMigrationRows(Database db) => {
               'cache_write_input_tokens',
               'reasoning_output_tokens',
               'project_hints_json',
+              'parse_options_hash',
             },
             'messages' => const {'token_cache_write', 'token_reasoning'},
             _ => const <String>{},

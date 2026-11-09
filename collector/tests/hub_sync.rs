@@ -4453,7 +4453,15 @@ fn before_snapshot_fields_upgrade(conn: &rusqlite::Connection) {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, migration.version - 1);
+    assert_eq!(
+        version,
+        codex_sessions_collector::store::schema::MIGRATIONS
+            .iter()
+            .filter(|entry| entry.version != migration.version)
+            .map(|entry| entry.version)
+            .max()
+            .unwrap()
+    );
     let columns: i64 = conn.query_row("select count(*) from pragma_table_info('sessions') where name in ('cache_write_input_tokens','reasoning_output_tokens','project_hints_json')", [], |r| r.get(0)).unwrap();
     assert_eq!(columns, 0);
 }

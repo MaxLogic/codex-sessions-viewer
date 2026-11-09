@@ -14,6 +14,8 @@ use codex_sessions_collector::resume::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+#[path = "support/incremental_store.rs"]
+mod incremental_store;
 #[path = "support/session_gen.rs"]
 mod session_gen;
 mod support;
@@ -31,6 +33,50 @@ fn extreme_source(claude: bool) -> Vec<u8> {
     bytes.extend_from_slice(&vec![b' '; 1024 * 1024]);
     bytes.push(b'\n');
     bytes
+}
+
+#[test]
+fn zero_complete_line_resume_preserves_checkpoint_and_step_counter() {
+    for claude in [false, true] {
+        let dir = support::TempDir::new("zero-step");
+        let file = dir.path().join("session.jsonl");
+        let path = file.to_str().unwrap();
+        let value = if claude {
+            json!({"type":"user","message":{"content":"first"}})
+        } else {
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":"first"}})
+        };
+        let prefix = format!("{value}\n");
+        std::fs::write(&file, &prefix).unwrap();
+        let saved = parse(
+            path,
+            claude,
+            SourceType::Windows,
+            Resume::Fresh(ResumePolicy::testing()),
+        )
+        .unwrap()
+        .checkpoint
+        .unwrap();
+        for tail in ["", &value.to_string()] {
+            std::fs::write(&file, format!("{prefix}{tail}")).unwrap();
+            let actual = parse(
+                path,
+                claude,
+                SourceType::Windows,
+                Resume::From(LoadedCheckpoint {
+                    policy: ResumePolicy::testing(),
+                    ..LoadedCheckpoint::new(saved.decode().unwrap(), "row", "hash")
+                }),
+            )
+            .unwrap();
+            assert_eq!(actual.outcome, ResumeOutcome::Resumed);
+            assert_eq!(
+                actual.checkpoint.unwrap(),
+                saved,
+                "zero complete-line progress preserves the exact saved observer state"
+            );
+        }
+    }
 }
 fn extreme_full_parse(claude: bool) {
     let dir = support::TempDir::new("extreme-default");

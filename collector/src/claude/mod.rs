@@ -20,7 +20,11 @@ use crate::store::projects::resolve_windows_project;
 use crate::store::writer::CachedSource;
 use crate::store::{ApplySummary, Store, StoreResult, writer};
 
-use parser::{CLAUDE_PARSER_VERSION, ClaudeOptions, ClaudeTranscript, HARNESS, parse_transcript};
+use crate::resume::{Resume, SessionDelta};
+use crate::store::checkpoints;
+use parser::{
+    CLAUDE_PARSER_VERSION, ClaudeOptions, ClaudeTranscript, HARNESS, parse_transcript_with,
+};
 
 pub const FLUSH_SESSIONS: usize = 32;
 const CACHE_MODIFIED_TOLERANCE_MICROS: i64 = 2_000_000;
@@ -111,7 +115,7 @@ fn status(
     }
 }
 
-fn is_unchanged(path: &str, cached: &HashMapCache) -> bool {
+fn is_unchanged_with(path: &str, cached: &HashMapCache, allow_pending: bool) -> bool {
     let Some(source) = cached.get(&canonical_scan_path(path)) else {
         return false;
     };
@@ -120,7 +124,10 @@ fn is_unchanged(path: &str, cached: &HashMapCache) -> bool {
     else {
         return false;
     };
-    if source.scan_status != "available" || version != CLAUDE_PARSER_VERSION {
+    if (source.scan_status != "available"
+        && !(allow_pending && source.scan_status == "changed_pending_parse"))
+        || version != CLAUDE_PARSER_VERSION
+    {
         return false;
     }
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -205,7 +212,18 @@ pub struct ClaudeScanOptions {
     pub resolve_wsl_projects: bool,
 }
 
-type Parsed = (String, SourceType, Result<ClaudeTranscript, ParseError>);
+type Parsed = (
+    String,
+    SourceType,
+    Result<parser::ClaudeParse, ParseError>,
+    Option<crate::resume::ResumeReceipt>,
+);
+type PreparedTranscript = (
+    String,
+    SourceType,
+    parser::ClaudeParse,
+    Option<crate::resume::ResumeReceipt>,
+);
 
 /// Scan Claude transcripts into `store`, reparsing only changed files.
 pub fn collect(store: &Store, options: &ClaudeScanOptions) -> StoreResult<CollectReport> {
@@ -235,6 +253,10 @@ pub fn collect_coordinated(
     let is_cancelled = || cancel.load(Ordering::Relaxed);
     let loaded = writer::cached_sources(&store.conn, HARNESS)?;
     let status_index = writer::StatusIndex::new(&loaded);
+    let checkpoint_index = checkpoints::index(&store.conn, HARNESS)?;
+    let options_hash = crate::resume::CheckpointOptions::from(options.parser).digest();
+    let policy = crate::resume::ResumePolicy::current();
+    let mut remaining = crate::resume::MAX_DECODED_BYTES;
     let cached: HashMapCache = loaded
         .into_iter()
         .flat_map(|source| {
@@ -249,7 +271,7 @@ pub fn collect_coordinated(
     let mut statuses = Vec::new();
     let mut errors = Vec::new();
     let mut found: HashSet<String> = HashSet::new();
-    let mut work: Vec<(String, SourceType)> = Vec::new();
+    let mut work: Vec<(String, SourceType, Resume)> = Vec::new();
     let mut scanned_roots = Vec::new();
     progress(&counts, 0);
     for root in &options.roots {
@@ -274,11 +296,32 @@ pub fn collect_coordinated(
             let path = file.to_string_lossy().into_owned();
             counts.files_found += 1;
             found.insert(canonical_scan_path(&path));
-            if !options.force && is_unchanged(&path, &cached) {
+            let checkpoint = checkpoint_index.get(&canonical_scan_path(&path));
+            let same_revision = is_unchanged_with(&path, &cached, true);
+            // No checkpoint preserves the pre-existing scan limitation: an
+            // option change alone does not reparse an unchanged legacy session.
+            let options_changed = checkpoint
+                .is_some_and(|cp| cp.parse_options_hash.as_deref() != Some(options_hash.as_str()));
+            let settle = same_revision && checkpoint.is_some_and(|c| c.steps_since_full > 0);
+            let unchanged = is_unchanged_with(
+                &path,
+                &cached,
+                checkpoint.is_some_and(|c| c.steps_since_full == 0),
+            );
+            if !options.force && unchanged && !settle && !options_changed {
                 counts.files_skipped += 1;
-                statuses.push(status(&path, "available", root.source_type, None));
+                let status_name = cached
+                    .get(&canonical_scan_path(&path))
+                    .map_or("available", |c| c.scan_status.as_str());
+                statuses.push(status(&path, status_name, root.source_type, None));
             } else {
-                work.push((path, root.source_type));
+                let resume = if options.force || settle || options_changed {
+                    Resume::Fresh(policy)
+                } else {
+                    checkpoints::load_bounded(&store.conn, HARNESS, &path, policy, &mut remaining)?
+                        .map_or(Resume::Fresh(policy), Resume::From)
+                };
+                work.push((path, root.source_type, resume));
             }
         }
         progress(&counts, 0);
@@ -301,24 +344,32 @@ pub fn collect_coordinated(
                         return;
                     }
                     let next = queue.lock().ok().and_then(|mut items| items.next());
-                    let Some((path, source_type)) = next else {
+                    let Some((path, source_type, resume)) = next else {
                         return;
                     };
-                    let result = parse_transcript(&path, &parser_options);
-                    if sender.send((path, source_type, result)).is_err() {
+                    let loaded = match &resume {
+                        Resume::From(cp) => Some(crate::resume::ResumeReceipt::from(cp)),
+                        _ => None,
+                    };
+                    let mut phases = crate::timing::Phases::start();
+                    let result = parse_transcript_with(&path, &parser_options, resume);
+                    if let Ok(parsed) = &result {
+                        phases.mark(&format!("parse {:?}", parsed.outcome));
+                    }
+                    if sender.send((path, source_type, result, loaded)).is_err() {
                         return;
                     }
                 }
             });
         }
         drop(sender);
-        let mut pending: Vec<SessionSnapshot> = Vec::new();
-        let mut flush = |pending: Vec<SessionSnapshot>,
+        let mut pending: Vec<PreparedTranscript> = Vec::new();
+        let mut flush = |pending: Vec<PreparedTranscript>,
                          applied: &mut ApplySummary,
                          flushes: &mut u64|
          -> StoreResult<()> {
             match gated(&mut gate, || {
-                writer::apply_session_batch(&store.conn, pending)
+                apply_parsed_batch(store, &options.mapper, &parser_options, pending)
             })? {
                 Some(count) => {
                     applied.sessions += count;
@@ -328,16 +379,20 @@ pub fn collect_coordinated(
             }
             Ok(())
         };
-        for (path, source_type, result) in receiver.iter() {
+        for (path, source_type, result, loaded) in receiver.iter() {
             if apply_error.is_some() {
                 continue;
             }
             match result {
-                Ok(transcript) => {
+                Ok(parsed) => {
                     counts.files_parsed += 1;
-                    let snapshot = snapshot(&path, source_type, &options.mapper, transcript);
-                    statuses.push(status(&path, &snapshot.source.status, source_type, None));
-                    pending.push(snapshot);
+                    let status_name = if parsed.success.needs_reread {
+                        "changed_pending_parse"
+                    } else {
+                        "available"
+                    };
+                    statuses.push(status(&path, status_name, source_type, None));
+                    pending.push((path, source_type, parsed, loaded));
                     if pending.len() >= flush_sessions.max(1)
                         && let Err(error) =
                             flush(std::mem::take(&mut pending), &mut applied, &mut flushes)
@@ -441,27 +496,26 @@ pub fn collect_coordinated(
     })
 }
 
-/// Whether the stored row of the subagent transcript `path` of session
-/// `parent` was collected from the file as it is now. The row ID follows the
-/// parser's `<parent>:agent-<id>` naming; any mismatch reads the file.
-fn subagent_unchanged(store: &Store, parent: &str, path: &str) -> StoreResult<bool> {
-    let Some(agent) = Path::new(path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.strip_prefix("agent-"))
-    else {
+/// Direct hooks skip unchanged revisions; the idle scan owns the one-time
+/// full convergence parse, including partial tails and missing state blobs.
+fn ingest_unchanged(store: &Store, path: &str, options: &ClaudeOptions) -> StoreResult<bool> {
+    let Some(source) = writer::cached_source_by_path(&store.conn, HARNESS, path)? else {
         return Ok(false);
     };
-    let session_id = format!("{parent}:agent-{agent}");
-    let id = writer::session_row_id(HARNESS, Some(&session_id), path);
-    let Some(source) = writer::cached_source_by_id(&store.conn, &id)? else {
+    if source.parse_options_hash.as_deref()
+        != Some(
+            crate::resume::CheckpointOptions::from(*options)
+                .digest()
+                .as_str(),
+        )
+    {
         return Ok(false);
-    };
+    }
     let mut cache = HashMapCache::new();
     for key in std::iter::once(&source.source_path).chain(source.unc_path.as_ref()) {
         cache.insert(canonical_scan_path(key), source.clone());
     }
-    Ok(is_unchanged(path, &cache))
+    Ok(is_unchanged_with(path, &cache, true))
 }
 
 /// Ingest one transcript and, for a main transcript, its subagents.
@@ -479,29 +533,33 @@ pub fn collect_file(
     let mut counts = ScanCounts::default();
     let mut statuses = Vec::new();
     let mut errors = Vec::new();
-    let mut snapshots = Vec::new();
-    let mut parent: Option<String> = None;
-    for (index, file) in files.into_iter().enumerate() {
+    let mut parsed_files = Vec::new();
+    let mut phases = crate::timing::Phases::start();
+    for file in files {
         let file = file.to_string_lossy().into_owned();
         counts.files_found += 1;
-        // A Stop hook names the main transcript; its subagents mostly finished
-        // earlier. One whose stored row matches its size and time is skipped.
-        if index > 0
-            && let Some(parent) = &parent
-            && subagent_unchanged(store, parent, &file)?
-        {
+        if ingest_unchanged(store, &file, options)? {
             counts.files_skipped += 1;
             continue;
         }
-        match parse_transcript(&file, options) {
-            Ok(transcript) => {
-                if index == 0 {
-                    parent = transcript.session.session_id.clone();
-                }
+        let resume = checkpoints::resume(&store.conn, HARNESS, &file, false)?;
+        phases.mark("load checkpoint");
+        let loaded = match &resume {
+            Resume::From(cp) => Some(crate::resume::ResumeReceipt::from(cp)),
+            _ => None,
+        };
+        match parse_transcript_with(&file, options, resume) {
+            Ok(parsed) => {
+                phases.mark(&format!("parse {:?}", parsed.outcome));
+                let transcript = &parsed.success;
                 counts.files_parsed += 1;
-                let snapshot = snapshot(&file, source_type, mapper, transcript);
-                statuses.push(status(&file, &snapshot.source.status, source_type, None));
-                snapshots.push(snapshot);
+                let status_name = if transcript.needs_reread {
+                    "changed_pending_parse"
+                } else {
+                    "available"
+                };
+                statuses.push(status(&file, status_name, source_type, None));
+                parsed_files.push((file, source_type, parsed, loaded));
             }
             Err(error) => {
                 counts.files_failed += 1;
@@ -516,11 +574,14 @@ pub fn collect_file(
             }
         }
     }
-    let mut applied = ApplySummary::default();
-    if !snapshots.is_empty() {
-        applied.sessions = writer::apply_session_batch(&store.conn, snapshots)?;
-    }
+    let mut applied = ApplySummary {
+        sessions: apply_parsed_batch(store, mapper, options, parsed_files)?,
+        ..ApplySummary::default()
+    };
+    phases.mark("write session");
+    phases.mark("project hints");
     writer::apply_source_statuses(&store.conn, &statuses)?;
+    phases.mark("statuses");
     applied.statuses = statuses.len();
     Ok(CollectReport {
         write_hold: holds.report(),
@@ -529,4 +590,65 @@ pub fn collect_file(
         errors,
         cache_repair: None,
     })
+}
+
+/// Receipts and child rows share one transaction; stale deltas restart from byte 0.
+fn apply_parsed_batch(
+    store: &Store,
+    mapper: &PathMapper,
+    options: &ClaudeOptions,
+    items: Vec<PreparedTranscript>,
+) -> StoreResult<usize> {
+    let mut snapshots = Vec::new();
+    let mut records = std::collections::HashMap::new();
+    let mut deltas = Vec::new();
+    for (path, source_type, parsed, loaded) in items {
+        let snapshot = snapshot(&path, source_type, mapper, parsed.success);
+        if let Some((scope, loaded)) = parsed.scope.zip(loaded.as_ref()) {
+            deltas.push(SessionDelta::new(
+                snapshot,
+                scope,
+                parsed.checkpoint,
+                loaded,
+            ));
+        } else {
+            if let Some(record) = parsed.checkpoint {
+                records.insert(path, record);
+            }
+            snapshots.push(snapshot);
+        }
+    }
+    let sources: Vec<_> = deltas
+        .iter()
+        .map(|delta| delta.snapshot.source.clone())
+        .collect();
+    let outcomes = writer::apply_session_deltas(&store.conn, deltas)?;
+    let mut count = 0;
+    for (source, outcome) in sources.into_iter().zip(outcomes) {
+        if outcome == writer::DeltaOutcome::Applied {
+            count += 1;
+            continue;
+        }
+        let path = source.path;
+        let source_type = SourceType::from_wire(&source.environment).unwrap_or(SourceType::Windows);
+        let parsed = parse_transcript_with(
+            &path,
+            options,
+            Resume::Fresh(crate::resume::ResumePolicy::current()),
+        )
+        .map_err(|e| crate::store::StoreError::Refused(e.display_message()))?;
+        if let Some(record) = parsed.checkpoint {
+            records.insert(path.clone(), record);
+        }
+        snapshots.push(snapshot(&path, source_type, mapper, parsed.success));
+    }
+    if !snapshots.is_empty() {
+        count += writer::apply_session_batch_with_checkpoints(
+            &store.conn,
+            snapshots,
+            records,
+            Some((*options).into()),
+        )?;
+    }
+    Ok(count)
 }

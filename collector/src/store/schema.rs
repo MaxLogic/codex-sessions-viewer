@@ -14,7 +14,7 @@ use crate::claude::parser::CLAUDE_PARSER_VERSION;
 use crate::codex::parser::PARSER_VERSION;
 use crate::dart::{DartDateTime, sha256_hex};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 33;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 34;
 
 pub struct Migration {
     pub version: i64,
@@ -98,6 +98,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(31, "migration", "031_source_status_membership.sql"),
     migration!(32, "migration", "032_hub_snapshot_fields.sql"),
     migration!(33, "migration", "033_hub_status_plan_memo.sql"),
+    migration!(34, "migration", "034_session_parse_checkpoints.sql"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -965,7 +966,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
         // Compare the pre-lineage data projection across the schema upgrade;
         // new nullable provenance columns and their trigger are proven separately.
         let columns: Vec<String> = conn
-            .prepare("select name from pragma_table_info('sessions') where name not like 't3_%' and name not in ('cache_write_input_tokens','reasoning_output_tokens','project_hints_json')")
+            .prepare("select name from pragma_table_info('sessions') where name not like 't3_%' and name not in ('cache_write_input_tokens','reasoning_output_tokens','project_hints_json','parse_options_hash')")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -983,7 +984,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
         for (table, added) in [
             (
                 "sessions",
-                "'cache_write_input_tokens','reasoning_output_tokens','project_hints_json'",
+                "'cache_write_input_tokens','reasoning_output_tokens','project_hints_json','parse_options_hash'",
             ),
             ("messages", "'token_cache_write','token_reasoning'"),
         ] {
@@ -1020,7 +1021,7 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
             "select * from collector_upload_outbox",
             "select * from collector_hub_state",
             "select * from session_change_state",
-            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') and name not in ('trg_sessions_t3_change','idx_sessions_harness_source_path','idx_sessions_harness_source_unc_path','sqlite_autoindex_collector_hub_record_state_1') and name not like 'hub_status_plan_dirty_%' order by type,name",
+            "select type,name,tbl_name from sqlite_schema where type in ('index','trigger','view') and name not in ('trg_sessions_t3_change','idx_sessions_harness_source_path','idx_sessions_harness_source_unc_path','sqlite_autoindex_collector_hub_record_state_1','idx_session_parse_checkpoints_session','sqlite_autoindex_session_parse_checkpoints_1','idx_tool_calls_session_tool_index') and name not like 'hub_status_plan_dirty_%' order by type,name",
         ] {
             let mut statement = conn.prepare(query).unwrap();
             let columns = statement.column_count();
@@ -1042,6 +1043,20 @@ insert into usage_session_daily(session_id,day_utc,model_key,path_context_id,bra
         let before = native_fixture_snapshot(&conn);
         prepare_standalone(&mut conn, ":memory:").unwrap();
         assert_eq!(native_fixture_snapshot(&conn), before);
+        for name in [
+            "session_parse_checkpoints",
+            "idx_session_parse_checkpoints_session",
+            "idx_tool_calls_session_tool_index",
+        ] {
+            assert!(
+                conn.query_row(
+                    "select exists(select 1 from sqlite_schema where name=?)",
+                    [name],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+            );
+        }
         assert_eq!(
             last_applied_version(&conn).unwrap(),
             SUPPORTED_SCHEMA_VERSION

@@ -13,7 +13,8 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use sha2::{Digest, Sha256};
 
-use crate::codex::parser::{AuthorType, SourceType, Usage, is_compressed_jsonl};
+use super::checkpoints;
+use crate::codex::parser::{SourceType, Usage, is_compressed_jsonl};
 use crate::contract::{
     MessageRecord, ProjectHint, ProjectHints, Record, SessionRef, SessionSnapshot, SourceStatus,
     ThreadName, ToolCallRecord, UsageRecord, parse_time,
@@ -24,6 +25,7 @@ use crate::path_mapping::{
     HOST_PATHS_ARE_CASE_SENSITIVE, canonical_scan_path, normalize_identity_path,
     normalize_windows_path,
 };
+use crate::resume::{CheckpointRecord, DeltaScope, SessionDelta, SessionTotals};
 
 use super::projects::{
     ProjectMask, ProjectResolver, active_masks, lookup_project_id, lookup_usage_path_context,
@@ -175,6 +177,333 @@ pub fn apply_session_batch(
 }
 
 const SMALL_SESSION_ITEMS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaOutcome {
+    Applied,
+    Stale,
+}
+
+/// Compare-and-swap before planning and again under BEGIN IMMEDIATE. No stale
+/// delta may mutate contexts, child rows, checkpoint receipts or hub references.
+fn delta_current(conn: &Connection, delta: &SessionDelta) -> StoreResult<bool> {
+    let snapshot = &delta.snapshot;
+    if session_row_id(
+        &snapshot.harness,
+        snapshot.session.session_id.as_deref(),
+        &snapshot.source.path,
+    ) != delta.row_id
+    {
+        return Ok(false);
+    }
+    let current = conn.prepare_cached(&format!("select exists(select 1 from sessions s join session_parse_checkpoints c on c.session_row_id=s.id where s.id=? and s.harness=? and s.content_hash=? and s.parser_version=? and s.source_file_path=? and s.source_type=? and not ({LEGACY_PREDICATE}) and c.harness=? and c.source_key=? and c.source_file_path=? and c.content_hash=? and s.parse_options_hash=? and c.parse_options_hash=s.parse_options_hash)"))?
+        .query_row(params![delta.row_id, snapshot.harness, delta.expected_content_hash, snapshot.session.parser_version, snapshot.source.path, snapshot.source.environment, snapshot.harness, canonical_scan_path(&snapshot.source.path), snapshot.source.path, delta.expected_content_hash, delta.parse_options_hash], |r| r.get::<_, bool>(0))?;
+    // Repeated stored tool indexes cannot be synchronized by key. This check
+    // precedes every mutation, including context resolution, in both CAS checks.
+    let scope = KeyScope::From {
+        from: delta.scope.tool_from,
+        also: &delta.scope.tool_open,
+    };
+    let selected = scope.select("tool_calls", "session_id", "tool_index", "1");
+    let repeated: bool = conn.prepare_cached(&format!("select exists(select tool_index from ({selected}) group by tool_index having count(*) > 1)"))?
+        .query_row(params_from_iter(scope.parameters(&delta.row_id)), |r|r.get(0))?;
+    Ok(current
+        && !repeated
+        && is_current_parser(&snapshot.harness, snapshot.session.parser_version))
+}
+
+/// External commits and same-connection writes both invalidate read-only plans.
+/// Read this again after BEGIN IMMEDIATE: the lock then fences all other writers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DeltaRevision {
+    external: i64,
+    own: u64,
+}
+impl DeltaRevision {
+    fn read(conn: &Connection) -> StoreResult<Self> {
+        Ok(Self {
+            external: conn.query_row("pragma data_version", [], |r| r.get(0))?,
+            own: conn.total_changes(),
+        })
+    }
+}
+
+struct PlannedDelta {
+    delta: SessionDelta,
+    valid: bool,
+    bytes: u64,
+    checkpoint: Option<checkpoints::PreparedCheckpoint>,
+}
+
+pub fn apply_session_deltas(
+    conn: &Connection,
+    deltas: Vec<SessionDelta>,
+) -> StoreResult<Vec<DeltaOutcome>> {
+    let _phase = super::write_budget::write_phase("sessions");
+    let _lease = super::write_lease::WriteLease::acquire(conn)?;
+    let own_machine: Option<String> = conn
+        .query_row(
+            "select value from app_metadata where key='machine_id'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(foreign) = deltas
+        .iter()
+        .filter_map(|d| d.snapshot.machine_id.as_ref())
+        .find(|m| Some(*m) != own_machine.as_ref())
+    {
+        return Err(StoreError::Refused(format!(
+            "The records come from another machine ({foreign}); this database only stores its own machine's sessions."
+        )));
+    }
+    let mut outcomes = Vec::with_capacity(deltas.len());
+    let mut units = deltas
+        .into_iter()
+        .map(|delta| {
+            let bytes = serde_json::to_vec(&delta.snapshot)
+                .map_err(|e| StoreError::Io(std::io::Error::other(e)))?
+                .len()
+                .saturating_add(delta.checkpoint.as_ref().map_or(0, |c| c.state.len()))
+                as u64;
+            let checkpoint = if delta.checkpoint_advanced {
+                crate::timing::timed("write: prepare delta checkpoint", || {
+                    delta
+                        .checkpoint
+                        .as_ref()
+                        .and_then(checkpoints::PreparedCheckpoint::new)
+                })
+            } else {
+                None
+            };
+            Ok(PlannedDelta {
+                delta,
+                valid: false,
+                bytes,
+                checkpoint,
+            })
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    let mut revision = DeltaRevision::read(conn)?;
+    let planned_revision = revision;
+    super::write_budget::write_planned_admitted(
+        conn,
+        "sessions",
+        || {
+            let lookup = IdentityLookup::for_batch(conn)?;
+            for unit in &mut units {
+                let delta = &unit.delta;
+                unit.valid = delta_current(conn, delta)?
+                    && capture_identity_merge(conn, &delta.row_id, &delta.snapshot, lookup)?
+                        .is_none();
+            }
+            // A concurrent commit during planning cannot yield a mixed plan.
+            if planned_revision != DeltaRevision::read(conn)? {
+                for unit in &mut units {
+                    unit.valid = false;
+                }
+            }
+            PLAN_HOOK.with_borrow_mut(|hook| {
+                if let Some(hook) = hook {
+                    hook(conn);
+                }
+            });
+            Ok(std::mem::take(&mut units))
+        },
+        |unit| super::write_budget::UnitCost::Small { bytes: unit.bytes },
+        |PlannedDelta {
+             delta,
+             valid: planned,
+             bytes,
+             checkpoint,
+         }| {
+            let started = std::time::Instant::now();
+            let delta = &delta;
+            if !planned
+                || revision != DeltaRevision::read(conn)?
+                || !delta_current(conn, delta)?
+                || !delta_keys_unique(delta)
+            {
+                outcomes.push(DeltaOutcome::Stale);
+                return Ok(());
+            }
+            let now = DartDateTime::now().to_iso8601();
+            let snapshot = &delta.snapshot;
+            check_parser_version(conn, &snapshot.harness)?;
+            let resolver = snapshot_resolver(snapshot);
+            let rows =
+                SessionContent::build(conn, snapshot, &now, &resolver, source_type(snapshot))?;
+            let rest_digest = rows.digest.clone();
+            let before = conn.total_changes();
+            let message_shape = SessionRows {
+                table: "messages",
+                session_column: "session_id",
+                key: "message_index",
+                columns: &MESSAGE_COLUMNS,
+                indexed: Some(CONTENT_PLAIN),
+                inserted_stamps: &["created_at_db_utc", "updated_at_db_utc"],
+                updated_stamps: &["updated_at_db_utc"],
+            };
+            sync_session_rows_in(
+                conn,
+                &message_shape,
+                &delta.row_id,
+                &now,
+                &rows.messages,
+                KeyScope::From {
+                    from: delta.scope.message_from,
+                    also: &[],
+                },
+            )?;
+            replace_tool_calls_in(conn, &delta.row_id, snapshot, rows.tool_calls, &delta.scope)?;
+            let partitions = sync_usage_events_in(
+                conn,
+                &delta.row_id,
+                &now,
+                &rows.usage_events,
+                &rows.usage_inputs,
+                KeyScope::From {
+                    from: delta.scope.usage_from_ordinal,
+                    also: &[],
+                },
+            )?;
+            let digest = if before == conn.total_changes() {
+                delta.expected_content_hash.clone()
+            } else {
+                incremental_digest(&delta.expected_content_hash, &rest_digest, &delta.scope)
+            };
+            let mut totals = delta.closed.clone();
+            for message in &snapshot.messages {
+                totals.add_message(message);
+            }
+            for tool in &snapshot.tool_calls {
+                totals.add_tool(tool);
+            }
+            let mut names = delta.tool_names_prefix.clone();
+            for (index, tool) in snapshot
+                .tool_calls
+                .iter()
+                .filter(|t| t.tool_index >= delta.tool_prefix_count)
+                .enumerate()
+            {
+                if index > 0 || delta.tool_prefix_count != 0 {
+                    names.push(' ');
+                }
+                names.push_str(&tool.tool_name);
+            }
+            write_session_fields(
+                conn,
+                &delta.row_id,
+                snapshot,
+                &totals,
+                names,
+                &digest,
+                Some(&delta.parse_options_hash),
+                &now,
+                &resolver,
+            )?;
+            finish_session_write(
+                conn,
+                &delta.row_id,
+                snapshot,
+                &now,
+                &active_masks(conn)?,
+                None,
+                partitions,
+            )?;
+            if delta.checkpoint_advanced {
+                checkpoints::replace_prepared_for_session(
+                    conn,
+                    &delta.row_id,
+                    checkpoint.as_ref(),
+                    &digest,
+                )?;
+                if delta.checkpoint.is_none() {
+                    checkpoints::mark_full_parse_due(conn, &delta.row_id, snapshot)?;
+                }
+            }
+            if hub_client::queue_enabled(conn)? {
+                hub_client::enqueue_session(
+                    conn,
+                    &delta.row_id,
+                    &snapshot.harness,
+                    &snapshot.source.path,
+                    &now,
+                    false,
+                )?;
+            }
+            super::write_budget::record_session_unit(started.elapsed());
+            super::write_budget::record_session_shape(Some(session_shape(snapshot)));
+            super::write_budget::record_prepared_unit(0.0, bytes);
+            // Account for this admitted unit's writes without accepting any
+            // interleaved external commit between transaction chunks.
+            revision.own = conn.total_changes();
+            outcomes.push(DeltaOutcome::Applied);
+            Ok(())
+        },
+    )?;
+    Ok(outcomes)
+}
+
+fn delta_keys_unique(delta: &SessionDelta) -> bool {
+    fn unique(keys: impl Iterator<Item = i64>) -> bool {
+        let mut seen = HashSet::new();
+        keys.into_iter().all(|key| seen.insert(key))
+    }
+    unique(delta.snapshot.messages.iter().map(|m| m.index))
+        && unique(delta.snapshot.tool_calls.iter().map(|t| t.tool_index))
+        && unique(
+            delta
+                .snapshot
+                .usage_events
+                .iter()
+                .map(|u| u.source_record_ordinal),
+        )
+}
+
+fn incremental_digest(old: &str, rest: &str, scope: &DeltaScope) -> String {
+    crate::dart::sha256_hex(
+        format!(
+            "cxv-incremental-v1\n{old}\n{rest}\n{}",
+            serde_json::to_string(scope).expect("scope integers")
+        )
+        .as_bytes(),
+    )
+}
+
+fn replace_tool_calls_in(
+    conn: &Connection,
+    id: &str,
+    snapshot: &SessionSnapshot,
+    mut rows: Vec<SessionRow>,
+    scope: &DeltaScope,
+) -> StoreResult<()> {
+    for (tool, (_, values)) in snapshot.tool_calls.iter().zip(&mut rows) {
+        let message: Option<i64> = conn.prepare_cached("select id from messages where session_id=? and message_index < ? order by message_index desc limit 1")?.query_row(params![id, tool.message_index], |r| r.get(0)).optional()?;
+        values[0] = message.map_or(Value::Null, Value::Integer);
+    }
+    let shape = SessionRows {
+        table: "tool_calls",
+        session_column: "session_id",
+        key: "tool_index",
+        columns: &TOOL_CALL_COLUMNS,
+        indexed: Some(OUTPUT_PREVIEW),
+        inserted_stamps: &[],
+        updated_stamps: &[],
+    };
+    sync_session_rows_in(
+        conn,
+        &shape,
+        id,
+        "",
+        &rows,
+        KeyScope::From {
+            from: scope.tool_from,
+            also: &scope.tool_open,
+        },
+    )?;
+    Ok(())
+}
 const SMALL_SESSION_CONTENT_BYTES: usize = 256 * 1024;
 
 const PREPARE_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -222,6 +551,8 @@ impl Drop for SessionPreparationScope {
 struct PreparedSession {
     id: String,
     snapshot: SessionSnapshot,
+    resume: Option<CheckpointRecord>,
+    parse_options_hash: Option<String>,
     shape: super::write_budget::SessionWriteShape,
     content: Option<PreparedContent>,
     candidates: Vec<String>,
@@ -319,6 +650,8 @@ fn prepare_sessions(snapshots: Vec<SessionSnapshot>) -> StoreResult<Vec<Prepared
         units.push(PreparedSession {
             id,
             snapshot,
+            resume: None,
+            parse_options_hash: None,
             shape,
             content,
             candidates: Vec::new(),
@@ -335,6 +668,15 @@ pub(crate) fn apply_session_batch_versioned(
     snapshots: Vec<SessionSnapshot>,
     _version: Option<u32>,
 ) -> StoreResult<usize> {
+    apply_session_batch_with_checkpoints(conn, snapshots, HashMap::new(), None)
+}
+
+pub fn apply_session_batch_with_checkpoints(
+    conn: &Connection,
+    snapshots: Vec<SessionSnapshot>,
+    mut records: HashMap<String, CheckpointRecord>,
+    parse_options: Option<crate::resume::CheckpointOptions>,
+) -> StoreResult<usize> {
     let _phase = super::write_budget::write_phase("sessions");
     // Every original snapshot is validated: canonicalization in preparation
     // drops superseded snapshots, which may come from another machine.
@@ -345,6 +687,11 @@ pub(crate) fn apply_session_batch_versioned(
     let preparation_started = crate::timing::enabled().then(std::time::Instant::now);
     let mut units =
         crate::timing::timed("write: prepare snapshots", || prepare_sessions(snapshots))?;
+    let parse_options_hash = parse_options.map(crate::resume::CheckpointOptions::digest);
+    for unit in &mut units {
+        unit.parse_options_hash = parse_options_hash.clone();
+        unit.resume = records.remove(&unit.snapshot.source.path);
+    }
     if let Some(started) = preparation_started {
         eprintln!(
             "write_prepare phase=sessions units={} elapsed_ms={:.6}",
@@ -451,6 +798,9 @@ pub(crate) fn apply_session_batch_versioned(
                     } else {
                         unit.shape.content_bytes as u64
                     };
+                    unit.write_bytes = unit
+                        .write_bytes
+                        .saturating_add(unit.resume.as_ref().map_or(0, |cp| cp.state.len() as u64));
                     unit.predicted_ms = if unchanged {
                         PREDICT_UNIT_MS
                             + PREDICT_ITEM_US * (unit.shape.messages + unit.shape.tool_calls) as f64
@@ -489,6 +839,8 @@ pub(crate) fn apply_session_batch_versioned(
                 snapshot,
                 shape,
                 content,
+                resume,
+                parse_options_hash,
                 candidates,
                 predicted_ms,
                 write_bytes,
@@ -496,7 +848,7 @@ pub(crate) fn apply_session_batch_versioned(
             } = unit;
             check_parser_version(conn, &snapshot.harness)?;
             let resolver = snapshot_resolver(&snapshot);
-            crate::timing::timed("write: session total", || {
+            let replaced = crate::timing::timed("write: session total", || {
                 upsert_session(
                     conn,
                     &id,
@@ -506,10 +858,35 @@ pub(crate) fn apply_session_batch_versioned(
                     SessionApplyContext {
                         lookup: IdentityLookup::Planned(&candidates),
                         prepared: content,
+                        parse_options_hash: parse_options_hash.as_deref(),
                         masks: &transaction_masks.as_ref().expect("transaction masks").1,
                     },
                 )
             })?;
+            if let Some(digest) = replaced {
+                let legacy: bool = conn.query_row(
+                    &format!("select ({LEGACY_PREDICATE}) from sessions where id = ?"),
+                    [&id],
+                    |r| r.get(0),
+                )?;
+                let settled_without_blob = !legacy
+                    && resume.is_none()
+                    && snapshot.source.status == "changed_pending_parse"
+                    && conn.query_row(
+                        "select exists(select 1 from session_parse_checkpoints where session_row_id=?)",
+                        [&id],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                checkpoints::replace_for_session(
+                    conn,
+                    &id,
+                    resume.as_ref().filter(|_| !legacy),
+                    &digest,
+                )?;
+                if settled_without_blob {
+                    checkpoints::mark_full_parse_settled(conn, &id, &snapshot)?;
+                }
+            }
             if hub_client::queue_enabled(conn)? {
                 hub_client::enqueue_session(
                     conn,
@@ -622,28 +999,6 @@ fn same_source_file(existing: &Evidence, snapshot: &SessionSnapshot) -> bool {
     }
 }
 
-fn message_token_buckets(snapshot: &SessionSnapshot) -> (i64, i64, i64) {
-    let (mut user, mut assistant, mut tool) = (0i64, 0i64, 0i64);
-    for message in &snapshot.messages {
-        let total = Usage::from(message.usage).total_tokens().unwrap_or(0);
-        match message.author() {
-            AuthorType::User => user = user.wrapping_add(total),
-            AuthorType::Assistant => assistant = assistant.wrapping_add(total),
-            AuthorType::Tool => tool = tool.wrapping_add(total),
-            _ => {}
-        }
-    }
-    if user.wrapping_add(assistant).wrapping_add(tool) == 0 {
-        let usage = snapshot.session.usage;
-        return (
-            usage.input_tokens.unwrap_or(0),
-            usage.output_tokens.unwrap_or(0),
-            0,
-        );
-    }
-    (user, assistant, tool)
-}
-
 fn encode_membership(values: &[String]) -> String {
     if values.is_empty() {
         String::new()
@@ -656,6 +1011,7 @@ struct SessionApplyContext<'a> {
     lookup: IdentityLookup<'a>,
     prepared: Option<PreparedContent>,
     masks: &'a [ProjectMask],
+    parse_options_hash: Option<&'a str>,
 }
 
 /// `_upsertParsedSession`.
@@ -666,11 +1022,12 @@ fn upsert_session(
     now: &str,
     resolver: &ProjectResolver,
     context: SessionApplyContext<'_>,
-) -> StoreResult<()> {
+) -> StoreResult<Option<String>> {
     let SessionApplyContext {
         lookup,
         prepared,
         masks,
+        parse_options_hash,
     } = context;
     let session = &snapshot.session;
     let identity_merge = crate::timing::timed("write: identity capture", || {
@@ -707,14 +1064,8 @@ fn upsert_session(
                 }
             }
         }
-        return Ok(());
+        return Ok(None);
     }
-    let resolved_thread_name = session
-        .thread_name
-        .as_deref()
-        .map(trim)
-        .unwrap_or("")
-        .to_owned();
     let source_type = source_type(snapshot);
     let stored_digest: Option<String> = conn
         .prepare_cached("select content_hash from sessions where id = ?")?
@@ -731,11 +1082,67 @@ fn upsert_session(
         ),
         None => SessionContent::build(conn, snapshot, now, resolver, source_type),
     })?;
-    let has_errors = snapshot.messages.iter().any(|message| message.has_error)
-        || snapshot
+    write_session_fields(
+        conn,
+        id,
+        snapshot,
+        &SessionTotals::from_rows(&snapshot.messages, &snapshot.tool_calls),
+        snapshot
             .tool_calls
             .iter()
-            .any(|tool| tool.error_message.is_some() || tool.status == "error");
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        &content.digest,
+        parse_options_hash,
+        now,
+        resolver,
+    )?;
+    // While the stored digest matches, the stored rows already equal this
+    // parse's rows, and reading them back to compare is skipped.
+    let unchanged =
+        identity_merge.is_none() && stored_digest.as_deref() == Some(content.digest.as_str());
+    let partitions = if unchanged {
+        Some(Vec::new())
+    } else {
+        crate::timing::timed("write: messages", || {
+            replace_messages(conn, id, &content.messages, now)
+        })?;
+        crate::timing::timed("write: tool calls", || {
+            replace_tool_calls(conn, id, snapshot, content.tool_calls)
+        })?;
+        crate::timing::timed("write: usage events", || {
+            sync_usage_events(conn, id, now, &content.usage_events, &content.usage_inputs)
+        })?
+    };
+    // A merged identity may change this session's usage beyond the events
+    // that changed here: rebuild all of its days.
+    let partitions = partitions.filter(|_| identity_merge.is_none());
+    finish_session_write(conn, id, snapshot, now, masks, identity_merge, partitions)?;
+    Ok(Some(content.digest))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_session_fields(
+    conn: &Connection,
+    id: &str,
+    snapshot: &SessionSnapshot,
+    totals: &SessionTotals,
+    tool_names: String,
+    digest: &str,
+    parse_options_hash: Option<&str>,
+    now: &str,
+    resolver: &ProjectResolver,
+) -> StoreResult<()> {
+    let session = &snapshot.session;
+    let source_type = source_type(snapshot);
+    let resolved_thread_name = session
+        .thread_name
+        .as_deref()
+        .map(trim)
+        .unwrap_or("")
+        .to_owned();
+    let has_errors = totals.has_error_rows;
     let resolved =
         resolver.resolve_marked(session.working_directory_display.as_deref(), source_type);
     let project_refined = resolved.as_ref().is_some_and(|(_, hinted)| *hinted);
@@ -744,7 +1151,7 @@ fn upsert_session(
         Some(name) => Some(upsert_auto_project(conn, name, now)?),
         None => None,
     };
-    let (user_tokens, assistant_tokens, tool_tokens) = message_token_buckets(snapshot);
+    let (user_tokens, assistant_tokens, tool_tokens) = totals.token_buckets(session.usage);
     let usage = Usage::from(session.usage);
     crate::timing::timed("write: search document", || {
         upsert_search_document(
@@ -758,22 +1165,14 @@ fn upsert_session(
                 title: clean_display_title(session.title.as_deref()),
                 summary: clean_display_summary(session.summary.as_deref()),
                 thread_name: &resolved_thread_name,
-                tool_names: snapshot
-                    .tool_calls
-                    .iter()
-                    .map(|tool| tool.tool_name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
+                tool_names,
                 normalized_path_keys: snapshot.source.normalized_path_keys.join(" "),
                 started_at_utc: iso_or_null(session.started_at_utc.as_deref()),
                 last_message_at_utc: iso_or_null(session.last_message_at_utc.as_deref()),
                 models_used: &session.models,
                 scan_status: &snapshot.source.status,
-                has_code_blocks: snapshot
-                    .messages
-                    .iter()
-                    .any(|message| message.content_plain.contains("```")),
-                has_tool_calls: !snapshot.tool_calls.is_empty(),
+                has_code_blocks: totals.has_code_blocks,
+                has_tool_calls: totals.tool_calls > 0,
                 has_errors,
                 total_tokens: usage.total_tokens(),
                 project_name: auto_project.as_deref().unwrap_or(""),
@@ -783,16 +1182,6 @@ fn upsert_session(
     let modified_utc = DartDateTime::try_parse(&snapshot.source.modified_utc)
         .map(DartDateTime::to_iso8601)
         .unwrap_or_else(|| snapshot.source.modified_utc.clone());
-    let user_message_count = snapshot
-        .messages
-        .iter()
-        .filter(|message| message.author() == AuthorType::User)
-        .count() as i64;
-    let assistant_message_count = snapshot
-        .messages
-        .iter()
-        .filter(|message| message.author() == AuthorType::Assistant)
-        .count() as i64;
     conn.prepare_cached(
         "update sessions set
            session_id = ?, thread_name = ?, thread_source = ?, parent_thread_id = ?,
@@ -807,7 +1196,7 @@ fn upsert_session(
            user_message_tokens = ?, assistant_response_tokens = ?, tool_call_tokens = ?,
            detected_project_id = ?, project_refined = ?, last_scanned_utc = ?, last_parsed_utc = ?,
            harness = ?, machine_id = coalesce(?, machine_id),
-           cache_write_input_tokens = ?, reasoning_output_tokens = ?, project_hints_json = ?
+           cache_write_input_tokens = ?, reasoning_output_tokens = ?, project_hints_json = ?, parse_options_hash = ?
          where id = ?",
     )?
     .execute(params![
@@ -831,12 +1220,12 @@ fn upsert_session(
         session.working_directory_unc,
         snapshot.source.size as i64,
         modified_utc,
-        content.digest.as_str(),
+        digest,
         session.parser_version,
-        snapshot.messages.len() as i64,
-        user_message_count,
-        assistant_message_count,
-        snapshot.tool_calls.len() as i64,
+        totals.messages,
+        totals.user_messages,
+        totals.assistant_messages,
+        totals.tool_calls,
         usage.input_tokens,
         usage.output_tokens,
         usage.cached_input_tokens,
@@ -853,28 +1242,23 @@ fn upsert_session(
         usage.reasoning_output_tokens,
         serde_json::to_string(&snapshot.project_hints)
             .map_err(|e| StoreError::Io(std::io::Error::other(e)))?,
+        parse_options_hash,
         id,
     ])?;
-    // While the stored digest matches, the stored rows already equal this
-    // parse's rows, and reading them back to compare is skipped.
-    let unchanged =
-        identity_merge.is_none() && stored_digest.as_deref() == Some(content.digest.as_str());
-    let partitions = if unchanged {
-        Some(Vec::new())
-    } else {
-        crate::timing::timed("write: messages", || {
-            replace_messages(conn, id, &content.messages, now)
-        })?;
-        crate::timing::timed("write: tool calls", || {
-            replace_tool_calls(conn, id, snapshot, content.tool_calls)
-        })?;
-        crate::timing::timed("write: usage events", || {
-            sync_usage_events(conn, id, now, &content.usage_events, &content.usage_inputs)
-        })?
-    };
-    // A merged identity may change this session's usage beyond the events
-    // that changed here: rebuild all of its days.
-    let partitions = partitions.filter(|_| identity_merge.is_none());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_session_write(
+    conn: &Connection,
+    id: &str,
+    snapshot: &SessionSnapshot,
+    now: &str,
+    masks: &[ProjectMask],
+    identity_merge: Option<IdentityMerge>,
+    partitions: ChangedPartitions,
+) -> StoreResult<()> {
+    let session = &snapshot.session;
     crate::timing::timed("write: source extras", || {
         replace_source_extras(conn, id, snapshot, now)
     })?;
@@ -1173,6 +1557,38 @@ struct RowChange {
 /// that grew by one line rewrote and reindexed its whole history. Returns
 /// the changes, or `None`, having written nothing, when a key repeats and
 /// rows cannot be matched.
+#[derive(Clone, Copy)]
+enum KeyScope<'a> {
+    All,
+    From { from: i64, also: &'a [i64] },
+}
+impl KeyScope<'_> {
+    fn select(&self, table: &str, session: &str, key: &str, columns: &str) -> String {
+        let select = format!("select {key}, {columns} from {table} where {session} = ?");
+        match self {
+            Self::All => select,
+            Self::From { also: [], .. } => format!("{select} and {key} >= ?"),
+            Self::From { .. } => format!(
+                "{select} and {key} >= ? union all {select} and {key} < ? and {key} in (select value from json_each(?))"
+            ),
+        }
+    }
+    fn parameters(&self, id: &str) -> Vec<Value> {
+        let mut values = vec![Value::Text(id.to_owned())];
+        if let Self::From { from, also } = self {
+            values.push(Value::Integer(*from));
+            if !also.is_empty() {
+                values.extend([
+                    Value::Text(id.to_owned()),
+                    Value::Integer(*from),
+                    Value::Text(serde_json::to_string(also).expect("integer array")),
+                ]);
+            }
+        }
+        values
+    }
+}
+
 fn sync_session_rows(
     conn: &Connection,
     shape: &SessionRows<'_>,
@@ -1180,16 +1596,26 @@ fn sync_session_rows(
     now: &str,
     rows: &[(i64, Vec<Value>)],
 ) -> StoreResult<Option<Vec<RowChange>>> {
+    sync_session_rows_in(conn, shape, session_id, now, rows, KeyScope::All)
+}
+
+fn sync_session_rows_in(
+    conn: &Connection,
+    shape: &SessionRows<'_>,
+    session_id: &str,
+    now: &str,
+    rows: &[(i64, Vec<Value>)],
+    scope: KeyScope<'_>,
+) -> StoreResult<Option<Vec<RowChange>>> {
     let mut stored: HashMap<i64, Vec<Value>> = HashMap::new();
     {
-        let mut select = conn.prepare_cached(&format!(
-            "select {}, {} from {} where {} = ?",
-            shape.key,
-            shape.columns.join(", "),
+        let mut select = conn.prepare_cached(&scope.select(
             shape.table,
-            shape.session_column
+            shape.session_column,
+            shape.key,
+            &shape.columns.join(", "),
         ))?;
-        let mut cursor = select.query([session_id])?;
+        let mut cursor = select.query(params_from_iter(scope.parameters(session_id)))?;
         while let Some(row) = cursor.next()? {
             let values = (0..shape.columns.len())
                 .map(|column| row.get::<_, Value>(column + 1))
@@ -1227,12 +1653,13 @@ fn sync_session_rows(
         });
     }
     // A search trigger fires on any update that names its column, so an
-    // unchanged text is left out of the update. A row whose text changed is
-    // deleted and inserted again under the same row id instead: the schema's
-    // two update triggers run add-then-remove, which would drop the new
-    // entry from the index.
+    // unchanged text is left out of the update. Preserve the full writer's
+    // delete/insert behavior. Scoped updates must retain rows referenced by
+    // historical tools outside the delta: deleting a message cascades those
+    // tools. Migration 027's ordered FTS trigger supports updates in place.
     for (key, old, values) in updated {
-        if let Some(indexed) = shape.indexed
+        if matches!(scope, KeyScope::All)
+            && let Some(indexed) = shape.indexed
             && old[indexed] != values[indexed]
         {
             let row_id: i64 = conn
@@ -1883,6 +2310,17 @@ fn sync_usage_events(
     events: &[(i64, Vec<Value>)],
     inputs: &[(i64, Vec<Value>)],
 ) -> StoreResult<ChangedPartitions> {
+    sync_usage_events_in(conn, id, now, events, inputs, KeyScope::All)
+}
+
+fn sync_usage_events_in(
+    conn: &Connection,
+    id: &str,
+    now: &str,
+    events: &[(i64, Vec<Value>)],
+    inputs: &[(i64, Vec<Value>)],
+    scope: KeyScope<'_>,
+) -> StoreResult<ChangedPartitions> {
     let event_shape = SessionRows {
         table: "usage_events",
         session_column: "session_row_id",
@@ -1902,8 +2340,9 @@ fn sync_usage_events(
         updated_stamps: &[],
     };
     // Both tables are keyed by (session, ordinal), so keys never repeat.
-    let changes = sync_session_rows(conn, &event_shape, id, now, events)?.unwrap_or_default();
-    sync_session_rows(conn, &input_shape, id, now, inputs)?;
+    let changes =
+        sync_session_rows_in(conn, &event_shape, id, now, events, scope)?.unwrap_or_default();
+    sync_session_rows_in(conn, &input_shape, id, now, inputs, scope)?;
     let mut partitions: Vec<DailyPartition> = Vec::new();
     for values in changes
         .iter()
@@ -2268,6 +2707,7 @@ fn apply_identity_merge(
             canonical_id,
         ],
     )?;
+    checkpoints::invalidate_for_session(conn, canonical_id)?;
     for alternate in &merge.alternate_ids {
         conn.execute(
             "delete from usage_events where session_row_id = ?",
@@ -2381,7 +2821,7 @@ struct LegacyUsageSession {
 const LEGACY_COLUMNS: &str = "id, session_id, forked_from_id, parent_thread_id, parser_version,
     usage_projection_status, input_tokens, output_tokens, cached_input_tokens, total_tokens";
 
-const LEGACY_PREDICATE: &str = "history_base_thread_id is null
+pub(super) const LEGACY_PREDICATE: &str = "history_base_thread_id is null
     and subagent_history_start_ordinal is null
     and ((forked_from_id is not null and forked_from_id <> '')
       or (parent_thread_id is not null and parent_thread_id <> ''))";
@@ -2649,6 +3089,9 @@ fn reconcile_affected_legacy_usage(
         if rescoped.contains(&session.row_id) && !result.contains(&session.row_id) {
             result.push(session.row_id);
         }
+    }
+    for id in &changed {
+        checkpoints::invalidate_for_session(conn, id)?;
     }
     Ok((result, rescoped.contains(replaced_row_id), changed))
 }
@@ -3649,6 +4092,7 @@ pub struct CachedSource {
     pub modified_utc: Option<DartDateTime>,
     pub parser_version: Option<i64>,
     pub parse_status: Option<String>,
+    pub parse_options_hash: Option<String>,
 }
 
 /// Written after a scan that listed every configured root and was not
@@ -3682,7 +4126,7 @@ pub fn record_complete_codex_scan(conn: &Connection) -> StoreResult<()> {
     finish(conn, result)
 }
 
-const CACHED_SOURCE_COLUMNS: &str = "source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version, source_type, source_state, parse_status";
+const CACHED_SOURCE_COLUMNS: &str = "source_file_path, source_file_unc_path, scan_status, file_size, modified_utc, parser_version, source_type, source_state, parse_status, parse_options_hash";
 
 /// The cached invalidation metadata of one session row, by primary key.
 pub fn cached_source_by_id(conn: &Connection, id: &str) -> StoreResult<Option<CachedSource>> {
@@ -3691,6 +4135,23 @@ pub fn cached_source_by_id(conn: &Connection, id: &str) -> StoreResult<Option<Ca
             "select {CACHED_SOURCE_COLUMNS} from sessions where id = ?"
         ))?
         .query_row([id], cached_source_row)
+        .optional()?)
+}
+
+/// Single-file ingest uses the path indexes, without loading every session.
+pub fn cached_source_by_path(
+    conn: &Connection,
+    harness: &str,
+    path: &str,
+) -> StoreResult<Option<CachedSource>> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "select {CACHED_SOURCE_COLUMNS} from sessions where harness=?1 and source_file_path=?2
+             union all
+             select {CACHED_SOURCE_COLUMNS} from sessions where harness=?1 and source_file_unc_path=?2
+             limit 1"
+        ))?
+        .query_row(params![harness, path], cached_source_row)
         .optional()?)
 }
 
@@ -3722,6 +4183,7 @@ fn cached_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedSource> 
         parser_version: row.get(5)?,
         source_state: row.get(7)?,
         parse_status: row.get(8)?,
+        parse_options_hash: row.get(9)?,
     })
 }
 

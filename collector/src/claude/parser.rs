@@ -973,14 +973,12 @@ fn parse_transcript_inner(
     let size = metadata.len();
     let modified_utc = file_modified_utc(&metadata).map_err(io_error)?;
     let policy = resume.policy();
-    let checkpoint_options = CheckpointOptions {
-        max_tool_output_preview_chars: options.max_tool_output_preview_chars,
-        max_message_content_chars: options.max_message_content_chars,
-    };
+    let checkpoint_options = CheckpointOptions::from(*options);
     let mut file = SourceReader::open(path).map_err(io_error)?;
     let mut builder = Builder::new();
     let mut capture = WindowCapture::fresh(size);
     let mut scope = None;
+    let mut previous_checkpoint = None;
     let mut steps = 0;
     if let Resume::From(loaded) = resume {
         let cp = *loaded.checkpoint;
@@ -1022,6 +1020,7 @@ fn parse_transcript_inner(
             return Ok(Err(AbandonReason::Structure));
         };
         capture = restored;
+        previous_checkpoint = Some(cp);
     }
     let start = capture.consumed();
     let line_base = builder.line_base;
@@ -1148,6 +1147,13 @@ fn parse_transcript_inner(
             Ok(record) => record,
             Err(reason) => return Ok(Err(reason)),
         };
+    }
+    // Parsing an unterminated tail is not complete-line progress and must
+    // neither advance the step counter nor replace the saved observer state.
+    if capture.consumed() == start
+        && let Some(previous) = previous_checkpoint
+    {
+        checkpoint = previous.encode();
     }
     let after = std::fs::metadata(path).map_err(io_error)?;
     if after.len() != size || file_modified_utc(&after).map_err(io_error)? != modified_utc {

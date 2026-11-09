@@ -18,8 +18,10 @@ use crate::contract::{
 use crate::store::projects::resolve_windows_project;
 use crate::store::{ApplySummary, Store, StoreResult, writer};
 
+use crate::resume::{Resume, SessionDelta};
+use crate::store::checkpoints;
 use parser::SourceType;
-use parser::{ParseError, ParseSuccess, parse_file};
+use parser::{ParseError, ParseSuccess, parse_file_with};
 use scanner::{ParsedRef, ScanCounts, ScanOptions, ScanRoot};
 
 /// Snapshots per write transaction. Small batches keep the viewer's writes
@@ -130,7 +132,7 @@ pub fn collect_coordinated(
     let cached = writer::cached_sources(&store.conn, "codex")?;
     let known_failures = load_known_failures(&store.conn)?;
     phases.mark("load cached sources");
-    let mut pending: Vec<SessionSnapshot> = Vec::new();
+    let mut pending: Vec<scanner::ScanItem> = Vec::new();
     let mut pending_bytes = 0u64;
     let mut applied = ApplySummary::default();
     let committed = Cell::new(0);
@@ -138,11 +140,24 @@ pub fn collect_coordinated(
     // Started at the first WSL session and fed each parsed WSL working
     // directory, so WSL start-up and the git lookups overlap parsing.
     let mut wsl_resolver: Option<wsl::ProjectResolver> = None;
-    let mut outcome = scanner::scan_controlled(
+    let checkpoint_index = checkpoints::index(&store.conn, "codex")?;
+    let policy = crate::resume::ResumePolicy::current();
+    let mut remaining = crate::resume::MAX_DECODED_BYTES;
+    let mut outcome = scanner::scan_incremental(
         options,
         &cached,
         &known_failures,
-        |snapshot| {
+        &checkpoint_index,
+        |path, fresh| {
+            Ok(if fresh {
+                Resume::Fresh(policy)
+            } else {
+                checkpoints::load_bounded(&store.conn, "codex", path, policy, &mut remaining)?
+                    .map_or(Resume::Fresh(policy), Resume::From)
+            })
+        },
+        |item| {
+            let snapshot = item.snapshot();
             if resolve_wsl_projects
                 && snapshot.source.environment == SourceType::Wsl.wire_name()
                 && let Some(directory) = snapshot.session.working_directory_display.as_deref()
@@ -153,15 +168,13 @@ pub fn collect_coordinated(
                     .push(directory);
             }
             pending_bytes += snapshot.source.size;
-            pending.push(snapshot);
+            pending.push(item);
             if pending.len() >= batching.sessions.max(1)
                 || pending_bytes >= batching.source_bytes.max(1)
             {
                 let batch = std::mem::take(&mut pending);
                 pending_bytes = 0;
-                match gated(&mut gate, || {
-                    writer::apply_session_batch(&store.conn, batch)
-                })? {
+                match gated(&mut gate, || apply_scan_items(store, options, batch))? {
                     Some(written) => {
                         applied.sessions += written;
                         committed.set(applied.sessions);
@@ -180,9 +193,7 @@ pub fn collect_coordinated(
         },
     )?;
     if !pending.is_empty()
-        && let Some(written) = gated(&mut gate, || {
-            writer::apply_session_batch(&store.conn, pending)
-        })?
+        && let Some(written) = gated(&mut gate, || apply_scan_items(store, options, pending))?
     {
         applied.sessions += written;
         flushes.set(flushes.get() + 1);
@@ -589,10 +600,38 @@ pub fn collect_file_with(
     };
     let mut applied = ApplySummary::default();
     let mut errors = Vec::new();
-    let status = match parse_file(&root.path, options.parser) {
-        Ok(success) => {
+    let mut phases = crate::timing::Phases::start();
+    if !options.force
+        && let Some(cached) = writer::cached_source_by_path(&store.conn, "codex", &root.path)?
+        && cached.parse_options_hash.as_deref()
+            == Some(
+                crate::resume::CheckpointOptions::from(options.parser)
+                    .digest()
+                    .as_str(),
+            )
+        && scanner::source_unchanged(std::fs::metadata(&root.path).ok().as_ref(), &cached, true)
+    {
+        counts.files_skipped = 1;
+        return Ok(CollectReport {
+            write_hold: holds.report(),
+            counts,
+            applied,
+            errors,
+            cache_repair: None,
+        });
+    }
+    let resume = checkpoints::resume(&store.conn, "codex", &root.path, options.force)?;
+    phases.mark("load checkpoint");
+    let loaded = match &resume {
+        Resume::From(cp) => Some(crate::resume::ResumeReceipt::from(cp)),
+        _ => None,
+    };
+    let status = match parse_file_with(&root.path, options.parser, resume) {
+        Ok(mut parsed_result) => {
+            phases.mark(&format!("parse {:?}", parsed_result.outcome));
+            let success = &parsed_result.success;
             counts.files_parsed = 1;
-            let snapshot = snapshot_for(options, root, &success);
+            let snapshot = snapshot_for(options, root, success);
             let status = SourceStatus {
                 harness: "codex".to_owned(),
                 path: root.path.clone(),
@@ -613,7 +652,54 @@ pub fn collect_file_with(
             // wait ~12 s for a stopped distro to start (T-172). A changed
             // directory or a folder-name fallback is resolved again.
             let kept = stored_wsl_project(store, &parsed)?;
-            applied.sessions = writer::apply_session_batch(&store.conn, vec![snapshot])?;
+            let is_delta = parsed_result.scope.is_some();
+            let delta = parsed_result
+                .scope
+                .take()
+                .zip(loaded.as_ref())
+                .map(|(scope, loaded)| {
+                    SessionDelta::new(
+                        snapshot.clone(),
+                        scope,
+                        parsed_result.checkpoint.clone(),
+                        loaded,
+                    )
+                });
+            let stale = if let Some(delta) = delta {
+                writer::apply_session_deltas(&store.conn, vec![delta])?
+                    == [writer::DeltaOutcome::Stale]
+            } else {
+                false
+            };
+            if !is_delta || stale {
+                if stale {
+                    parsed_result = parse_file_with(
+                        &root.path,
+                        options.parser,
+                        Resume::Fresh(crate::resume::ResumePolicy::current()),
+                    )
+                    .map_err(|e| crate::store::StoreError::Refused(e.display_message()))?;
+                }
+                let full = if stale {
+                    snapshot_for(options, root, &parsed_result.success)
+                } else {
+                    snapshot
+                };
+                let records = parsed_result
+                    .checkpoint
+                    .map(|cp| (root.path.clone(), cp))
+                    .into_iter()
+                    .collect();
+                applied.sessions = writer::apply_session_batch_with_checkpoints(
+                    &store.conn,
+                    vec![full],
+                    records,
+                    Some(options.parser.into()),
+                )?;
+            } else {
+                applied.sessions = 1;
+            }
+            phases.mark("write session");
             let mut hints = refined_project_hints(std::slice::from_ref(&parsed), false);
             match kept {
                 Some(hint) => hints.hints.push(hint),
@@ -669,7 +755,9 @@ pub fn collect_file_with(
             status
         }
     };
+    phases.mark("project hints");
     writer::apply_source_statuses(&store.conn, std::slice::from_ref(&status))?;
+    phases.mark("statuses");
     applied.statuses = 1;
     Ok(CollectReport {
         write_hold: holds.report(),
@@ -678,4 +766,67 @@ pub fn collect_file_with(
         errors,
         cache_repair: None,
     })
+}
+
+fn apply_scan_items(
+    store: &Store,
+    options: &ScanOptions,
+    items: Vec<scanner::ScanItem>,
+) -> StoreResult<usize> {
+    let mut snapshots = Vec::new();
+    let mut records = HashMap::new();
+    let mut deltas = Vec::new();
+    for item in items {
+        match item {
+            scanner::ScanItem::Full(snapshot, record) => {
+                if let Some(record) = record {
+                    records.insert(snapshot.source.path.clone(), record);
+                }
+                snapshots.push(*snapshot);
+            }
+            scanner::ScanItem::Delta(delta) => deltas.push(*delta),
+        }
+    }
+    let sources: Vec<_> = deltas
+        .iter()
+        .map(|delta| delta.snapshot.source.clone())
+        .collect();
+    let outcomes = writer::apply_session_deltas(&store.conn, deltas)?;
+    let mut count = 0;
+    for (source, outcome) in sources.into_iter().zip(outcomes) {
+        if outcome == writer::DeltaOutcome::Applied {
+            count += 1;
+            continue;
+        }
+        let path = source.path;
+        let root = ScanRoot {
+            path: path.clone(),
+            availability_root_path: None,
+            source_type: SourceType::from_wire(&source.environment).unwrap_or(SourceType::Windows),
+            source_state: if source.state == "codex_archived" {
+                "codex_archived"
+            } else {
+                "active"
+            },
+        };
+        let parsed = parse_file_with(
+            &path,
+            options.parser,
+            Resume::Fresh(crate::resume::ResumePolicy::current()),
+        )
+        .map_err(|e| crate::store::StoreError::Refused(e.display_message()))?;
+        if let Some(record) = parsed.checkpoint {
+            records.insert(path, record);
+        }
+        snapshots.push(snapshot_for(options, &root, &parsed.success));
+    }
+    if !snapshots.is_empty() {
+        count += writer::apply_session_batch_with_checkpoints(
+            &store.conn,
+            snapshots,
+            records,
+            Some(options.parser.into()),
+        )?;
+    }
+    Ok(count)
 }

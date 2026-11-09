@@ -1296,13 +1296,11 @@ impl Parser<'_> {
     ) -> Result<CodexParse, Failure> {
         let mut file = SourceReader::open(self.path)?;
         let policy = resume.policy();
-        let options = CheckpointOptions {
-            max_tool_output_preview_chars: self.options.max_tool_output_preview_chars,
-            max_message_content_chars: self.options.max_message_content_chars,
-        };
+        let options = CheckpointOptions::from(self.options);
         let mut state = JsonlState::new(self.path);
         let mut capture = WindowCapture::fresh(size);
         let mut scope = None;
+        let mut previous_checkpoint = None;
         let mut steps = 0;
         let mut line_number = 0u64;
         if let Resume::From(loaded) = resume {
@@ -1330,6 +1328,7 @@ impl Parser<'_> {
                 .ok_or(Failure::Abandon(AbandonReason::Structure))?;
             capture = WindowCapture::resumed(&cp, tail, head)
                 .ok_or(Failure::Abandon(AbandonReason::Structure))?;
+            previous_checkpoint = Some(cp);
         }
         let start = capture.consumed();
         let compressed = is_compressed_jsonl(self.path);
@@ -1456,6 +1455,13 @@ impl Parser<'_> {
                 scope.is_some(),
             )
             .map_err(Failure::Abandon)?;
+        }
+        // A tail without a completed newline may affect output rows, but it
+        // is not an incremental checkpoint step. Preserve the saved observer.
+        if capture.consumed() == start
+            && let Some(previous) = previous_checkpoint
+        {
+            checkpoint = previous.encode();
         }
         let after = std::fs::metadata(self.path)?;
         Ok(CodexParse {

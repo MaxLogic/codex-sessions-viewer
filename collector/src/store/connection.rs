@@ -1,5 +1,7 @@
 //! Process-wide SQLite configuration shared by binaries and library callers.
 
+const STATEMENT_JOURNAL_SPILL_BYTES: i32 = 1024 * 1024;
+
 /// Configure SQLite before any connection is opened.
 ///
 /// Call this before using raw rusqlite in a process that also uses the collector.
@@ -17,13 +19,27 @@ pub fn ensure() -> rusqlite::Result<()> {
         let result = if code != rusqlite::ffi::SQLITE_OK {
             Err((code, "SQLITE_CONFIG_MEMSTATUS"))
         } else {
-            // SAFETY: configuration is complete, still under the same Once.
-            // Keep rusqlite's normal threading checks after this initialization.
-            let code = unsafe { rusqlite::ffi::sqlite3_initialize() };
-            if code == rusqlite::ffi::SQLITE_OK {
-                Ok(())
+            // Statement rollback journals can stay in memory up to this bounded
+            // threshold; larger journals still spill. Durable WAL/fsync is unchanged.
+            // SAFETY: this int-valued option is set under the same process-wide
+            // Once, before SQLite initialization or any connection can be opened.
+            let code = unsafe {
+                rusqlite::ffi::sqlite3_config(
+                    rusqlite::ffi::SQLITE_CONFIG_STMTJRNL_SPILL,
+                    STATEMENT_JOURNAL_SPILL_BYTES,
+                )
+            };
+            if code != rusqlite::ffi::SQLITE_OK {
+                Err((code, "SQLITE_CONFIG_STMTJRNL_SPILL"))
             } else {
-                Err((code, "sqlite3_initialize"))
+                // SAFETY: configuration is complete, still under the same Once.
+                // Keep rusqlite's normal threading checks after this initialization.
+                let code = unsafe { rusqlite::ffi::sqlite3_initialize() };
+                if code == rusqlite::ffi::SQLITE_OK {
+                    Ok(())
+                } else {
+                    Err((code, "sqlite3_initialize"))
+                }
             }
         };
         RESULT
@@ -173,5 +189,150 @@ mod tests {
             "if let Err(error) = codex_sessions_collector::store::connection::ensure() {",
             "the shipped binary must configure SQLite before argument parsing or dispatch"
         );
+    }
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    use rusqlite::ffi;
+
+    static ORIGINAL_VFS: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(std::ptr::null_mut());
+    static JOURNAL_OPENS: AtomicUsize = AtomicUsize::new(0);
+
+    // Only the isolated child installs this observer. SQLite provides all callback
+    // arguments; file layout and every operation still belong to the native VFS.
+    unsafe extern "C" fn observe_open(
+        _: *mut ffi::sqlite3_vfs,
+        name: *const std::ffi::c_char,
+        file: *mut ffi::sqlite3_file,
+        flags: i32,
+        out_flags: *mut i32,
+    ) -> i32 {
+        let original = ORIGINAL_VFS.load(Ordering::Acquire);
+        // SAFETY: the built-in VFS remains registered for this child's lifetime.
+        let Some(open) = (unsafe { original.as_ref() }).and_then(|vfs| vfs.xOpen) else {
+            return ffi::SQLITE_CANTOPEN;
+        };
+        // SAFETY: forward SQLite's unmodified arguments to their original VFS.
+        let result = unsafe { open(original, name, file, flags, out_flags) };
+        if result == ffi::SQLITE_OK && flags & ffi::SQLITE_OPEN_SUBJOURNAL != 0 {
+            JOURNAL_OPENS.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    #[test]
+    fn sqlite_statement_journal_spill_preserves_statement_rollback() {
+        const MARKER: &str = "CXV_SQLITE_JOURNAL_PROBE";
+        if std::env::var_os(MARKER).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "store::connection::tests::sqlite_statement_journal_spill_preserves_statement_rollback",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        crate::store::connection::ensure().unwrap();
+        // SAFETY: SQLite is initialized; its default VFS is a live C struct without
+        // Rust-owned fields. The observer changes only xOpen and the static name.
+        // Leak this small registration in the isolated process so even a failed
+        // assertion cannot leave SQLite with a dangling VFS pointer.
+        let observer = unsafe {
+            let original = ffi::sqlite3_vfs_find(std::ptr::null());
+            assert!(!original.is_null());
+            ORIGINAL_VFS.store(original, Ordering::Release);
+            let mut observer = Box::new(std::ptr::read(original));
+            observer.zName = c"statement-journal-observer".as_ptr();
+            observer.xOpen = Some(observe_open);
+            Box::leak(observer)
+        };
+        // SAFETY: the registration and its name outlive every connection in this
+        // single-test child. All other methods retain the native implementation.
+        assert_eq!(unsafe { ffi::sqlite3_vfs_register(observer, 1) }, 0);
+        let dir = std::env::var_os("CXV_TEST_SANDBOX_PARENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        for (rows, should_spill) in [(384_i64, false), (768, true)] {
+            let path = dir.join(format!("cxv-stmt-{}-{rows}.sqlite", std::process::id()));
+            // Exclusive creation establishes ownership before SQLite opens the file.
+            drop(std::fs::File::create_new(&path).unwrap());
+            crate::store::connection::ensure().unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "pragma page_size=4096;
+                 pragma journal_mode=wal;
+                 pragma temp_store=file;
+                 create table audit(value text);
+                 create table payload(id integer primary key, flag integer check(flag<>9), data blob);",
+            )
+            .unwrap();
+            conn.execute(
+                "with recursive n(i) as (values(1) union all select i+1 from n where i<?)
+                 insert into payload select i,0,zeroblob(2000) from n",
+                [rows],
+            )
+            .unwrap();
+            let pages: i64 = conn
+                .query_row("pragma page_count", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(pages * 4096 > 1024 * 1024, should_spill);
+            assert!(pages * 4096 > 64 * 1024);
+
+            conn.execute_batch("begin immediate; insert into audit values('before');")
+                .unwrap();
+            JOURNAL_OPENS.store(0, Ordering::Relaxed);
+            let error = conn
+                .execute(
+                    "update payload set flag=case when id=? then 9 else 1 end",
+                    [rows],
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ConstraintViolation)
+            );
+            let opens = JOURNAL_OPENS.load(Ordering::Relaxed);
+            println!("rows={rows} pages={pages} subjournal_opens={opens}");
+            assert_eq!(opens > 0, should_spill, "rows={rows}");
+            assert!(!conn.is_autocommit(), "only the statement must roll back");
+            assert_eq!(
+                conn.query_row("select count(*) from payload where flag<>0", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            conn.execute_batch("insert into audit values('after'); commit;")
+                .unwrap();
+            assert_eq!(
+                conn.query_row("select group_concat(value, ',') from audit", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+                "before,after"
+            );
+            assert_eq!(
+                conn.query_row("select count(*) from payload", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                rows
+            );
+            drop(conn);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }
