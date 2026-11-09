@@ -940,32 +940,30 @@ mod status_memo_differential {
 
     #[test]
     fn upgrade_from_previous_schema_probes_once_then_memoizes() {
-        use codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION;
-        let temp = TempDir::new("memo_upgrade");
-        let db = temp.path().join("local.sqlite");
-        let original = Store::open(&db, OwnerMode::Standalone).unwrap();
-        original.conn.execute_batch("drop trigger hub_status_plan_dirty_insert; drop trigger hub_status_plan_dirty_update; drop trigger hub_status_plan_dirty_delete; drop table hub_status_plan; drop table hub_status_plan_dirty;").unwrap();
-        original
-            .conn
-            .execute(
-                "delete from schema_version where version=?",
-                [SUPPORTED_SCHEMA_VERSION],
-            )
+        use codex_sessions_collector::store::schema::{MIGRATIONS, SUPPORTED_SCHEMA_VERSION};
+        let memo = MIGRATIONS
+            .iter()
+            .find(|entry| entry.filename.ends_with("_hub_status_plan_memo.sql"))
             .unwrap();
-        assert_eq!(
-            original
-                .conn
-                .query_row("select max(version) from schema_version", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap(),
-            SUPPORTED_SCHEMA_VERSION - 1
-        );
-        drop(original);
-        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
-        store.conn.execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','machine-a')",[]).unwrap();
-        let statuses = [pool()[3].clone()];
-        assert_eq!(scan(&store, &statuses), 1);
-        assert_eq!(scan(&store, &statuses), 0);
+        // Cover the memo's original upgrade and the current previous version.
+        for version in [memo.version - 1, SUPPORTED_SCHEMA_VERSION - 1] {
+            let temp = TempDir::new("memo_upgrade");
+            let db = temp.path().join("local.sqlite");
+            let original = Store::open(&db, OwnerMode::Standalone).unwrap();
+            let original = previous_schema_fixture(original, version);
+            let db = std::path::PathBuf::from(&original.path);
+            assert_eq!(
+                codex_sessions_collector::store::schema::last_applied_version(&original.conn)
+                    .unwrap(),
+                version
+            );
+            drop(original);
+            let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+            store.conn.execute("insert into collector_hub_state(id,enabled,hub_url,machine_id) values(1,1,'http://127.0.0.1:1','machine-a')",[]).unwrap();
+            let statuses = [pool()[3].clone()];
+            assert_eq!(scan(&store, &statuses), 1);
+            assert_eq!(scan(&store, &statuses), 0);
+        }
     }
 
     #[test]
@@ -4414,56 +4412,149 @@ fn legacy_packed(json: &str) -> String {
     )
 }
 
-/// Preserve populated rows, but remove the snapshot-fields and later migrations so the
-/// next Store::open must perform the real upgrade. After integration, any
-/// preceding index-only migration remains applied to the ff6675c-era rows.
-fn before_snapshot_fields_upgrade(conn: &rusqlite::Connection) {
-    let migration = codex_sessions_collector::store::schema::MIGRATIONS
-        .iter()
-        .find(|migration| migration.filename.ends_with("_hub_snapshot_fields.sql"))
+/// Build the historical schema from the real migration prefix, retaining the
+/// populated fixture's old columns and exact queue/hash bytes. No later objects
+/// or receipts can survive just because a new migration was added.
+fn previous_schema_fixture(store: Store, version: i64) -> Store {
+    use codex_sessions_collector::store::schema::{self, SUPPORTED_SCHEMA_VERSION};
+    use rusqlite::config::DbConfig;
+
+    assert!(version < SUPPORTED_SCHEMA_VERSION);
+    let path =
+        std::path::Path::new(&store.path).with_file_name(format!("previous-{version}.sqlite"));
+    assert!(!path.exists());
+    support::create_database_at_version(&path, version);
+    let mut previous = rusqlite::Connection::open(&path).unwrap();
+    schema::configure(&mut previous, schema::BUSY_TIMEOUT_MS).unwrap();
+    // Complete the empty usage data migration, as standalone creation does.
+    // Its generation/state rows are copied from the already initialized seed.
+    previous
+        .execute_batch(
+            "drop view billable_usage_events;
+         alter table usage_events rename to usage_events_legacy;
+         alter table usage_events_next rename to usage_events;
+         create view billable_usage_events as
+           select e.*, c.effective_project_id as project_id
+           from usage_events e join usage_path_contexts c on c.id = e.path_context_id
+           where e.branch_scope = 'local';
+         drop table usage_events_legacy;",
+        )
         .unwrap();
+    drop(previous);
+
+    let conn = &store.conn;
+    conn.execute("attach database ? as previous", [path.to_str().unwrap()])
+        .unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+        .unwrap();
+    conn.execute_batch("begin immediate").unwrap();
+    let mut tables = conn
+        .prepare("pragma previous.table_list")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    // External-content FTS indexes are populated after their content tables.
+    tables.sort_by_key(|(_, kind, _)| kind == "virtual");
+    for (table, kind, without_rowid) in tables {
+        if !matches!(kind.as_str(), "table" | "virtual")
+            || table.starts_with("sqlite_")
+            || table == "schema_version"
+        {
+            continue;
+        }
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        let columns = conn
+            .prepare(&format!("pragma previous.table_info({quoted})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut columns = columns
+            .into_iter()
+            .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>();
+        let source_without_rowid: i64 = conn
+            .query_row(
+                "select wr from pragma_table_list where schema='main' and name=?",
+                [&table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if without_rowid == 0 && source_without_rowid == 0 {
+            columns.insert(0, "rowid".to_owned());
+        }
+        let columns = columns.join(",");
+        if kind != "virtual" {
+            conn.execute_batch(&format!("delete from previous.{quoted}"))
+                .unwrap();
+        }
+        conn.execute_batch(&format!(
+            "insert into previous.{quoted}({columns}) select {columns} from main.{quoted}"
+        ))
+        .unwrap();
+        for (left, right) in [("main", "previous"), ("previous", "main")] {
+            let changed: i64 = conn.query_row(&format!(
+                "select count(*) from (select {columns} from {left}.{quoted} except select {columns} from {right}.{quoted})"
+            ), [], |row| row.get(0)).unwrap();
+            assert_eq!(changed, 0, "historical fixture lost rows in {table}");
+        }
+    }
     conn.execute_batch(
-        "begin immediate;
-         drop trigger hub_status_plan_dirty_insert;
-         drop trigger hub_status_plan_dirty_update;
-         drop trigger hub_status_plan_dirty_delete;
-         drop table hub_status_plan;
-         drop table hub_status_plan_dirty;
-         alter table messages drop column token_cache_write;
-         alter table messages drop column token_reasoning;
-         alter table sessions drop column cache_write_input_tokens;
-         alter table sessions drop column reasoning_output_tokens;
-         alter table sessions drop column project_hints_json;",
+        "delete from previous.sqlite_sequence;
+         insert into previous.sqlite_sequence select * from main.sqlite_sequence
+         where name in (select name from previous.sqlite_schema where type='table');",
+    )
+    .unwrap();
+    conn.execute(
+        "update previous.database_state set last_optimized_schema_version=? where id=1",
+        [version],
     )
     .unwrap();
     assert_eq!(
-        conn.execute(
-            "delete from schema_version where version>=?",
-            [migration.version]
+        conn.query_row(
+            "select count(*) from pragma_foreign_key_check(null, 'previous')",
+            [],
+            |row| row.get::<_, i64>(0)
         )
         .unwrap(),
-        (codex_sessions_collector::store::schema::SUPPORTED_SCHEMA_VERSION - migration.version + 1)
-            as usize
+        0
     );
-    conn.execute_batch("commit").unwrap();
-    let version: i64 = conn
-        .query_row(
-            "select max(version) from schema_version where success=1",
-            [],
-            |r| r.get(0),
-        )
+    conn.execute_batch("commit; detach database previous")
         .unwrap();
-    assert_eq!(
-        version,
-        codex_sessions_collector::store::schema::MIGRATIONS
-            .iter()
-            .filter(|entry| entry.version != migration.version)
-            .map(|entry| entry.version)
-            .max()
-            .unwrap()
-    );
-    let columns: i64 = conn.query_row("select count(*) from pragma_table_info('sessions') where name in ('cache_write_input_tokens','reasoning_output_tokens','project_hints_json')", [], |r| r.get(0)).unwrap();
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true)
+        .unwrap();
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    drop(store);
+    let mut conn = rusqlite::Connection::open(&path).unwrap();
+    schema::configure(&mut conn, schema::BUSY_TIMEOUT_MS).unwrap();
+    assert_eq!(schema::last_applied_version(&conn).unwrap(), version);
+    assert_eq!(conn.query_row("select count(*) from sqlite_schema where name in ('session_parse_checkpoints','idx_session_parse_checkpoints_session','idx_tool_calls_session_tool_index')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    Store {
+        conn,
+        path: path.display().to_string(),
+        mode: OwnerMode::Standalone,
+    }
+}
+
+fn before_snapshot_fields_upgrade(store: Store) -> Store {
+    let migration = codex_sessions_collector::store::schema::MIGRATIONS
+        .iter()
+        .find(|entry| entry.filename.ends_with("_hub_snapshot_fields.sql"))
+        .unwrap();
+    let store = previous_schema_fixture(store, migration.version - 1);
+    let columns: i64 = store.conn.query_row("select count(*) from pragma_table_info('sessions') where name in ('cache_write_input_tokens','reasoning_output_tokens','project_hints_json')", [], |r| r.get(0)).unwrap();
     assert_eq!(columns, 0);
+    store
 }
 
 #[test]
@@ -4472,7 +4563,8 @@ fn ff6675c_outbox_rows_are_delivered_once_unchanged() {
     let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
     let db = paired_database(&temp, &fake.url);
     let store = Store::open(&db, OwnerMode::Standalone).unwrap();
-    before_snapshot_fields_upgrade(&store.conn);
+    let store = before_snapshot_fields_upgrade(store);
+    let db = std::path::PathBuf::from(&store.path);
     let mut expected = Vec::new();
     for (i, packed) in [false, true, false].into_iter().enumerate() {
         let raw = serde_json::to_string(&Envelope::new(Record::SessionSnapshot(Box::new(
@@ -4537,7 +4629,8 @@ fn ff6675c_plain_and_packed_dead_letters_rebuild_from_rows_after_upgrade() {
             )))])
             .unwrap();
     }
-    before_snapshot_fields_upgrade(&store.conn);
+    let store = before_snapshot_fields_upgrade(store);
+    let db = std::path::PathBuf::from(&store.path);
     store
         .conn
         .execute("delete from collector_upload_outbox", [])
@@ -4644,7 +4737,8 @@ fn ff6675c_envelope_hash_transitions_once_on_post_upgrade_ingest() {
         let key = "session:session:old-hash";
         let store = Store::open(&db, OwnerMode::Standalone).unwrap();
         store.apply(vec![envelope.clone()]).unwrap();
-        before_snapshot_fields_upgrade(&store.conn);
+        let store = before_snapshot_fields_upgrade(store);
+        let db = std::path::PathBuf::from(&store.path);
         store
             .conn
             .execute("delete from collector_upload_outbox", [])
