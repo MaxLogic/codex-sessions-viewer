@@ -131,11 +131,8 @@ impl Store {
     fn flush(&self, pending: &mut Pending) -> StoreResult<ApplySummary> {
         let mut summary = ApplySummary::default();
         if !pending.snapshots.is_empty() {
-            summary.sessions = writer::apply_session_batch_versioned(
-                &self.conn,
-                std::mem::take(&mut pending.snapshots),
-                Some(pending.version),
-            )?;
+            summary.sessions =
+                writer::apply_session_batch(&self.conn, std::mem::take(&mut pending.snapshots))?;
         }
         if !pending.statuses.is_empty() {
             writer::apply_source_statuses_versioned(

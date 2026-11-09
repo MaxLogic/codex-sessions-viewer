@@ -173,7 +173,7 @@ pub fn apply_session_batch(
     conn: &Connection,
     snapshots: Vec<SessionSnapshot>,
 ) -> StoreResult<usize> {
-    apply_session_batch_versioned(conn, snapshots, None)
+    apply_session_batch_with_checkpoints(conn, snapshots, HashMap::new(), None)
 }
 
 const SMALL_SESSION_ITEMS: usize = 256;
@@ -284,12 +284,16 @@ pub fn apply_session_deltas(
             })
         })
         .collect::<StoreResult<Vec<_>>>()?;
-    let mut revision = DeltaRevision::read(conn)?;
-    let planned_revision = revision;
+    let revision = std::cell::Cell::new(None);
     super::write_budget::write_planned_admitted(
         conn,
         "sessions",
         || {
+            // Reset recovery commits chunks, so finish it before capturing the
+            // revision fenced by planning and each admitted transaction.
+            hub_client::queue_enabled(conn)?;
+            let planned_revision = DeltaRevision::read(conn)?;
+            revision.set(Some(planned_revision));
             let lookup = IdentityLookup::for_batch(conn)?;
             for unit in &mut units {
                 let delta = &unit.delta;
@@ -320,7 +324,7 @@ pub fn apply_session_deltas(
             let started = std::time::Instant::now();
             let delta = &delta;
             if !planned
-                || revision != DeltaRevision::read(conn)?
+                || revision.get() != Some(DeltaRevision::read(conn)?)
                 || !delta_current(conn, delta)?
                 || !delta_keys_unique(delta)
             {
@@ -437,7 +441,10 @@ pub fn apply_session_deltas(
             super::write_budget::record_prepared_unit(0.0, bytes);
             // Account for this admitted unit's writes without accepting any
             // interleaved external commit between transaction chunks.
-            revision.own = conn.total_changes();
+            revision.set(revision.get().map(|current| DeltaRevision {
+                own: conn.total_changes(),
+                ..current
+            }));
             outcomes.push(DeltaOutcome::Applied);
             Ok(())
         },
@@ -663,14 +670,6 @@ fn prepare_sessions(snapshots: Vec<SessionSnapshot>) -> StoreResult<Vec<Prepared
     Ok(units)
 }
 
-pub(crate) fn apply_session_batch_versioned(
-    conn: &Connection,
-    snapshots: Vec<SessionSnapshot>,
-    _version: Option<u32>,
-) -> StoreResult<usize> {
-    apply_session_batch_with_checkpoints(conn, snapshots, HashMap::new(), None)
-}
-
 pub fn apply_session_batch_with_checkpoints(
     conn: &Connection,
     snapshots: Vec<SessionSnapshot>,
@@ -724,6 +723,9 @@ pub fn apply_session_batch_with_checkpoints(
         conn,
         "sessions",
         || {
+            // Recover durable hub resets under the collector lease, before BEGIN.
+            // The queue check inside apply remains the transaction fence.
+            hub_client::queue_enabled(conn)?;
             crate::timing::timed("write: plan prepared", || {
                 let lookup = IdentityLookup::for_batch(conn)?;
                 let limit = PREPARE_LIMIT.with(std::cell::Cell::get);
@@ -3911,6 +3913,7 @@ pub fn apply_project_backfill(conn: &Connection, hints: &[ProjectHint]) -> Store
         "project_backfill",
         250,
         || {
+            hub_client::queue_enabled(conn)?;
             let mut units = Vec::new();
             for candidate in project_backfill_candidates(conn)? {
                 if let Some((name, refined)) = resolver
@@ -4061,6 +4064,7 @@ pub fn clean_session_metadata_placeholders(conn: &Connection) -> StoreResult<()>
         "metadata_placeholders",
         500,
         || {
+            hub_client::queue_enabled(conn)?;
             Ok(conn.prepare("select id from sessions where lower(trim(coalesce(title,''))) like '# agents.md%' or lower(trim(coalesce(summary,'')))='auto'")?
             .query_map([],|row|row.get::<_,String>(0))?.collect::<Result<_,_>>()?)
         },

@@ -614,6 +614,52 @@ mod status_memo_differential {
 
     #[test]
     fn interrupted_reset_matches_atomic_reset_after_every_commit_and_recovery_path() {
+        reset_boundary_consumers(0..5);
+    }
+
+    #[test]
+    fn interrupted_reset_recovers_before_full_session_ingest_at_every_boundary() {
+        reset_boundary_consumers(5..6);
+    }
+
+    #[test]
+    fn interrupted_reset_recovers_before_delta_ingest_at_every_boundary() {
+        reset_boundary_consumers(6..7);
+    }
+
+    fn reset_session_options(
+        path: &std::path::Path,
+    ) -> codex_sessions_collector::codex::scanner::ScanOptions {
+        use codex_sessions_collector::{
+            codex::{
+                parser::SourceType,
+                scanner::{ScanOptions, ScanRoot},
+            },
+            path_mapping::PathMapper,
+        };
+        ScanOptions {
+            roots: vec![ScanRoot {
+                path: path.display().to_string(),
+                availability_root_path: None,
+                source_type: SourceType::Windows,
+                source_state: "active",
+            }],
+            mapper: PathMapper::new(""),
+            parser: Default::default(),
+            parser_workers: 1,
+            wsl_root_retry_delays: vec![],
+            thread_names: Default::default(),
+            force: false,
+        }
+    }
+
+    fn reset_boundary_consumers(consumers: std::ops::Range<usize>) {
+        use codex_sessions_collector::{
+            codex,
+            resume::{self, Resume, ResumePolicy, ResumePolicyScope},
+            store::checkpoints,
+        };
+        let _policy = ResumePolicyScope::enter(ResumePolicy::testing());
         let _budget = WriteBudgetScope::enter(WriteBudget {
             gap: Duration::ZERO,
             ..WriteBudget::default()
@@ -621,22 +667,53 @@ mod status_memo_differential {
         let fake = fake_hub(Box::new(|body| Some(acknowledge(body))));
         for kind in ["disable", "resync"] {
             for boundary in 0..=3 {
-                for consumer in 0..5 {
+                for consumer in consumers.clone() {
                     let temp = TempDir::new("reset_boundary");
                     let reference_temp = TempDir::new("reset_atomic");
                     let db = paired_database(&temp, &fake.url);
                     let reference_db = paired_database(&reference_temp, &fake.url);
                     let statuses = [pool()[3].clone()];
+                    let source = temp.path().join("reset-session.jsonl");
+                    let options = reset_session_options(&source);
+                    let prefix = format!(
+                        "{}\n{}\n",
+                        json!({"type":"session_meta","payload":{"id":"reset-session"}}),
+                        json!({"type":"event_msg","payload":{"type":"user_message","message":"first"}})
+                    );
+                    std::fs::write(&source, &prefix).unwrap();
                     for path in [&db, &reference_db] {
                         let store = Store::open(path, OwnerMode::Standalone).unwrap();
                         scan(&store, &statuses);
                         scan(&store, &statuses);
+                        if consumer == 6 {
+                            let parsed = codex::parser::parse_file_with(
+                                source.to_str().unwrap(),
+                                options.parser,
+                                Resume::Fresh(ResumePolicy::testing()),
+                            )
+                            .unwrap();
+                            let snapshot =
+                                codex::snapshot_for(&options, &options.roots[0], &parsed.success);
+                            let checkpoint =
+                                parsed.checkpoint.expect("seed must create a checkpoint");
+                            writer::apply_session_batch_with_checkpoints(
+                                &store.conn,
+                                vec![snapshot],
+                                std::collections::HashMap::from([(
+                                    checkpoint.source_path.clone(),
+                                    checkpoint,
+                                )]),
+                                Some(options.parser.into()),
+                            )
+                            .unwrap();
+                        }
                         store.conn.execute_batch("begin immediate").unwrap();
                         for i in 0..4096 {
                             store.conn.execute("insert into collector_hub_record_state(record_key,record_hash) values(?,'previous')", [format!("status:codex:{i:06}")]).unwrap();
                         }
                         store.conn.execute_batch("commit").unwrap();
                     }
+                    std::fs::write(&source, prefix + &format!("{}\n", json!({"type":"event_msg","payload":{"type":"agent_message","message":"appended"}}))).unwrap();
                     // Frozen pre-chunk reset SQL, not the current reset on both sides.
                     let reference = Store::open(&reference_db, OwnerMode::Standalone).unwrap();
                     reference.conn.execute_batch(if kind == "disable" {
@@ -725,6 +802,58 @@ mod status_memo_differential {
                                 let store = Store::open(path, OwnerMode::Standalone).unwrap();
                                 writer::apply_source_statuses(&store.conn, &statuses).unwrap();
                             }
+                            5 => {
+                                let store = Store::open(path, OwnerMode::Standalone).unwrap();
+                                let parsed = codex::parser::parse_file_with(
+                                    source.to_str().unwrap(),
+                                    options.parser,
+                                    Resume::Disabled,
+                                )
+                                .unwrap();
+                                let snapshot = codex::snapshot_for(
+                                    &options,
+                                    &options.roots[0],
+                                    &parsed.success,
+                                );
+                                assert_eq!(
+                                    writer::apply_session_batch(&store.conn, vec![snapshot])
+                                        .unwrap(),
+                                    1
+                                );
+                            }
+                            6 => {
+                                let store = Store::open(path, OwnerMode::Standalone).unwrap();
+                                let loaded = checkpoints::load(
+                                    &store.conn,
+                                    "codex",
+                                    source.to_str().unwrap(),
+                                    ResumePolicy::testing(),
+                                )
+                                .unwrap()
+                                .unwrap();
+                                let receipt = resume::ResumeReceipt::from(&loaded);
+                                let parsed = codex::parser::parse_file_with(
+                                    source.to_str().unwrap(),
+                                    options.parser,
+                                    Resume::From(loaded),
+                                )
+                                .unwrap();
+                                let snapshot = codex::snapshot_for(
+                                    &options,
+                                    &options.roots[0],
+                                    &parsed.success,
+                                );
+                                let delta = resume::SessionDelta::new(
+                                    snapshot,
+                                    parsed.scope.expect("must resume"),
+                                    parsed.checkpoint,
+                                    &receipt,
+                                );
+                                assert_eq!(
+                                    writer::apply_session_deltas(&store.conn, vec![delta]).unwrap(),
+                                    [writer::DeltaOutcome::Applied]
+                                );
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -734,6 +863,37 @@ mod status_memo_differential {
                         queue_state(&reference.conn),
                         "{kind}/{boundary}/{consumer}"
                     );
+                    if consumer >= 5 {
+                        use codex_sessions_collector::hub_snapshot::{self, Children};
+                        for id in support::rows(&actual.conn, "select id from sessions order by id")
+                        {
+                            let id = id["id"].as_str().unwrap();
+                            assert_eq!(
+                                serde_json::to_value(
+                                    hub_snapshot::build(&actual.conn, id, Children::Include)
+                                        .unwrap()
+                                )
+                                .unwrap(),
+                                serde_json::to_value(
+                                    hub_snapshot::build(&reference.conn, id, Children::Include)
+                                        .unwrap()
+                                )
+                                .unwrap(),
+                                "stored snapshot {kind}/{boundary}/{consumer}"
+                            );
+                        }
+                        assert_eq!(
+                            support::rows(
+                                &actual.conn,
+                                "select session_row_id,consumed_bytes,hex(state),content_hash from session_parse_checkpoints order by session_row_id"
+                            ),
+                            support::rows(
+                                &reference.conn,
+                                "select session_row_id,consumed_bytes,hex(state),content_hash from session_parse_checkpoints order by session_row_id"
+                            ),
+                            "checkpoint {kind}/{boundary}/{consumer}"
+                        );
+                    }
                     let enabled = |store: &Store| {
                         store
                             .conn
@@ -743,7 +903,7 @@ mod status_memo_differential {
                             .unwrap()
                     };
                     assert_eq!(enabled(&actual), enabled(&reference));
-                    let remaining: i64 = actual.conn.query_row("select count(*) from collector_hub_record_state where record_key < 'status:codex:source-status:'", [], |r| r.get(0)).unwrap();
+                    let remaining: i64 = actual.conn.query_row("select count(*) from collector_hub_record_state where record_key >= 'status:codex:000000' and record_key <= 'status:codex:004095'", [], |r| r.get(0)).unwrap();
                     assert_eq!(remaining, 0);
                     assert!(!actual.conn.query_row("select exists(select 1 from app_metadata where key='collector_hub_reset_intent')", [], |r| r.get::<_,bool>(0)).unwrap());
                     for path in [&reference_db, &db] {
@@ -759,8 +919,12 @@ mod status_memo_differential {
                     );
                     assert_eq!(
                         hub_client::pending(&actual.conn).unwrap(),
-                        1,
-                        "no discarded delivery may be suppressed"
+                        if consumer >= 5 && kind == "resync" {
+                            2
+                        } else {
+                            1
+                        },
+                        "no discarded delivery may be suppressed; session consumers also queue their changed session"
                     );
                 }
             }
@@ -4424,6 +4588,7 @@ fn previous_schema_fixture(store: Store, version: i64) -> Store {
         std::path::Path::new(&store.path).with_file_name(format!("previous-{version}.sqlite"));
     assert!(!path.exists());
     support::create_database_at_version(&path, version);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut previous = rusqlite::Connection::open(&path).unwrap();
     schema::configure(&mut previous, schema::BUSY_TIMEOUT_MS).unwrap();
     // Complete the empty usage data migration, as standalone creation does.
@@ -4535,6 +4700,7 @@ fn previous_schema_fixture(store: Store, version: i64) -> Store {
         .unwrap();
     conn.pragma_update(None, "foreign_keys", true).unwrap();
     drop(store);
+    codex_sessions_collector::store::connection::ensure().unwrap();
     let mut conn = rusqlite::Connection::open(&path).unwrap();
     schema::configure(&mut conn, schema::BUSY_TIMEOUT_MS).unwrap();
     assert_eq!(schema::last_applied_version(&conn).unwrap(), version);

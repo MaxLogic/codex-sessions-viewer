@@ -8,11 +8,22 @@
   once. Unsent changes of a locally deleted session are dropped; the hub keeps
   its last received copy. Update the viewer, collector and hub together.
 
+- Source availability checks use indexed session paths instead of loading the
+  whole session table, keeping scans responsive as history grows (CXV-216).
+- Quiet scans reuse hub status plans without probing or rewriting unchanged
+  queue state. Interrupted hub disable/resync operations recover before the
+  next session write (CXV-218).
+- Growing Codex and Claude files parse only appended complete lines and update
+  the affected rows. Once a file settles, one full parse verifies the result.
+  On the 79 MB Codex rollout, reads per turn fell from 201 to 10.9 MiB and
+  writes from 3.41 to 0.72 MiB with the combined collector improvements (CXV-215).
+- Deploy all binaries and the hub server together: schema 34.
+
 ### Changed
 - Built with Flutter 3.47.9 and Rust 1.99.1. Dart packages are updated, including sqlite3 3.8.0, and so are the collector crates, including zstd 0.14 and rusqlite 0.41.1 (bundled SQLite 3.54.1). Collector hooks now use exclusive connection access. screen_retriever stays at 0.2 because window_manager requires it.
 
 ### Fixed
-- The background collector wrote far more to disk than its work needed. With a hub paired, every ingest of a changed session stored the whole session snapshot in the upload outbox again, and a Claude Stop hook re-read and re-queued every unchanged subagent transcript. Snapshots now queue small stored-row references, an unchanged snapshot is not queued again, and unchanged subagent transcripts are skipped: the preceding compression-only release reduced one turn of a 79 MB Codex rollout from 17.4 MB to 3.4 MB; the stored-row improvement is awaiting measurement. Idle scans no longer re-read malformed rollouts or read the whole sessions table several times, cutting the bytes read per idle cycle by about 73% on a 78,000-session database. Every collector that writes or syncs a database must be updated together, because the stored-row token fields require the matching schema.
+- The background collector wrote far more to disk than its work needed. With a hub paired, every ingest of a changed session stored the whole session snapshot in the upload outbox again, and a Claude Stop hook re-read and re-queued every unchanged subagent transcript. Snapshots now queue small stored-row references, an unchanged snapshot is not queued again, and unchanged subagent transcripts are skipped: the preceding compression-only release reduced one turn of a 79 MB Codex rollout from 17.4 MB to 3.4 MB; the combined stored-row and incremental parsing improvements reduce this to 0.72 MiB per turn. Idle scans no longer re-read malformed rollouts or read the whole sessions table several times, cutting the bytes read per idle cycle by about 73% on a 78,000-session database. Every collector that writes or syncs a database must be updated together, because the stored-row token fields require the matching schema.
 - Stopping database maintenance on Linux now interrupts the running SQLite statement, using sqlite3 3.9.0, so cancelled index builds roll back without advancing their checkpoints.
 - Collector connections disable unused SQLite heap accounting before initialization, avoiding a global allocation mutex that stalled parallel database setup.
 - The resident preserves clients that connect while a Windows pipe accept poll is being cancelled, instead of disconnecting them before reading their request.
