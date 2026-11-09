@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:codex_sessions_viewer/src/database/database_connection.dart';
+import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/session_list_query.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -147,32 +149,33 @@ void main() {
     }
   });
 
-  test('stored activity preserves order and ignores metadata-only edits', () {
-    final db = sqlite3.openInMemory();
+  test('stored activity preserves order and ignores metadata-only edits', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'session_activity_',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    final databaseFile = File(
+      '${directory.path}${Platform.pathSeparator}activity.sqlite',
+    );
+    final previous = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+      supportedSchemaVersion: 15,
+    ).openAndMigrate(databaseFile);
+    expect(
+      previous.canStartNormalUi,
+      isTrue,
+      reason: previous.fatalError?.details,
+    );
+    final db = openFileBackedDatabase(databaseFile, maintenanceWriter: true);
     addTearDown(db.close);
-    final scripts =
-        [
-          ...Directory('../sql/init').listSync().whereType<File>(),
-          ...Directory('../sql/migration').listSync().whereType<File>(),
-        ].where((file) => file.path.endsWith('.sql')).toList()..sort(
-          (a, b) => a.uri.pathSegments.last.compareTo(b.uri.pathSegments.last),
-        );
-    for (final file in scripts) {
-      // This isolated ordering fixture omits the usage-generation schema.
-      // Later migrations install triggers that require those usage tables;
-      // 024 extends the price tables that 023 creates.
-      // 029 replaces the complete schema-28 parent and requires the skipped
-      // columns and journal/usage objects; this pre-016 fixture is incomplete.
-      if (file.uri.pathSegments.last.startsWith('016_') ||
-          file.uri.pathSegments.last.startsWith('021_') ||
-          file.uri.pathSegments.last.startsWith('023_') ||
-          file.uri.pathSegments.last.startsWith('024_') ||
-          file.uri.pathSegments.last.startsWith('025_') ||
-          file.uri.pathSegments.last.startsWith('029_')) {
-        continue;
-      }
-      db.execute(file.readAsStringSync());
-    }
+    // Start with a complete schema-15 database. The real migrator must backfill
+    // activity and apply every later dependency, including 024 before 033.
+    expect(
+      db.select(
+        "select name from sqlite_schema where name='collector_hub_record_state'",
+      ),
+      isEmpty,
+    );
     db.execute('''
       with recursive n(i) as (select 1 union all select i+1 from n where i<10000)
       insert into sessions(id,session_id,source_type,source_file_path,display_path,
@@ -185,7 +188,14 @@ void main() {
         '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z' from n;
     ''');
     final query = sessionListQuery(limit: 512);
-    final legacySql = query.sql
+    // The historical schema lacks newer metadata columns. Time the same ID
+    // projection on both schemas; check the full production query after upgrade.
+    final idSql = query.sql.replaceRange(
+      query.sql.indexOf('select'),
+      query.sql.indexOf('from sessions s'),
+      'select s.id\n    ',
+    );
+    final legacySql = idSql
         .replaceAll(' indexed by idx_sessions_available_activity', '')
         .replaceAll(
           's.activity_at_utc',
@@ -213,12 +223,33 @@ void main() {
       'Session ordering baseline: rows=10000 limit=512 us=$samples plan=$beforePlan',
     );
     final migrationWatch = Stopwatch()..start();
-    db.execute(
-      scripts
-          .singleWhere((file) => file.uri.pathSegments.last.startsWith('016_'))
-          .readAsStringSync(),
+    final upgraded = await DatabaseMigrator(
+      sqlRoot: Directory('../sql'),
+    ).migrateOpenDatabase(db, databaseFile);
+    expect(
+      upgraded.canStartNormalUi,
+      isTrue,
+      reason: upgraded.fatalError?.details,
     );
     migrationWatch.stop();
+    expect(
+      db
+          .select(
+            'select version from schema_version where success=1 order by version',
+          )
+          .map((row) => row['version']),
+      List.generate(latestSchemaVersion, (index) => index + 1),
+    );
+    expect(
+      db
+          .select(
+            "select sql from sqlite_schema where name='collector_hub_record_state'",
+          )
+          .single['sql']
+          .toString()
+          .toUpperCase(),
+      contains('WITHOUT ROWID'),
+    );
     expect(
       db.select('pragma table_info(sessions)').map((row) => row['name']),
       contains('activity_at_utc'),
@@ -261,7 +292,7 @@ void main() {
     final indexedSamples = <int>[];
     for (var sample = 0; sample < 7; sample++) {
       final watch = Stopwatch()..start();
-      final rows = db.select(query.sql, query.parameters);
+      final rows = db.select(idSql, query.parameters);
       watch.stop();
       indexedSamples.add(watch.elapsedMicroseconds);
       expect(rows.map((row) => row['id']).toList(), before);
@@ -273,7 +304,7 @@ void main() {
         .single['n'];
     // ignore: avoid_print
     print(
-      'Session ordering indexed: rows=10000 limit=512 us=$indexedSamples index_bytes=$indexBytes migration_us=${migrationWatch.elapsedMicroseconds} plan=$plan',
+      'Session ordering indexed: rows=10000 limit=512 us=$indexedSamples index_bytes=$indexBytes upgrade_us=${migrationWatch.elapsedMicroseconds} plan=$plan',
     );
 
     // STAT1 averages two status values even when almost every row is available.
