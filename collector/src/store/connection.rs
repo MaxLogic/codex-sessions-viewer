@@ -1,5 +1,6 @@
 //! Process-wide SQLite configuration shared by binaries and library callers.
 
+#[cfg(windows)]
 const STATEMENT_JOURNAL_SPILL_BYTES: i32 = 1024 * 1024;
 
 /// Configure SQLite before any connection is opened.
@@ -19,16 +20,22 @@ pub fn ensure() -> rusqlite::Result<()> {
         let result = if code != rusqlite::ffi::SQLITE_OK {
             Err((code, "SQLITE_CONFIG_MEMSTATUS"))
         } else {
-            // Statement rollback journals can stay in memory up to this bounded
-            // threshold; larger journals still spill. Durable WAL/fsync is unchanged.
+            // Windows can keep statement rollback journals in memory up to this
+            // bounded threshold without changing durable WAL/fsync. Leave other
+            // platforms at SQLite's default: SQLite 3.54.1's Unix seekAndWriteFd
+            // masks large write lengths, turning a 1 MiB spill into false SQLITE_FULL.
+            // CXV-215 deployment evidence: nas-hub-e7ba905/diag/RESULT.md.
             // SAFETY: this int-valued option is set under the same process-wide
             // Once, before SQLite initialization or any connection can be opened.
+            #[cfg(windows)]
             let code = unsafe {
                 rusqlite::ffi::sqlite3_config(
                     rusqlite::ffi::SQLITE_CONFIG_STMTJRNL_SPILL,
                     STATEMENT_JOURNAL_SPILL_BYTES,
                 )
             };
+            #[cfg(not(windows))]
+            let code = rusqlite::ffi::SQLITE_OK;
             if code != rusqlite::ffi::SQLITE_OK {
                 Err((code, "SQLITE_CONFIG_STMTJRNL_SPILL"))
             } else {
@@ -190,15 +197,97 @@ mod tests {
             "the shipped binary must configure SQLite before argument parsing or dispatch"
         );
     }
+    /// Enough changed pages to force a journal larger than the Unix VFS's
+    /// 128 KiB write boundary. The failure must roll back only this statement.
+    #[test]
+    fn large_statement_journal_reports_check_constraint_and_preserves_transaction() {
+        let dir = std::env::var_os("CXV_TEST_SANDBOX_PARENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("cxv-stmt-large-{}.sqlite", std::process::id()));
+        drop(std::fs::File::create_new(&path).unwrap());
+        crate::store::connection::ensure().unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "pragma page_size=4096;
+             pragma journal_mode=wal;
+             pragma temp_store=file;
+             create table audit(value text);
+             create table payload(id integer primary key, flag integer check(flag<>9), data blob);",
+        )
+        .unwrap();
+        let rows = 768_i64;
+        conn.execute(
+            "with recursive n(i) as (values(1) union all select i+1 from n where i<?)
+             insert into payload select i,0,zeroblob(2000) from n",
+            [rows],
+        )
+        .unwrap();
+        let pages: i64 = conn
+            .query_row("pragma page_count", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            pages * 4096 > 1024 * 1024,
+            "fixture exceeds the 128 KiB journal boundary"
+        );
+        conn.execute_batch("begin immediate; insert into audit values('before');")
+            .unwrap();
+        let error = conn
+            .execute(
+                "update payload set flag=case when id=? then 9 else 1 end",
+                [rows],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation),
+            "large statement journal must not turn CHECK into FULL: {error}"
+        );
+        let rusqlite::Error::SqliteFailure(code, _) = error else {
+            panic!("expected SQLite CHECK constraint");
+        };
+        assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_CHECK);
+        assert!(!conn.is_autocommit(), "the transaction must remain open");
+        assert_eq!(
+            conn.query_row("select count(*) from payload where flag<>0", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        conn.execute_batch("insert into audit values('after'); commit;")
+            .unwrap();
+        assert_eq!(
+            conn.query_row("select group_concat(value, ',') from audit", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "before,after"
+        );
+        assert_eq!(
+            conn.query_row("select count(*) from payload", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            rows
+        );
+        println!("large journal CHECK rollback: rows={rows} pages={pages}");
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+    #[cfg(windows)]
     use rusqlite::ffi;
 
+    #[cfg(windows)]
     static ORIGINAL_VFS: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(std::ptr::null_mut());
+    #[cfg(windows)]
     static JOURNAL_OPENS: AtomicUsize = AtomicUsize::new(0);
 
     // Only the isolated child installs this observer. SQLite provides all callback
     // arguments; file layout and every operation still belong to the native VFS.
+    #[cfg(windows)]
     unsafe extern "C" fn observe_open(
         _: *mut ffi::sqlite3_vfs,
         name: *const std::ffi::c_char,
@@ -219,6 +308,7 @@ mod tests {
         result
     }
 
+    #[cfg(windows)]
     #[test]
     fn sqlite_statement_journal_spill_preserves_statement_rollback() {
         const MARKER: &str = "CXV_SQLITE_JOURNAL_PROBE";
