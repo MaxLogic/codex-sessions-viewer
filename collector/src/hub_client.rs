@@ -404,134 +404,64 @@ pub mod test_hooks {
     }
 }
 
-/// Legacy fixture packing threshold; production no longer packs outbox records. A
-/// session snapshot carries every message and tool call, and an active session
-/// is queued again after each turn, so storing it as plain text dominated the
-/// collector's disk writes. The outbox column must stay valid JSON (its CHECK),
-/// so the compressed bytes travel base64-encoded inside a wrapper object that
-/// only this module writes and reads; `hub sync` sends the original envelope.
-#[cfg(test)]
-const PACK_AT: usize = 16 * 1024;
-const PACKED_PREFIX: &str = r#"{"outbox_encoding":"zstd-base64","bytes":"#;
-/// Largest decoded record a packed outbox row may claim.
-const MAX_PACKED_BYTES: usize = 1024 * 1024 * 1024;
-
-#[derive(serde::Deserialize)]
-struct Packed {
-    bytes: usize,
-    data: String,
-}
-
-/// SQL for a stored outbox or dead-letter record's decoded size in UTF-8
-/// bytes, which the size limits refer to.
+/// Current references carry a size only after a local size refusal.
 fn record_bytes_sql() -> String {
-    format!(
-        "(case when substr(record_json, 1, {}) = '{PACKED_PREFIX}' \
-         then cast(json_extract(record_json, '$.bytes') as integer) \
-         when substr(record_json,1,15) = '{{\"outbox_ref\":\"' then coalesce(cast(json_extract(record_json,'$.bytes') as integer),0) else length(cast(record_json as blob)) end)",
-        PACKED_PREFIX.len()
-    )
+    "(case when substr(record_json,1,15) = '{\"outbox_ref\":\"' then coalesce(cast(json_extract(record_json,'$.bytes') as integer),0) else length(cast(record_json as blob)) end)".to_owned()
 }
 
-/// The stored form of an envelope: compressed when large and when that is smaller.
-#[cfg(test)]
-pub(crate) fn pack_record(json: String) -> StoreResult<String> {
-    if json.len() < PACK_AT {
-        return Ok(json);
-    }
-    let compressed = zstd::bulk::compress(json.as_bytes(), 3).map_err(StoreError::Io)?;
-    let mut packed = format!("{PACKED_PREFIX}{},\"data\":\"", json.len());
-    base64_encode(&compressed, &mut packed);
-    packed.push_str("\"}");
-    Ok(if packed.len() < json.len() {
-        packed
-    } else {
-        json
-    })
-}
-
-/// The envelope a stored outbox row holds, decompressed when it was packed.
-pub(crate) fn unpack_record(stored: String) -> StoreResult<String> {
-    if !stored.starts_with(PACKED_PREFIX) {
-        return Ok(stored);
-    }
-    let invalid = |message: &str| {
-        StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("queued hub record cannot be decoded: {message}"),
-        ))
-    };
-    let packed: Packed =
-        serde_json::from_str(&stored).map_err(|error| invalid(&error.to_string()))?;
-    if packed.bytes > MAX_PACKED_BYTES {
-        return Err(invalid("decoded size exceeds the limit"));
-    }
-    let compressed = base64_decode(&packed.data).ok_or_else(|| invalid("invalid base64"))?;
-    let json = zstd::bulk::decompress(&compressed, packed.bytes)
-        .map_err(|error| invalid(&error.to_string()))?;
-    if json.len() != packed.bytes {
-        return Err(invalid("decoded size differs from the recorded size"));
-    }
-    String::from_utf8(json).map_err(|_| invalid("decoded record is not UTF-8"))
-}
-
-#[cfg(test)]
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-#[cfg(test)]
-fn base64_encode(bytes: &[u8], out: &mut String) {
-    out.reserve(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let value = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for index in 0..4 {
-            if index <= chunk.len() {
-                out.push(BASE64[((value >> (18 - 6 * index)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-}
-
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
-        return None;
-    }
-    let digit = |byte: u8| match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    };
-    let quads = bytes.len() / 4;
-    let mut out = Vec::with_capacity(quads * 3);
-    for (index, quad) in bytes.chunks(4).enumerate() {
-        let padding = if index + 1 == quads {
-            quad.iter().rev().take_while(|byte| **byte == b'=').count()
-        } else {
-            0
-        };
-        if padding > 2 {
-            return None;
-        }
-        let mut value = 0u32;
-        for (position, byte) in quad.iter().enumerate() {
-            let sextet = if position >= 4 - padding {
-                0
-            } else {
-                digit(*byte)?
+/// Old backups can restore packed payloads. Never decode them: their key is
+/// the only identity we trust, and the current snapshot is authoritative.
+fn replace_legacy_packed_rows(conn: &Connection) -> StoreResult<usize> {
+    use crate::store::write_budget::{current_budget, write_chunked};
+    let _lease = crate::store::write_lease::WriteLease::acquire(conn)?;
+    finish_pending_reset(conn)?;
+    let mut pruned = 0;
+    for table in ["collector_upload_outbox", "collector_upload_dead_letters"] {
+        let marker = r#"{"outbox_encoding":"zstd-base64""#;
+        let predicate = "substr(record_json,1,length(?1))=?1";
+        let usable = "substr(record_key,1,8)='session:' and exists(select 1 from sessions where id=substr(record_key,9))";
+        // A high-water fence and keyset pages bound discovery even if foreign
+        // writers keep adding rows. Recheck both marker and identity inside
+        // each write transaction; never act on a stale pre-write decision.
+        let high: i64 = conn.query_row(
+            &format!("select coalesce(max(id),0) from {table}"),
+            [],
+            |r| r.get(0),
+        )?;
+        let mut after = 0;
+        while after < high {
+            let ids: Vec<i64> = conn.prepare(&format!("select id from {table} where id>?2 and id<=?3 and {predicate} order by id limit ?4"))?
+                .query_map(params![marker,after,high,MAX_RECORDS as i64], |r| r.get(0))?.collect::<Result<_,_>>()?;
+            let Some(last) = ids.last().copied() else {
+                break;
             };
-            value = (value << 6) | u32::from(sextet);
+            write_chunked(
+                conn,
+                "hub_reconcile",
+                current_budget(),
+                1,
+                ids,
+                || Ok(()),
+                |_, id| {
+                    pruned += conn.execute(&format!("delete from {table} where {predicate} and id=?2 and not coalesce(({usable}),0)"),params![marker,id])?;
+                    // Pruning content cannot abandon an ambiguous delivery identity.
+                    // read_batch retries even an empty batch with its original ID.
+                    let retry = if table == "collector_upload_dead_letters" {
+                        ",http_status=null"
+                    } else {
+                        ""
+                    };
+                    conn.execute(&format!("update {table} set record_json=?3{retry} where {predicate} and id=?2 and ({usable})"),params![marker,id,SESSION_REF])?;
+                    Ok(())
+                },
+            )?;
+            after = last;
         }
-        let decoded = [(value >> 16) as u8, (value >> 8) as u8, value as u8];
-        out.extend_from_slice(&decoded[..3 - padding]);
     }
-    Some(out)
+    if pruned > 0 {
+        eprintln!("hub sync: dropped {pruned} legacy packed rows without a stored session");
+    }
+    Ok(pruned)
 }
 
 /// Serialize a session without cloning its potentially large snapshot.
@@ -1258,7 +1188,7 @@ fn read_record(
             [id],
             |r| r.get(0),
         )?;
-        unpack_record(stored).map(Some)
+        Ok(Some(stored))
     }
 }
 
@@ -1491,8 +1421,10 @@ pub fn sync(db_path: &Path, mode: OwnerMode, url: &str, token: &str) -> Result<S
     };
     let mut isolate_until: Option<i64> = None;
     let conn = &store.conn;
+    let legacy_pruned = replace_legacy_packed_rows(conn).map_err(|error| error.to_string())?;
     (report.requeued, report.pruned) = reconcile_dead_letters(conn, verified.max_record_bytes)
         .map_err(|error| error.to_string())?;
+    report.pruned += legacy_pruned;
     while report.batches < MAX_BATCHES_PER_RUN {
         let lease = crate::store::write_lease::WriteLease::acquire(conn)
             .map_err(|error| error.to_string())?;
@@ -1783,83 +1715,5 @@ mod tests {
                 > crate::hub_server::MAX_INGEST_DECODED_BYTES as u64 / SLOW_UPLINK_BYTES_PER_SECOND
         );
         const _: () = assert!(MAX_BATCH_BYTES <= 8 * 1024 * 1024);
-    }
-
-    #[test]
-    fn base64_round_trips_every_padding_length() {
-        for length in 0usize..=7 {
-            let bytes: Vec<u8> = (0..length).map(|value| (value * 89 + 250) as u8).collect();
-            let mut text = String::new();
-            base64_encode(&bytes, &mut text);
-            assert_eq!(text.len(), length.div_ceil(3) * 4);
-            assert_eq!(base64_decode(&text).unwrap(), bytes, "{text}");
-        }
-        let mut text = String::new();
-        base64_encode(b"Man", &mut text);
-        assert_eq!(text, "TWFu");
-        assert_eq!(base64_decode("TWE=").unwrap(), b"Ma");
-        assert_eq!(base64_decode("TQ==").unwrap(), b"M");
-        assert!(base64_decode("TQ=").is_none());
-        assert!(base64_decode("T===").is_none());
-        assert!(base64_decode("TQ==TWFu").is_none());
-        assert!(base64_decode("TW!u").is_none());
-    }
-
-    #[test]
-    fn large_envelopes_are_stored_compressed_and_read_back_unchanged() {
-        let small = r#"{"contract":"x","kind":"source_status"}"#.to_owned();
-        assert_eq!(pack_record(small.clone()).unwrap(), small);
-        assert_eq!(unpack_record(small.clone()).unwrap(), small);
-
-        let messages: Vec<_> = (0..2000)
-            .map(|index| json!({"index": index, "text": format!("message {index} with ünïcode text")}))
-            .collect();
-        let large =
-            json!({"contract":"codex-sessions-viewer.ingest","record":{"messages":messages}})
-                .to_string();
-        let packed = pack_record(large.clone()).unwrap();
-        assert!(packed.starts_with(PACKED_PREFIX));
-        assert!(
-            packed.len() * 4 < large.len(),
-            "{} vs {}",
-            packed.len(),
-            large.len()
-        );
-        assert_eq!(unpack_record(packed.clone()).unwrap(), large);
-
-        // The outbox CHECK accepts the wrapper, and SQL reports the decoded size.
-        crate::store::connection::ensure().unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table outbox(record_json text not null check (json_valid(record_json)))",
-        )
-        .unwrap();
-        for record in [&small, &packed] {
-            conn.execute("insert into outbox values (?)", [record])
-                .unwrap();
-        }
-        let sizes: Vec<i64> = conn
-            .prepare(&format!("select {} from outbox", record_bytes_sql()))
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(sizes, [small.len() as i64, large.len() as i64]);
-    }
-
-    #[test]
-    fn a_damaged_packed_record_is_an_error_not_a_different_record() {
-        let large = "x".repeat(PACK_AT * 2);
-        let large = json!({ "text": large }).to_string();
-        let packed = pack_record(large.clone()).unwrap();
-        let wrong_size = packed.replacen(
-            &format!("\"bytes\":{}", large.len()),
-            &format!("\"bytes\":{}", large.len() + 1),
-            1,
-        );
-        assert!(unpack_record(wrong_size).is_err());
-        let truncated = format!("{PACKED_PREFIX}{},\"data\":\"AAAA\"}}", large.len());
-        assert!(unpack_record(truncated).is_err());
     }
 }

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Restored legacy packed hub queue rows now resend the current stored session;
+  rows without a stored session are dropped and counted, without decoding old payloads.
+  In-flight batches retain their identity even when pruning leaves no records (CXV-221).
+
 - Hub sync now builds each session snapshot from its latest stored rows at send
   time. Repeated turns queue one small reference; reasoning/cache-write tokens
   and project hints survive rebuilding. Existing queued payloads still deliver
