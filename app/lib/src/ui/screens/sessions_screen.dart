@@ -3,6 +3,8 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+
+import '../scan_activity.dart';
 import 'package:flutter/services.dart';
 
 import '../../commands/resume_command_generator.dart';
@@ -154,6 +156,7 @@ class SessionsScreen extends StatefulWidget {
     this.onRefreshResult,
     this.onRefreshWithProgress,
     this.onRefreshOperation,
+    this.scanActivity,
     this.onOpenSettings,
     this.onTestWslPath,
     this.onSessionAction,
@@ -190,6 +193,7 @@ class SessionsScreen extends StatefulWidget {
   final Future<SessionsRefreshResult> Function()? onRefreshResult;
   final SessionsRefreshWithProgress? onRefreshWithProgress;
   final SessionsRefreshOperationFactory? onRefreshOperation;
+  final ScanActivity? scanActivity;
   final VoidCallback? onOpenSettings;
   final VoidCallback? onTestWslPath;
   final SessionActionCallback? onSessionAction;
@@ -338,6 +342,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
     _hideChildSessions = tableState.hideChildSessions;
     _setExcludedProjects(tableState.excludedProjects);
     _scanAnnouncement = widget.initialStatusMessage;
+    widget.scanActivity?.addListener(_syncScanActivity);
+    _syncScanActivity(updateUi: false);
     _handledAutoRefreshToken = widget.autoRefreshToken;
     _handledOpenTargetSerial = -1;
     _searchController.addListener(_filtersChanged);
@@ -432,7 +438,21 @@ class _SessionsScreenState extends State<SessionsScreen> {
     if (_tableStateEmitTimer?.isActive ?? false) {
       _emitTableState();
     }
-    _requestRefreshCancel(updateUi: false);
+    widget.scanActivity?.removeListener(_syncScanActivity);
+    // Only a forced reparse belongs to the app across navigation. Ordinary
+    // scans retain the Sessions screen's cancellation-on-dispose behavior.
+    final activity = widget.scanActivity;
+    if (activity == null) {
+      _requestRefreshCancel(updateUi: false);
+    } else if (!activity.forced) {
+      // Notify surviving views after Flutter finishes disposing this subtree.
+      final operation = activity.operation;
+      unawaited(
+        Future<void>.microtask(() async {
+          if (identical(activity.operation, operation)) await activity.cancel();
+        }),
+      );
+    }
     _filterDebounceTimer?.cancel();
     _searchController
       ..removeListener(_filtersChanged)
@@ -634,6 +654,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                     hasRows: _rows.isNotEmpty,
                                     hasActiveFilters: _hasActiveFilters,
                                     statusMessage: _scanAnnouncement,
+                                    scanAnnouncement: _activeScanAnnouncement,
                                     isScanning: _isScanning,
                                     visibleCount: visibleDisplayRows.length,
                                     unreachablePaths: _unreachablePaths,
@@ -663,6 +684,7 @@ class _SessionsScreenState extends State<SessionsScreen> {
                                     canSaveCsv:
                                         widget.onSaveSessionListCsv != null,
                                     statusMessage: _scanAnnouncement,
+                                    scanAnnouncement: _activeScanAnnouncement,
                                     isScanning: _isScanning,
                                     animatedRowIds: _rowMotionIds,
                                     rowMotionGeneration: _rowMotionGeneration,
@@ -1998,6 +2020,30 @@ class _SessionsScreenState extends State<SessionsScreen> {
 
   /// Starts a scan; [userInitiated] scans (Refresh button, F5) also play
   /// voice-over events, background rescans stay quiet.
+  String? get _activeScanAnnouncement {
+    final announcement = widget.scanActivity?.announcement;
+    return _isScanning && announcement != null && announcement.isNotEmpty
+        ? announcement
+        : null;
+  }
+
+  void _syncScanActivity({bool updateUi = true}) {
+    final activity = widget.scanActivity;
+    if (activity == null) return;
+    void update() {
+      _isScanning = activity.running;
+      _isCancellingRefresh = activity.cancelling;
+      _activeRefreshOperation = activity.operation;
+      if (activity.status.isNotEmpty) _scanAnnouncement = activity.status;
+    }
+
+    if (updateUi && mounted) {
+      setState(update);
+    } else {
+      update();
+    }
+  }
+
   Future<void> _refresh({bool userInitiated = false}) async {
     if (_isScanning) {
       _requestRefreshCancel();
@@ -2055,6 +2101,10 @@ class _SessionsScreenState extends State<SessionsScreen> {
   }
 
   void _requestRefreshCancel({bool updateUi = true}) {
+    if (widget.scanActivity case final activity?) {
+      unawaited(activity.cancel());
+      return;
+    }
     final operation = _activeRefreshOperation;
     if (operation == null || _isCancellingRefresh) {
       return;
@@ -3263,6 +3313,7 @@ class _SessionsEmptyState extends StatelessWidget {
     required this.hasRows,
     required this.hasActiveFilters,
     required this.statusMessage,
+    this.scanAnnouncement,
     required this.isScanning,
     required this.visibleCount,
     required this.unreachablePaths,
@@ -3276,6 +3327,7 @@ class _SessionsEmptyState extends StatelessWidget {
   final bool hasRows;
   final bool hasActiveFilters;
   final String statusMessage;
+  final String? scanAnnouncement;
   final bool isScanning;
   final int visibleCount;
   final List<String> unreachablePaths;
@@ -3310,7 +3362,11 @@ class _SessionsEmptyState extends StatelessWidget {
           _SessionsHeading(visibleCount: visibleCount),
           if (statusMessage.isNotEmpty) ...[
             const SizedBox(height: 8),
-            _StatusLine(message: statusMessage, isScanning: isScanning),
+            _StatusLine(
+              message: statusMessage,
+              isScanning: isScanning,
+              announcement: scanAnnouncement,
+            ),
           ],
           const SizedBox(height: 24),
           Semantics(
@@ -4306,9 +4362,14 @@ class _SessionsHeadingState extends State<_SessionsHeading> {
 }
 
 class _StatusLine extends StatelessWidget {
-  const _StatusLine({required this.message, required this.isScanning});
+  const _StatusLine({
+    required this.message,
+    required this.isScanning,
+    this.announcement,
+  });
 
   final String message;
+  final String? announcement;
   final bool isScanning;
 
   @override
@@ -4326,7 +4387,8 @@ class _StatusLine extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return Semantics(
       liveRegion: true,
-      label: displayMessage,
+      label: announcement ?? displayMessage,
+      excludeSemantics: true,
       child: Row(
         children: [
           SizedBox.square(
@@ -4625,6 +4687,7 @@ class _SessionsTable extends StatelessWidget {
     required this.onListAction,
     required this.canSaveCsv,
     required this.statusMessage,
+    this.scanAnnouncement,
     required this.isScanning,
     required this.animatedRowIds,
     required this.rowMotionGeneration,
@@ -4648,6 +4711,7 @@ class _SessionsTable extends StatelessWidget {
   final ValueChanged<_SessionListAction> onListAction;
   final bool canSaveCsv;
   final String statusMessage;
+  final String? scanAnnouncement;
   final bool isScanning;
   final Set<String> animatedRowIds;
   final int rowMotionGeneration;
@@ -4707,7 +4771,11 @@ class _SessionsTable extends StatelessWidget {
         if (statusMessage.isNotEmpty)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-            child: _StatusLine(message: statusMessage, isScanning: isScanning),
+            child: _StatusLine(
+              message: statusMessage,
+              isScanning: isScanning,
+              announcement: scanAnnouncement,
+            ),
           ),
         if (_isUnreachableStatus(statusMessage))
           Padding(

@@ -3,14 +3,18 @@ import 'package:flutter/material.dart';
 import '../../accessibility/announcement_service.dart';
 import '../../background_collection/background_collection.dart';
 import '../../config/app_settings.dart';
+import '../../config/parsed_with_settings.dart';
 import '../../config/settings_diagnostics.dart';
 import '../../database/maintenance_job.dart';
 import '../../database/database_maintenance.dart';
 import '../../platform/app_locations.dart';
 import '../motion.dart';
+import '../scan_activity.dart';
 import '../widgets/svg_icon.dart';
 import '../widgets/app_button.dart';
 import '../widgets/background_collection_panel.dart';
+import '../widgets/reparse_settings_notice.dart';
+import 'sessions_screen.dart';
 
 typedef SettingsSaveCallback = Future<void> Function(AppSettings settings);
 typedef SettingsReloadCallback = Future<AppSettings> Function();
@@ -29,11 +33,19 @@ class SettingsScreen extends StatefulWidget {
     this.backgroundCollection,
     this.onOpenFolder,
     this.hostPlatform,
+    this.parsedWithSettings,
+    this.reloadParsedWithSettings,
+    this.onReparse,
+    this.scanActivity,
     DateTime Function()? clock,
   }) : clock = clock ?? DateTime.now;
 
   final DateTime Function() clock;
   final AppHostPlatform? hostPlatform;
+  final Future<ParsedWithSettings>? parsedWithSettings;
+  final Future<ParsedWithSettings> Function()? reloadParsedWithSettings;
+  final SessionsRefreshOperationFactory? onReparse;
+  final ScanActivity? scanActivity;
   final AppSettings? initialSettings;
   final SettingsSaveCallback? onSave;
   final SettingsReloadCallback? onReload;
@@ -192,12 +204,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
       });
       return;
     }
+    if (!mounted) return;
     setState(() {
       _settings = next;
       _savedSettings = next;
       _loadControllers(next);
       _status = 'Settings reloaded.';
     });
+    try {
+      final previous = await widget.parsedWithSettings;
+      final parseChanged =
+          previous != null &&
+          ParsedWithSettings.capture(next).changesFrom(previous).isNotEmpty;
+      if (!mounted || !identical(_savedSettings, next)) return;
+      setState(() {
+        _status = parseChanged
+            ? 'Settings reloaded. History parsing settings changed; reparse available in Data and cache.'
+            : 'Settings reloaded.';
+      });
+    } on Object catch (error) {
+      if (!mounted || !identical(_savedSettings, next)) return;
+      setState(() {
+        _status =
+            'Settings reloaded. Could not compare history parsing settings. Details: $error';
+      });
+    }
   }
 
   Future<void> _runDiagnostic(SettingsDiagnosticAction action) async {
@@ -732,6 +763,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     _Section(
                       title: 'Data and cache',
                       children: [
+                        if (widget.parsedWithSettings != null &&
+                            widget.reloadParsedWithSettings != null &&
+                            widget.onReparse != null)
+                          ReparseSettingsNotice(
+                            settings: _savedSettings,
+                            parsedWith: widget.parsedWithSettings!,
+                            reloadParsedWith: widget.reloadParsedWithSettings!,
+                            onReparse: widget.onReparse!,
+                            scanActivity: widget.scanActivity,
+                          ),
                         _SwitchSetting(
                           label: 'Automatic database optimization',
                           value: _settings.maintenance.databaseOptimizeEnabled,

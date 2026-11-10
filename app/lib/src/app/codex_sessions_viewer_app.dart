@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 
 import '../background_collection/background_collection.dart';
 import '../config/app_settings.dart';
+import '../config/parsed_with_settings.dart';
 import '../config/settings_diagnostics.dart';
 import '../commands/resume_command_generator.dart';
 import '../database/database_connection.dart';
@@ -29,6 +30,7 @@ import '../platform/terminal_launcher.dart';
 import '../pricing/pricing_repository.dart';
 import '../search/message_search.dart';
 import '../ui/app_shell.dart';
+import '../ui/scan_activity.dart';
 import '../ui/dialogs/move_to_project_dialog.dart';
 import '../ui/dialogs/delayed_export_progress.dart';
 import '../ui/models/session_project_change.dart';
@@ -131,6 +133,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   late final DatabaseMaintenanceCoordinator _writerCoordinator;
   late final ResidentCollectorClient _resident;
   AppSettings? _settings;
+  Future<ParsedWithSettings>? _parsedWithSettings;
   UsageSummary? _usageSummary;
   UsageSummaryRequest? _usageRequest;
   var _usageIsRefreshing = false;
@@ -144,6 +147,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   var _sessionOpenTargetSerial = 0;
   CancellableMessageSearchBackfillOperation? _messageSearchBackfill;
   SessionsRefreshOperation? _activeSessionRefreshOperation;
+  final _scanActivity = ScanActivity();
   final _databaseMaintenanceProgress =
       ValueNotifier<DatabaseMaintenanceProgress?>(null);
   Future<DatabaseMaintenanceResult?>? _databaseMaintenanceFuture;
@@ -455,10 +459,14 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                         settingsSnapshot.data ??
                         AppSettings.defaults();
                     Widget readyShell() {
-                      if (_settings == null &&
+                      if (_parsedWithSettings == null &&
                           settingsSnapshot.connectionState ==
                               ConnectionState.done) {
                         _settings = settings;
+                        _parsedWithSettings = _loadParsedWithSettings(settings);
+                        // The Settings notice displays metadata errors. Keep
+                        // them observed before that screen is first opened.
+                        _parsedWithSettings!.ignore();
                         _syncStartupPreferenceLater(settings);
                         // Apply the theme, density, and font size settings.
                         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -489,6 +497,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                                 pricingRevision: _pricingRevision,
                                 pricingUpdating: _pricingUpdating,
                                 onRefreshOperation: _sessionRefreshOperation,
+                                scanActivity: _scanActivity,
                                 onLoadCachedRows:
                                     widget.sessionCachedRowsLoader,
                                 deferInitialLoad:
@@ -560,6 +569,12 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
                           },
                         ),
                         settingsScreen: SettingsScreen(
+                          scanActivity: _scanActivity,
+                          parsedWithSettings: _parsedWithSettings,
+                          reloadParsedWithSettings: () =>
+                              _loadParsedWithSettings(_settings ?? settings),
+                          onReparse: (onProgress) =>
+                              _sessionRefreshOperation(onProgress, force: true),
                           initialSettings: settings,
                           diagnostics: DatabaseSettingsDiagnostics(
                             widget.databaseFile,
@@ -656,6 +671,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     );
     unawaited(_databaseMaintenanceSubscription?.cancel());
     _databaseMaintenanceProgress.dispose();
+    _scanActivity.dispose();
     super.dispose();
   }
 
@@ -742,15 +758,25 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
   }
 
   SessionsRefreshOperation _sessionRefreshOperation(
-    SessionsRefreshProgressCallback onProgress,
-  ) {
+    SessionsRefreshProgressCallback onProgress, {
+    bool force = false,
+  }) {
+    // All overlapping requests join the current operation. Never dispatch a
+    // second scan or replace the cancellation owner, regardless of scan kind.
+    final active = _activeSessionRefreshOperation;
+    if (active != null) return active;
+    void progress(SessionsRefreshProgress value) {
+      _scanActivity.update(value);
+      onProgress(value);
+    }
+
     final refreshOperation = widget.sessionRefreshOperation;
     SessionsRefreshOperation operation;
-    if (refreshOperation != null) {
-      operation = refreshOperation(onProgress);
+    if (refreshOperation != null && !force) {
+      operation = refreshOperation(progress);
     } else {
       final refresh = widget.sessionRefresh;
-      if (refresh != null) {
+      if (refresh != null && !force) {
         operation = SessionsRefreshOperation.fromFuture(refresh());
       } else {
         final runtimeOperation = RuntimeSessionController(
@@ -758,7 +784,7 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
           databaseFile: widget.databaseFile,
           writerCoordinator: _writerCoordinator,
           collectorClient: _resident,
-        ).startRefreshInBackgroundOperation(onProgress: onProgress);
+        ).startRefreshInBackgroundOperation(onProgress: progress, force: force);
         operation = SessionsRefreshOperation(
           result: runtimeOperation.result,
           cancel: runtimeOperation.cancel,
@@ -769,9 +795,26 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
     Future<void>? cancellation;
     trackedOperation = SessionsRefreshOperation(
       result: operation.result
-          .then((result) {
+          .then((result) async {
+            if (force) {
+              final recorded = await _loadParsedWithSettings(
+                _settings ?? AppSettings.defaults(),
+              );
+              if (mounted) {
+                setState(() {
+                  _parsedWithSettings = Future.value(recorded);
+                });
+              }
+            }
             unawaited(_loadUsageSummary(_settings ?? AppSettings.defaults()));
+            _scanActivity.finish(result.statusMessage);
             return result;
+          })
+          .catchError((Object error, StackTrace stack) {
+            _scanActivity.finish(
+              'Could not complete the scan. Details: $error',
+            );
+            Error.throwWithStackTrace(error, stack);
           })
           .whenComplete(() {
             if (identical(_activeSessionRefreshOperation, trackedOperation)) {
@@ -781,8 +824,16 @@ class _CodexSessionsViewerAppState extends State<CodexSessionsViewerApp> {
       cancel: () => cancellation ??= Future<void>.sync(operation.cancel),
     );
     _activeSessionRefreshOperation = trackedOperation;
+    _scanActivity.start(trackedOperation, force: force);
     return trackedOperation;
   }
+
+  Future<ParsedWithSettings> _loadParsedWithSettings(AppSettings settings) =>
+      RuntimeSessionController(
+        settingsFile: widget.settingsFile,
+        databaseFile: widget.databaseFile,
+        writerCoordinator: _writerCoordinator,
+      ).loadParsedWithSettings(settings);
 
   Future<void> _saveSettings(AppSettings settings) async {
     final save = widget.settingsSave;
@@ -1438,6 +1489,7 @@ class _SessionsScreenLoader extends StatefulWidget {
     required this.pricingRevision,
     required this.pricingUpdating,
     required this.onRefreshOperation,
+    required this.scanActivity,
     this.onLoadCachedRows,
     required this.deferInitialLoad,
     required this.onOpenSettings,
@@ -1463,6 +1515,7 @@ class _SessionsScreenLoader extends StatefulWidget {
   final int pricingRevision;
   final bool pricingUpdating;
   final SessionsRefreshOperationFactory onRefreshOperation;
+  final ScanActivity scanActivity;
   final SessionCachedRowsLoader? onLoadCachedRows;
   final FrameDeferredCallback deferInitialLoad;
   final VoidCallback onOpenSettings;
@@ -1620,6 +1673,7 @@ class _SessionsScreenLoaderState extends State<_SessionsScreenLoader> {
       pricingUpdating: widget.pricingUpdating,
       onLoadPersistedCosts: _controller.loadPersistedSessionCosts,
       onRefreshOperation: widget.onRefreshOperation,
+      scanActivity: widget.scanActivity,
       onOpenSettings: widget.onOpenSettings,
       onSessionAction: _handleSessionAction,
       onSaveSessionListCsv: widget.onSaveSessionListCsv,

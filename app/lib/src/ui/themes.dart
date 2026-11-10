@@ -2,11 +2,23 @@ import 'package:flutter/material.dart';
 
 enum CodexThemeMode { system, light, dark, highContrastLight, highContrastDark }
 
-class CodexFocusStyle {
+class CodexFocusStyle extends ThemeExtension<CodexFocusStyle> {
   const CodexFocusStyle({required this.color, required this.width});
 
   final Color color;
   final double width;
+
+  @override
+  CodexFocusStyle copyWith({Color? color, double? width}) =>
+      CodexFocusStyle(color: color ?? this.color, width: width ?? this.width);
+
+  @override
+  CodexFocusStyle lerp(CodexFocusStyle? other, double t) => other == null
+      ? this
+      : CodexFocusStyle(
+          color: Color.lerp(color, other.color, t)!,
+          width: width + (other.width - width) * t,
+        );
 }
 
 class CodexAppTheme {
@@ -88,6 +100,7 @@ class CodexAppTheme {
       brightness: scheme.brightness,
       useMaterial3: true,
       focusColor: focus.color,
+      extensions: [focus],
       scaffoldBackgroundColor: scheme.surface,
       visualDensity: VisualDensity.standard,
       navigationRailTheme: NavigationRailThemeData(

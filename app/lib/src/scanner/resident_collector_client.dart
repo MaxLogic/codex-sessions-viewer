@@ -600,6 +600,7 @@ class ResidentCollectorClient extends ChangeNotifier {
     List<String> claudeRoots = const [],
     bool resolveWslProjects = true,
     int? parserWorkers,
+    bool force = false,
   }) async {
     for (var attempt = 0; ; attempt++) {
       try {
@@ -609,6 +610,7 @@ class ResidentCollectorClient extends ChangeNotifier {
           claudeRoots: claudeRoots,
           resolveWslProjects: resolveWslProjects,
           parserWorkers: parserWorkers,
+          force: force,
         );
       } on CollectorRequestException catch (error) {
         if (error.code != 'busy' ||
@@ -630,12 +632,14 @@ class ResidentCollectorClient extends ChangeNotifier {
     required List<String> claudeRoots,
     required bool resolveWslProjects,
     int? parserWorkers,
+    required bool force,
   }) async {
     final request = _command('scan')
       ..addAll({
         'harnesses': ['codex', if (claudeRoots.isNotEmpty) 'claude'],
         'context': await _context(claudeRoots, resolveWslProjects),
         'parser_workers': ?parserWorkers,
+        'force': force,
       });
     final reports = <String, Map<String, dynamic>>{};
     final counts = <String, Map<String, dynamic>>{};

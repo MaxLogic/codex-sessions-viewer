@@ -8,6 +8,7 @@ import 'dart:math' as math;
 import 'package:sqlite3/sqlite3.dart' show sqlite3, OpenMode;
 
 import '../config/app_settings.dart';
+import '../config/parsed_with_settings.dart';
 import '../config/default_session_folders.dart';
 import '../database/collector_versions.dart';
 import '../database/database_connection.dart';
@@ -127,6 +128,18 @@ class RuntimeSessionController implements ProjectsRepository {
   Future<T> _runWrite<T>(Future<T> Function() work) =>
       writerCoordinator?.runWriter(work) ?? work();
 
+  Future<ParsedWithSettings> loadParsedWithSettings(AppSettings settings) =>
+      _runWrite(() async {
+        final db = openFileBackedDatabase(databaseFile);
+        try {
+          return ParsedWithSettingsStore(
+            db,
+          ).loadOrInitialize(ParsedWithSettings.capture(settings));
+        } finally {
+          db.close();
+        }
+      });
+
   Future<T> _writeScan<T>(Future<T> Function() work) async {
     final owner = _backgroundWriterPort;
     if (owner == null) {
@@ -150,16 +163,21 @@ class RuntimeSessionController implements ProjectsRepository {
 
   CancellableSessionScanOperation startRefreshOperation({
     SessionsRefreshProgressCallback? onProgress,
+    bool force = false,
   }) {
     final cancellation = ScanCancellationController();
-    Future<SessionsRefreshResult> work() =>
-        _refresh(onProgress: onProgress, cancellationToken: cancellation.token);
+    Future<SessionsRefreshResult> work() => _refresh(
+      onProgress: onProgress,
+      cancellationToken: cancellation.token,
+      force: force,
+    );
     final result = writerCoordinator?.runScan(work) ?? work();
     return CancellableSessionScanOperation._(result, cancellation.cancel);
   }
 
   CancellableSessionScanOperation startRefreshInBackgroundOperation({
     SessionsRefreshProgressCallback? onProgress,
+    bool force = false,
   }) {
     return _BackgroundSessionScanOperation.start(
       controller: RuntimeSessionController(
@@ -173,6 +191,7 @@ class RuntimeSessionController implements ProjectsRepository {
         collectorPort: collectorClient?.requestPort ?? collectorPort,
       ),
       onProgress: onProgress,
+      force: force,
     );
   }
 
@@ -638,6 +657,7 @@ class RuntimeSessionController implements ProjectsRepository {
   Future<SessionsRefreshResult> _refreshInBackground({
     SessionsRefreshProgressCallback? onProgress,
     required _BackgroundScanCancellationHandle cancellationHandle,
+    required bool force,
   }) async {
     final messages = ReceivePort();
     final errors = ReceivePort();
@@ -647,6 +667,7 @@ class RuntimeSessionController implements ProjectsRepository {
       isolate = await AppEnvironment.spawnIsolate<_BackgroundRefreshRequest>(
         _backgroundRefreshEntry,
         _BackgroundRefreshRequest(
+          force: force,
           settingsFilePath: settingsFile.path,
           databaseFilePath: databaseFile.path,
           sendPort: messages.sendPort,
@@ -929,9 +950,14 @@ class RuntimeSessionController implements ProjectsRepository {
   Future<SessionsRefreshResult> _refresh({
     SessionsRefreshProgressCallback? onProgress,
     required ScanCancellationToken cancellationToken,
+    required bool force,
   }) {
     return Profiling.spanAsync('scan.runtime.refresh', () async {
       final settings = await SettingsRepository(settingsFile).loadOrCreate();
+      final parseSnapshot = force
+          ? await ParseSettingsSnapshot.capture(settingsFile)
+          : null;
+      var settingsChangedDuringReparse = false;
       final db = openFileBackedDatabase(databaseFile);
       StructuredLogger? logger;
       int? scanRunId;
@@ -983,6 +1009,7 @@ class RuntimeSessionController implements ProjectsRepository {
         final result = await Profiling.spanAsync(
           'scan.runtime.collector',
           () => collector.scan(
+            force: force,
             cancellation: cancellationToken,
             claudeRoots: _claudeRoots,
             // An injected resolver supplies WSL names after the scan.
@@ -1056,7 +1083,7 @@ class RuntimeSessionController implements ProjectsRepository {
           'scan.runtime.final_load_rows',
           () => _loadRowsProfiled(db, pricing: pricing),
         );
-        final refreshCancelled =
+        var refreshCancelled =
             result.cancelled || cancellationToken.isCancellationRequested;
         await Profiling.spanAsync('scan.runtime.write_finish_log', () {
           return _writeScan(
@@ -1077,13 +1104,38 @@ class RuntimeSessionController implements ProjectsRepository {
             ),
           );
         });
+        if (force &&
+            !refreshCancelled &&
+            result.allConfiguredRootsReachable &&
+            result.progress.filesFailed == 0 &&
+            result.errors.isEmpty &&
+            result.errorsOmitted == 0 &&
+            result.unreachablePathsOmitted == 0) {
+          await _writeScan(() async {
+            // Cancellation may arrive while the completion log waits for its
+            // writer slot. Recheck under the metadata writer slot too.
+            refreshCancelled = cancellationToken.isCancellationRequested;
+            if (!refreshCancelled) {
+              settingsChangedDuringReparse = !await parseSnapshot!.isUnchanged(
+                settingsFile,
+              );
+              if (!settingsChangedDuringReparse &&
+                  !cancellationToken.isCancellationRequested) {
+                ParsedWithSettingsStore(db).record(parseSnapshot.values);
+              }
+              refreshCancelled = cancellationToken.isCancellationRequested;
+            }
+          });
+        }
         return SessionsRefreshResult(
           rows: rows,
-          statusMessage: _statusMessage(
-            result,
-            visibleSessionCount: rows.length,
-            cancelled: refreshCancelled,
-          ),
+          statusMessage: settingsChangedDuringReparse
+              ? 'Settings changed during the reparse. Run Reparse all sessions again to apply them to stored history.'
+              : _statusMessage(
+                  result,
+                  visibleSessionCount: rows.length,
+                  cancelled: refreshCancelled,
+                ),
           cancelled: refreshCancelled,
           persistenceFlushCount: collector.persistenceFlushCount,
           fullRowSnapshotCount: fullRowSnapshotCount,
@@ -1258,6 +1310,7 @@ Future<void> _backgroundRefreshEntry(_BackgroundRefreshRequest request) async {
     }
     controller.emitCachedRowsAtScanStart = request.emitCachedRowsAtScanStart;
     final operation = controller.startRefreshOperation(
+      force: request.force,
       onProgress: (progress) {
         request.sendPort.send(_BackgroundRefreshProgress(progress));
       },
@@ -1415,6 +1468,7 @@ List<SessionRowViewModel> _loadRowsProfiled(
 
 class _BackgroundRefreshRequest {
   const _BackgroundRefreshRequest({
+    required this.force,
     required this.settingsFilePath,
     required this.databaseFilePath,
     required this.sendPort,
@@ -1430,6 +1484,7 @@ class _BackgroundRefreshRequest {
   });
 
   final String settingsFilePath;
+  final bool force;
   final String databaseFilePath;
   final SendPort sendPort;
   final int parsedSessionFlushBatchSize;
@@ -1733,11 +1788,13 @@ class _BackgroundSessionScanOperation {
   static CancellableSessionScanOperation start({
     required RuntimeSessionController controller,
     SessionsRefreshProgressCallback? onProgress,
+    required bool force,
   }) {
     final cancellationHandle = _BackgroundScanCancellationHandle();
     Future<SessionsRefreshResult> work() => controller._refreshInBackground(
       onProgress: onProgress,
       cancellationHandle: cancellationHandle,
+      force: force,
     );
     final result = controller.writerCoordinator?.runScan(work) ?? work();
     return CancellableSessionScanOperation._(
