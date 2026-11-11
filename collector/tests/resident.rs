@@ -5090,3 +5090,186 @@ fn child_process_ids(parent: u32) -> Vec<u32> {
         children
     }
 }
+
+// CXV-187 checkpoint fixtures use explicit process-local knobs, never the live DB.
+impl Fixture {
+    fn start_wal(&mut self, frames: u32, idle_ms: u64) {
+        let child = self
+            .command()
+            .args(["serve", "--db"])
+            .arg(&self.db)
+            .args(["--lifetime", "resident"])
+            .env(
+                "CODEX_SESSIONS_COLLECTOR_TEST_WAL_FRAMES",
+                frames.to_string(),
+            )
+            .env(
+                "CODEX_SESSIONS_COLLECTOR_TEST_WAL_IDLE_MS",
+                idle_ms.to_string(),
+            )
+            .env("CODEX_SESSIONS_COLLECTOR_TIMINGS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(self.root.join("wal.stderr")).unwrap())
+            .spawn()
+            .unwrap();
+        self.children.push(child);
+    }
+    fn wal_scan(&self) {
+        let mut wire = self.wire();
+        protocol::send(wire.get_mut(), &self.viewer_request("wal-scan", "scan")).unwrap();
+        loop {
+            let event = next_event(&mut wire);
+            assert_ne!(event["event"], "error", "{event}");
+            if event["event"] == "done" {
+                assert_eq!(event["cancelled"], false);
+                break;
+            }
+        }
+    }
+    fn wal_status(&self) -> Value {
+        let output = self.cli("status");
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+}
+
+#[test]
+fn resident_idle_checkpoint_resets_the_wal() {
+    let _fixture_load = ordinary_fixture_lane();
+    let mut fixture = Fixture::new();
+    fixture.rollout("01a0aaaa-0000-7000-8000-000000000187");
+    codex_sessions_collector::store::connection::ensure().unwrap();
+    let mut viewer = rusqlite::Connection::open(&fixture.db).unwrap();
+    fixture.start_wal(u32::MAX, 300);
+    let ready = fixture.ready();
+    assert!(ready["wal_checkpoint"].is_object(), "{ready}");
+    fixture.wal_scan();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let report = loop {
+        let status = fixture.wal_status();
+        if status["wal_checkpoint"]["last_reason"] == "idle" {
+            break status["wal_checkpoint"].clone();
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(report["complete"].as_u64().unwrap() >= 1, "{report}");
+    assert_eq!(report["failed"], 0);
+    // Observe more than three idle intervals: no new write means no new attempt.
+    let until = Instant::now() + Duration::from_millis(950);
+    while Instant::now() < until {
+        assert_eq!(
+            fixture.wal_status()["wal_checkpoint"]["checkpoints"],
+            report["checkpoints"]
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let frames = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
+    let observed = frames.clone();
+    viewer
+        .wal_hook(Some(move |_: &mut rusqlite::hooks::Wal, n| {
+            observed.store(n, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }))
+        .unwrap();
+    viewer
+        .execute(
+            "insert into app_metadata values ('wal-witness','v','now')",
+            [],
+        )
+        .unwrap();
+    let n = frames.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&n),
+        "WAL must restart after idle checkpoint: {n}"
+    );
+}
+
+#[test]
+fn resident_long_scan_keeps_wal_within_bound() {
+    let _fixture_load = ordinary_fixture_lane();
+    let mut fixture = Fixture::new();
+    for index in 0..40 {
+        fixture.rollout(&format!("01a0aaaa-0000-7000-8000-{index:012}"));
+    }
+    codex_sessions_collector::store::connection::ensure().unwrap();
+    let _viewer = rusqlite::Connection::open(&fixture.db).unwrap();
+    fixture.start_wal(64, 30_000);
+    let ready = fixture.ready();
+    assert!(ready["wal_checkpoint"].is_object(), "{ready}");
+    fixture.wal_scan();
+    let report = fixture.wal_status()["wal_checkpoint"].clone();
+    assert!(report["checkpoints"].as_u64().unwrap() > 0, "{report}");
+    assert_eq!(report["last_reason"], "threshold");
+    assert_eq!(report["failed"], 0);
+    let bound = 63 + report["max_tx_frames"].as_u64().unwrap();
+    assert!(
+        report["max_wal_frames"].as_u64().unwrap() <= bound,
+        "{report}"
+    );
+    let bytes = std::fs::metadata(fixture.db.with_extension("sqlite-wal"))
+        .unwrap()
+        .len();
+    let page_size: u32 = _viewer
+        .query_row("pragma page_size", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        bytes <= 32 + bound * (u64::from(page_size) + 24),
+        "bytes={bytes}, bound={bound}"
+    );
+}
+
+#[test]
+fn resident_wal_skips_final_checkpoint_during_pause_and_stop() {
+    let _fixture_load = ordinary_fixture_lane();
+    for action in ["pause", "shutdown"] {
+        let mut fixture = Fixture::new();
+        fixture.rollout("01a0aaaa-0000-7000-8000-000000000188");
+        codex_sessions_collector::store::connection::ensure().unwrap();
+        let viewer = rusqlite::Connection::open(&fixture.db).unwrap();
+        viewer
+            .execute_batch("pragma journal_mode=wal; begin; select count(*) from app_metadata")
+            .unwrap();
+        fixture.start_wal(1, 30_000);
+        fixture.ready();
+        fixture.wal_scan();
+        let before = fixture.wal_status();
+        assert!(
+            before["wal_checkpoint"]["partial"].as_u64().unwrap() > 0,
+            "snapshot must pin due frames: {before}"
+        );
+        let mut wire = fixture.wire();
+        let reply = exchange(
+            &mut wire,
+            serde_json::json!({"v":1,"id":"wal-control","op":action}),
+        );
+        assert_eq!(
+            reply["event"],
+            if action == "pause" {
+                "paused"
+            } else {
+                "stopping"
+            },
+            "{reply}"
+        );
+        if action == "pause" {
+            let status = fixture.wal_status();
+            assert_eq!(status["state"], "paused");
+            assert_eq!(
+                status["wal_checkpoint"]["checkpoints"],
+                before["wal_checkpoint"]["checkpoints"]
+            );
+            // Keep the pausing connection alive until shutdown is published.
+            assert!(fixture.cli("stop").status.success());
+        }
+        fixture.wait_all(Duration::from_secs(10));
+        let log = std::fs::read_to_string(fixture.root.join("wal.stderr")).unwrap();
+        assert!(log.contains("result=partial"), "{log}");
+        assert!(
+            !log.contains("reason=exit"),
+            "control must suppress Store Drop checkpoint: {log}"
+        );
+        viewer.execute_batch("commit").unwrap();
+    }
+}

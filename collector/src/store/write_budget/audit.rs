@@ -19,6 +19,8 @@ pub struct AuditReport {
     pub connections: u64,
     pub commits: u64,
     pub completed_holds: u64,
+    pub checkpoints: u64,
+    pub checkpoints_in_transaction: u64,
     pub unattributed: Vec<String>,
     pending: HashMap<usize, u64>,
 }
@@ -134,6 +136,11 @@ fn attach(conn: &mut Connection, state: State) -> rusqlite::Result<()> {
         } = context.action
         {
             let name = pragma_name.to_ascii_lowercase();
+            if name == "wal_autocheckpoint" && pragma_value.is_some() {
+                state.lock().unwrap().unattributed.push(
+                    "pragma wal_autocheckpoint replaces the collector checkpoint owner".into(),
+                );
+            }
             let writes = match name.as_str() {
                 "journal_mode" | "user_version" | "application_id" | "auto_vacuum" => {
                     pragma_value.is_some()
@@ -151,6 +158,23 @@ fn attach(conn: &mut Connection, state: State) -> rusqlite::Result<()> {
         }
         Authorization::Allow
     }))
+}
+pub(crate) fn checkpoint(conn: &Connection) {
+    CONNECTIONS.with_borrow(|connections| {
+        if let Some(state) = connections
+            .get(&connection_key(conn))
+            .and_then(Weak::upgrade)
+        {
+            let mut report = state.lock().unwrap();
+            report.checkpoints += 1;
+            if owned(connection_key(conn)) || !conn.is_autocommit() {
+                report.checkpoints_in_transaction += 1;
+                report
+                    .unattributed
+                    .push("checkpoint inside write transaction".into());
+            }
+        }
+    });
 }
 pub(super) fn completed(conn: &Connection) {
     CONNECTIONS.with_borrow(|connections| {

@@ -148,6 +148,7 @@ fn hello(key: &str) -> Value {
         idle_since: instant,
         started: instant,
         write_hold: crate::store::write_budget::hold_report(),
+        wal_checkpoint: crate::store::wal::checkpoint_report(),
         last_scan: Value::Null,
     };
     let mut hello = super::super::hello("bridge-hello", &state);

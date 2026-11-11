@@ -46,6 +46,7 @@ struct State {
     idle_since: Instant,
     started: Instant,
     write_hold: write_budget::WriteHoldReport,
+    wal_checkpoint: crate::store::wal::WalCheckpointReport,
     last_scan: Value,
 }
 struct Shared {
@@ -130,7 +131,7 @@ fn hello(id: &str, state: &State) -> Value {
 fn status(id: &str, state: &State) -> Value {
     json!({"v":protocol::VERSION,"id":id,"event":"status","pid":std::process::id(),
         "state":state.state,"lifetime":state.lifetime.name(),"queue":{"pending":0,"claimed":0},
-        "last_scan":state.last_scan,"write_hold":state.write_hold,"uptime":state.started.elapsed().as_secs_f64()})
+        "last_scan":state.last_scan,"write_hold":state.write_hold,"wal_checkpoint":state.wal_checkpoint,"uptime":state.started.elapsed().as_secs_f64()})
 }
 
 struct ConnectionGuard {
@@ -779,6 +780,7 @@ fn run_inner(
             idle_since: now,
             started: now,
             write_hold: write_budget::hold_report(),
+            wal_checkpoint: crate::store::wal::checkpoint_report(),
             last_scan: Value::Null,
         }),
         stopping: AtomicBool::new(false),
@@ -1043,6 +1045,7 @@ mod tests {
                 idle_since: now - VIEWER_IDLE,
                 started: now,
                 write_hold: write_budget::hold_report(),
+                wal_checkpoint: crate::store::wal::checkpoint_report(),
                 last_scan: Value::Null,
             }),
             stopping: AtomicBool::new(false),

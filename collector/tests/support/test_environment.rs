@@ -528,6 +528,8 @@ impl TestCommand {
                     "PATHEXT",
                     "CODEX_SESSIONS_COLLECTOR_BUSY_TIMEOUT_MS",
                     "CODEX_SESSIONS_COLLECTOR_TIMINGS",
+                    "CODEX_SESSIONS_COLLECTOR_TEST_WAL_FRAMES",
+                    "CODEX_SESSIONS_COLLECTOR_TEST_WAL_IDLE_MS",
                     "CODEX_SESSIONS_HUB_MACHINE_TOKEN",
                     "CODEX_SESSIONS_HUB_OWNER_TOKEN",
                     "CSV_TEST_LEASE_CHILD",
@@ -576,6 +578,8 @@ impl TestCommand {
                     "CODEX_SESSIONS_COLLECTOR_EXE",
                     "CODEX_SESSIONS_COLLECTOR_BUSY_TIMEOUT_MS",
                     "CODEX_SESSIONS_COLLECTOR_TIMINGS",
+                    "CODEX_SESSIONS_COLLECTOR_TEST_WAL_FRAMES",
+                    "CODEX_SESSIONS_COLLECTOR_TEST_WAL_IDLE_MS",
                 ]
                 .contains(&key.as_ref())
             {
@@ -871,6 +875,7 @@ fn admit_executable(command: &Command, raw: Option<&str>, cwd: &Path) -> io::Res
         && args[2] == "--nocapture"
         && [
             "lease_child_helper",
+            "owned_transaction_lock_accounting_fixture",
             "protocol_windows_first_instance_security_and_handle_cleanup",
         ]
         .contains(&args[1].as_str())

@@ -5,6 +5,7 @@ pub mod checkpoints;
 pub mod connection;
 pub mod projects;
 pub mod schema;
+pub mod wal;
 pub mod write_budget;
 pub mod write_lease;
 pub mod writer;
@@ -21,6 +22,12 @@ pub struct Store {
     pub conn: Connection,
     pub path: String,
     pub mode: OwnerMode,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        wal::leave_bounded(&self.conn);
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

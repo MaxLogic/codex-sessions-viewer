@@ -82,6 +82,7 @@ fn reconnect_survives_a_disconnect_during_hello() {
                 idle_since: instant,
                 started: instant,
                 write_hold: crate::store::write_budget::hold_report(),
+                wal_checkpoint: crate::store::wal::checkpoint_report(),
                 last_scan: Value::Null,
             };
             let mut hello = crate::resident::hello("bridge-hello", &state);

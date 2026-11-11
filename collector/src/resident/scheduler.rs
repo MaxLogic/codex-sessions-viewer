@@ -576,6 +576,7 @@ impl Scheduler {
             state.state = name;
         }
         state.write_hold = crate::store::write_budget::hold_report();
+        state.wal_checkpoint = crate::store::wal::checkpoint_report();
     }
     fn reload(&mut self) {
         let path = self
@@ -779,6 +780,14 @@ impl Scheduler {
         }
         if self.store.is_none() {
             return Ok(());
+        }
+        if self.shared.pending.lock().unwrap().is_empty()
+            && self.shared.requests.lock().unwrap().is_empty()
+            && crate::store::write_budget::check_control().is_ok()
+            && let Some(store) = &self.store
+            && crate::store::wal::idle_due(&store.conn, Instant::now())
+        {
+            crate::store::wal::checkpoint(&store.conn, "idle");
         }
         self.busy_delay = Duration::from_secs(5);
         self.state("ready");
@@ -1148,6 +1157,20 @@ fn ingest_request(store: &Store, base: &cli::Options, request: &Request) {
         Err(message) => request.emit(protocol::error("", "refused", &message)),
     }
     request.completed.store(true, Ordering::SeqCst);
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        let shared = self.shared.clone();
+        let _control = crate::store::write_budget::WriteControlScope::enter(move || {
+            shared.stopping.load(Ordering::SeqCst)
+                || signals::stopping()
+                || shared.pausers.load(Ordering::SeqCst) > 0
+        });
+        // The tick's control scope has ended before the worker is destroyed.
+        // Keep stop/pause cancellation active across Store's final due checkpoint.
+        self.store.take();
+    }
 }
 
 #[cfg(test)]

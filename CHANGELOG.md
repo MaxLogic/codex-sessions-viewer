@@ -10,6 +10,10 @@
   change. The reparse continues when you navigate away, with progress and
   cancellation available in Settings (CXV-220).
 
+- Collector WAL checkpoints run between write transactions and after 30 seconds
+  idle. Write-hold timings exclude checkpoints, which are reported separately
+  when timing logging is enabled (CXV-187).
+
 - Hub sync now builds each session snapshot from its latest stored rows at send
   time. Repeated turns queue one small reference; reasoning/cache-write tokens
   and project hints survive rebuilding. Existing queued payloads still deliver

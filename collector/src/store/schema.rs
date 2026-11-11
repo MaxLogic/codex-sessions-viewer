@@ -187,6 +187,7 @@ pub fn configure(conn: &mut Connection, busy_timeout_ms: u64) -> StoreResult<()>
             "SQLite did not enable WAL journal mode; active mode is {mode}."
         )));
     }
+    super::wal::install(conn)?;
     Ok(())
 }
 

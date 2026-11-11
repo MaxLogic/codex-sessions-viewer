@@ -19,6 +19,329 @@ fn budget_test() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// A fresh process isolates timing opt-in from other tests' OnceLock state.
+#[test]
+fn owned_transaction_lock_accounting() {
+    let _serial = budget_test();
+    let output = support::test_command(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "owned_transaction_lock_accounting_fixture",
+            "--nocapture",
+        ])
+        .env("CODEX_SESSIONS_COLLECTOR_TIMINGS", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("{stderr}");
+    assert!(
+        !stderr.contains("collector write hold exceeded hard budget"),
+        "BEGIN acquisition wait cannot trigger physical budget warnings: {stderr}"
+    );
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn owned_transaction_lock_accounting_fixture() {
+    // A fresh child isolates timing opt-in from other tests' OnceLock state.
+    if !std::env::args().any(|arg| arg == "--exact") {
+        return;
+    }
+    use codex_sessions_collector::store::{connection, write_budget::in_write_transaction};
+    use std::time::Instant;
+
+    // Retained BEGIN row of the prior six-case matrix, with every owned-write
+    // assertion. The five open-time rows were dropped by the user decision.
+    const TOLERANCE_MS: f64 = 25.0;
+    let temp = support::TempDir::new("begin-wait");
+    let db = temp.path().join("fixture.sqlite");
+    support::create_viewer_database(&db);
+    connection::ensure().unwrap();
+    let blocker = Connection::open(&db).unwrap();
+    blocker
+        .execute_batch("create table fixture(id integer)")
+        .unwrap();
+    blocker
+        .pragma_update(None, "journal_mode", "delete")
+        .unwrap();
+    blocker.execute_batch("begin exclusive").unwrap();
+    connection::ensure().unwrap();
+    let probe = Connection::open(&db).unwrap();
+    probe.busy_timeout(Duration::ZERO).unwrap();
+    let try_writer = || match probe.execute_batch("begin immediate") {
+        Ok(()) => {
+            probe.execute_batch("rollback").unwrap();
+            false
+        }
+        Err(error) => {
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            true
+        }
+    };
+    assert!(try_writer(), "blocker-only control");
+    let path = db.clone();
+    let (go, ready) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        connection::ensure().unwrap();
+        let conn = Connection::open(path).unwrap();
+        let scope = WriteHoldScope::start();
+        let timeout_ms = 5000;
+        conn.busy_timeout(Duration::from_millis(timeout_ms))
+            .unwrap();
+        go.send(()).unwrap();
+        let result = in_write_transaction(&conn, || {
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+        });
+        let ended = Instant::now();
+        let restored: u32 = conn
+            .query_row("pragma busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        (result, scope.report(), ended, restored, timeout_ms)
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = Instant::now();
+    let mut released = None;
+    let mut first = None;
+    let mut last = None;
+    let mut samples = 0;
+    let mut external_busy_samples = 0;
+    while !worker.is_finished() && start.elapsed() < Duration::from_secs(10) {
+        let busy = try_writer();
+        let now = Instant::now();
+        if busy && released.is_some() {
+            first.get_or_insert(now);
+            last = Some(now);
+            samples += 1;
+        } else if busy {
+            external_busy_samples += 1;
+        }
+        if released.is_none() && start.elapsed() >= Duration::from_millis(1300) {
+            let at = Instant::now();
+            blocker.execute_batch("rollback").unwrap();
+            released = Some(at);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let finished = worker.is_finished();
+    if released.is_none() {
+        blocker.execute_batch("rollback").unwrap();
+    }
+    let (result, report, ended, restored, timeout_ms) = worker.join().unwrap();
+    let observed_ms = first
+        .zip(last)
+        .map_or(0.0, |(a, b)| b.duration_since(a).as_secs_f64() * 1000.0);
+    let physical_upper_ms = released.map_or(0.0, |at| {
+        ended.saturating_duration_since(at).as_secs_f64() * 1000.0
+    });
+    eprintln!(
+        "owned_begin sqlite={} os={} success={} busy_samples={samples} external_busy_samples={external_busy_samples} observed_exclusion_ms={observed_ms:.3} physical_upper_ms={physical_upper_ms:.3} report={report:?}",
+        rusqlite::version(),
+        std::env::consts::OS,
+        result.is_ok()
+    );
+    assert!(finished, "fixture deadline");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(u64::from(restored), timeout_ms);
+    assert!(
+        report.max_ms + TOLERANCE_MS >= observed_ms,
+        "exclusion undercount"
+    );
+    if physical_upper_ms + TOLERANCE_MS < 1000.0 {
+        assert_eq!(report.over_budget, 0, "false physical budget breach");
+    }
+    assert!(samples >= 5 && observed_ms >= 100.0);
+    assert!(external_busy_samples >= 5);
+    assert_eq!(report.transactions, 1);
+    assert!(report.max_ms < physical_upper_ms + TOLERANCE_MS);
+}
+
+#[test]
+fn collector_connections_run_no_automatic_checkpoint() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{OwnerMode, Store};
+    let temp = support::TempDir::new("wal_owner");
+    for mode in [OwnerMode::Standalone, OwnerMode::Viewer] {
+        let db = temp.path().join(format!("{mode:?}.sqlite"));
+        if mode == OwnerMode::Viewer {
+            support::create_viewer_database(&db);
+        }
+        let store = Store::open(&db, mode).unwrap();
+        let automatic: u32 = store
+            .conn
+            .query_row("pragma wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(automatic, 0, "collector connection must own checkpoints");
+    }
+}
+
+#[test]
+fn commit_runs_no_checkpoint_inside_the_write_transaction() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store, wal, write_budget::in_write_transaction,
+    };
+    let _policy = wal::WalPolicyScope::enter(wal::WalPolicy {
+        threshold_frames: u32::MAX,
+        ..Default::default()
+    });
+    #[cfg(debug_assertions)]
+    let audit = codex_sessions_collector::store::write_budget::audit::WriteAudit::start();
+    let temp = support::TempDir::new("no_backfill");
+    let db = temp.path().join("fixture.sqlite");
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let initial_size = std::fs::metadata(&db).unwrap().len();
+    let before = wal::checkpoint_report();
+    in_write_transaction(&store.conn, || {
+        for index in 0..1500 {
+            store.conn.execute(
+                "insert into app_metadata values (?,?,'now')",
+                rusqlite::params![format!("bulk-{index}"), "x".repeat(3000)],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().len(),
+        initial_size,
+        "COMMIT must not backfill the main database"
+    );
+    let report = wal::checkpoint_report();
+    assert_eq!(report.checkpoints, before.checkpoints);
+    assert!(
+        report.max_tx_frames >= 1000,
+        "fixture must cross SQLite's automatic checkpoint threshold"
+    );
+    #[cfg(debug_assertions)]
+    {
+        audit.assert_complete();
+        assert_eq!(audit.report().checkpoints_in_transaction, 0);
+    }
+}
+
+#[test]
+fn threshold_checkpoint_runs_after_release_and_outside_the_hold() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store, wal,
+        write_budget::{WriteBudget, write_chunked},
+        write_lease::WriteLease,
+    };
+    #[cfg(debug_assertions)]
+    let audit = codex_sessions_collector::store::write_budget::audit::WriteAudit::start();
+    let temp = support::TempDir::new("checkpoint_gap");
+    let store = Store::open(&temp.path().join("fixture.sqlite"), OwnerMode::Standalone).unwrap();
+    let _policy = wal::WalPolicyScope::enter(wal::WalPolicy {
+        threshold_frames: 64,
+        ..Default::default()
+    });
+    let _delay = wal::test_hooks::checkpoint_delay(Duration::from_millis(300));
+
+    let hold = WriteHoldScope::for_phase("checkpoint_gap");
+    let _lease = WriteLease::acquire(&store.conn).unwrap();
+    let before = wal::checkpoint_report();
+    let mut starts = Vec::new();
+    write_chunked(
+        &store.conn,
+        "checkpoint_gap",
+        WriteBudget {
+            soft: Duration::ZERO,
+            ..Default::default()
+        },
+        1,
+        0..2,
+        || {
+            starts.push(std::time::Instant::now());
+            Ok(())
+        },
+        |_, index| {
+            for row in 0..80 {
+                store.conn.execute(
+                    "insert into app_metadata values (?,?,'now')",
+                    rusqlite::params![format!("delay-{index}-{row}"), "x".repeat(3000)],
+                )?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let report = wal::checkpoint_report();
+    assert_eq!(
+        report.complete - before.complete,
+        2,
+        "both chunks must reach the explicit checkpoint path"
+    );
+    assert!(report.total_ms - before.total_ms >= 600.0);
+    assert!(std::fs::metadata(&store.path).unwrap().len() > 4096);
+    assert!(
+        hold.report().max_ms < 300.0,
+        "checkpoint delay must not enter hold samples"
+    );
+    assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(300));
+    #[cfg(debug_assertions)]
+    {
+        audit.assert_complete();
+        assert_eq!(audit.report().checkpoints_in_transaction, 0);
+    }
+}
+
+#[test]
+fn wal_stays_bounded_across_many_transactions() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store, wal,
+        write_budget::{WriteBudget, write_chunked},
+        write_lease::WriteLease,
+    };
+    let _policy = wal::WalPolicyScope::enter(wal::WalPolicy {
+        threshold_frames: 64,
+        ..Default::default()
+    });
+    let temp = support::TempDir::new("wal_bound");
+    let db = temp.path().join("fixture.sqlite");
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    let _lease = WriteLease::acquire(&store.conn).unwrap();
+    write_chunked(
+        &store.conn,
+        "wal_bound",
+        WriteBudget {
+            soft: Duration::ZERO,
+            gap: Duration::ZERO,
+            ..Default::default()
+        },
+        1,
+        0..50,
+        || Ok(()),
+        |_, index| {
+            for row in 0..20 {
+                store.conn.execute(
+                    "insert into app_metadata values (?,?,'now')",
+                    rusqlite::params![format!("bound-{index}-{row}"), "x".repeat(3000)],
+                )?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let report = wal::checkpoint_report();
+    assert!(report.checkpoints > 0);
+    assert!(report.max_wal_frames <= 63 + report.max_tx_frames);
+    let page_size: u32 = store
+        .conn
+        .query_row("pragma page_size", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        std::fs::metadata(format!("{}-wal", db.display()))
+            .unwrap()
+            .len()
+            <= 32 + u64::from(63 + report.max_tx_frames) * (u64::from(page_size) + 24)
+    );
+}
+
 #[test]
 fn idle_memoized_status_scan_has_no_write_transaction() {
     let _serial = budget_test();
@@ -1866,5 +2189,176 @@ fn hub_bootstrap_identity_and_each_ddl_statement_have_write_holds() {
         )
         .unwrap(),
         "machine-a"
+    );
+}
+
+#[test]
+fn reader_snapshot_makes_checkpoint_partial_without_failing_the_write() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{
+        OwnerMode, Store, wal, write_budget::in_write_transaction,
+    };
+    let temp = support::TempDir::new("wal_reader");
+    let db = temp.path().join("fixture.sqlite");
+    let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+    assert_eq!(
+        wal::checkpoint(&store.conn, "idle").result,
+        wal::CheckpointResult::Complete
+    );
+    codex_sessions_collector::store::connection::ensure().unwrap();
+    let reader = Connection::open(&db).unwrap();
+    reader
+        .execute_batch("begin; select count(*) from app_metadata")
+        .unwrap();
+    let _policy = wal::WalPolicyScope::enter(wal::WalPolicy {
+        threshold_frames: 64,
+        ..Default::default()
+    });
+    let before = wal::checkpoint_report();
+    in_write_transaction(&store.conn, || {
+        for i in 0..100 {
+            store.conn.execute(
+                "insert into app_metadata values (?,?,'now')",
+                rusqlite::params![format!("reader-{i}"), "x".repeat(3000)],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let partial = wal::checkpoint_report();
+    assert_eq!(partial.partial - before.partial, 1);
+    assert_eq!(partial.failed, before.failed);
+    assert!(
+        partial.max_tx_frames >= 64,
+        "fixture must reach checkpoint threshold"
+    );
+    assert_eq!(
+        reader
+            .query_row(
+                "select count(*) from app_metadata where key like 'reader-%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    reader.execute_batch("commit").unwrap();
+    let outcome = wal::checkpoint(&store.conn, "idle");
+    assert_eq!(outcome.result, wal::CheckpointResult::Complete);
+    assert_eq!(outcome.log_frames, outcome.checkpointed_frames);
+    assert_eq!(
+        reader
+            .query_row(
+                "select count(*) from app_metadata where key like 'reader-%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        100
+    );
+}
+
+#[test]
+fn store_drop_checkpoints_due_writes_but_skips_cancelled_and_panicking() {
+    let _serial = budget_test();
+    use codex_sessions_collector::store::{OwnerMode, Store, wal};
+    for mode in ["normal", "cancelled", "panicking"] {
+        let temp = support::TempDir::new("wal_drop");
+        let db = temp.path().join("fixture.sqlite");
+        let store = Store::open(&db, OwnerMode::Standalone).unwrap();
+        codex_sessions_collector::store::connection::ensure().unwrap();
+        let viewer = Connection::open(&db).unwrap();
+        let _policy = wal::WalPolicyScope::enter(wal::WalPolicy {
+            threshold_frames: 1,
+            ..Default::default()
+        });
+        // A raw committed statement reaches the hook but bypasses finish_immediate,
+        // so Drop is the only collector checkpoint opportunity in this fixture.
+        store
+            .conn
+            .execute("insert into app_metadata values ('drop-due','v','now')", [])
+            .unwrap();
+        let before = wal::checkpoint_report();
+        match mode {
+            "normal" => drop(store),
+            "cancelled" => {
+                wal::test_hooks::with_cancelled(|| drop(store));
+            }
+            _ => {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let _store = store;
+                    panic!("synthetic Drop unwind");
+                }));
+                assert!(panic.is_err());
+            }
+        }
+        let after = wal::checkpoint_report();
+        assert_eq!(
+            after.checkpoints - before.checkpoints,
+            u64::from(mode == "normal")
+        );
+        assert_eq!(after.failed, before.failed);
+        assert_eq!(
+            viewer
+                .query_row(
+                    "select value from app_metadata where key='drop-due'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "v"
+        );
+    }
+}
+
+#[test]
+fn one_shot_scan_leaves_wal_within_threshold() {
+    let _serial = budget_test();
+    let temp = support::TempDir::new("wal_one_shot");
+    let home = support::codex_home(&temp, &["rich_session.jsonl"]);
+    let db = support::viewer_database(&temp);
+    codex_sessions_collector::store::connection::ensure().unwrap();
+    let mut viewer = Connection::open(&db).unwrap();
+    let output = support::collector()
+        .args(["codex", "scan", "--db"])
+        .arg(&db)
+        .arg("--windows-root")
+        .arg(&home)
+        .args([
+            "--wsl-root",
+            "",
+            "--wsl-unc-root",
+            "",
+            "--no-wsl-projects",
+            "--json",
+        ])
+        .env("CODEX_SESSIONS_COLLECTOR_TEST_WAL_FRAMES", "64")
+        .env("CODEX_SESSIONS_COLLECTOR_TIMINGS", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let log = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        log.contains("wal_checkpoint reason=threshold"),
+        "fixture must checkpoint: {log}"
+    );
+    let frames = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
+    let observed = frames.clone();
+    viewer
+        .wal_hook(Some(move |_: &mut rusqlite::hooks::Wal, n| {
+            observed.store(n, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }))
+        .unwrap();
+    viewer
+        .execute(
+            "insert into app_metadata values ('one-shot-witness','v','now')",
+            [],
+        )
+        .unwrap();
+    let n = frames.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (1..=66).contains(&n),
+        "one-shot residue must be below threshold: {n}"
     );
 }

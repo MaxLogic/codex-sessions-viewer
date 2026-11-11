@@ -30,6 +30,9 @@ thread_local! {
     // key by a raw connection address that SQLite can reuse after close.
     static RELEASED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     static COMPLETION_TIME: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    static LOCK_WAIT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    static COMMIT_STARTED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static LAST_DETAIL: std::cell::Cell<(Duration, Duration, u32, u32)> = const { std::cell::Cell::new((Duration::ZERO, Duration::ZERO, 0, 0)) };
     static SESSION_SHAPE: std::cell::Cell<Option<SessionWriteShape>> = const { std::cell::Cell::new(None) };
     static PREPARED_DETAIL: std::cell::Cell<(f64, u64, usize)> = const { std::cell::Cell::new((0.0, 0, 0)) };
     static CHUNK_OBSERVER: RefCell<Option<Box<ChunkObserver>>> = const { RefCell::new(None) };
@@ -316,8 +319,10 @@ fn write_chunks<U, S>(
             let shape = SESSION_SHAPE.with(std::cell::Cell::get);
             let (predicted_ms, write_bytes, prepared_fallbacks) =
                 PREPARED_DETAIL.with(std::cell::Cell::get);
+            let (lock_wait, commit_lock, tx_frames, wal_frames) =
+                LAST_DETAIL.with(std::cell::Cell::get);
             eprintln!(
-                "write_detail phase={phase} units={count} setup_ms={:.6} apply_ms={:.6} commit_ms={:.6} gap_ms={:.6} required_gap_ms={:.6} messages={} tool_calls={} source_bytes={} content_bytes={} predicted_ms={predicted_ms:.6} write_bytes={write_bytes} prepared_fallbacks={prepared_fallbacks}",
+                "write_detail phase={phase} units={count} setup_ms={:.6} apply_ms={:.6} commit_ms={:.6} gap_ms={:.6} required_gap_ms={:.6} messages={} tool_calls={} source_bytes={} content_bytes={} predicted_ms={predicted_ms:.6} write_bytes={write_bytes} prepared_fallbacks={prepared_fallbacks} lock_wait_ms={:.6} commit_lock_ms={:.6} tx_frames={tx_frames} wal_frames={wal_frames}",
                 (validation_time + setup_time).as_secs_f64() * 1000.0,
                 apply_time.as_secs_f64() * 1000.0,
                 COMPLETION_TIME.with(std::cell::Cell::get).as_secs_f64() * 1000.0,
@@ -327,6 +332,8 @@ fn write_chunks<U, S>(
                 shape.map_or(0, |shape| shape.tool_calls),
                 shape.map_or(0, |shape| shape.source_bytes),
                 shape.map_or(0, |shape| shape.content_bytes),
+                lock_wait.as_secs_f64() * 1000.0,
+                commit_lock.as_secs_f64() * 1000.0,
             );
         }
         let _yielding = super::write_lease::between_chunks();
@@ -511,7 +518,8 @@ impl Drop for PanicRollback<'_> {
     }
 }
 
-/// Cumulative physical write holds on the current collector worker thread.
+/// Cumulative write timing on the current collector worker thread.
+/// Open-time statements retain legacy whole-statement timing, including wait.
 pub fn hold_report() -> WriteHoldReport {
     TOTALS.with_borrow(HoldStats::report)
 }
@@ -572,8 +580,12 @@ impl Drop for WritePhase {
 /// Schema bootstrap and the price-history database have their own validation contracts.
 /// They still use this same measured BEGIN IMMEDIATE owner.
 pub(crate) fn begin_immediate(conn: &Connection) -> rusqlite::Result<()> {
+    super::wal::begin(conn);
+    COMMIT_STARTED.with(|started| started.set(None));
+    let waiting = Instant::now();
     conn.execute_batch("begin immediate")?;
     let start = Instant::now();
+    LOCK_WAIT.with(|wait| wait.set(start.duration_since(waiting)));
     let phase = PHASE.with_borrow(|phase| *phase);
     #[cfg(debug_assertions)]
     audit::check_replaced_owner(conn);
@@ -581,6 +593,95 @@ pub(crate) fn begin_immediate(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 pub(crate) fn complete_hold(conn: &Connection) {
+    if !conn.is_autocommit() {
+        return;
+    }
+    if let Some((start, phase)) =
+        ACTIVE.with_borrow_mut(|active| active.remove(&connection_key(conn)))
+    {
+        let released = super::wal::take_release(conn).unwrap_or_else(Instant::now);
+        let elapsed = released.saturating_duration_since(start);
+        RELEASED.with(|last| last.set(Some(released)));
+        let lock_wait = LOCK_WAIT.with(std::cell::Cell::get);
+        let commit_lock = COMMIT_STARTED
+            .with(|started| started.take())
+            .map_or(Duration::ZERO, |at| released.saturating_duration_since(at));
+        let (tx_frames, wal_frames) = super::wal::frames(conn);
+        LAST_DETAIL.with(|detail| detail.set((lock_wait, commit_lock, tx_frames, wal_frames)));
+        if crate::timing::enabled() {
+            eprintln!(
+                "write_hold phase={phase} hold_ms={:.6} lock_wait_ms={:.6} tx_frames={tx_frames} wal_frames={wal_frames}",
+                elapsed.as_secs_f64() * 1000.0,
+                lock_wait.as_secs_f64() * 1000.0,
+            );
+        }
+        if elapsed > current_budget().hard && crate::timing::enabled() {
+            eprintln!(
+                "collector write hold exceeded hard budget: phase={phase} hold_ms={:.3}",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+        TOTALS.with_borrow_mut(|stats| stats.record(elapsed, phase));
+        OBSERVERS.with_borrow(|observers| {
+            for observer in observers {
+                if observer.phase.is_none_or(|filter| filter == phase) {
+                    observer.stats.borrow_mut().record(elapsed, phase);
+                }
+            }
+        });
+        #[cfg(debug_assertions)]
+        audit::completed(conn);
+    }
+}
+thread_local! {
+    /// The connection whose outer transaction `in_write_transaction` owns on
+    /// this thread (its address, 0 for none). Writers on that connection use
+    /// a savepoint inside it; any other connection starts its own checked
+    /// transaction.
+    static OUTER_WRITE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn connection_key(conn: &Connection) -> usize {
+    // SAFETY: only use the live connection's SQLite handle as an opaque
+    // identity; never dereference it. Unlike &Connection this survives moves.
+    unsafe { conn.handle() as usize }
+}
+
+/// Identity of the currently owned physical transaction, including nested writes.
+pub(crate) fn transaction_started(conn: &Connection) -> Option<Instant> {
+    ACTIVE.with_borrow(|active| active.get(&connection_key(conn)).map(|entry| entry.0))
+}
+
+/// Measure an operation SQLite requires outside BEGIN (for example changing
+/// journal_mode). The elapsed sample conservatively includes any lock wait:
+/// SQLite does not expose its internal lock-acquisition instant for this path.
+/// Record failed attempts too, since they may acquire/release a lock internally.
+pub(crate) fn outside_transaction<T>(
+    conn: &Connection,
+    phase: &'static str,
+    body: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    if !conn.is_autocommit() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    #[cfg(debug_assertions)]
+    audit::check_replaced_owner(conn);
+    ACTIVE.with_borrow_mut(|active| {
+        active.insert(connection_key(conn), (Instant::now(), phase));
+    });
+    struct Complete<'a>(&'a Connection);
+    impl Drop for Complete<'_> {
+        fn drop(&mut self) {
+            complete_outside_hold(self.0);
+        }
+    }
+    let _complete = Complete(conn);
+    body()
+}
+
+// Preserve bfec44f timing for statements outside an owned transaction.
+// In particular, never consume WAL release/wait/frame state on this path.
+fn complete_outside_hold(conn: &Connection) {
     if !conn.is_autocommit() {
         return;
     }
@@ -612,51 +713,6 @@ pub(crate) fn complete_hold(conn: &Connection) {
         #[cfg(debug_assertions)]
         audit::completed(conn);
     }
-}
-thread_local! {
-    /// The connection whose outer transaction `in_write_transaction` owns on
-    /// this thread (its address, 0 for none). Writers on that connection use
-    /// a savepoint inside it; any other connection starts its own checked
-    /// transaction.
-    static OUTER_WRITE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn connection_key(conn: &Connection) -> usize {
-    // SAFETY: only use the live connection's SQLite handle as an opaque
-    // identity; never dereference it. Unlike &Connection this survives moves.
-    unsafe { conn.handle() as usize }
-}
-
-/// Identity of the currently owned physical transaction, including nested writes.
-pub(crate) fn transaction_started(conn: &Connection) -> Option<Instant> {
-    ACTIVE.with_borrow(|active| active.get(&connection_key(conn)).map(|entry| entry.0))
-}
-
-/// Measure an operation SQLite requires outside BEGIN (for example changing
-/// journal_mode). The elapsed sample conservatively includes any lock wait:
-/// SQLite does not expose its internal lock-acquisition instant for this path.
-/// Record failed attempts too, since they may acquire/release a lock internally.
-pub(crate) fn outside_transaction<T>(
-    conn: &Connection,
-    phase: &'static str,
-    body: impl FnOnce() -> rusqlite::Result<T>,
-) -> rusqlite::Result<T> {
-    if !conn.is_autocommit() {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    #[cfg(debug_assertions)]
-    audit::check_replaced_owner(conn);
-    ACTIVE.with_borrow_mut(|active| {
-        active.insert(connection_key(conn), (Instant::now(), phase));
-    });
-    struct Complete<'a>(&'a Connection);
-    impl Drop for Complete<'_> {
-        fn drop(&mut self) {
-            complete_hold(self.0);
-        }
-    }
-    let _complete = Complete(conn);
-    body()
 }
 
 /// Marks `conn` as owning the outer write for its lifetime. Dropping it
@@ -770,6 +826,7 @@ pub(crate) fn finish_immediate<T, E>(
     sql_error: impl FnOnce(rusqlite::Error) -> E,
 ) -> Result<T, E> {
     let completion_start = Instant::now();
+    COMMIT_STARTED.with(|started| started.set(result.is_ok().then_some(completion_start)));
     let finished = match result {
         Ok(value) => match conn.execute_batch("commit") {
             Ok(()) => Ok(value),
@@ -785,6 +842,9 @@ pub(crate) fn finish_immediate<T, E>(
     };
     COMPLETION_TIME.with(|elapsed| elapsed.set(completion_start.elapsed()));
     complete_hold(conn);
+    if finished.is_ok() && conn.is_autocommit() {
+        super::wal::committed(conn);
+    }
     finished
 }
 
@@ -802,4 +862,46 @@ pub fn execute_write(
     }
     let _phase = write_phase(phase);
     in_write_transaction(conn, || Ok(conn.execute(sql, params)?))
+}
+
+#[cfg(test)]
+mod owned_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn exclusive_writer_blocked_begin_immediate_reports_lock_wait() {
+        let parent = std::env::var_os("CXV_TEST_SANDBOX_PARENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let db = parent.join(format!("cxv-begin-wait-{}.sqlite", std::process::id()));
+        drop(std::fs::File::create_new(&db).unwrap());
+        super::super::connection::ensure().unwrap();
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch("create table fixture(id integer); begin exclusive")
+            .unwrap();
+        super::super::connection::ensure().unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        let blocker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            writer.execute_batch("rollback").unwrap();
+        });
+        let _phase = write_phase("begin_fixture");
+        let holds = WriteHoldScope::for_phase("begin_fixture");
+        begin_immediate(&conn).unwrap();
+        conn.execute_batch("rollback").unwrap();
+        complete_hold(&conn);
+        let wait = LAST_DETAIL.with(std::cell::Cell::get).0;
+        let report = holds.report();
+        blocker.join().unwrap();
+        drop(conn);
+        std::fs::remove_file(&db).unwrap();
+        assert_eq!(report.transactions, 1);
+        assert!(wait >= Duration::from_millis(200), "wait={wait:?}");
+        assert!(
+            report.max_ms < 100.0 && report.max_ms < wait.as_secs_f64() * 1000.0,
+            "wait before any writer lock stays lock_wait: wait={wait:?}, report={report:?}"
+        );
+    }
 }
