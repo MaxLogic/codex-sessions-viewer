@@ -1052,7 +1052,7 @@ fn bridge_resident_disconnect_releases_pause_with_full_output_queue() {
 
 #[test]
 fn bridge_resident_stalled_refusals_isolate_other_clients() {
-    let _fixture_load = ordinary_fixture_lane();
+    let _fixture_load = latency_fixture_lane();
     let mut fixture = Fixture::new();
     fixture.start("resident");
     fixture.ready();
@@ -1119,9 +1119,10 @@ fn bridge_resident_stalled_refusals_isolate_other_clients() {
     };
     let status = control("status");
     let shutdown = control("stop");
+    let controls_elapsed = started.elapsed();
     eprintln!(
         "independent controls completed_ms={:.3}",
-        started.elapsed().as_secs_f64() * 1000.0
+        controls_elapsed.as_secs_f64() * 1000.0
     );
     // Stop the fixture before joining the producer, including on a regression.
     for child in &mut fixture.children {
@@ -1147,7 +1148,7 @@ fn bridge_resident_stalled_refusals_isolate_other_clients() {
         String::from_utf8_lossy(&shutdown.stderr)
     );
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        controls_elapsed < Duration::from_secs(3),
         "independent controls were delayed"
     );
 }
@@ -3516,8 +3517,9 @@ fn hook_recovery_sweep_drains_legacy_but_leaves_foreign_partition() {
     let mut fixture = Fixture::new();
     let id = "01a0aaaa-0000-7000-8000-000000000185";
     fixture.rollout(id);
-    fixture.start("resident");
-    fixture.ready();
+    // Prepare both partitions before the first real recovery sweep. Enqueuing
+    // after readiness waits out the 30-second sweep interval and races the
+    // periodic scan, leaving only three seconds of discovery slack under load.
     assert!(fixture.hook(id, true).status.success());
     let entry = fixture.entries().pop().unwrap();
     let mut item: Value = serde_json::from_slice(&std::fs::read(&entry).unwrap()).unwrap();
@@ -3527,11 +3529,13 @@ fn hook_recovery_sweep_drains_legacy_but_leaves_foreign_partition() {
     let foreign = fixture.root.join("queue").join("foreign.json");
     let bytes = serde_json::to_vec(&item).unwrap();
     std::fs::write(&foreign, &bytes).unwrap();
+    fixture.start("resident");
+    fixture.ready();
     let deadline = Instant::now() + Duration::from_secs(33);
     while entry.exists() {
         assert!(
             Instant::now() < deadline,
-            "lost wakeup not recovered by sweep"
+            "recovery sweep did not claim legacy entry"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
