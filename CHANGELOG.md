@@ -2,23 +2,29 @@
 
 ## [Unreleased]
 
-- Restored legacy packed hub queue rows now resend the current stored session;
-  rows without a stored session are dropped and counted, without decoding old payloads.
-  In-flight batches retain their identity even when pruning leaves no records (CXV-221).
+- Restored legacy packed hub queue rows now resend the current stored session.
+  Rows without a stored session are dropped and counted in hub sync's
+  `pruned_dead_letters` count, without decoding old payloads. In-flight batches
+  retain their identity even when pruning leaves no records (CXV-221).
 
 - Settings now offers an explicit full reparse when history parsing settings
   change. The reparse continues when you navigate away, with progress and
   cancellation available in Settings (CXV-220).
 
-- Collector WAL checkpoints run between write transactions and after 30 seconds
-  idle. Write-hold timings exclude checkpoints, which are reported separately
-  when timing logging is enabled (CXV-187).
+- Collector WAL checkpoints run between write transactions. The resident also
+  checkpoints after 30 seconds idle. One-shot commands and the hub server
+  checkpoint when the store closes if the WAL has reached 1,000 frames.
+  Write-hold timings exclude checkpoints, which are reported separately when
+  collector timing logging is enabled. Hard-budget warnings for owned write
+  transactions now require timing logging too (CXV-187).
 
 - Hub sync now builds each session snapshot from its latest stored rows at send
   time. Repeated turns queue one small reference; reasoning/cache-write tokens
-  and project hints survive rebuilding. Existing queued payloads still deliver
-  once. Unsent changes of a locally deleted session are dropped; the hub keeps
-  its last received copy. Update the viewer, collector and hub together.
+  and project hints survive rebuilding. Existing queued plain payloads still
+  deliver once. Packed rows, never written by a tagged release, are resent
+  from stored rows by `record_key`. Unsent changes of a locally deleted session
+  are dropped; the hub keeps its last received copy. Update the viewer,
+  collector and hub together.
 
 - Source availability checks use indexed session paths instead of loading the
   whole session table, keeping scans responsive as history grows (CXV-216).
