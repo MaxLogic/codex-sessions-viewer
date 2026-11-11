@@ -3729,7 +3729,7 @@ fn options_change_viewer_ingest_both_harnesses() {
                     codex_sessions_collector::claude::collect_file(
                         &reference,
                         &path,
-                        codex_sessions_collector::codex::parser::SourceType::Windows,
+                        codex_sessions_collector::codex::parser::SourceType::native(),
                         &codex_sessions_collector::path_mapping::PathMapper::new(""),
                         &codex_sessions_collector::claude::parser::ClaudeOptions {
                             max_tool_output_preview_chars: limit,
@@ -3751,7 +3751,7 @@ fn options_change_viewer_ingest_both_harnesses() {
                     let root = codex_sessions_collector::codex::scanner::ScanRoot {
                         path: path.display().to_string(),
                         availability_root_path: None,
-                        source_type: codex_sessions_collector::codex::parser::SourceType::Windows,
+                        source_type: codex_sessions_collector::codex::parser::SourceType::native(),
                         source_state: "active",
                     };
                     codex_sessions_collector::codex::collect_file_with(
