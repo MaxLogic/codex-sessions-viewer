@@ -204,6 +204,7 @@ mod tests {
         let dir = std::env::var_os("CXV_TEST_SANDBOX_PARENT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("cxv-stmt-large-{}.sqlite", std::process::id()));
         drop(std::fs::File::create_new(&path).unwrap());
         crate::store::connection::ensure().unwrap();
@@ -357,6 +358,7 @@ mod tests {
         let dir = std::env::var_os("CXV_TEST_SANDBOX_PARENT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&dir).unwrap();
         for (rows, should_spill) in [(384_i64, false), (768, true)] {
             let path = dir.join(format!("cxv-stmt-{}-{rows}.sqlite", std::process::id()));
             // Exclusive creation establishes ownership before SQLite opens the file.

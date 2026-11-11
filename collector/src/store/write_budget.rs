@@ -873,6 +873,7 @@ mod owned_transaction_tests {
         let parent = std::env::var_os("CXV_TEST_SANDBOX_PARENT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&parent).unwrap();
         let db = parent.join(format!("cxv-begin-wait-{}.sqlite", std::process::id()));
         drop(std::fs::File::create_new(&db).unwrap());
         super::super::connection::ensure().unwrap();
