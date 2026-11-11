@@ -57,6 +57,14 @@ Each archive contains the viewer, the `codex-sessions-collector` that parses
 session files, the `codex-sessions-hub` server, and on Windows the windowless
 `codex-sessions-scan-launcher` for scheduled scans.
 
+To update, replace the files in the same folder with the new release and start
+the viewer. When a release changes the database schema, the viewer upgrades
+the database first and backs it up beforehand (see
+[database backups](#database-backups)); until then the collector stops with a
+message asking you to open the viewer. Install the viewer and the collector
+from the same release. With a hub, update the hub and every machine together,
+as described in [hub setup](docs/hub-setup.md).
+
 ## First start
 
 On first start the viewer creates its settings file from the packaged
@@ -84,6 +92,12 @@ linux_home = '/home/<user>'
 linux_root_unc = '\\wsl.localhost\Ubuntu\'
 ```
 
+Some settings change how sessions are parsed, such as
+`max_tool_output_preview_chars` under `[tool_output]`. A change applies to new
+turns; stored sessions keep the old value until you choose **Reparse all
+sessions** in Settings under Data and cache. Nothing is reparsed automatically,
+because a full reparse reads every session file again.
+
 Press F1 for the keyboard shortcuts. F5 refreshes, Ctrl+F searches sessions or
 the open conversation, and Ctrl+L moves to the filters.
 
@@ -93,7 +107,9 @@ The viewer does not parse session files itself. A resident
 `codex-sessions-collector` process owns the database: it scans the session
 folders, writes what it parsed, and the viewer reads the result. Writes are
 split into short transactions with pauses between them, so the viewer stays
-responsive during a full rescan.
+responsive during a full rescan. A session file that only grew since the last
+scan is read from where that scan stopped, and parsed in full once more when
+it stops growing.
 
 When the viewer starts, it connects to the collector for its database or starts
 one. That collector rescans on the interval set under Settings and exits 30
