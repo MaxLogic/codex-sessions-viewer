@@ -298,50 +298,68 @@ Invoke-Step 'Check Flutter installation' { & $flutter --version }
 # so the release needs neither a Rust toolchain nor a VC++ redistributable.
 . (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
 $testEnvironment = New-TestEnvironment
-Push-Location $collectorRoot
+$testRunPassed = $false
 try {
-    Invoke-Step 'Check collector formatting' { & $cargo fmt --check }
-    Invoke-Step 'Lint collector' { & $cargo clippy --locked --all-targets -- -D warnings }
-    Invoke-Step 'Test collector' { Invoke-TestProcess -Context $testEnvironment -FilePath $cargo -ArgumentList @('test', '--locked', '--no-fail-fast') -WorkingDirectory $collectorRoot } -Test
-    Invoke-Step 'Build collector and hub release' { & $cargo build --locked --release --bins }
-}
-finally {
-    Pop-Location
-}
-$collectorBuildExe = Join-Path $collectorRoot "target\release\$collectorExeName"
-if (-not (Test-Path -LiteralPath $collectorBuildExe -PathType Leaf)) {
-    throw "Expected collector build output not found at '$collectorBuildExe'."
-}
-$hubBuildExe = Join-Path $collectorRoot "target\release\$hubExeName"
-if (-not (Test-Path -LiteralPath $hubBuildExe -PathType Leaf)) {
-    throw "Expected hub build output not found at '$hubBuildExe'."
-}
-$launcherBuildExe = Join-Path $collectorRoot "target\release\$launcherExeName"
-if (-not (Test-Path -LiteralPath $launcherBuildExe -PathType Leaf)) {
-    throw "Expected scan launcher build output not found at '$launcherBuildExe'."
+    Push-Location $collectorRoot
+    try {
+        Invoke-Step 'Check collector formatting' { & $cargo fmt --check }
+        Invoke-Step 'Lint collector' { & $cargo clippy --locked --all-targets -- -D warnings }
+        Invoke-Step 'Test collector' { Invoke-TestProcess -Context $testEnvironment -FilePath $cargo -ArgumentList @('test', '--locked', '--no-fail-fast') -WorkingDirectory $collectorRoot } -Test
+        Invoke-Step 'Build collector and hub release' { & $cargo build --locked --release --bins }
+    }
+    finally {
+        Pop-Location
+    }
+    $collectorBuildExe = Join-Path $collectorRoot "target\release\$collectorExeName"
+    if (-not (Test-Path -LiteralPath $collectorBuildExe -PathType Leaf)) {
+        throw "Expected collector build output not found at '$collectorBuildExe'."
+    }
+    $hubBuildExe = Join-Path $collectorRoot "target\release\$hubExeName"
+    if (-not (Test-Path -LiteralPath $hubBuildExe -PathType Leaf)) {
+        throw "Expected hub build output not found at '$hubBuildExe'."
+    }
+    $launcherBuildExe = Join-Path $collectorRoot "target\release\$launcherExeName"
+    if (-not (Test-Path -LiteralPath $launcherBuildExe -PathType Leaf)) {
+        throw "Expected scan launcher build output not found at '$launcherBuildExe'."
+    }
+
+    Push-Location $appRoot
+    try {
+        Invoke-Step 'Install Flutter dependencies' { & $flutter pub get }
+        Invoke-Step 'Check Dart formatting' { & $dart format --set-exit-if-changed . }
+        Invoke-Step 'Analyze Flutter app' { & $flutter analyze }
+        $testEnvironment.Variables['CODEX_SESSIONS_COLLECTOR_EXE'] = $collectorBuildExe
+        $testEnvironment.Variables['CODEX_SESSIONS_HUB_EXE'] = $hubBuildExe
+        Invoke-Step 'Run Flutter tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test') -WorkingDirectory $appRoot } -Test
+        Invoke-Step 'Run Flutter integration tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test', 'integration_test') -WorkingDirectory $appRoot } -Test
+        Invoke-Step 'Run script checks' {
+            $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+            $savedSandboxParent = $env:CXV_TEST_SANDBOX_PARENT
+            try {
+                $env:CXV_TEST_SANDBOX_PARENT = $testEnvironment.Variables['CXV_TEST_SANDBOX_PARENT']
+                & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'test_scripts.ps1') -CollectorPath $collectorBuildExe
+            } finally {
+                $env:CXV_TEST_SANDBOX_PARENT = $savedSandboxParent
+            }
+        } -Test
+        if ($testFailures.Count -gt 0) {
+            Write-Output 'Windows release test failures:'
+            $testFailures | Write-Output
+            throw "$($testFailures.Count) Windows release test step(s) failed."
+        }
+        $testRunPassed = $true
+    }
+    finally {
+        Pop-Location
+    }
+} finally {
+    Complete-TestEnvironment -Context $testEnvironment -Passed:$testRunPassed
 }
 
 Push-Location $appRoot
 try {
-    Invoke-Step 'Install Flutter dependencies' { & $flutter pub get }
-    Invoke-Step 'Check Dart formatting' { & $dart format --set-exit-if-changed . }
-    Invoke-Step 'Analyze Flutter app' { & $flutter analyze }
-    $testEnvironment.Variables['CODEX_SESSIONS_COLLECTOR_EXE'] = $collectorBuildExe
-    $testEnvironment.Variables['CODEX_SESSIONS_HUB_EXE'] = $hubBuildExe
-    Invoke-Step 'Run Flutter tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test') -WorkingDirectory $appRoot } -Test
-    Invoke-Step 'Run Flutter integration tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test', 'integration_test') -WorkingDirectory $appRoot } -Test
-    Invoke-Step 'Run script checks' {
-        $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-        & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'test_scripts.ps1') -CollectorPath $collectorBuildExe
-    } -Test
-    if ($testFailures.Count -gt 0) {
-        Write-Output 'Windows release test failures:'
-        $testFailures | Write-Output
-        throw "$($testFailures.Count) Windows release test step(s) failed."
-    }
     Invoke-Step 'Build Windows release' { & $flutter build windows }
-}
-finally {
+} finally {
     Pop-Location
 }
 

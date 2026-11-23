@@ -23,7 +23,9 @@ pwsh -NoProfile -File scripts/test_fast.ps1 -ChangedPath app/lib/src/database/ap
 pwsh -NoProfile -File scripts/test_scripts.ps1
 ```
 
-`-OutputRoot` must be a new directory. It retains `selection.json`, a log and
+`-OutputRoot` must be a new directory. Use a short path so nested SQLite
+fixtures and Windows tools have room for their file names. The output retains
+`selection.json`, a log and
 monotonic duration for every command/setup step in `timings.json`, plus the
 total duration, sandbox path, script-check sandbox parent, step results,
 failures and skipped steps in `run.json`. Unfiltered Flutter files run
@@ -35,10 +37,12 @@ build and Flutter dependency install run independently. If either fails,
 the runner records the Flutter test steps as not run. An
 incomplete Flutter batch report counts as a failed test step even if Flutter
 exits zero. The summary lists failures and steps not run, and the runner
-exits nonzero if any step failed. Sandboxes are retained for inspection; remove
-only that run's sandboxes after collecting proof and confirming its writers
-have stopped. Reuse the checkout's incremental `collector/target` and Flutter
-caches. Do not set `CARGO_TARGET_DIR`.
+exits nonzero if any step failed. Rust, Flutter and script checks use the run's
+own sandbox tree. A passing run removes that tree. Failed, interrupted or
+locked sandboxes are retained, and `run.json` lists their paths under
+`retained_sandboxes`. The fast lane writes the run result before starting
+cleanup and keeps its sandbox if it cannot write that result. Reuse the checkout's
+incremental `collector/target` and Flutter caches. Do not set `CARGO_TARGET_DIR`.
 
 Changes under `scripts/` also select `script-checks`. The existing
 `-AllowWide` guard still applies to that selection. For script checks alone,
@@ -48,7 +52,9 @@ Python selection suites and recursive PowerShell analysis. It reports each
 check's exit, count and duration and requires zero analyzer diagnostics.
 The standalone gate locates or builds the debug collector. The Windows
 release gate supplies the collector it already built. Collector probes in
-Pester run in the isolated test profile.
+Pester run in the isolated test profile. The script gate gives Pester and
+Python a shared sandbox parent, removes its sandbox on a pass, and prints
+the retained path if a check fails or cleanup encounters a lock.
 
 The checked-in policy is `scripts/fast_tests.py` and the source graph and
 semantic rules are in `scripts/test_dependencies.py`. Each selected path has
@@ -131,6 +137,26 @@ python3 scripts/test_fast_tests.py
 Only selection is offered on Linux/macOS in this slice; the execution wrapper
 is Windows-only. Use the existing native release scripts for a complete
 platform gate. No new dependencies are required.
+
+## Prune retained checkout sandboxes
+
+Direct `cargo test`, `flutter test` and Python test-helper callers keep their
+default sandbox parents. Once their processes exit and you no longer need the
+retained fixtures, preview or remove the entries with PowerShell 7:
+
+```powershell
+pwsh -NoProfile -File scripts/prune_test_sandboxes.ps1
+pwsh -NoProfile -File scripts/prune_test_sandboxes.ps1 -Execute
+```
+
+The command selects direct children of `collector/target/test-sandboxes`
+and `app/build/test-sandboxes` relative to its checkout. It unlinks junctions
+and symlinks without traversing them. It first renames each entry in the same
+parent. On Windows, a descendant opened without delete sharing prevents the
+rename, so the entry stays intact and the command lists it and exits nonzero.
+Run prune only in an idle checkout, after test processes have exited. Do not
+run it while another process modifies the sandbox folders. Files opened with
+delete sharing can be removed while the writer still has them open.
 
 ## Parser resume differential modes
 

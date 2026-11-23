@@ -1012,26 +1012,169 @@ mod tests {
     use super::*;
     use std::sync::{TryLockError, mpsc};
 
+    pub(super) struct TestSandbox(pub(super) PathBuf);
+
+    fn physical_sandbox_path(path: &Path) -> io::Result<PathBuf> {
+        let absolute = std::path::absolute(path)?;
+        for ancestor in absolute.ancestors() {
+            if ancestor.try_exists()? {
+                let tail = absolute.strip_prefix(ancestor).unwrap();
+                if tail
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+                {
+                    return Err(io::Error::other(
+                        "unresolved parent traversal in test sandbox path",
+                    ));
+                }
+                return Ok(std::fs::canonicalize(ancestor)?.join(tail));
+            }
+        }
+        Err(io::Error::other(
+            "test sandbox path has no existing ancestor",
+        ))
+    }
+
+    impl TestSandbox {
+        pub(super) fn new(label: &str) -> Self {
+            let parent = std::env::var_os("CXV_TEST_SANDBOX_PARENT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-sandboxes")
+                });
+            let profile_keys = [
+                "LOCALAPPDATA",
+                "APPDATA",
+                "USERPROFILE",
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_RUNTIME_DIR",
+                "XDG_CONFIG_DIRS",
+                "XDG_DATA_DIRS",
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "CLAUDE_HOME",
+                "CODEX_SESSIONS_COLLECTOR_QUEUE",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+            ];
+            let profiles = profile_keys
+                .into_iter()
+                .filter_map(std::env::var_os)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            Self::in_parent(label, &parent, profiles)
+                .expect("could not allocate resident test sandbox")
+        }
+
+        fn in_parent(
+            label: &str,
+            parent: &Path,
+            profiles: impl IntoIterator<Item = PathBuf>,
+        ) -> io::Result<Self> {
+            let parent = physical_sandbox_path(parent)?;
+            for profile in profiles {
+                let profile = physical_sandbox_path(&profile)?;
+                let inside = if cfg!(windows) {
+                    let parent = parent.to_string_lossy().to_lowercase();
+                    let profile = profile.to_string_lossy().to_lowercase();
+                    Path::new(&parent).starts_with(Path::new(&profile))
+                } else {
+                    parent.starts_with(profile)
+                };
+                if inside {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "resident test sandbox parent is inside an inherited profile: {}",
+                            parent.display()
+                        ),
+                    ));
+                }
+            }
+            std::fs::create_dir_all(&parent)?;
+            let root = parent.join(format!(
+                "{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root)?;
+            Ok(Self(root))
+        }
+    }
+
+    impl Drop for TestSandbox {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                eprintln!("Retained test sandbox: {}", self.0.display());
+            } else if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("Retained test sandbox: {} ({error})", self.0.display());
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_rejects_an_inherited_profile_before_creating_the_parent() {
+        let fixture = TestSandbox::new("profile-guard");
+        let profile = fixture.0.join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let parent = profile.join("not-created");
+        let result = TestSandbox::in_parent("guarded", &parent, [profile]);
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
+        assert!(!parent.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_cleanup_unlinks_junction_and_preserves_its_target() {
+        use std::os::windows::process::CommandExt;
+
+        let outside = TestSandbox::new("outside");
+        let sentinel = outside.0.join("sentinel.txt");
+        std::fs::write(&sentinel, "outside sandbox").unwrap();
+        let sandbox = TestSandbox::new("junction");
+        // cmd's mklink builtin does not accept verbatim Win32 paths.
+        let normal_path = |path: &Path| {
+            path.to_str()
+                .unwrap()
+                .trim_start_matches(r"\\?\")
+                .to_owned()
+        };
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/v:off", "/c"])
+            .raw_arg(r#"mklink /J "%CXV_JUNCTION%" "%CXV_JUNCTION_TARGET%""#)
+            .env("CXV_JUNCTION", normal_path(&sandbox.0.join("Content.IE5")))
+            .env("CXV_JUNCTION_TARGET", normal_path(&outside.0))
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let linked_parent = sandbox.0.join("Content.IE5").join("not-created");
+        let guarded = TestSandbox::in_parent("guarded", &linked_parent, [outside.0.clone()]);
+        assert!(matches!(guarded, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
+        assert!(!outside.0.join("not-created").exists());
+
+        let path = sandbox.0.clone();
+        drop(sandbox);
+        assert!(!path.exists(), "sandbox still exists: {}", path.display());
+        assert_eq!(
+            std::fs::read_to_string(sentinel).unwrap(),
+            "outside sandbox"
+        );
+    }
+
     #[test]
     fn expired_shutdown_deadline_rejects_even_an_already_free_lock() {
-        let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-sandboxes");
-        std::fs::create_dir_all(&parent).unwrap();
-        let root = parent.join(format!(
-            "expired-stop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        let database = root.join("viewer.sqlite");
+        let sandbox = TestSandbox::new("expired-stop");
+        let database = sandbox.0.join("viewer.sqlite");
         let result = wait_for_stop(&database, Instant::now() - Duration::from_millis(1));
-        let lock = instance::lock_path(&database).unwrap();
-        if lock.exists() {
-            std::fs::remove_file(lock).unwrap();
-        }
-        std::fs::remove_dir(root).unwrap();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 

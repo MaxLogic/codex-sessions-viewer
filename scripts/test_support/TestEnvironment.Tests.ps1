@@ -1,3 +1,95 @@
+Describe 'Sandbox lifetime' {
+    It 'refuses an existing explicit run root without changing it' {
+        $existing = Join-Path $script:context.Root 'existing-run'
+        New-Item -ItemType Directory -Path $existing | Out-Null
+        $sentinel = Join-Path $existing 'sentinel.txt'
+        Set-Content -LiteralPath $sentinel -Value 'prior run'
+
+        { New-TestEnvironment -RunRoot $existing } | Should -Throw '*must be a new directory*'
+
+        Get-Content -LiteralPath $sentinel | Should -BeExactly 'prior run'
+        @(Get-ChildItem -LiteralPath $existing).Count | Should -Be 1
+    }
+
+    It 'cannot acquire a directory claimed by another allocator during admission' {
+        $script:contestedRoot = Join-Path $script:context.Root 'contested-run'
+        $sentinel = Join-Path $script:contestedRoot 'competing.txt'
+        $script:competingMarker = $sentinel
+        Mock Test-Path -ParameterFilter { $LiteralPath -eq $script:contestedRoot } {
+            [IO.Directory]::CreateDirectory($script:contestedRoot) | Out-Null
+            [IO.File]::WriteAllText($script:competingMarker, 'competing allocator')
+            return $false
+        }
+
+        { New-TestEnvironment -RunRoot $script:contestedRoot } | Should -Throw '*must be a new directory*'
+        [IO.File]::ReadAllText($sentinel) | Should -BeExactly 'competing allocator'
+        @(Get-ChildItem -LiteralPath $script:contestedRoot).Count | Should -Be 1
+    }
+
+    It 'removes its own junction without deleting the outside target' {
+        $owned = New-TestEnvironment -Parent $script:context.Root
+        $outside = New-Item -ItemType Directory -Path (Join-Path $script:context.Root 'outside')
+        $sentinel = Join-Path $outside.FullName 'sentinel.txt'
+        Set-Content -LiteralPath $sentinel -Value 'outside sandbox'
+        New-Item -ItemType Junction -Path (Join-Path $owned.Root 'Content.IE5') -Target $outside.FullName | Out-Null
+
+        Complete-TestEnvironment -Context $owned -Passed
+
+        $owned.Root | Should -Not -Exist
+        Get-Content -LiteralPath $sentinel | Should -BeExactly 'outside sandbox'
+    }
+
+    It 'unlinks read-only files without changing the attributes of an outside hard link' {
+        $owned = New-TestEnvironment -Parent $script:context.Root
+        $sentinel = Join-Path $script:context.Root 'read-only-sentinel.txt'
+        $ordinary = Join-Path $owned.Root 'read-only.txt'
+        Set-Content -LiteralPath $sentinel -Value 'outside sandbox'
+        Set-Content -LiteralPath $ordinary -Value 'inside sandbox'
+        New-Item -ItemType HardLink -Path (Join-Path $owned.Root 'read-only-hardlink.txt') -Target $sentinel | Out-Null
+        [IO.File]::SetAttributes($sentinel, [IO.FileAttributes]::ReadOnly)
+        [IO.File]::SetAttributes($ordinary, [IO.FileAttributes]::ReadOnly)
+
+        Complete-TestEnvironment -Context $owned -Passed
+
+        $owned.Root | Should -Not -Exist
+        Get-Content -LiteralPath $sentinel | Should -BeExactly 'outside sandbox'
+        ([IO.File]::GetAttributes($sentinel) -band [IO.FileAttributes]::ReadOnly) | Should -Be ([IO.FileAttributes]::ReadOnly)
+    }
+
+    It 'refuses an extended-length spelling inside an inherited profile' {
+        $inheritedProfile = Join-Path $script:context.Root 'inherited'
+        $inside = Join-Path $inheritedProfile 'run'
+        New-Item -ItemType Directory -Path $inheritedProfile | Out-Null
+        $savedAppData = $env:APPDATA
+        try {
+            $env:APPDATA = $inheritedProfile
+            foreach ($spelling in @($inside, ('\\?\' + $inside))) {
+                { New-TestEnvironment -RunRoot $spelling } | Should -Throw '*inherited profile*'
+            }
+            $inside | Should -Not -Exist
+        } finally {
+            $env:APPDATA = $savedAppData
+        }
+    }
+
+    It 'keeps a failed run and reports its exact sandbox path' {
+        $owned = New-TestEnvironment -Parent $script:context.Root
+
+        Complete-TestEnvironment -Context $owned -WarningVariable retained -WarningAction SilentlyContinue
+
+        $owned.Root | Should -Exist
+        [string]$retained | Should -BeLike "*$($owned.Root)*"
+        Complete-TestEnvironment -Context $owned -Passed
+    }
+}
+
+AfterAll {
+    $ownedEnvironment = Get-Variable context -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($ownedEnvironment) {
+        Complete-PesterTestEnvironment $ownedEnvironment (Get-Variable ____Pester -ValueOnly -ErrorAction SilentlyContinue)
+    }
+}
+
 BeforeAll {
     . (Join-Path $PSScriptRoot 'TestEnvironment.ps1')
     $script:collectorPath = $env:CODEX_SESSIONS_COLLECTOR_EXE
@@ -21,7 +113,7 @@ Describe 'Shared PowerShell test profile boundary' {
             foreach ($key in @('PUB_CACHE', 'HOME')) { [Environment]::SetEnvironmentVariable($key, [NullString]::Value, 'Process') }
             [Environment]::SetEnvironmentVariable('INCLUDE', '', 'Process')
             [Environment]::SetEnvironmentVariable('CXV_TEST_INHERITED_SENTINEL', 'inherited', 'Process')
-            $isolated = New-TestEnvironment
+            $isolated = New-TestEnvironment -Parent $script:context.Root
             $operation = {
                 Invoke-TestEnvironment $isolated {
                     $native = (& $python -I -c $probe) | ConvertFrom-Json
@@ -125,10 +217,11 @@ Describe 'Shared PowerShell test profile boundary' {
         { Invoke-TestProcess $script:context 'missing-native-isolation-probe.exe' @('scan', '--settings', $settings) } | Should -Throw '*isolation rejected*'
     }
     It 'rejects junction traversal even when lexically owned' {
-        $external = New-TestEnvironment
-        $link = Join-Path $script:context.Root 'escape'
+        $context = New-TestEnvironment -Parent $script:context.Root
+        $external = New-TestEnvironment -Parent $script:context.Root
+        $link = Join-Path $context.Root 'escape'
         New-Item -ItemType Junction -Path $link -Target $external.Root | Out-Null
-        try { { Assert-TestPath $script:context (Join-Path $link 'log') } | Should -Throw '*reparse*' }
+        try { { Assert-TestPath $context (Join-Path $link 'log') } | Should -Throw '*reparse*' }
         finally { [IO.Directory]::Delete($link) }
     }
     It 'fails fast for a packaged viewer before Registry or Task Scheduler can be touched' {
@@ -148,14 +241,14 @@ Describe 'Shared PowerShell test profile boundary' {
         $LASTEXITCODE | Should -Be 7
     }
     It 'does not read poisoned inherited default settings' {
-        $poison = New-TestEnvironment
+        $poison = New-TestEnvironment -Parent $script:context.Root
         $sentinel = Join-Path $poison.Variables['APPDATA'] 'CodexSessionViewer/settings.toml'
         [IO.Directory]::CreateDirectory((Split-Path $sentinel)) | Out-Null
         [IO.File]::WriteAllText($sentinel, 'POISONED_INHERITED_SETTINGS = [')
         $saved = $env:APPDATA
         try {
             $env:APPDATA = $poison.Variables['APPDATA']
-            $isolated = New-TestEnvironment
+            $isolated = New-TestEnvironment -Parent $script:context.Root
             $db = Join-Path $isolated.Root 'sentinel.sqlite'
             $output = Invoke-TestProcess $isolated $script:collectorPath @('codex','scan','--standalone',$db,'--no-wsl-projects','--json')
             $LASTEXITCODE | Should -Be 0

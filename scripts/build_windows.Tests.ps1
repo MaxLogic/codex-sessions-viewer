@@ -1,3 +1,10 @@
+AfterAll {
+    $ownedEnvironment = Get-Variable testEnvironment -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($ownedEnvironment) {
+        Complete-PesterTestEnvironment $ownedEnvironment (Get-Variable ____Pester -ValueOnly -ErrorAction SilentlyContinue)
+    }
+}
+
 BeforeAll {
     . (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
     $script:testEnvironment = New-TestEnvironment

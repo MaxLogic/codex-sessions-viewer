@@ -189,6 +189,12 @@ fn make_environment(original: BTreeMap<OsString, OsString>) -> Environment {
         variables.insert((*key).into(), directory.into_os_string());
     }
     variables.insert("HOME".into(), variables[OsStr::new("USERPROFILE")].clone());
+    // Some admitted commands re-enter libtest in a fresh process. Its
+    // sandbox must stay under this test run after env_clear().
+    variables.insert(
+        "CXV_TEST_SANDBOX_PARENT".into(),
+        root.as_os_str().to_owned(),
+    );
     let env = Environment {
         root,
         variables,
@@ -537,6 +543,7 @@ impl TestCommand {
                     "CODEX_SESSIONS_HUB_OWNER_TOKEN",
                     "CSV_TEST_LEASE_CHILD",
                     "CXV_HANDLE_CHECK_CHILD",
+                    "CXV_TEST_SANDBOX_PARENT",
                     "CSV_COMPUTER_USE_TEST_SINK",
                     "CSV_COMPUTER_USE_TEST_MODE",
                 ]
@@ -562,6 +569,13 @@ impl TestCommand {
             }
         }
         let mut profile_paths = std::collections::BTreeSet::new();
+        if let Some(parent) = variables.get(OsStr::new("CXV_TEST_SANDBOX_PARENT")) {
+            let parent = Path::new(parent);
+            if !parent.is_absolute() {
+                return Err(denied("test sandbox parent must be absolute"));
+            }
+            profile_paths.insert(parent.to_path_buf());
+        }
         for key in PROFILE_KEYS {
             let value = variables.get(OsStr::new(key)).ok_or_else(|| {
                 io::Error::other(format!("test profile isolation requires {key}"))

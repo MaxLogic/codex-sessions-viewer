@@ -54,19 +54,89 @@ function Assert-TestEndpoint {
     if ($Register) { return $origin }
     if (-not $Context.Endpoints.ContainsKey($origin)) { throw 'Test isolation rejected unowned network endpoint' }
 }
+function Initialize-TestSandboxFileApi {
+    if ('CxvTest.SandboxFileApi' -as [type]) { return }
+    Add-Type -Namespace CxvTest -Name SandboxFileApi -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+private static extern bool CreateDirectoryW(string path, IntPtr security);
+[DllImport("libc", SetLastError = true)]
+private static extern int mkdir(string path, uint mode);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string path,
+    uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+[DllImport("kernel32.dll", SetLastError = true)]
+private static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle,
+    int infoClass, ref uint info, uint size);
+
+private static string ExtendedPath(string path) {
+    if (path.StartsWith(@"\\?\")) return path;
+    return path.StartsWith(@"\\") ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;
+}
+
+public static int CreateExclusiveDirectory(string path, bool windows) {
+    bool created = windows ? CreateDirectoryW(ExtendedPath(path), IntPtr.Zero) : mkdir(path, 448) == 0;
+    return created ? 0 : Marshal.GetLastWin32Error();
+}
+
+public static void UnlinkReadOnlyFile(string path) {
+    // DELETE access, share all, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT.
+    using (var handle = CreateFileW(ExtendedPath(path), 0x10000, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception();
+        // FileDispositionInfoEx: DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE.
+        uint flags = 0x1 | 0x2 | 0x10;
+        if (!SetFileInformationByHandle(handle, 21, ref flags, 4)) throw new System.ComponentModel.Win32Exception();
+    }
+}
+'@
+}
+
+function New-TestRunDirectory {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Caller owns the ShouldProcess decision.')]
+    param([string] $LiteralPath)
+
+    $volume = [IO.Path]::GetPathRoot($LiteralPath)
+    $LiteralPath = $LiteralPath.TrimEnd('\', '/')
+    if ($LiteralPath -eq $volume.TrimEnd('\', '/')) {
+        throw "Test sandbox must be a new directory: $LiteralPath"
+    }
+    Initialize-TestSandboxFileApi
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($LiteralPath)) | Out-Null
+    $windows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $code = [CxvTest.SandboxFileApi]::CreateExclusiveDirectory($LiteralPath, $windows)
+    $alreadyExists = if ($windows) { $code -in @(80, 183) } else { $code -eq 17 }
+    if ($alreadyExists) { throw "Test sandbox must be a new directory: $LiteralPath" }
+    if ($code) { throw "Could not create test run directory '$LiteralPath' (OS error $code)." }
+}
+
+function Get-TestPathComparisonForm {
+    param([string] $Path)
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { return '\\' + $Path.Substring(8) }
+    if ($Path -match '^\\\\\?\\[A-Za-z]:\\') { return $Path.Substring(4) }
+    if ($Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\')) { throw "Test profile isolation rejected device path: $Path" }
+    return $Path
+}
+
 function New-TestEnvironment {
-    [CmdletBinding(SupportsShouldProcess = $true)]
-    param([string] $Parent = $env:CXV_TEST_SANDBOX_PARENT)
-    if (-not $Parent) { $Parent = Join-Path $PSScriptRoot '../../app/build/test-sandboxes' }
+    [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'Parent')]
+    param(
+        [Parameter(ParameterSetName = 'Parent')][string] $Parent = $env:CXV_TEST_SANDBOX_PARENT,
+        [Parameter(Mandatory, ParameterSetName = 'RunRoot')][string] $RunRoot
+    )
+    if (-not $RunRoot) {
+        if (-not $Parent) { $Parent = Join-Path $PSScriptRoot '../../app/build/test-sandboxes' }
+        # Leave room for nested profiles, SQLite sidecars and Win32 path limits.
+        $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
+        $RunRoot = Join-Path $Parent "powershell-$id"
+    }
     $keys = @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'XDG_CONFIG_DIRS', 'XDG_DATA_DIRS', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_HOME', 'CODEX_SESSIONS_COLLECTOR_QUEUE', 'TEMP', 'TMP', 'TMPDIR')
     $original = @{}
     foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) { $original[$entry.Key] = [string]$entry.Value }
-    $root = [IO.Path]::GetFullPath((Join-Path $Parent ('powershell-' + [guid]::NewGuid().ToString('N'))))
+    $root = [IO.Path]::GetFullPath((Get-TestPathComparisonForm $RunRoot))
     # Reject reparse traversal rather than guessing a physical destination.
     $context = [pscustomobject]@{ Root = $root; Keys = $keys; Original = $original; Variables = @{}; Endpoints = @{} }
     Assert-TestSystemVariable $context $original
     # Construct from a closed set, never inherit arbitrary tool/profile overrides.
-    foreach ($key in @('PATH','SYSTEMROOT','WINDIR','COMSPEC','SYSTEMDRIVE','PATHEXT','PROGRAMFILES','PROGRAMFILES(X86)','PROGRAMW6432','PROGRAMDATA','ALLUSERSPROFILE','COMMONPROGRAMFILES','COMMONPROGRAMFILES(X86)','COMMONPROGRAMW6432','INCLUDE','LIB','LIBPATH','FLUTTER_ROOT','CARGO_HOME','RUSTUP_HOME','PUB_CACHE','CODEX_SESSIONS_COLLECTOR_EXE','CODEX_SESSIONS_HUB_EXE','CXV_TEST_SANDBOX_PARENT')) {
+    foreach ($key in @('PATH','SYSTEMROOT','WINDIR','COMSPEC','SYSTEMDRIVE','PATHEXT','PROGRAMFILES','PROGRAMFILES(X86)','PROGRAMW6432','PROGRAMDATA','ALLUSERSPROFILE','COMMONPROGRAMFILES','COMMONPROGRAMFILES(X86)','COMMONPROGRAMW6432','INCLUDE','LIB','LIBPATH','FLUTTER_ROOT','CARGO_HOME','RUSTUP_HOME','PUB_CACHE','CODEX_SESSIONS_COLLECTOR_EXE','CODEX_SESSIONS_HUB_EXE')) {
         if ($original.ContainsKey($key)) { $context.Variables[$key] = $original[$key] }
     }
     foreach ($key in $keys) { $context.Variables[$key] = Join-Path $root $key }
@@ -78,22 +148,91 @@ function New-TestEnvironment {
     if (-not $context.Variables['PUB_CACHE'] -and $original['LOCALAPPDATA']) { $context.Variables['PUB_CACHE'] = Join-Path $original['LOCALAPPDATA'] 'Pub/Cache' }
     Assert-TestPath -Context $context -LiteralPath $root
     if (-not $PSCmdlet.ShouldProcess($root, 'Allocate isolated test profile')) { return }
-    [IO.Directory]::CreateDirectory($root) | Out-Null
+    New-TestRunDirectory $root
     foreach ($key in $keys) { [IO.Directory]::CreateDirectory($context.Variables[$key]) | Out-Null }
+    $context.Variables['CXV_TEST_SANDBOX_PARENT'] = Join-Path $root 'children'
+    [IO.Directory]::CreateDirectory($context.Variables['CXV_TEST_SANDBOX_PARENT']) | Out-Null
+    # Flutter's desktop integration tests enumerate devices before selecting
+    # Windows. Disable Android only in the synthetic tool profile.
+    $flutterConfigHome = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'APPDATA' } else { 'HOME' }
+    [IO.File]::WriteAllText((Join-Path $context.Variables[$flutterConfigHome] '.flutter_settings'), '{"enable-android":false}')
+    $context | Add-Member -NotePropertyName GetOwnedRoot -NotePropertyValue ({ $root }.GetNewClosure())
     return $context
+}
+
+function Complete-TestEnvironment {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+    param([Parameter(Mandatory)] $Context, [switch] $Passed)
+    $root = & $Context.GetOwnedRoot
+    if (-not $Passed) {
+        Write-Warning "Retained test sandbox: $root"
+        return
+    }
+    try {
+        Assert-TestPath -Context $Context -LiteralPath $root
+        if ($PSCmdlet.ShouldProcess($root, 'Remove passing test sandbox')) {
+            Invoke-TestSandboxDeletion ([IO.DirectoryInfo]::new($root))
+        }
+    } catch {
+        Write-Warning "Retained test sandbox: $root ($($_.Exception.Message))"
+    }
+}
+
+function Test-PesterSandboxBlock {
+    param([Pester.Block] $Block)
+
+    if ($Block.ErrorRecord.Count -or (-not $Block.IsRoot -and -not $Block.OwnPassed)) { return $false }
+    foreach ($test in $Block.Tests) {
+        if ($test.ShouldRun -and -not ($test.Executed -and $test.Passed)) { return $false }
+    }
+    foreach ($child in $Block.Blocks) {
+        if ($child.ShouldRun -and -not (Test-PesterSandboxBlock $child)) { return $false }
+    }
+    return $true
+}
+
+function Complete-PesterTestEnvironment {
+    param([AllowNull()] $Context, [AllowNull()] $PesterState)
+
+    if (-not $Context) { return }
+    # Pester 5 exposes its runtime state in AfterAll. The root aggregate is
+    # populated later, but the selected tests and child blocks have finished.
+    # Keep the profile if a future Pester version no longer exposes that state.
+    $root = if ($PesterState -and $PesterState.PSObject.Properties['CurrentBlock']) { $PesterState.CurrentBlock }
+    $passed = $root -is [Pester.Block] -and $root.IsRoot -and (Test-PesterSandboxBlock $root)
+    Complete-TestEnvironment -Context $Context -Passed:$passed
+}
+
+function Invoke-TestSandboxDeletion {
+    param([IO.FileSystemInfo] $Entry)
+    $Entry.Refresh()
+    if ($Entry -is [IO.DirectoryInfo] -and -not ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        foreach ($child in $Entry.EnumerateFileSystemInfos()) {
+            Invoke-TestSandboxDeletion $child
+        }
+    }
+    # A nonrecursive call unlinks junctions without enumerating their targets.
+    if ($Entry -is [IO.FileInfo] -and ($Entry.Attributes -band [IO.FileAttributes]::ReadOnly) -and
+        [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Initialize-TestSandboxFileApi
+        [CxvTest.SandboxFileApi]::UnlinkReadOnlyFile($Entry.FullName)
+    } else {
+        $Entry.Delete()
+    }
 }
 
 function Assert-TestPath {
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Context, [Parameter(Mandatory)][AllowEmptyString()][string] $LiteralPath, [string] $WorkingDirectory = $Context.Root)
     if ([string]::IsNullOrWhiteSpace($LiteralPath)) { return }
+    $LiteralPath = Get-TestPathComparisonForm $LiteralPath
     $path = if ([IO.Path]::IsPathRooted($LiteralPath)) { [IO.Path]::GetFullPath($LiteralPath) } else { [IO.Path]::GetFullPath((Join-Path $WorkingDirectory $LiteralPath)) }
     $root = $Context.Root.TrimEnd('\', '/')
     if ($path -ne $root -and -not $path.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw "Test profile isolation rejected unowned path: $LiteralPath" }
     foreach ($key in $Context.Keys) {
         $real = $Context.Original[$key]
         if ($real -and [IO.Path]::IsPathRooted($real)) {
-            $real = [IO.Path]::GetFullPath($real).TrimEnd('\', '/')
+            $real = [IO.Path]::GetFullPath((Get-TestPathComparisonForm $real)).TrimEnd('\', '/')
             if ($path -eq $real -or $path.StartsWith($real + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw "Test profile isolation rejected inherited profile: $LiteralPath" }
         }
     }
@@ -119,6 +258,9 @@ function Assert-TestEnvironment {
     foreach ($key in $Context.Keys) {
         if (-not $Variables[$key] -or -not [IO.Path]::IsPathRooted($Variables[$key])) { throw "Test profile isolation requires $key" }
         Assert-TestPath $Context $Variables[$key]
+    }
+    if ($Variables['CXV_TEST_SANDBOX_PARENT']) {
+        Assert-TestPath $Context $Variables['CXV_TEST_SANDBOX_PARENT']
     }
     foreach ($key in $Variables.Keys) {
         if ($key -like 'CODEX_SESSIONS_COLLECTOR_*' -and $key -notin @('CODEX_SESSIONS_COLLECTOR_EXE', 'CODEX_SESSIONS_COLLECTOR_BUSY_TIMEOUT_MS', 'CODEX_SESSIONS_COLLECTOR_TIMINGS')) { Assert-TestPath $Context $Variables[$key] }

@@ -1,10 +1,14 @@
 #Requires -Version 7.0
 [CmdletBinding()]
-param([string] $CollectorPath)
+param([string] $CollectorPath, [switch] $DeferSandboxCleanup)
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repo = Split-Path -Parent $PSScriptRoot
+$savedSandboxParent = $env:CXV_TEST_SANDBOX_PARENT
+if ($DeferSandboxCleanup -and -not $savedSandboxParent) {
+    throw 'Deferred sandbox cleanup requires the supervising runner to supply a sandbox parent.'
+}
 $collectorRoot = Join-Path $repo 'collector'
 $failures = [Collections.Generic.List[string]]::new()
 
@@ -39,45 +43,59 @@ if (-not $CollectorPath) {
     }
 }
 
-Invoke-ScriptCheck 'Pester under scripts/' {
-    param($Report)
-    Import-Module Pester -MinimumVersion 5.0 -ErrorAction Stop
-    $savedCollector = $env:CODEX_SESSIONS_COLLECTOR_EXE
-    try {
-        $env:CODEX_SESSIONS_COLLECTOR_EXE = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CollectorPath)
-        $config = New-PesterConfiguration
-        $config.Run.Path = $PSScriptRoot
-        $config.Run.PassThru = $true
-        $config.Output.Verbosity = 'Normal'
-        $result = Invoke-Pester -Configuration $config
-        $Report.Counts = "$($result.TotalCount) tests, $($result.PassedCount) passed, $($result.FailedCount) failed, $($result.SkippedCount) skipped, $($result.NotRunCount) not run"
-        $Report.Code = if ($result.Result -eq 'Passed' -and $result.TotalCount -gt 0) { 0 } else { 1 }
-    } finally {
-        $env:CODEX_SESSIONS_COLLECTOR_EXE = $savedCollector
-    }
-}
+. (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
+$testEnvironment = New-TestEnvironment
+$completed = $false
+try {
+    $env:CXV_TEST_SANDBOX_PARENT = $testEnvironment.Variables['CXV_TEST_SANDBOX_PARENT']
 
-foreach ($suite in @('test_fast_tests.py', 'test_selection_invariant.py')) {
-    Invoke-ScriptCheck $suite {
+    Invoke-ScriptCheck 'Pester under scripts/' {
         param($Report)
-        $output = & python -B (Join-Path $PSScriptRoot $suite) 2>&1
-        $Report.Code = $LASTEXITCODE
-        $output | ForEach-Object { [string] $_ }
-        if (($output -join "`n") -match '(?m)^Ran (\d+) tests? in ') {
-            $Report.Counts = "$($Matches[1]) tests"
-        } elseif ($Report.Code -eq 0) {
-            $Report.Code = 1
-            Write-Output 'Python suite produced no test-count summary.'
+        Import-Module Pester -MinimumVersion 5.0 -ErrorAction Stop
+        $savedCollector = $env:CODEX_SESSIONS_COLLECTOR_EXE
+        try {
+            $env:CODEX_SESSIONS_COLLECTOR_EXE = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CollectorPath)
+            $config = New-PesterConfiguration
+            $config.Run.Path = $PSScriptRoot
+            $config.Run.PassThru = $true
+            $config.Output.Verbosity = 'Normal'
+            $result = Invoke-Pester -Configuration $config
+            $Report.Counts = "$($result.TotalCount) tests, $($result.PassedCount) passed, $($result.FailedCount) failed, $($result.SkippedCount) skipped, $($result.NotRunCount) not run"
+            $Report.Code = if ($result.Result -eq 'Passed' -and $result.TotalCount -gt 0) { 0 } else { 1 }
+        } finally {
+            $env:CODEX_SESSIONS_COLLECTOR_EXE = $savedCollector
         }
     }
-}
+    foreach ($suite in @('test_fast_tests.py', 'test_selection_invariant.py')) {
+        Invoke-ScriptCheck $suite {
+            param($Report)
+            $output = & python -B (Join-Path $PSScriptRoot $suite) 2>&1
+            $Report.Code = $LASTEXITCODE
+            $output | ForEach-Object { [string] $_ }
+            if (($output -join "`n") -match '(?m)^Ran (\d+) tests? in ') {
+                $Report.Counts = "$($Matches[1]) tests"
+            } elseif ($Report.Code -eq 0) {
+                $Report.Code = 1
+                Write-Output 'Python suite produced no test-count summary.'
+            }
+        }
+    }
 
-Invoke-ScriptCheck 'PSScriptAnalyzer under scripts/' {
-    param($Report)
-    $diagnostics = @(Invoke-ScriptAnalyzer -Path $PSScriptRoot -Recurse -ErrorAction Stop)
-    $diagnostics | Format-Table -AutoSize | Out-String | Write-Output
-    $Report.Counts = "$($diagnostics.Count) diagnostics"
-    $Report.Code = [int]($diagnostics.Count -gt 0)
+    Invoke-ScriptCheck 'PSScriptAnalyzer under scripts/' {
+        param($Report)
+        $diagnostics = @(Invoke-ScriptAnalyzer -Path $PSScriptRoot -Recurse -ErrorAction Stop)
+        $diagnostics | Format-Table -AutoSize | Out-String | Write-Output
+        $Report.Counts = "$($diagnostics.Count) diagnostics"
+        $Report.Code = [int]($diagnostics.Count -gt 0)
+    }
+
+    $completed = $true
+} finally {
+    $env:CXV_TEST_SANDBOX_PARENT = $savedSandboxParent
+    $passed = $completed -and $failures.Count -eq 0
+    if (-not $DeferSandboxCleanup -or -not $passed) {
+        Complete-TestEnvironment -Context $testEnvironment -Passed:$passed
+    }
 }
 
 if ($failures.Count -gt 0) {

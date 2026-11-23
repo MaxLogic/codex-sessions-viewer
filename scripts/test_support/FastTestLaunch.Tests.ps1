@@ -1,3 +1,10 @@
+AfterAll {
+    $ownedEnvironment = Get-Variable context -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($ownedEnvironment) {
+        Complete-PesterTestEnvironment $ownedEnvironment (Get-Variable ____Pester -ValueOnly -ErrorAction SilentlyContinue)
+    }
+}
+
 BeforeAll {
     . (Join-Path $PSScriptRoot 'TestEnvironment.ps1')
     . (Join-Path $PSScriptRoot 'FastTestLaunch.ps1')

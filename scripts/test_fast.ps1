@@ -23,16 +23,17 @@ if ($selection.widened -and -not $AllowWide) {
     throw 'Selection widened. Run the full release gate at slice closure, or pass -AllowWide to run all tests now. See docs/testing.md.'
 }
 if (-not $OutputRoot) { throw 'Supply -OutputRoot for retained selection, logs and per-target timings.' }
-$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
-if (Test-Path -LiteralPath $OutputRoot) { throw 'OutputRoot must be a new run directory.' }
-New-Item -ItemType Directory -Path $OutputRoot | Out-Null
+. (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
+$OutputRoot = [IO.Path]::GetFullPath((Get-TestPathComparisonForm $OutputRoot))
+New-TestRunDirectory $OutputRoot
 $selectionJson | Set-Content -LiteralPath (Join-Path $OutputRoot 'selection.json') -Encoding utf8
 $records = [Collections.Generic.List[object]]::new()
 $total = [Diagnostics.Stopwatch]::StartNew()
-. (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
 . (Join-Path $PSScriptRoot 'test_support/FastTestLaunch.ps1')
-$context = New-TestEnvironment -Parent (Join-Path $OutputRoot 'sandboxes')
+$sandboxParent = Join-Path $OutputRoot 'sandboxes'
+$context = New-TestEnvironment -RunRoot $sandboxParent
 $scriptCheckSandboxParent = $null
+$completed = $false
 
 function Read-FastFlutterEvidence {
     param([string] $Log, [int] $ExpectedCount)
@@ -71,7 +72,8 @@ function Read-FastFlutterEvidence {
 function Invoke-FastStep {
     param(
         [string] $Name, [string] $Executable, [string[]] $Arguments, [string] $Directory,
-        [switch] $Isolated, [string] $Needs, [int] $ExpectedFlutterSuites
+        [switch] $Isolated, [string] $Needs, [int] $ExpectedFlutterSuites,
+        [hashtable] $NamedArguments = @{}
     )
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $log = $null
@@ -89,7 +91,7 @@ function Invoke-FastStep {
                 Invoke-TestProcess -Context $context -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory $Directory *> $log
             } else {
                 Push-Location -LiteralPath $Directory
-                try { & $Executable @Arguments *> $log } finally { Pop-Location }
+                try { & $Executable @Arguments @NamedArguments *> $log } finally { Pop-Location }
             }
             $code = $LASTEXITCODE
             if ($code -eq 0) {
@@ -104,6 +106,7 @@ function Invoke-FastStep {
     $timer.Stop()
     $records.Add([pscustomobject]@{
         name=$Name; executable=$Executable; arguments=$Arguments; directory=$Directory
+        named_arguments=$NamedArguments
         exit_code=$code; duration_seconds=$timer.Elapsed.TotalSeconds; log=$log
         status=$status; reason=$reason
     })
@@ -151,25 +154,48 @@ try {
         }
     }
     if ($selection.script_checks) {
-        $scriptCheckSandboxParent = Join-Path $OutputRoot 'sandboxes/script-checks'
+        $scriptCheckSandboxParent = $context.Variables['CXV_TEST_SANDBOX_PARENT']
         $savedSandboxParent = $env:CXV_TEST_SANDBOX_PARENT
         try {
             $env:CXV_TEST_SANDBOX_PARENT = $scriptCheckSandboxParent
-            Invoke-FastStep -Name 'script-checks' -Executable (Join-Path $PSScriptRoot 'test_scripts.ps1') -Directory $repo
+            Invoke-FastStep -Name 'script-checks' -Executable (Join-Path $PSScriptRoot 'test_scripts.ps1') -NamedArguments @{ DeferSandboxCleanup = $true } -Directory $repo
         } finally {
             $env:CXV_TEST_SANDBOX_PARENT = $savedSandboxParent
         }
     }
+    $completed = $true
 } finally {
     $total.Stop()
     $failed = @($records | Where-Object status -eq 'failed')
     $notRun = @($records | Where-Object status -eq 'not_run')
-    [pscustomobject]@{
+    $passed = $completed -and -not $failed.Count -and -not $notRun.Count
+    $receipt = [pscustomobject]@{
         duration_seconds=$total.Elapsed.TotalSeconds; sandbox=$context.Root
         script_check_sandbox_parent=$scriptCheckSandboxParent
-        cleanup='Retained for inspection; remove these owned sandboxes after reviewing logs.'
+        retained_sandboxes=@($context.Root)
+        cleanup=if ($passed) { 'Sandbox retained when the result was recorded, before cleanup.' } else { 'Sandbox retained. See test output for details.' }
         steps=@($records.ToArray()); failed=$failed; not_run=$notRun
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputRoot 'run.json') -Encoding utf8
+    }
+    $receiptPath = Join-Path $OutputRoot 'run.json'
+    try {
+        $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receiptPath -Encoding utf8
+    } catch {
+        Write-Warning "Could not write the test result. Retained test sandbox: $($context.Root)"
+        throw
+    }
+    Complete-TestEnvironment -Context $context -Passed:$passed
+    if ($passed -and -not [IO.Directory]::Exists($context.Root)) {
+        $receipt.retained_sandboxes = @()
+        $receipt.cleanup = 'Sandbox removed.'
+        # Leave the persisted outcome intact if the cleanup-only update fails.
+        $receiptUpdate = Join-Path $OutputRoot 'run.cleanup.json'
+        try {
+            $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receiptUpdate -Encoding utf8
+            [IO.File]::Move($receiptUpdate, $receiptPath, $true)
+        } catch {
+            Write-Warning "Sandbox removed, but could not update the cleanup status in '$receiptPath': $($_.Exception.Message)"
+        }
+    }
 }
 
 if ($failed.Count -or $notRun.Count) {

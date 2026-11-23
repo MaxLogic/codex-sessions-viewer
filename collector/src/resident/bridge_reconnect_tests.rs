@@ -18,19 +18,9 @@ fn reconnect_recognizes_the_windows_pipe_not_connected_error() {
 
 #[test]
 fn reconnect_survives_a_disconnect_during_hello() {
-    let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-sandboxes");
-    std::fs::create_dir_all(&parent).unwrap();
-    let root = parent.join(format!(
-        "reconnect-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let sandbox = crate::resident::tests::TestSandbox::new("reconnect");
     let context = Context {
-        database: root.join("viewer.sqlite"),
+        database: sandbox.0.join("viewer.sqlite"),
         settings: None,
         windows_root: None,
         wsl_root: None,
@@ -121,8 +111,6 @@ fn reconnect_survives_a_disconnect_during_hello() {
     drop(connection);
     let attempts = server.join().unwrap();
     drop(lock);
-    std::fs::remove_file(instance::lock_path(&context.database).unwrap()).unwrap();
-    std::fs::remove_dir(root).unwrap();
     assert!(
         result.is_ok(),
         "reconnect gave up on transient hello: {result:?}; events={}",
