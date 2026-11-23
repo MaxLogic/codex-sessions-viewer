@@ -1,5 +1,6 @@
 import '../support/test_environment.dart';
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -69,7 +70,205 @@ HistoricalUsageCost cost(Database db, int hour, {PricingSettings? settings}) =>
       reasoningOutputTokens: 1,
     );
 
+const _hubReadyPrefix = 'hub listening on http://';
+const _hubDiagnosticLimit = 64 * 1024;
+
+final class _HubOutputTail {
+  String text = '';
+  bool truncated = false;
+
+  void add(String chunk) {
+    final next = text + chunk;
+    if (next.length > _hubDiagnosticLimit) {
+      truncated = true;
+      text = next.substring(next.length - _hubDiagnosticLimit);
+    } else {
+      text = next;
+    }
+  }
+
+  String get diagnostic => truncated ? '[output tail truncated]\n$text' : text;
+}
+
+Future<void> _withHubProcess(
+  Process process,
+  Future<void> Function(Uri endpoint) use,
+) async {
+  final errors = process.stderr
+      .transform(const Utf8Decoder(allowMalformed: true))
+      .fold(_HubOutputTail(), (tail, chunk) => tail..add(chunk));
+  final ready = Completer<String>();
+  final startupOutput = _HubOutputTail();
+  var pendingLine = _HubOutputTail();
+  final stdout = process.stdout
+      .transform(const Utf8Decoder(allowMalformed: true))
+      .listen(
+        (chunk) {
+          if (ready.isCompleted) return;
+          for (var start = 0; start < chunk.length;) {
+            final newline = chunk.indexOf('\n', start);
+            final end = newline == -1 ? chunk.length : newline + 1;
+            final part = chunk.substring(start, end);
+            startupOutput.add(part);
+            pendingLine.add(part);
+            if (newline != -1) {
+              final line = pendingLine.text;
+              if (!pendingLine.truncated && line.startsWith(_hubReadyPrefix)) {
+                final terminator = line.endsWith('\r\n') ? 2 : 1;
+                ready.complete(line.substring(0, line.length - terminator));
+                return;
+              }
+              pendingLine = _HubOutputTail();
+            }
+            start = end;
+          }
+        },
+        onError: (Object error, StackTrace stack) {
+          if (!ready.isCompleted) ready.completeError(error, stack);
+        },
+        onDone: () {
+          if (!ready.isCompleted) {
+            ready.completeError(
+              StateError('Hub stdout closed before its listening report'),
+            );
+          }
+        },
+      );
+  Object? startupError;
+  try {
+    late final Uri endpoint;
+    try {
+      final line = await ready.future.timeout(const Duration(seconds: 20));
+      final address = RegExp(
+        r'^hub listening on (http://127\.0\.0\.1:[0-9]+)$',
+      ).firstMatch(line);
+      final uri = Uri.tryParse(address?.group(1) ?? '');
+      if (uri == null || uri.port < 1 || uri.port > 65535) {
+        throw StateError('Invalid hub listening report: $line');
+      }
+      endpoint = uri;
+      TestEnvironment.current.ownEndpoint(endpoint);
+    } catch (error) {
+      startupError = error;
+      return;
+    }
+    await use(endpoint);
+  } finally {
+    process.kill();
+    await process.exitCode.timeout(const Duration(seconds: 10));
+    await stdout.cancel();
+    final stderr = await errors;
+    if (startupError != null) {
+      throw StateError(
+        '$startupError\nHub stdout:\n${startupOutput.diagnostic}'
+        '\nHub stderr:\n${stderr.diagnostic}',
+      );
+    }
+    expect(stderr.diagnostic, isEmpty);
+  }
+}
+
+// Supplies the same byte streams as a native child without widening the
+// test profile's process allowlist.
+final class _HubPipeFixture implements Process {
+  _HubPipeFixture(List<String> output, List<String> errors)
+    : stdout = Stream.fromIterable(output.map(utf8.encode)),
+      stderr = Stream.fromIterable(errors.map(utf8.encode));
+
+  @override
+  final Stream<List<int>> stdout;
+  @override
+  final Stream<List<int>> stderr;
+  bool killed = false;
+
+  @override
+  Future<int> get exitCode async => 0;
+
+  @override
+  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => killed = true;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 void main() {
+  group('native hub listening report', () {
+    test('rejects a valid-looking address without a newline', () async {
+      final trap = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(trap.close);
+      final endpoint = Uri.parse('http://127.0.0.1:${trap.port}');
+      final process = _HubPipeFixture(
+        ['hub listening on $endpoint'],
+        ['fixture: truncated report'],
+      );
+      await expectLater(
+        _withHubProcess(process, (_) async => fail('used incomplete address')),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.toString(),
+            'message',
+            allOf(
+              contains('stdout closed before its listening report'),
+              contains('fixture: truncated report'),
+            ),
+          ),
+        ),
+      );
+      expect(
+        () => TestEnvironment.current.guardEndpoint('$endpoint'),
+        throwsStateError,
+      );
+      expect(process.killed, isTrue);
+    });
+
+    test('skips startup output and reads a split CRLF report', () async {
+      final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(socket.close);
+      final endpoint = Uri.parse('http://127.0.0.1:${socket.port}');
+      final process = _HubPipeFixture([
+        'fixture: startup output\nhub listen',
+        'ing on $endpoint\r',
+        '\n',
+      ], []);
+      Uri? used;
+      await _withHubProcess(process, (uri) async {
+        TestEnvironment.current.guardEndpoint('$uri');
+        used = uri;
+      });
+      expect(used, endpoint);
+      expect(process.killed, isTrue);
+    });
+
+    test(
+      'retains the last stderr diagnostic and earlier stdout on failure',
+      () async {
+        final process = _HubPipeFixture(
+          ['fixture: startup output\n'],
+          ['x' * (80 * 1024), '\nfixture: final diagnostic\n'],
+        );
+        await expectLater(
+          _withHubProcess(
+            process,
+            (_) async => fail('no address was reported'),
+          ),
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.toString(),
+              'bounded diagnostic',
+              allOf(
+                contains('fixture: startup output'),
+                contains('fixture: final diagnostic'),
+                contains('tail truncated'),
+                hasLength(lessThan(65 * 1024)),
+              ),
+            ),
+          ),
+        );
+        expect(process.killed, isTrue);
+      },
+    );
+  });
+
   test(
     'unchanged observations retain provenance without copying prior periods',
     () {
@@ -241,9 +440,7 @@ void main() {
         reason: 'Build the schema23 Rust hub or set CODEX_SESSIONS_HUB_EXE.',
       );
       final temp = Directory.systemTemp.createTempSync('hub_price_interop_');
-      final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-      final port = socket.port;
-      await socket.close();
+      addTearDown(() => temp.deleteSync(recursive: true));
       final config = File('${temp.path}/hub.json')
         ..writeAsStringSync(
           jsonEncode({
@@ -252,18 +449,11 @@ void main() {
           }),
         );
       final process = await startTestProcess(executable.absolute.path, [
-        '127.0.0.1:$port',
+        '127.0.0.1:0',
         '${temp.path}/data',
         config.path,
       ]);
-      final errors = process.stderr.transform(utf8.decoder).join();
-      try {
-        final ready = await process.stdout
-            .transform(utf8.decoder)
-            .transform(const LineSplitter())
-            .first
-            .timeout(const Duration(seconds: 20));
-        expect(ready, contains('hub listening'));
+      await _withHubProcess(process, (endpoint) async {
         final sample =
             jsonDecode(
                   File('../samples/pricing/hub-parity.json').readAsStringSync(),
@@ -273,7 +463,7 @@ void main() {
           sample['observation'] as Map<String, dynamic>,
         );
         final response = await HubPriceHistoryClient().synchronize(
-          endpoint: Uri.parse('http://127.0.0.1:$port'),
+          endpoint: endpoint,
           token: 'machine-token-fixture-1234567890',
           observations: [input],
         );
@@ -288,13 +478,7 @@ void main() {
         } finally {
           db.close();
         }
-      } finally {
-        process.kill();
-        await process.exitCode.timeout(const Duration(seconds: 10));
-        final stderr = await errors;
-        temp.deleteSync(recursive: true);
-        expect(stderr, isEmpty);
-      }
+      });
     },
   );
   test(

@@ -159,44 +159,14 @@ fn absent_or_unreadable_root_and_invalid_config_are_actionable_and_secret_safe()
 
 #[test]
 fn explicit_hub_verification_authenticates_without_uploads_and_preserves_local_status() {
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
     let f = Fixture::new("codex");
     f.setup();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
     let config = f.temp.path().join("hub.json");
     let data = f.temp.path().join("hub-data");
     const TOKEN: &str = "synthetic-private-machine-token-123456789";
     std::fs::write(&config, serde_json::json!({"owner_token":"synthetic-owner-token-123456789","machines":{"test-machine":TOKEN}}).to_string()).unwrap();
-    struct Server(std::process::Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut server = Server(
-        support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
-            .arg(address.to_string())
-            .arg(&data)
-            .arg(&config)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let url = format!("http://{address}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if ureq::get(format!("{url}/v1/health")).call().is_ok() {
-            break;
-        }
-        assert!(server.0.try_wait().unwrap().is_none(), "hub exited");
-        assert!(Instant::now() < deadline, "hub startup timed out");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let server = support::hub_process::Hub::start(&data, &config, None);
+    let url = server.url.clone();
     // Configured URL alone never sends a request or requires credentials.
     assert_eq!(
         f.run("verify", &["--hub-url", &url], 0)["hub"]["state"],

@@ -37,7 +37,6 @@ fn a_quiet_cycle_probes_no_record_state() {
 }
 
 use std::net::TcpListener;
-use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,11 +44,107 @@ use codex_sessions_collector::contract::{Envelope, Record, SourceStatus, ThreadN
 use codex_sessions_collector::hub_client;
 use codex_sessions_collector::store::{OwnerMode, Store};
 use serde_json::{Value, json};
-use support::{TempDir, sample_snapshot};
+use support::{TempDir, hub_process::Hub, sample_snapshot};
 
 const MACHINE_A_TOKEN: &str = "synthetic-machine-a-token-123456789";
 const MACHINE_B_TOKEN: &str = "synthetic-machine-b-token-123456789";
 const OWNER_TOKEN: &str = "synthetic-owner-token-123456789012";
+
+#[test]
+#[ignore = "run as a child of the hub readiness tests"]
+fn hub_report_child_helper() {
+    use std::io::{Read, Write};
+
+    let mut mode = String::new();
+    std::io::stdin().read_to_string(&mut mode).unwrap();
+    println!("fixture: ordinary startup output");
+    match mode.as_str() {
+        "noisy" => {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            println!("hub listening on http://{}", listener.local_addr().unwrap());
+            std::io::stdout().flush().unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.read(&mut [0; 4096]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        }
+        "late-stderr" => {
+            std::io::stderr().write_all(&vec![b'x'; 80 * 1024]).unwrap();
+            eprintln!("fixture: final stderr diagnostic");
+        }
+        mode => {
+            let address = mode
+                .strip_prefix("truncated ")
+                .unwrap()
+                .parse::<std::net::SocketAddrV4>()
+                .unwrap();
+            assert!(address.ip().is_loopback());
+            eprintln!("fixture: truncated report");
+            print!("hub listening on http://{address}");
+            std::io::stdout().flush().unwrap();
+        }
+    }
+    // Exit without the test harness appending a newline to stdout.
+    std::process::exit(0);
+}
+
+fn hub_report_child(mode: &str) -> std::process::Child {
+    let mut command = support::test_command(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    command
+        .args([
+            "--exact",
+            "hub_report_child_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_with_input(mode)
+        .unwrap()
+}
+
+fn hub_report_failure(mode: &str) -> String {
+    let result = std::panic::catch_unwind(|| Hub::from_child(hub_report_child(mode)));
+    let Err(panic) = result else {
+        panic!("hub reported readiness in fixture mode {mode}");
+    };
+    *panic.downcast::<String>().unwrap()
+}
+
+#[test]
+fn hub_readiness_requires_a_line_terminator() {
+    let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+    trap.set_nonblocking(true).unwrap();
+    let message = hub_report_failure(&format!("truncated {}", trap.local_addr().unwrap()));
+    assert!(
+        message.contains("stdout closed before it reported"),
+        "{message}"
+    );
+    assert!(message.contains("fixture: truncated report"), "{message}");
+    assert_eq!(
+        trap.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn hub_readiness_skips_ordinary_startup_output() {
+    let hub = Hub::from_child(hub_report_child("noisy"));
+    assert!(hub.url.starts_with("http://127.0.0.1:"));
+}
+
+#[test]
+fn hub_readiness_failure_keeps_the_stderr_tail() {
+    let message = hub_report_failure("late-stderr");
+    let (context, stderr) = message.split_once("\nhub stderr:\n").unwrap();
+    assert!(context.contains("fixture: ordinary startup output"));
+    assert!(stderr.starts_with("[output tail truncated]\n"));
+    assert!(stderr.contains("fixture: final stderr diagnostic"));
+    assert!(stderr.len() <= 64 * 1024 + "[output tail truncated]\n".len());
+}
 
 mod status_memo_differential {
     use super::*;
@@ -1332,51 +1427,18 @@ mod status_memo_differential {
     }
 }
 
-struct Hub {
-    child: Child,
-    url: String,
-}
-
-impl Drop for Hub {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Hub {
-    fn restart(&mut self, temp: &TempDir) {
-        let address = self.url.trim_start_matches("http://");
-        self.child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
-            .arg(address)
-            .arg(temp.path().join("hub-data"))
-            .arg(temp.path().join("hub.json"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if ureq::get(format!("{}/v1/health", self.url)).call().is_ok() {
-                break;
-            }
-            if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("hub exited during restart: {status}");
-            }
-            assert!(Instant::now() < deadline, "hub did not restart");
-            thread::sleep(Duration::from_millis(30));
-        }
-    }
-}
-
 fn start(temp: &TempDir) -> Hub {
     start_with(temp, json!({}))
 }
 
+#[test]
+#[should_panic(expected = "hub: hub credentials must contain at least 24 characters")]
+fn hub_start_failure_includes_stderr() {
+    let temp = TempDir::new("hub_bad_config");
+    start_with(&temp, json!({"owner_token": "too-short"}));
+}
+
 fn start_with(temp: &TempDir, extra: Value) -> Hub {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
     let config = temp.path().join("hub.json");
     let mut value = json!({
         "owner_token": OWNER_TOKEN,
@@ -1386,27 +1448,7 @@ fn start_with(temp: &TempDir, extra: Value) -> Hub {
         value[key] = item.clone();
     }
     std::fs::write(&config, value.to_string()).unwrap();
-    let url = format!("http://127.0.0.1:{port}");
-    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
-        .arg(format!("127.0.0.1:{port}"))
-        .arg(temp.path().join("hub-data"))
-        .arg(config)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut hub = Hub { child, url };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if ureq::get(format!("{}/v1/health", hub.url)).call().is_ok() {
-            return hub;
-        }
-        if let Some(status) = hub.child.try_wait().unwrap() {
-            panic!("hub exited before health check: {status}");
-        }
-        assert!(Instant::now() < deadline, "hub did not start");
-        thread::sleep(Duration::from_millis(30));
-    }
+    Hub::start(&temp.path().join("hub-data"), &config, None)
 }
 
 fn upload(
@@ -1682,8 +1724,7 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
             .unwrap();
         std::fs::write(temp.path().join("legacy-record.txt"), legacy).unwrap();
     }
-    let _ = hub.child.kill();
-    let _ = hub.child.wait();
+    hub.stop();
     let offline = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", "sync", "--standalone"])
         .arg(&db)
@@ -1704,7 +1745,24 @@ fn locally_committed_records_survive_failed_upload_and_restart() {
     );
     let local: Value = serde_json::from_slice(&local_query.stdout).unwrap();
     assert_eq!(local["results"].as_array().unwrap().len(), 1);
-    hub.restart(&temp);
+    hub = Hub::start(
+        &temp.path().join("hub-data"),
+        &temp.path().join("hub.json"),
+        None,
+    );
+    // The fixture's hub moved ports. Keep the pairing and delivery state.
+    let reopened = Store::open(&db, OwnerMode::Standalone).unwrap();
+    assert_eq!(
+        reopened
+            .conn
+            .execute(
+                "update collector_hub_state set hub_url = ? where id = 1",
+                [&hub.url],
+            )
+            .unwrap(),
+        1
+    );
+    drop(reopened);
     let denied = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-collector"))
         .args(["hub", "sync", "--standalone"])
         .arg(&db)

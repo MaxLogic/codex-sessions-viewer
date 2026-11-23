@@ -1,6 +1,7 @@
 //! Fixtures and helpers shared by the collector integration tests.
 #![allow(dead_code)]
 
+pub mod hub_process;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 mod test_environment;

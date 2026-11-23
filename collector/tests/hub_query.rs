@@ -1,32 +1,16 @@
 mod support;
 
 use std::net::TcpListener;
-use std::process::{Child, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use codex_sessions_collector::contract::{Envelope, Record};
 use serde_json::{Value, json};
-use support::{TempDir, collector, sample_snapshot};
+use support::{TempDir, collector, hub_process::Hub, sample_snapshot};
 
 const MACHINE_TOKEN: &str = "query-machine-token-123456789012345";
 const OWNER_TOKEN: &str = "query-owner-token-12345678901234567";
 
-struct Hub(Child, String);
-
-impl Drop for Hub {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn start(temp: &TempDir) -> Hub {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let config = temp.path().join("hub.json");
     std::fs::write(
         &config,
@@ -37,26 +21,11 @@ fn start(temp: &TempDir) -> Hub {
         .to_string(),
     )
     .unwrap();
-    let url = format!("http://127.0.0.1:{port}");
-    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
-        .arg(format!("127.0.0.1:{port}"))
-        .arg(temp.path().join("hub-data"))
-        .arg(config)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let hub = Hub(child, url);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ureq::get(format!("{}/v1/health", hub.1)).call().is_err() {
-        assert!(Instant::now() < deadline, "hub did not start");
-        thread::sleep(Duration::from_millis(25));
-    }
-    hub
+    Hub::start(&temp.path().join("hub-data"), &config, None)
 }
 
 fn remote(hub: &Hub, args: &[&str]) -> Value {
-    let mut response = ureq::post(format!("{}/v1/query", hub.1))
+    let mut response = ureq::post(format!("{}/v1/query", hub.url))
         .header("Authorization", format!("Bearer {OWNER_TOKEN}"))
         .send_json(json!({"protocol":1,"machine":"test-machine","args":args}))
         .unwrap();
@@ -89,7 +58,7 @@ fn remote_queries_preserve_local_contract_filters_paging_context_and_usage() {
         ))))
         .unwrap()
     });
-    let mut response = ureq::post(format!("{}/v1/ingest", hub.1))
+    let mut response = ureq::post(format!("{}/v1/ingest", hub.url))
         .header("Authorization", format!("Bearer {MACHINE_TOKEN}"))
         .send_json(json!({"protocol":1,"sequence":1,"batch_id":"first","records":snapshots}))
         .unwrap();
@@ -110,7 +79,7 @@ fn remote_queries_preserve_local_contract_filters_paging_context_and_usage() {
             "--harness",
             "codex",
             "--hub",
-            &hub.1,
+            &hub.url,
             "--hub-machine",
             "test-machine",
         ])
@@ -159,7 +128,7 @@ fn remote_queries_preserve_local_contract_filters_paging_context_and_usage() {
         );
     }
 
-    let mut usage = ureq::post(format!("{}/v1/usage", hub.1))
+    let mut usage = ureq::post(format!("{}/v1/usage", hub.url))
         .header("Authorization", format!("Bearer {OWNER_TOKEN}"))
         .send_json(json!({"protocol":1,"machine":"test-machine","limit":10}))
         .unwrap();
@@ -173,12 +142,12 @@ fn remote_query_rejects_protocol_and_credential_mismatch() {
     let temp = TempDir::new("hub_query_reject");
     let hub = start(&temp);
     for (token, protocol) in [("wrong", 1), (OWNER_TOKEN, 99)] {
-        let result = ureq::post(format!("{}/v1/query", hub.1))
+        let result = ureq::post(format!("{}/v1/query", hub.url))
             .header("Authorization", format!("Bearer {token}"))
             .send_json(json!({"protocol":protocol,"machine":"test-machine","args":["sessions"]}));
         assert!(result.is_err());
     }
-    let override_attempt = ureq::post(format!("{}/v1/query", hub.1))
+    let override_attempt = ureq::post(format!("{}/v1/query", hub.url))
         .header("Authorization", format!("Bearer {OWNER_TOKEN}"))
         .send_json(json!({"protocol":1,"machine":"test-machine","args":["sessions","--db=C:\\other.sqlite"]}));
     assert!(override_attempt.is_err());
@@ -191,11 +160,6 @@ fn remote_query_never_forwards_to_another_hub_with_the_server_credential() {
     let trap = TcpListener::bind("127.0.0.1:0").unwrap();
     trap.set_nonblocking(true).unwrap();
     let trap_url = format!("http://{}", trap.local_addr().unwrap());
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let config = temp.path().join("hub.json");
     std::fs::write(
         &config,
@@ -205,21 +169,7 @@ fn remote_query_never_forwards_to_another_hub_with_the_server_credential() {
     .unwrap();
     // The hub process has an owner credential in its environment, which a
     // forwarded `--hub` would send to the chosen destination.
-    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
-        .arg(format!("127.0.0.1:{port}"))
-        .arg(temp.path().join("hub-data"))
-        .arg(config)
-        .env("CODEX_SESSIONS_HUB_OWNER_TOKEN", OWNER_TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let hub = Hub(child, format!("http://127.0.0.1:{port}"));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ureq::get(format!("{}/v1/health", hub.1)).call().is_err() {
-        assert!(Instant::now() < deadline, "hub did not start");
-        thread::sleep(Duration::from_millis(25));
-    }
+    let hub = Hub::start(&temp.path().join("hub-data"), &config, Some(OWNER_TOKEN));
     for args in [
         vec![
             "sessions",
@@ -233,7 +183,7 @@ fn remote_query_never_forwards_to_another_hub_with_the_server_credential() {
         vec!["sessions", "--unknown-option", "1"],
         vec!["--hub", &trap_url],
     ] {
-        let result = ureq::post(format!("{}/v1/query", hub.1))
+        let result = ureq::post(format!("{}/v1/query", hub.url))
             .header("Authorization", format!("Bearer {OWNER_TOKEN}"))
             .config()
             .timeout_global(Some(Duration::from_secs(20)))

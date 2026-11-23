@@ -2,52 +2,26 @@ mod support;
 
 use codex_sessions_collector::price_history::{self, FetchConfig, History, Observation};
 use serde_json::{Value, json};
-use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
-use support::TempDir;
+use support::{TempDir, hub_process::Hub as HubProcess};
 
 const TOKEN: &str = "synthetic-pricing-machine-token-123456789";
 struct Hub {
-    child: Child,
-    url: String,
+    process: HubProcess,
     _temp: TempDir,
 }
-impl Drop for Hub {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+
 fn hub() -> Hub {
     let temp = TempDir::new("price-history");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
     let config = temp.path().join("hub.json");
     std::fs::write(&config, json!({"owner_token":"synthetic-pricing-owner-token-123456789","machines":{"machine-a":TOKEN}}).to_string()).unwrap();
-    let child = support::test_command(env!("CARGO_BIN_EXE_codex-sessions-hub"))
-        .arg(address.to_string())
-        .arg(temp.path().join("data"))
-        .arg(config)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut hub = Hub {
-        child,
-        url: format!("http://{address}"),
+    Hub {
+        process: HubProcess::start(&temp.path().join("data"), &config, None),
         _temp: temp,
-    };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ureq::get(format!("{}/v1/health", hub.url)).call().is_err() {
-        assert!(hub.child.try_wait().unwrap().is_none());
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(20));
     }
-    hub
 }
 fn sync(hub: &Hub, token: &str, observations: Vec<Value>) -> Result<Value, ureq::Error> {
-    ureq::post(format!("{}/v1/prices/sync", hub.url))
+    ureq::post(format!("{}/v1/prices/sync", hub.process.url))
         .header("Authorization", format!("Bearer {token}"))
         .send_json(json!({"protocol":1,"observations":observations}))?
         .body_mut()
@@ -767,7 +741,7 @@ fn malformed_conditions_and_provider_identity_cannot_poison_immutable_history() 
 }
 
 fn request(hub: &Hub, body: Value) -> Result<Value, ureq::Error> {
-    ureq::post(format!("{}/v1/prices/sync", hub.url))
+    ureq::post(format!("{}/v1/prices/sync", hub.process.url))
         .header("Authorization", format!("Bearer {TOKEN}"))
         .send_json(body)?
         .body_mut()

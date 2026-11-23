@@ -477,8 +477,11 @@ impl TestCommand {
                 .to_string_lossy()
                 .contains("sessions-hub")
             && let Some(address) = self.command.get_args().next()
+            && let Ok(socket) = address.to_string_lossy().parse::<std::net::SocketAddr>()
+            && socket.port() != 0
         {
-            own_endpoint(&format!("http://{}", address.to_string_lossy()));
+            // For port 0 the caller owns the address reported after bind.
+            own_endpoint(&format!("http://{socket}"));
         }
         if let (Some(started), Some(admitted)) = (started, admitted) {
             eprintln!(
@@ -870,15 +873,22 @@ fn admit_executable(command: &Command, raw: Option<&str>, cwd: &Path) -> io::Res
     }
     if program == std::fs::canonicalize(std::env::current_exe()?)?
         && raw.is_none()
-        && args.len() == 3
-        && args[0] == "--exact"
-        && args[2] == "--nocapture"
-        && [
-            "lease_child_helper",
-            "owned_transaction_lock_accounting_fixture",
-            "protocol_windows_first_instance_security_and_handle_cleanup",
-        ]
-        .contains(&args[1].as_str())
+        && (args
+            == [
+                "--exact",
+                "hub_report_child_helper",
+                "--ignored",
+                "--nocapture",
+            ]
+            || (args.len() == 3
+                && args[0] == "--exact"
+                && args[2] == "--nocapture"
+                && [
+                    "lease_child_helper",
+                    "owned_transaction_lock_accounting_fixture",
+                    "protocol_windows_first_instance_security_and_handle_cleanup",
+                ]
+                .contains(&args[1].as_str())))
     {
         return Ok(());
     }
