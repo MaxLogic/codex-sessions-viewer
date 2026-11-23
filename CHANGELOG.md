@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Removed `sqlite3_flutter_libs`. The Dart `sqlite3` package bundles SQLite through its native-asset hook (CXV-226).
+
 - Updated the Dart SQLite package to 3.9.2, which fixes duplicate native
   finalization when a worker isolate is killed during SQLite cleanup.
   Maintenance cancellation now uses the package's interrupt API (CXV-209).

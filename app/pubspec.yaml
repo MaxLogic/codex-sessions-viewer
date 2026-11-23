@@ -37,7 +37,6 @@ dependencies:
   toml: ^0.18.0
   sqlite3: ^3.9.2
   ffi: ^2.2.0
-  sqlite3_flutter_libs: ^0.6.0+eol
   path: ^1.9.1
   xml: ^7.0.1
   crypto: ^3.0.7
