@@ -1,10 +1,13 @@
 """Selection contracts; no Rust/Flutter processes are started."""
+import os
 import unittest
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
-from fast_tests import changed_paths, select
+from fast_tests import changed_paths, explicit_paths, select
+from test_dependencies import DependencyIndex
 from test_selection_invariant import DependencyInvariantTests
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +62,71 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(plan["rust"], [])
             self.assertEqual(plan["flutter"], [])
             self.assertFalse(plan["widened"])
+
+    def test_script_checks_follow_scripts_changes_only(self):
+        script_paths = [r"scripts\test_fast.ps1", r".\scripts\test_fast.ps1"]
+        if os.name == "nt":
+            script_paths.extend([r"Scripts\test_fast.ps1", r".\SCRIPTS\TEST_FAST.PS1"])
+        for path in script_paths:
+            with self.subTest(path=path):
+                plan = select(ROOT, explicit_paths(ROOT, [path]))
+                self.assertTrue(plan["script_checks"])
+                self.assertEqual(plan["rust"], ["all"])
+                self.assertEqual(plan["flutter"], ["test", "integration_test"])
+                self.assertIn("shared/high-risk path", plan["reasons"][0]["reason"])
+        for path in ("app/lib/src/database/application_maintenance.dart", "docs/testing.md"):
+            with self.subTest(path=path):
+                self.assertFalse(select(ROOT, [path])["script_checks"])
+
+    def test_equivalent_path_spellings_select_the_same_plan(self):
+        # Every accepted spelling of one repository path must produce the
+        # canonical path's whole plan: separators, `.` segments, `..` detours
+        # (including detours through scripts/), absolute paths, a detour
+        # through the repository's parent and, on Windows, letter case.
+        canonical = ["scripts/test_fast.ps1", "scripts/test_support/TestEnvironment.ps1",
+                     "docs/testing.md", "app/lib/src/database/application_maintenance.dart",
+                     "collector/src/hub_server.rs", "CHANGELOG.md"]
+        detours = ["", "./", "././", "app/../", "scripts/../", "docs/../collector/../",
+                   f"../{ROOT.name}/", str(ROOT) + "/"]
+        index = DependencyIndex(ROOT)
+        for path in canonical:
+            expected = select(ROOT, [path], index)
+            self.assertEqual(expected["reasons"][0]["path"], path)
+            parts = path.split("/")
+            # A detour inside the path: first segment, then into scripts/ and back out.
+            inner = "/".join(parts[:1] + ["..", "scripts", ".."] + parts) if len(parts) > 1 else path
+            spellings = [prefix + body for prefix in detours for body in (path, inner)]
+            if os.name == "nt":
+                spellings += [s.upper() for s in spellings] + [s.lower() for s in spellings]
+            for spelling in spellings:
+                for variant in (spelling, spelling.replace("/", "\\")):
+                    with self.subTest(path=path, variant=variant):
+                        self.assertEqual(select(ROOT, explicit_paths(ROOT, [variant]), index), expected)
+
+    def test_paths_outside_the_repository_are_rejected(self):
+        drive_root = Path(ROOT.anchor)
+        outside = ["../outside.txt", f"../{ROOT.name}-other/scripts/test_fast.ps1",
+                   str(drive_root / ".." / "docs" / "testing.md"),
+                   str(drive_root / ".." / "scripts" / "test_fast.ps1"),
+                   str(drive_root / "docs" / "testing.md")]
+        for path in outside:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    explicit_paths(ROOT, [path])
+                result = subprocess.run([sys.executable, "-B", str(ROOT / "scripts" / "fast_tests.py"),
+                                         "--path", path, "--dry-run"],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("outside the repository", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_git_reported_paths_are_selected_as_reported(self):
+        # Git reports both sides of a case-only rename. Each side keeps its
+        # own spelling, so the unmapped side still widens as before.
+        plan = select(ROOT, ["DOCS/sample test.md", "docs/sample test.md"])
+        self.assertEqual([r["path"] for r in plan["reasons"]], ["DOCS/sample test.md", "docs/sample test.md"])
+        self.assertTrue(plan["widened"])
+        self.assertEqual(plan["rust"], ["all"])
 
     def test_deleted_tests_widen_instead_of_silently_disappearing(self):
         plan = select(ROOT, ["collector/tests/deleted_target.rs"])

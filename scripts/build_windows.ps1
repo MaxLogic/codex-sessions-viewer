@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$testFailures = [Collections.Generic.List[string]]::new()
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $appRoot = Join-Path $repoRoot 'app'
@@ -48,14 +49,25 @@ function Invoke-Step {
         [string] $Name,
 
         [Parameter(Mandatory = $true)]
-        [scriptblock] $ScriptBlock
+        [scriptblock] $ScriptBlock,
+
+        [switch] $Test
     )
 
     Write-Output "==> $Name"
-    & $ScriptBlock
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Name failed with exit code $LASTEXITCODE."
+    # Capture native failures here, even when the caller enables native
+    # nonzero exits as PowerShell errors.
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        & $ScriptBlock
+        if ($LASTEXITCODE -eq 0) { return }
+        $failure = "$Name failed with exit code $LASTEXITCODE."
+    } catch {
+        if (-not $Test) { throw }
+        $failure = "$Name failed to complete: $($_.Exception.Message)"
     }
+    if (-not $Test) { throw $failure }
+    $testFailures.Add($failure)
 }
 
 function Copy-DirectoryClean {
@@ -290,7 +302,7 @@ Push-Location $collectorRoot
 try {
     Invoke-Step 'Check collector formatting' { & $cargo fmt --check }
     Invoke-Step 'Lint collector' { & $cargo clippy --locked --all-targets -- -D warnings }
-    Invoke-Step 'Test collector' { Invoke-TestProcess -Context $testEnvironment -FilePath $cargo -ArgumentList @('test', '--locked', '--no-fail-fast') -WorkingDirectory $collectorRoot }
+    Invoke-Step 'Test collector' { Invoke-TestProcess -Context $testEnvironment -FilePath $cargo -ArgumentList @('test', '--locked', '--no-fail-fast') -WorkingDirectory $collectorRoot } -Test
     Invoke-Step 'Build collector and hub release' { & $cargo build --locked --release --bins }
 }
 finally {
@@ -316,8 +328,17 @@ try {
     Invoke-Step 'Analyze Flutter app' { & $flutter analyze }
     $testEnvironment.Variables['CODEX_SESSIONS_COLLECTOR_EXE'] = $collectorBuildExe
     $testEnvironment.Variables['CODEX_SESSIONS_HUB_EXE'] = $hubBuildExe
-    Invoke-Step 'Run Flutter tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test') -WorkingDirectory $appRoot }
-    Invoke-Step 'Run Flutter integration tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test', 'integration_test') -WorkingDirectory $appRoot }
+    Invoke-Step 'Run Flutter tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test') -WorkingDirectory $appRoot } -Test
+    Invoke-Step 'Run Flutter integration tests' { Invoke-TestProcess -Context $testEnvironment -FilePath $flutter -ArgumentList @('test', 'integration_test') -WorkingDirectory $appRoot } -Test
+    Invoke-Step 'Run script checks' {
+        $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+        & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'test_scripts.ps1') -CollectorPath $collectorBuildExe
+    } -Test
+    if ($testFailures.Count -gt 0) {
+        Write-Output 'Windows release test failures:'
+        $testFailures | Write-Output
+        throw "$($testFailures.Count) Windows release test step(s) failed."
+    }
     Invoke-Step 'Build Windows release' { & $flutter build windows }
 }
 finally {

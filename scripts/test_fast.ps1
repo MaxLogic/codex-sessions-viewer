@@ -32,85 +32,156 @@ $total = [Diagnostics.Stopwatch]::StartNew()
 . (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
 . (Join-Path $PSScriptRoot 'test_support/FastTestLaunch.ps1')
 $context = New-TestEnvironment -Parent (Join-Path $OutputRoot 'sandboxes')
+$scriptCheckSandboxParent = $null
+
+function Read-FastFlutterEvidence {
+    param([string] $Log, [int] $ExpectedCount)
+
+    # The machine reporter identifies each suite/test even when files
+    # run concurrently. Retain measured per-file spans, not a guessed
+    # division of the batch wall time. Spans overlap and do not sum.
+    $suites = @{}
+    $tests = @{}
+    foreach ($line in Get-Content -LiteralPath $Log) {
+        try { $testEvent = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($testEvent.type -eq 'suite') {
+            $suites[[string]$testEvent.suite.id] = [pscustomobject]@{ file=$testEvent.suite.path; first_ms=$null; last_ms=$null; passed=0; failed=0; skipped=0 }
+        } elseif ($testEvent.type -eq 'testStart') {
+            $tests[[string]$testEvent.test.id] = [string]$testEvent.test.suiteID
+            $suite = $suites[[string]$testEvent.test.suiteID]
+            if ($suite -and $null -eq $suite.first_ms) { $suite.first_ms = $testEvent.time }
+        } elseif ($testEvent.type -eq 'testDone') {
+            $suiteId = $tests[[string]$testEvent.testID]
+            $suite = if ($null -ne $suiteId) { $suites[$suiteId] }
+            if ($suite) {
+                $suite.last_ms = $testEvent.time
+                if (-not $testEvent.hidden) {
+                    if ($testEvent.skipped) { $suite.skipped++ } elseif ($testEvent.result -eq 'success') { $suite.passed++ } else { $suite.failed++ }
+                }
+            }
+        }
+    }
+    $targetTimings = @($suites.Values | ForEach-Object {
+        [pscustomobject]@{ file=$_.file; duration_seconds=($_.last_ms - $_.first_ms)/1000.0; measurement='concurrent suite span including load'; passed=$_.passed; failed=$_.failed; skipped=$_.skipped }
+    } | Sort-Object file)
+    $targetTimings | ConvertTo-Json -AsArray | Set-Content -LiteralPath (Join-Path $OutputRoot 'flutter-target-timings.json') -Encoding utf8
+    if ($targetTimings.Count -ne $ExpectedCount -or ($targetTimings | Measure-Object passed -Sum).Sum -le 0) { throw 'Flutter batch produced incomplete or empty suite evidence.' }
+}
 
 function Invoke-FastStep {
-    param([string] $Name, [string] $Executable, [string[]] $Arguments, [string] $Directory, [switch] $Isolated)
+    param(
+        [string] $Name, [string] $Executable, [string[]] $Arguments, [string] $Directory,
+        [switch] $Isolated, [string] $Needs, [int] $ExpectedFlutterSuites
+    )
     $timer = [Diagnostics.Stopwatch]::StartNew()
-    $log = Join-Path $OutputRoot ($Name + '.log')
-    $code = -1
-    try {
-        if ($Isolated) {
-            Invoke-TestProcess -Context $context -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory $Directory *> $log
-        } else {
-            Push-Location -LiteralPath $Directory
-            try { & $Executable @Arguments *> $log } finally { Pop-Location }
+    $log = $null
+    $code = $null
+    $reason = $null
+    $status = 'not_run'
+    if ($Needs) {
+        $reason = "needs $Needs"
+    } else {
+        $log = Join-Path $OutputRoot ($Name + '.log')
+        $PSNativeCommandUseErrorActionPreference = $false
+        $status = 'failed'
+        try {
+            if ($Isolated) {
+                Invoke-TestProcess -Context $context -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory $Directory *> $log
+            } else {
+                Push-Location -LiteralPath $Directory
+                try { & $Executable @Arguments *> $log } finally { Pop-Location }
+            }
+            $code = $LASTEXITCODE
+            if ($code -eq 0) {
+                if ($ExpectedFlutterSuites) { Read-FastFlutterEvidence -Log $log -ExpectedCount $ExpectedFlutterSuites }
+                $status = 'passed'
+            }
+        } catch {
+            $reason = $_.Exception.Message
+            try { Add-Content -LiteralPath $log -Value $reason } catch { $log = $null }
         }
-        $code = $LASTEXITCODE
-    } finally {
-        $timer.Stop()
-        $records.Add([pscustomobject]@{ name=$Name; executable=$Executable; arguments=$Arguments; directory=$Directory; exit_code=$code; duration_seconds=$timer.Elapsed.TotalSeconds; log=$log })
-        $records | ConvertTo-Json -Depth 6 -AsArray | Set-Content -LiteralPath (Join-Path $OutputRoot 'timings.json') -Encoding utf8
-        Write-Output ("{0}: exit {1}, {2:N2}s; {3}" -f $Name, $code, $timer.Elapsed.TotalSeconds, $log)
     }
-    if ($code -ne 0) { throw "$Name failed (exit $code); see $log" }
+    $timer.Stop()
+    $records.Add([pscustomobject]@{
+        name=$Name; executable=$Executable; arguments=$Arguments; directory=$Directory
+        exit_code=$code; duration_seconds=$timer.Elapsed.TotalSeconds; log=$log
+        status=$status; reason=$reason
+    })
+    $records | ConvertTo-Json -Depth 6 -AsArray | Set-Content -LiteralPath (Join-Path $OutputRoot 'timings.json') -Encoding utf8
+    if (-not $Needs) {
+        $exitText = if ($null -ne $code) { "exit $code" } else { 'no native exit' }
+        $logText = if ($log) { $log } else { 'log unavailable' }
+        Write-Output ("{0}: {1}, {2:N2}s; {3}" -f $Name, $exitText, $timer.Elapsed.TotalSeconds, $logText)
+    }
 }
 
 try {
-    $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $cargoCommand = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $cargo = if ($cargoCommand) { $cargoCommand.Source } else { 'cargo' }
     $collectorRoot = Join-Path $repo 'collector'
     foreach ($target in $selection.rust) {
         $arguments = if ($target -eq 'all') { @('test','--locked','--no-fail-fast') } elseif ($target -eq 'lib') { @('test','--locked','--lib') } else { @('test','--locked','--test',$target) }
         Invoke-FastStep -Name "rust-$target" -Executable $cargo -Arguments $arguments -Directory $collectorRoot -Isolated
     }
     if (@($selection.flutter).Count -gt 0) {
-        # Same tool-cache/build environment as build_windows.ps1. Tests alone
-        # enter the fail-closed profile, preserving the checkout's default target.
-        Invoke-FastStep -Name 'native-debug-build' -Executable $cargo -Arguments @('build','--locked','--bins') -Directory $collectorRoot
-        $flutter = (Get-Command flutter -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-        if (-not $flutter) { $flutter = 'C:\tools\flutter\bin\flutter.bat' }
+        # Keep the checkout's incremental build and tool caches. The test
+        # processes alone use the fail-closed profile.
+        $appRoot = Join-Path $repo 'app'
+        $flutterCommand = Get-Command flutter -ErrorAction SilentlyContinue | Select-Object -First 1
+        $flutter = if ($flutterCommand) { $flutterCommand.Source } else { 'C:\\tools\\flutter\\bin\\flutter.bat' }
         $context.Variables['PATH'] = (Split-Path -Parent $flutter) + [IO.Path]::PathSeparator + $context.Variables['PATH']
         $context.Variables['CODEX_SESSIONS_COLLECTOR_EXE'] = Join-Path $collectorRoot 'target/debug/codex-sessions-collector.exe'
         $context.Variables['CODEX_SESSIONS_HUB_EXE'] = Join-Path $collectorRoot 'target/debug/codex-sessions-hub.exe'
-        Invoke-FastStep -Name 'flutter-pub-get' -Executable $flutter -Arguments @('pub','get') -Directory (Join-Path $repo 'app')
+
+        $failedSetups = @()
+        Invoke-FastStep -Name 'native-debug-build' -Executable $cargo -Arguments @('build','--locked','--bins') -Directory $collectorRoot
+        if ($records[$records.Count - 1].status -eq 'failed') { $failedSetups += 'native-debug-build' }
+        Invoke-FastStep -Name 'flutter-pub-get' -Executable $flutter -Arguments @('pub','get') -Directory $appRoot
+        if ($records[$records.Count - 1].status -eq 'failed') { $failedSetups += 'flutter-pub-get' }
+        $needs = $failedSetups -join ' and '
+
         $batch = @($selection.flutter | Where-Object { -not $selection.flutter_filters.PSObject.Properties[$_] -and $_ -notin @('test','integration_test') -and -not $_.StartsWith('integration_test/') })
         if ($batch.Count -gt 0) {
-            Invoke-FastStep -Name 'flutter-selected' -Executable $flutter -Arguments (@('test','--machine') + $batch) -Directory (Join-Path $repo 'app') -Isolated
-            # The machine reporter identifies each suite/test even when files
-            # run concurrently. Retain measured per-file spans, not a guessed
-            # division of the batch wall time. Spans overlap and do not sum.
-            $suites = @{}
-            $tests = @{}
-            foreach ($line in Get-Content -LiteralPath (Join-Path $OutputRoot 'flutter-selected.log')) {
-                try { $testEvent = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-                if ($testEvent.type -eq 'suite') {
-                    $suites[[string]$testEvent.suite.id] = [pscustomobject]@{ file=$testEvent.suite.path; first_ms=$null; last_ms=$null; passed=0; failed=0; skipped=0 }
-                } elseif ($testEvent.type -eq 'testStart') {
-                    $tests[[string]$testEvent.test.id] = [string]$testEvent.test.suiteID
-                    $suite = $suites[[string]$testEvent.test.suiteID]
-                    if ($suite -and $null -eq $suite.first_ms) { $suite.first_ms = $testEvent.time }
-                } elseif ($testEvent.type -eq 'testDone') {
-                    $suite = $suites[$tests[[string]$testEvent.testID]]
-                    if ($suite) {
-                        $suite.last_ms = $testEvent.time
-                        if (-not $testEvent.hidden) {
-                            if ($testEvent.skipped) { $suite.skipped++ } elseif ($testEvent.result -eq 'success') { $suite.passed++ } else { $suite.failed++ }
-                        }
-                    }
-                }
-            }
-            $targetTimings = @($suites.Values | ForEach-Object {
-                [pscustomobject]@{ file=$_.file; duration_seconds=($_.last_ms - $_.first_ms)/1000.0; measurement='concurrent suite span including load'; passed=$_.passed; failed=$_.failed; skipped=$_.skipped }
-            } | Sort-Object file)
-            $targetTimings | ConvertTo-Json -AsArray | Set-Content -LiteralPath (Join-Path $OutputRoot 'flutter-target-timings.json') -Encoding utf8
-            if ($targetTimings.Count -ne $batch.Count -or ($targetTimings | Measure-Object passed -Sum).Sum -le 0) { throw 'Flutter batch produced incomplete or empty suite evidence.' }
+            Invoke-FastStep -Name 'flutter-selected' -Executable $flutter -Arguments (@('test','--machine') + $batch) -Directory $appRoot -Isolated -Needs $needs -ExpectedFlutterSuites $batch.Count
         }
         foreach ($file in @($selection.flutter | Where-Object { $_ -notin $batch })) {
             $name = 'flutter-' + ($file -replace '[/\\.]','_')
             $arguments = @(Get-FastFlutterTestArgumentList -Target $file -Filters $selection.flutter_filters)
-            Invoke-FastStep -Name $name -Executable $flutter -Arguments $arguments -Directory (Join-Path $repo 'app') -Isolated
+            Invoke-FastStep -Name $name -Executable $flutter -Arguments $arguments -Directory $appRoot -Isolated -Needs $needs
+        }
+    }
+    if ($selection.script_checks) {
+        $scriptCheckSandboxParent = Join-Path $OutputRoot 'sandboxes/script-checks'
+        $savedSandboxParent = $env:CXV_TEST_SANDBOX_PARENT
+        try {
+            $env:CXV_TEST_SANDBOX_PARENT = $scriptCheckSandboxParent
+            Invoke-FastStep -Name 'script-checks' -Executable (Join-Path $PSScriptRoot 'test_scripts.ps1') -Directory $repo
+        } finally {
+            $env:CXV_TEST_SANDBOX_PARENT = $savedSandboxParent
         }
     }
 } finally {
     $total.Stop()
-    [pscustomobject]@{ duration_seconds=$total.Elapsed.TotalSeconds; sandbox=$context.Root; cleanup='Retained for inspection; remove this owned sandbox after reviewing logs.' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputRoot 'run.json') -Encoding utf8
+    $failed = @($records | Where-Object status -eq 'failed')
+    $notRun = @($records | Where-Object status -eq 'not_run')
+    [pscustomobject]@{
+        duration_seconds=$total.Elapsed.TotalSeconds; sandbox=$context.Root
+        script_check_sandbox_parent=$scriptCheckSandboxParent
+        cleanup='Retained for inspection; remove these owned sandboxes after reviewing logs.'
+        steps=@($records.ToArray()); failed=$failed; not_run=$notRun
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputRoot 'run.json') -Encoding utf8
 }
+
+if ($failed.Count -or $notRun.Count) {
+    Write-Output 'Fast-lane test summary:'
+    foreach ($step in $failed) {
+        $exitText = if ($null -ne $step.exit_code) { "exit $($step.exit_code)" } else { 'no native exit' }
+        $logText = if ($step.log) { $step.log } else { 'log unavailable' }
+        $reasonText = if ($step.reason) { " ($($step.reason))" } else { '' }
+        Write-Output "$($step.name) $exitText $logText$reasonText"
+    }
+    foreach ($step in $notRun) { Write-Output "$($step.name) not run: $($step.reason)" }
+    exit 1
+}
+Write-Output "All $($records.Count) selected steps passed."
+exit 0

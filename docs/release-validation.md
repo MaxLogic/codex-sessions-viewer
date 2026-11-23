@@ -1,6 +1,8 @@
 # Release Validation
 
 Use the checked-in PowerShell scripts from the repository root.
+Install PowerShell 7, Pester 5 and PSScriptAnalyzer for the script checks.
+The Windows PowerShell commands below start PowerShell 7 for that step.
 
 During development use the [change-scoped fast lane](testing.md). The complete
 gate below remains required before closing a larger slice or release, and in CI.
@@ -18,7 +20,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_release.ps1
 2. Checks Rust formatting and Clippy, runs the Rust tests, and builds the collector and hub executables.
 3. Runs `flutter pub get`, `dart format --set-exit-if-changed .`, and `flutter analyze`.
 4. Runs `flutter test` and `flutter test integration_test` with the just-built collector and hub.
-5. Runs `flutter build windows` and prepares `release\windows`.
+5. Runs `scripts/test_scripts.ps1` for the PowerShell and Python checks.
+6. Runs `flutter build windows` and prepares `release\windows` if all tests passed.
+
+The collector, Flutter, Flutter integration and script test steps all run
+after an earlier test failure. The gate reports every failed test step before
+building the Windows release. Formatting, lint, analysis, dependency install
+and build failures stop the gate immediately.
 
 The release folder contains:
 
@@ -64,11 +72,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_release_filter_
 
 ## Additional Checks
 
-PowerShell script checks:
+Run the automated script checks on their own:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_release_scripts.ps1
-Invoke-ScriptAnalyzer -Path scripts -Recurse
+pwsh -NoProfile -File scripts/test_scripts.ps1
 ```
 
 Documentation privacy check:

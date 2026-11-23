@@ -20,20 +20,35 @@ pwsh -NoProfile -File scripts/test_fast.ps1 -Base origin/main -OutputRoot F:\dev
 pwsh -NoProfile -File scripts/test_fast.ps1 -ChangedPath collector/src/resident/bridge.rs -DryRun
 pwsh -NoProfile -File scripts/test_fast.ps1 -ChangedPath app/lib/src/database/application_maintenance.dart -OutputRoot F:\dev-artifacts\runs\codex-sessions-viewer-main\my-unique-maintenance-run
 
-python scripts/test_fast_tests.py
-Invoke-Pester scripts/test_support/FastTestLaunch.Tests.ps1
+pwsh -NoProfile -File scripts/test_scripts.ps1
 ```
 
 `-OutputRoot` must be a new directory. It retains `selection.json`, a log and
 monotonic duration for every command/setup step in `timings.json`, plus the
-total duration and sandbox path in `run.json`. Unfiltered Flutter files run
+total duration, sandbox path, script-check sandbox parent, step results,
+failures and skipped steps in `run.json`. Unfiltered Flutter files run
 together; `flutter-target-timings.json` records each suite's measured span
 including load time and its pass/fail/skip counts. These concurrent spans
-overlap and must not be summed. A failed native step records its
-exit code and stops the run. Sandboxes are retained for inspection; remove
-only that run's sandbox after collecting proof and confirming its writers
+overlap and must not be summed. A failed test step keeps its native exit code
+and any available log, and independent steps still run. The native debug
+build and Flutter dependency install run independently. If either fails,
+the runner records the Flutter test steps as not run. An
+incomplete Flutter batch report counts as a failed test step even if Flutter
+exits zero. The summary lists failures and steps not run, and the runner
+exits nonzero if any step failed. Sandboxes are retained for inspection; remove
+only that run's sandboxes after collecting proof and confirming its writers
 have stopped. Reuse the checkout's incremental `collector/target` and Flutter
 caches. Do not set `CARGO_TARGET_DIR`.
+
+Changes under `scripts/` also select `script-checks`. The existing
+`-AllowWide` guard still applies to that selection. For script checks alone,
+run `test_scripts.ps1` directly with PowerShell 7, Pester 5 and
+PSScriptAnalyzer installed. It runs every Pester suite under `scripts/`, both
+Python selection suites and recursive PowerShell analysis. It reports each
+check's exit, count and duration and requires zero analyzer diagnostics.
+The standalone gate locates or builds the debug collector. The Windows
+release gate supplies the collector it already built. Collector probes in
+Pester run in the isolated test profile.
 
 The checked-in policy is `scripts/fast_tests.py` and the source graph and
 semantic rules are in `scripts/test_dependencies.py`. Each selected path has
@@ -80,6 +95,13 @@ real run requires `-AllowWide`; otherwise the runner stops before starting
 tests and points to the full gate. Review the reasons rather than bypassing
 them with a guessed narrow path. `-ChangedPath` replaces the Git-derived list
 and is intended for diagnostics/representative proof, not slice closure.
+Give its paths relative to the repository root or as absolute paths; `.`, `..`,
+either separator and (on Windows) the letter case of existing files and folders
+resolve to the repository's own spelling. A path that no longer exists keeps
+the case you typed, so a miscased deleted file can only widen the run. Links
+are not followed, and a path outside the repository, including
+another spelling of the repository root such as a `\\?\` prefix, stops the
+selector with exit 2. Git-derived paths are used exactly as Git reports them.
 
 Tests use the same `New-TestEnvironment` / `Invoke-TestProcess` boundary as
 `build_windows.ps1`, plus Flutter's `TestEnvironment.testMain` configuration.

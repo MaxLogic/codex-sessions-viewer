@@ -1,5 +1,12 @@
 BeforeAll {
     . (Join-Path $PSScriptRoot 'TestEnvironment.ps1')
+    $script:collectorPath = $env:CODEX_SESSIONS_COLLECTOR_EXE
+    if (-not $script:collectorPath) {
+        $script:collectorPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../collector/target/debug/codex-sessions-collector.exe'))
+    }
+    if (-not (Test-Path -LiteralPath $script:collectorPath -PathType Leaf)) {
+        throw "These tests require the collector at '$script:collectorPath'. Build it with cargo build --locked --bin codex-sessions-collector from collector/, or use scripts/test_scripts.ps1."
+    }
     $script:context = New-TestEnvironment
 }
 Describe 'Shared PowerShell test profile boundary' {
@@ -70,14 +77,14 @@ Describe 'Shared PowerShell test profile boundary' {
     }
     It 'rejects external and unregistered loopback hub endpoints before launch' {
         foreach ($url in @('https://example.invalid','http://127.0.0.1:12345')) {
-            { Assert-TestLaunch $script:context $env:CODEX_SESSIONS_COLLECTOR_EXE @('codex','verify','--hub-url',$url) } | Should -Throw '*endpoint*'
+            { Assert-TestLaunch $script:context $script:collectorPath @('codex','verify','--hub-url',$url) } | Should -Throw '*endpoint*'
         }
         $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
         $listener.Start()
         try {
             $url = 'http://127.0.0.1:' + $listener.LocalEndpoint.Port
             Register-TestEndpoint $script:context $url
-            { Assert-TestLaunch $script:context $env:CODEX_SESSIONS_COLLECTOR_EXE @('codex','verify','--hub-url',$url) } | Should -Not -Throw
+            { Assert-TestLaunch $script:context $script:collectorPath @('codex','verify','--hub-url',$url) } | Should -Not -Throw
         } finally { $listener.Stop() }
     }
     It 'rejects quoted and unsupported TOML keys before spawning' {
@@ -128,7 +135,7 @@ Describe 'Shared PowerShell test profile boundary' {
         { Start-TestProcess -Context $script:context -FilePath 'codex_session_viewer.exe' } | Should -Throw '*refuses normal packaged-viewer startup*'
     }
     It 'starts native probes with the same guarded environment' {
-        $child = Start-TestProcess -Context $script:context -FilePath $env:CODEX_SESSIONS_COLLECTOR_EXE -ArgumentList @('version') -RedirectOutput
+        $child = Start-TestProcess -Context $script:context -FilePath $script:collectorPath -ArgumentList @('version') -RedirectOutput
         try {
             $output = $child.StandardOutput.ReadToEnd()
             $child.WaitForExit()
@@ -149,9 +156,8 @@ Describe 'Shared PowerShell test profile boundary' {
         try {
             $env:APPDATA = $poison.Variables['APPDATA']
             $isolated = New-TestEnvironment
-            $exe = $env:CODEX_SESSIONS_COLLECTOR_EXE
             $db = Join-Path $isolated.Root 'sentinel.sqlite'
-            $output = Invoke-TestProcess $isolated $exe @('codex','scan','--standalone',$db,'--no-wsl-projects','--json')
+            $output = Invoke-TestProcess $isolated $script:collectorPath @('codex','scan','--standalone',$db,'--no-wsl-projects','--json')
             $LASTEXITCODE | Should -Be 0
             ($output -join '') | Should -Not -Match 'POISONED_INHERITED_SETTINGS'
             [IO.File]::ReadAllText($sentinel) | Should -Be 'POISONED_INHERITED_SETTINGS = ['
