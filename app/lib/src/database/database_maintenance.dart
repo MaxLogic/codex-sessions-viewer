@@ -10,7 +10,6 @@ import 'package:sqlite3/sqlite3.dart' show sqlite3, SqliteException;
 
 import '../config/app_settings.dart';
 import '../scanner/resident_collector_client.dart';
-import 'sqlite_interrupt.dart';
 import 'database_connection.dart';
 import 'database_generation.dart';
 import 'database_maintenance_cancelled.dart';
@@ -628,7 +627,7 @@ final class DatabaseMaintenanceCoordinator {
 
     void interruptAtomicSection() {
       if (stopRequested && atomicSectionActive && !result.isCompleted) {
-        interruptSqlite(setup.handle.cast());
+        setup.interrupt();
       }
     }
 
@@ -729,7 +728,7 @@ final class DatabaseMaintenanceCoordinator {
         controlPort?.send(true);
         armAtomicInterrupts();
         if (!explicitAtomicSections && atomicStatementPhase) {
-          interruptSqlite(setup.handle.cast());
+          setup.interrupt();
         }
       },
     );

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Updated the Dart SQLite package to 3.9.2, which fixes duplicate native
+  finalization when a worker isolate is killed during SQLite cleanup.
+  Maintenance cancellation now uses the package's interrupt API (CXV-209).
+
 - Restored legacy packed hub queue rows now resend the current stored session.
   Rows without a stored session are dropped and counted in hub sync's
   `pruned_dead_letters` count, without decoding old payloads. In-flight batches

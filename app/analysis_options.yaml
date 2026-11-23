@@ -11,8 +11,6 @@ include: package:flutter_lints/flutter.yaml
 
 analyzer:
   exclude:
-    # Resolved and analyzed with the isolated generator package, not app deps.
-    - tool/ffigen.dart
     - build/**
     - windows/**
     - macos/**

@@ -88,7 +88,6 @@ Spans are last-minus-first mm:ss stamps seen for the file in the expanded report
 | test/database/session_activity_reader_test.dart | 1 | 0 | - |
 | test/database/session_activity_test.dart | 4 | 2 | 2 |
 | test/database/space_reclaim_test.dart | - | - | 0 |
-| test/database/sqlite_interrupt_test.dart | - | - | - |
 | test/database/startup_during_collection_test.dart | 17 | 4 | 10 |
 | test/database/startup_usage_migration_test.dart | 3 | 0 | 4 |
 | test/database/startup_usage_populated_test.dart | 5 | 1 | - |

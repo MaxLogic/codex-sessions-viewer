@@ -7,8 +7,6 @@ import 'package:codex_sessions_viewer/src/database/database_migrator.dart';
 import 'package:codex_sessions_viewer/src/database/project_tag_state.dart';
 import 'package:codex_sessions_viewer/src/search/message_search.dart';
 import 'package:codex_sessions_viewer/src/search/session_search.dart';
-import 'package:codex_sessions_viewer/src/third_party/sqlite_interrupt.g.dart'
-    as native;
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -502,7 +500,7 @@ void main() {
         functionName: 'interrupt_migration',
         argumentCount: const AllowedArgumentCount(1),
         function: (args) {
-          native.sqlite3_interrupt(db.handle.cast());
+          db.interrupt();
           return args.single;
         },
       );
