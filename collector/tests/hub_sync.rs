@@ -64,7 +64,8 @@ fn hub_report_child_helper() {
             println!("hub listening on http://{}", listener.local_addr().unwrap());
             std::io::stdout().flush().unwrap();
             let (mut socket, _) = listener.accept().unwrap();
-            socket.read(&mut [0; 4096]).unwrap();
+            let request_bytes = socket.read(&mut [0; 4096]).unwrap();
+            assert!(request_bytes > 0, "health probe sent no request");
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
                 .unwrap();
