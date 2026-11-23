@@ -30,6 +30,7 @@ $selectionJson | Set-Content -LiteralPath (Join-Path $OutputRoot 'selection.json
 $records = [Collections.Generic.List[object]]::new()
 $total = [Diagnostics.Stopwatch]::StartNew()
 . (Join-Path $PSScriptRoot 'test_support/TestEnvironment.ps1')
+. (Join-Path $PSScriptRoot 'test_support/FastTestLaunch.ps1')
 $context = New-TestEnvironment -Parent (Join-Path $OutputRoot 'sandboxes')
 
 function Invoke-FastStep {
@@ -105,9 +106,7 @@ try {
         }
         foreach ($file in @($selection.flutter | Where-Object { $_ -notin $batch })) {
             $name = 'flutter-' + ($file -replace '[/\\.]','_')
-            $arguments = @('test',$file)
-            $filter = $selection.flutter_filters.PSObject.Properties[$file]
-            if ($filter) { $arguments += @('--plain-name', [string]$filter.Value) }
+            $arguments = @(Get-FastFlutterTestArgumentList -Target $file -Filters $selection.flutter_filters)
             Invoke-FastStep -Name $name -Executable $flutter -Arguments $arguments -Directory (Join-Path $repo 'app') -Isolated
         }
     }
