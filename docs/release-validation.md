@@ -61,6 +61,13 @@ that both sample copies match the repository sample, and that
 `release\windows\settings.toml` retains its local contents. A package that
 contains only the executable is incomplete.
 
+The script gate (`scripts/test_scripts.ps1`, part of `build_windows.ps1`)
+checks this packaging logic on fixture build output with
+`scripts/package_release.Tests.ps1`. It checks that the local `settings.toml` stays
+out of the package and ZIP and is left unchanged, that the repository sample replaces
+any sample in the build output, and that overlapping build and package
+folders are refused. Inspect the real ZIP as well before sharing it.
+
 Run the native UI Automation filter smoke check against the packaged executable
 and complete the separate NVDA keyboard and speech pass in
 [accessibility release checks](accessibility-release-check.md). Flutter widget
