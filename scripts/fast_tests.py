@@ -112,9 +112,16 @@ def select(root, paths, index=None):
         if path != "app/lib/src/database/application_maintenance.dart":
             unfiltered.update(f)
         reasons.append({"path": path, "reason": reason, "rust": r, "flutter": f})
-    return {"rust": ["all"] if widened else sorted(rust),
-            "flutter": ["test", "integration_test"] if widened else sorted(flutter),
+    rust_plan = ["all"] if widened else sorted(rust)
+    flutter_plan = ["test", "integration_test"] if widened else sorted(flutter)
+    # The release gate's whole-package format and lint checks, for each
+    # toolchain with a selected test.
+    static_checks = ((["rust-fmt", "rust-clippy"] if rust_plan else [])
+                     + (["dart-format", "flutter-analyze"] if flutter_plan else []))
+    return {"rust": rust_plan,
+            "flutter": flutter_plan,
             "flutter_filters": {} if widened else {k: v for k, v in filters.items() if k not in unfiltered},
+            "static_checks": static_checks,
             "script_checks": script_checks,
             "widened": widened, "reasons": reasons}
 

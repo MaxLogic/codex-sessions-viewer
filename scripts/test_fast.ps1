@@ -122,6 +122,14 @@ try {
     $cargoCommand = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     $cargo = if ($cargoCommand) { $cargoCommand.Source } else { 'cargo' }
     $collectorRoot = Join-Path $repo 'collector'
+    # The release gate's format and lint checks run as independent steps.
+    $staticChecks = @($selection.static_checks)
+    if ('rust-fmt' -in $staticChecks) {
+        Invoke-FastStep -Name 'rust-fmt' -Executable $cargo -Arguments @('fmt','--check') -Directory $collectorRoot
+    }
+    if ('rust-clippy' -in $staticChecks) {
+        Invoke-FastStep -Name 'rust-clippy' -Executable $cargo -Arguments @('clippy','--locked','--all-targets','--','-D','warnings') -Directory $collectorRoot
+    }
     foreach ($target in $selection.rust) {
         $arguments = if ($target -eq 'all') { @('test','--locked','--no-fail-fast') } elseif ($target -eq 'lib') { @('test','--locked','--lib') } else { @('test','--locked','--test',$target) }
         Invoke-FastStep -Name "rust-$target" -Executable $cargo -Arguments $arguments -Directory $collectorRoot -Isolated
@@ -140,8 +148,20 @@ try {
         Invoke-FastStep -Name 'native-debug-build' -Executable $cargo -Arguments @('build','--locked','--bins') -Directory $collectorRoot
         if ($records[$records.Count - 1].status -eq 'failed') { $failedSetups += 'native-debug-build' }
         Invoke-FastStep -Name 'flutter-pub-get' -Executable $flutter -Arguments @('pub','get') -Directory $appRoot
-        if ($records[$records.Count - 1].status -eq 'failed') { $failedSetups += 'flutter-pub-get' }
+        $pubGetFailed = $records[$records.Count - 1].status -eq 'failed'
+        if ($pubGetFailed) { $failedSetups += 'flutter-pub-get' }
         $needs = $failedSetups -join ' and '
+
+        if ('dart-format' -in $staticChecks) {
+            $dartCommand = Get-Command dart -ErrorAction SilentlyContinue | Select-Object -First 1
+            $dart = if ($dartCommand) { $dartCommand.Source } else { Join-Path (Split-Path -Parent $flutter) 'dart.bat' }
+            # Check only; unlike the release gate, never rewrite the working tree.
+            Invoke-FastStep -Name 'dart-format' -Executable $dart -Arguments @('format','--output=none','--set-exit-if-changed','.') -Directory $appRoot
+        }
+        if ('flutter-analyze' -in $staticChecks) {
+            $analyzeNeeds = if ($pubGetFailed) { 'flutter-pub-get' } else { '' }
+            Invoke-FastStep -Name 'flutter-analyze' -Executable $flutter -Arguments @('analyze') -Directory $appRoot -Needs $analyzeNeeds
+        }
 
         $batch = @($selection.flutter | Where-Object { -not $selection.flutter_filters.PSObject.Properties[$_] -and $_ -notin @('test','integration_test') -and -not $_.StartsWith('integration_test/') })
         if ($batch.Count -gt 0) {

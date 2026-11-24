@@ -78,6 +78,23 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(select(ROOT, [path])["script_checks"])
 
+    def test_static_checks_follow_the_selected_toolchains(self):
+        cases = [
+            (["collector/tests/context_query.rs"], ["rust-fmt", "rust-clippy"]),
+            (["app/test/database/application_maintenance_test.dart"], ["dart-format", "flutter-analyze"]),
+            (["collector/tests/context_query.rs", "app/test/database/application_maintenance_test.dart"],
+             ["rust-fmt", "rust-clippy", "dart-format", "flutter-analyze"]),
+            (["collector/Cargo.toml"], ["rust-fmt", "rust-clippy", "dart-format", "flutter-analyze"]),
+            (["docs/testing.md"], []),
+            ([], []),
+        ]
+        for paths, expected in cases:
+            with self.subTest(paths=paths):
+                plan = select(ROOT, paths)
+                self.assertEqual(plan["static_checks"], expected)
+                self.assertEqual(bool(plan["rust"]), "rust-clippy" in expected)
+                self.assertEqual(bool(plan["flutter"]), "flutter-analyze" in expected)
+
     def test_equivalent_path_spellings_select_the_same_plan(self):
         # Every accepted spelling of one repository path must produce the
         # canonical path's whole plan: separators, `.` segments, `..` detours

@@ -31,10 +31,17 @@ total duration, sandbox path, script-check sandbox parent, step results,
 failures and skipped steps in `run.json`. Unfiltered Flutter files run
 together; `flutter-target-timings.json` records each suite's measured span
 including load time and its pass/fail/skip counts. These concurrent spans
-overlap and must not be summed. A failed test step keeps its native exit code
+overlap and must not be summed. When any Rust test is selected, the lane
+also runs the release gate's `rust-fmt` (`cargo fmt --check`) and
+`rust-clippy` (`cargo clippy --locked --all-targets -- -D warnings`) steps.
+When any Flutter test is selected, it runs `dart-format` (`dart format
+--output=none --set-exit-if-changed .`, which checks without rewriting files,
+unlike the release gate) and `flutter-analyze`. These whole-package checks
+appear under `static_checks` in the dry-run selection. A failed test step keeps its native exit code
 and any available log, and independent steps still run. The native debug
 build and Flutter dependency install run independently. If either fails,
-the runner records the Flutter test steps as not run. An
+the runner records the Flutter test steps as not run; a failed dependency
+install also leaves `flutter-analyze` not run. An
 incomplete Flutter batch report counts as a failed test step even if Flutter
 exits zero. The summary lists failures and steps not run, and the runner
 exits nonzero if any step failed. Rust, Flutter and script checks use the run's

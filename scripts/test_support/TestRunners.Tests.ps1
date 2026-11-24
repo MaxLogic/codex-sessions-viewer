@@ -57,7 +57,8 @@ exit 0
 
     function Initialize-FixtureSelection {
         param([string] $Root, [string[]] $Flutter, [bool] $ScriptChecks = $false)
-        $plan = @{ rust = @('all'); flutter = $Flutter; flutter_filters = @{}; script_checks = $ScriptChecks; widened = $true }
+        $static = @('rust-fmt','rust-clippy') + $(if ($Flutter.Count) { @('dart-format','flutter-analyze') } else { @() })
+        $plan = @{ rust = @('all'); flutter = $Flutter; flutter_filters = @{}; static_checks = $static; script_checks = $ScriptChecks; widened = $true }
         $plan | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $Root 'selection.json')
         @'
 from pathlib import Path
@@ -89,8 +90,8 @@ Describe 'Fast lane runner in a disposable checkout' {
         $output = & $script:runner -AllowWide -OutputRoot $script:outputRoot 3>&1
         $LASTEXITCODE | Should -Not -Be 0
         $steps = Get-Content (Join-Path $script:outputRoot 'timings.json') -Raw | ConvertFrom-Json
-        $steps.name | Should -Be @('rust-all','native-debug-build','flutter-pub-get','flutter-test','script-checks')
-        foreach ($step in $steps | Select-Object -Skip 1) {
+        $steps.name | Should -Be @('rust-fmt','rust-clippy','rust-all','native-debug-build','flutter-pub-get','dart-format','flutter-analyze','flutter-test','script-checks')
+        foreach ($step in $steps | Where-Object name -ne 'rust-all') {
             $step.status | Should -Be 'passed'
             $step.exit_code | Should -Be 0
         }
@@ -108,17 +109,18 @@ Describe 'Fast lane runner in a disposable checkout' {
         Get-Content -LiteralPath ($steps | Where-Object name -eq 'flutter-test').log | Should -Contain "Flutter sandbox parent=$childParent"
     }
     It 'records dependent steps as not run after <Setup>' -ForEach @(
-        @{ Setup = 'native-debug-build'; Trigger = 'build---locked' }
-        @{ Setup = 'flutter-pub-get'; Trigger = 'pub-get' }
+        @{ Setup = 'native-debug-build'; Trigger = 'build---locked'; NotRun = @('flutter-test','flutter-integration_test') }
+        @{ Setup = 'flutter-pub-get'; Trigger = 'pub-get'; NotRun = @('flutter-analyze','flutter-test','flutter-integration_test') }
     ) {
         Initialize-FixtureSelection -Root $root -Flutter @('test','integration_test') -ScriptChecks $true
         Initialize-FixtureFailure -Root $root -Markers "fail-$Trigger"
         $output = & $script:runner -AllowWide -OutputRoot $script:outputRoot
         $LASTEXITCODE | Should -Not -Be 0
         $run = Get-Content (Join-Path $script:outputRoot 'run.json') -Raw | ConvertFrom-Json
-        $run.failed[0].name | Should -Be $Setup
+        $run.failed.name | Should -Be $Setup
         $run.failed[0].exit_code | Should -Be 37
-        $run.not_run.name | Should -Be @('flutter-test','flutter-integration_test')
+        $run.not_run.name | Should -Be $NotRun
+        ($run.steps | Where-Object name -eq 'dart-format').status | Should -Be 'passed'
         if ($Setup -eq 'native-debug-build') {
             $pubGet = $run.steps | Where-Object name -eq 'flutter-pub-get'
             $pubGet.exit_code | Should -Be 0
@@ -138,13 +140,29 @@ Describe 'Fast lane runner in a disposable checkout' {
         $run = Get-Content (Join-Path $script:outputRoot 'run.json') -Raw | ConvertFrom-Json
         $run.failed.name | Should -Be @('rust-all','native-debug-build','flutter-pub-get')
         $run.failed.exit_code | Should -Be @(101,37,42)
-        $run.not_run.name | Should -Be @('flutter-test','flutter-integration_test')
-        foreach ($step in $run.not_run) {
-            $step.reason | Should -Be 'needs native-debug-build and flutter-pub-get'
-        }
+        $run.not_run.name | Should -Be @('flutter-analyze','flutter-test','flutter-integration_test')
+        $run.not_run.reason | Should -Be @('needs flutter-pub-get','needs native-debug-build and flutter-pub-get','needs native-debug-build and flutter-pub-get')
         $output | Should -Match 'rust-all exit 101'
         $output | Should -Match 'native-debug-build exit 37'
         $output | Should -Match 'flutter-pub-get exit 42'
+    }
+    It 'reports format and lint failures with every test step still run' {
+        Initialize-FixtureSelection -Root $root -Flutter @('test','integration_test') -ScriptChecks $true
+        Initialize-FixtureFailure -Root $root -Markers @('fail-fmt---check','fail-clippy---locked','fail-format---output','fail-analyze-')
+        $output = (& $script:runner -AllowWide -OutputRoot $script:outputRoot) -join "`n"
+        $LASTEXITCODE | Should -Be 1
+        $run = Get-Content (Join-Path $script:outputRoot 'run.json') -Raw | ConvertFrom-Json
+        $run.failed.name | Should -Be @('rust-fmt','rust-clippy','dart-format','flutter-analyze')
+        $run.failed.exit_code | Should -Be @(37,37,37,37)
+        $run.not_run | Should -BeNullOrEmpty
+        foreach ($name in @('rust-all','native-debug-build','flutter-pub-get','flutter-test','flutter-integration_test','script-checks')) {
+            ($run.steps | Where-Object name -eq $name).status | Should -Be 'passed'
+        }
+        foreach ($name in @('rust-fmt','rust-clippy','dart-format','flutter-analyze')) {
+            $output | Should -Match "$name exit 37"
+        }
+        Get-Content -LiteralPath ($run.steps | Where-Object name -eq 'rust-clippy').log | Should -Contain 'invoked cargo clippy --locked --all-targets -- -D warnings'
+        Get-Content -LiteralPath ($run.steps | Where-Object name -eq 'dart-format').log | Should -Contain 'invoked dart format --output=none --set-exit-if-changed .'
     }
     It 'records an unavailable step log and runs later steps' {
         Initialize-FixtureSelection -Root $root -Flutter @('test','integration_test') -ScriptChecks $true
