@@ -21,10 +21,49 @@ import urllib.request
 TOKEN = "synthetic-cxv203-machine-token-123456789"
 
 
+HUB_READY = "hub listening on http://"
+
+
 def port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return listener.getsockname()[1]
+
+
+def log_tail(path, limit=4000):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        return f"<{path} unreadable: {error}>"
+    return text if len(text) <= limit else "...[truncated]\n" + text[-limit:]
+
+
+def hub_address(child, log_path, timeout=10):
+    """Return host:port from the hub's newline-terminated ready line in its log.
+
+    The hub binds port 0 and reports the bound address on stdout, so no other
+    process can take the port between selection and start. If the hub exits or
+    stays silent, the error carries the end of its log (stdout and stderr).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        exited = child.poll() is not None
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            text = ""
+        for line in text.splitlines(keepends=True):
+            if line.startswith(HUB_READY) and line.endswith("\n"):
+                address = line[len(HUB_READY):].strip()
+                host, _, bound = address.rpartition(":")
+                if host != "127.0.0.1" or not bound.isdigit() or int(bound) == 0:
+                    raise AssertionError(f"invalid hub listening report: {line!r}")
+                return address
+        if exited:
+            raise AssertionError(f"hub exited with {child.returncode} before listening:\n{log_tail(log_path)}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"hub did not report its address within {timeout} s:\n{log_tail(log_path)}")
+        time.sleep(.05)
 
 
 def main():
@@ -99,8 +138,11 @@ def main():
         version = run([args.caddy, "version"])
         require(version["exit"] == 0, version)
         results["caddy_sha256"] = hashlib.sha256(args.caddy.read_bytes()).hexdigest()
-        hp, pp = port(), port()
-        direct, proxy = f"http://127.0.0.1:{hp}", f"http://127.0.0.1:{pp}"
+        # The collector's hub URL and the Caddyfile need the proxy port before
+        # Caddy starts, and Caddy with its admin API off cannot report a bound
+        # port 0, so only the proxy port is picked here. The hub binds port 0.
+        pp = port()
+        proxy = f"http://127.0.0.1:{pp}"
         db = root / "local.sqlite"
         enabled = run([collector, "hub", "enable", "--hub-url", proxy, "--standalone", db])
         require(enabled["exit"] == 0, enabled)
@@ -109,6 +151,10 @@ def main():
         config.write_text(json.dumps({"owner_token": "synthetic-cxv203-owner-token-123456789",
                                       "machines": {machine: TOKEN},
                                       "request_timeout_seconds": 2}), encoding="utf-8")
+        hub = spawn([hub_exe, "127.0.0.1:0", root / "hub-data", config], "hub")
+        hub_bound = hub_address(hub, root / "hub.log")
+        hp = int(hub_bound.rpartition(":")[2])
+        results["hub_address"] = hub_bound
         caddyfile = root / "Caddyfile"
         caddyfile.write_text(f"""{{
  admin off
@@ -122,7 +168,7 @@ http://127.0.0.1:{pp} {{
  request_body {{
   max_size 80MB
  }}
- reverse_proxy 127.0.0.1:{hp} {{
+ reverse_proxy {hub_bound} {{
   transport http {{
    read_timeout 15m
    write_timeout 15m
@@ -130,8 +176,7 @@ http://127.0.0.1:{pp} {{
  }}
 }}
 """, encoding="utf-8")
-        spawn([hub_exe, f"127.0.0.1:{hp}", root / "hub-data", config], "hub")
-        spawn([args.caddy, "run", "--config", caddyfile, "--adapter", "caddyfile"], "caddy")
+        caddy = spawn([args.caddy, "run", "--config", caddyfile, "--adapter", "caddyfile"], "caddy")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.monotonic() + 10
         while True:
@@ -140,7 +185,11 @@ http://127.0.0.1:{pp} {{
                     require(response.status == 200, "health response")
                 break
             except OSError:
-                require(time.monotonic() < deadline, "local fixtures did not start")
+                for label, child in (("hub", hub), ("caddy", caddy)):
+                    require(child.poll() is None, f"{label} exited with {child.returncode} before the proxy was healthy:\n"
+                            + log_tail(root / f"{label}.log"))
+                require(time.monotonic() < deadline, "proxy did not become healthy within 10 s:\n"
+                        + log_tail(root / "caddy.log"))
                 time.sleep(.05)
         ingested = run([collector, "codex", "ingest", "--standalone", db,
                         repo / "samples/sessions/sample_codex_jsonl_session.jsonl"])
@@ -150,21 +199,20 @@ http://127.0.0.1:{pp} {{
         noise = entropy + "x" * (56 * 1024 * 1024 - len(entropy))
         results["noise_mib"] = args.noise_mib
         with sqlite3.connect(db) as conn:
+            # The outbox queues a reference for each changed session and the
+            # collector builds the snapshot from the stored rows at send time,
+            # so the stored tool output carries the large body.
             rows = conn.execute("select id,record_json from collector_upload_outbox order by id").fetchall()
-            for row_id, payload in rows:
-                record = json.loads(payload)
-                if record["kind"] == "session_snapshot":
-                    record["record"]["tool_calls"][0]["output_preview"] = noise
-                    conn.execute("update collector_upload_outbox set record_json=? where id=?",
-                                 (json.dumps(record, separators=(",", ":")), row_id))
-                    large_id = row_id
-                    break
-            else:
-                raise AssertionError("no snapshot in fixture")
+            large_id = next((row_id for row_id, payload in rows
+                             if json.loads(payload).get("outbox_ref") == "session_snapshot"), None)
+            require(large_id is not None, "no snapshot in fixture")
+            changed = conn.execute("update tool_calls set output_preview=? where id=(select min(id) from tool_calls)",
+                                   (noise,)).rowcount
+            require(changed == 1, "no tool call in fixture")
         before = sql(db, "select id,record_json from collector_upload_outbox order by id")
         require(before[0][0] == large_id, "fixture must start with the oversized snapshot")
-        results["decoded_record_bytes"] = sum(len(text.encode()) for _, text in before)
-        require(results["decoded_record_bytes"] > 56 * 1024 * 1024, "large fixture missing")
+        results["decoded_record_bytes"] = sql(db, "select sum(length(cast(output_preview as blob))) from tool_calls")[0][0]
+        require(results["decoded_record_bytes"] >= 56 * 1024 * 1024, "large fixture missing")
         # A direct client owns the REAL hub's ingest gate after receiving 100.
         gate = socket.create_connection(("127.0.0.1", hp), timeout=5)
         gate.sendall(f"POST /v1/ingest HTTP/1.1\r\nHost: hub\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 1048576\r\nExpect: 100-continue\r\n\r\n".encode())
